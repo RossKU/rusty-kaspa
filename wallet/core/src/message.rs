@@ -2,6 +2,7 @@
 //! Message signing and verification functions.
 //!
 
+use kaspa_addresses::{Address, Version as AddressVersion};
 use kaspa_hashes::{Hash, PersonalMessageSigningHash};
 use secp256k1::{Error, XOnlyPublicKey};
 
@@ -51,6 +52,19 @@ pub fn verify_message(msg: &PersonalMessage, signature: &Vec<u8>, pubkey: &XOnly
     let msg = secp256k1::Message::from_digest_slice(hash.as_bytes().as_slice())?;
     let sig = secp256k1::schnorr::Signature::from_slice(signature.as_slice())?;
     sig.verify(&msg, pubkey)
+}
+
+/// Verifies a signed message using a Kaspa [`Address`].
+///
+/// Extracts the public key from the address payload and delegates to [`verify_message`].
+/// Only `PubKey` addresses are supported; `ScriptHash` and `PubKeyECDSA` addresses
+/// will return [`secp256k1::Error::InvalidPublicKey`].
+pub fn verify_message_with_address(msg: &PersonalMessage, signature: &Vec<u8>, address: &Address) -> Result<(), Error> {
+    if address.version != AddressVersion::PubKey {
+        return Err(Error::InvalidPublicKey);
+    }
+    let pubkey = XOnlyPublicKey::from_slice(&address.payload)?;
+    verify_message(msg, signature, &pubkey)
 }
 
 fn calc_personal_message_hash(msg: &PersonalMessage) -> Hash {
@@ -175,6 +189,37 @@ Ut omnis magnam et accusamus earum rem impedit provident eum commodi repellat qu
 
         let verify_result = verify_message(&pm, &fake_sig, &pubkey);
         assert!(verify_result.is_err());
+    }
+
+    #[test]
+    fn test_verify_with_address() {
+        use kaspa_addresses::{Address, Prefix, Version};
+
+        let pm = PersonalMessage("Hello Kaspa!");
+        let privkey: [u8; 32] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03,
+        ];
+        let pubkey_bytes: [u8; 32] = [
+            0xF9, 0x30, 0x8A, 0x01, 0x92, 0x58, 0xC3, 0x10, 0x49, 0x34, 0x4F, 0x85, 0xF8, 0x9D, 0x52, 0x29, 0xB5, 0x31, 0xC8, 0x45,
+            0x83, 0x6F, 0x99, 0xB0, 0x86, 0x01, 0xF1, 0x13, 0xBC, 0xE0, 0x36, 0xF9,
+        ];
+
+        let sign_opts = SignMessageOptions { no_aux_rand: true };
+        let signature = sign_message(&pm, &privkey, &sign_opts).expect("sign_message failed");
+
+        // Verify with PubKey address (should succeed)
+        let address = Address::new(Prefix::Mainnet, Version::PubKey, &pubkey_bytes);
+        verify_message_with_address(&pm, &signature, &address).expect("verify_message_with_address failed");
+
+        // Verify with wrong PubKey address (should fail)
+        let wrong_bytes: [u8; 32] = [0x01; 32];
+        let wrong_address = Address::new(Prefix::Mainnet, Version::PubKey, &wrong_bytes);
+        assert!(verify_message_with_address(&pm, &signature, &wrong_address).is_err());
+
+        // Verify with ScriptHash address (should fail with InvalidPublicKey)
+        let script_address = Address::new(Prefix::Mainnet, Version::ScriptHash, &pubkey_bytes);
+        assert!(verify_message_with_address(&pm, &signature, &script_address).is_err());
     }
 
     #[test]

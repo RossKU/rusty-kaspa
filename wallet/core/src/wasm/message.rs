@@ -1,5 +1,6 @@
 use crate::imports::*;
 use crate::message::*;
+use kaspa_addresses::Version as AddressVersion;
 use kaspa_wallet_keys::privatekey::PrivateKey;
 use kaspa_wallet_keys::publickey::PublicKey;
 use kaspa_wasm_core::types::HexString;
@@ -54,7 +55,8 @@ const TS_VERIFY_MESSAGE_TYPES: &'static str = r#"
 export interface IVerifyMessage {
     message: string;
     signature: HexString;
-    publicKey: PublicKey | string;
+    publicKey?: PublicKey | string;
+    address?: Address | string;
 }
 "#;
 
@@ -64,20 +66,34 @@ extern "C" {
     pub type IVerifyMessage;
 }
 
-/// Verifies with a public key the signature of the given message
+/// Verifies the signature of the given message with a public key or address.
+///
+/// Supply either `publicKey` or `address` (a Schnorr PubKey address).
+/// When `address` is provided, the public key is extracted from it automatically.
+///
 /// @category Message Signing
 #[wasm_bindgen(js_name = verifyMessage, skip_jsdoc)]
 pub fn js_verify_message(value: IVerifyMessage) -> Result<bool, Error> {
     if let Some(object) = Object::try_from(&value) {
-        let public_key = object.cast_into::<PublicKey>("publicKey")?;
         let raw_msg = object.get_string("message")?;
         let signature = object.get_string("signature")?;
+
+        let xonly_public_key = if let Ok(public_key) = object.cast_into::<PublicKey>("publicKey") {
+            public_key.xonly_public_key
+        } else if let Ok(address) = object.cast_into::<Address>("address") {
+            if address.version != AddressVersion::PubKey {
+                return Err(Error::custom("Address not supported for message verification. Only PubKey addresses are supported"));
+            }
+            secp256k1::XOnlyPublicKey::from_slice(&address.payload)?
+        } else {
+            return Err(Error::custom("publicKey or address is required"));
+        };
 
         let pm = PersonalMessage(&raw_msg);
         let mut signature_bytes = [0u8; 64];
         faster_hex::hex_decode(signature.as_bytes(), &mut signature_bytes)?;
 
-        Ok(verify_message(&pm, &signature_bytes.to_vec(), &public_key.xonly_public_key).is_ok())
+        Ok(verify_message(&pm, &signature_bytes.to_vec(), &xonly_public_key).is_ok())
     } else {
         Err(Error::custom("Failed to parse input"))
     }

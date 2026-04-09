@@ -82,6 +82,11 @@ pub struct RpcClient {
     auth_token: Option<String>,
     /// Retry configuration for transient errors.
     retry_config: RetryConfig,
+    /// Channel for receiving subscription notifications (blockAddedNotification, etc.).
+    /// Notifications are messages from the node that have a `method` field but no `id`.
+    notification_rx: Arc<Mutex<Option<mpsc::Receiver<serde_json::Value>>>>,
+    /// Sender side kept for reconnection (cloned into reader task).
+    notification_tx: mpsc::Sender<serde_json::Value>,
 }
 
 impl RpcClient {
@@ -135,6 +140,7 @@ impl RpcClient {
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let (write_tx, mut write_rx) = mpsc::channel::<String>(256);
+        let (notif_tx, notif_rx) = mpsc::channel::<serde_json::Value>(512);
 
         // Split WebSocket into reader and writer
         use futures_util::stream::StreamExt;
@@ -160,20 +166,34 @@ impl RpcClient {
         // Reader task
         let pending_r = pending.clone();
         let alive_r = alive.clone();
+        let notif_tx_r = notif_tx.clone();
         tokio::spawn(async move {
             while let Some(msg_result) = ws_reader.next().await {
                 match msg_result {
                     Ok(Message::Text(text)) => {
                         if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&text) {
                             if let Some(id) = resp.id {
+                                // RPC response — route to pending caller
                                 let mut map = pending_r.lock().await;
                                 if let Some(tx) = map.remove(&id) {
                                     if tx.send(resp).is_err() {
                                         tracing::warn!("[RPC] Response channel closed for request {}", id);
                                     }
                                 }
+                            } else if resp.method.is_some() {
+                                // Subscription notification (no id, has method)
+                                // Build a notification value with method + params
+                                let mut notif = serde_json::Map::new();
+                                if let Some(m) = &resp.method {
+                                    notif.insert("method".to_string(), serde_json::Value::String(m.clone()));
+                                }
+                                if let Some(p) = resp.params {
+                                    notif.insert("params".to_string(), p);
+                                }
+                                if let Err(e) = notif_tx_r.try_send(serde_json::Value::Object(notif)) {
+                                    tracing::warn!("[RPC] Failed to enqueue notification: {}", e);
+                                }
                             }
-                            // Subscription notifications (method-based) could be handled here
                         }
                     }
                     Ok(Message::Close(_)) => {
@@ -198,6 +218,8 @@ impl RpcClient {
             alive,
             auth_token,
             retry_config,
+            notification_rx: Arc::new(Mutex::new(Some(notif_rx))),
+            notification_tx: notif_tx,
         })
     }
 
@@ -425,6 +447,33 @@ impl RpcClient {
 
 }
 
+// Subscription / notification support
+
+impl RpcClient {
+    /// Subscribe to a notification scope (e.g., `BlockAdded`, `VirtualChainChanged`).
+    ///
+    /// Sends a `subscribe` RPC call with the given scope. The node will respond
+    /// with a confirmation, and then send notification messages asynchronously
+    /// (e.g., `blockAddedNotification`). These are routed to the notification
+    /// channel and can be received via `take_notification_receiver()`.
+    ///
+    /// The scope parameter should match Kaspa's Scope enum variant name
+    /// (PascalCase), e.g., `"BlockAdded"`, `"VirtualChainChanged"`.
+    pub async fn subscribe(&self, scope: &str) -> Result<serde_json::Value, String> {
+        let params = serde_json::json!({ scope: {} });
+        self.call("subscribe", params).await
+    }
+
+    /// Take ownership of the notification receiver channel.
+    ///
+    /// Returns `None` if already taken (can only be taken once per connection).
+    /// The caller should use this in a `tokio::select!` or dedicated task to
+    /// process incoming notifications.
+    pub async fn take_notification_receiver(&self) -> Option<mpsc::Receiver<serde_json::Value>> {
+        self.notification_rx.lock().await.take()
+    }
+}
+
 #[allow(dead_code)] // Reconnect/retry — wired into executor loop for production resilience
 impl RpcClient {
     /// Check if the connection is alive.
@@ -563,6 +612,8 @@ impl RpcClient {
                     self.pending = new_client.pending;
                     self.write_tx = new_client.write_tx;
                     self.alive = new_client.alive;
+                    self.notification_tx = new_client.notification_tx;
+                    self.notification_rx = new_client.notification_rx;
                     tracing::info!(
                         "[RPC RECONNECT] Successfully reconnected to {}",
                         self.url

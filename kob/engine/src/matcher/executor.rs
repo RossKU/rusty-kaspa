@@ -2307,20 +2307,31 @@ async fn scan_new_blocks(
 
 /// Parse block notification JSON into TransactionData list.
 ///
-/// Handles the Kaspa RPC `notifyBlockAddedResponse` format:
+/// Handles the Kaspa wRPC `blockAddedNotification` format:
 /// ```json
 /// {
-///   "block": {
-///     "transactions": [{ ... }, ...]
+///   "BlockAdded": {
+///     "block": {
+///       "transactions": [{ ... }, ...]
+///     }
 ///   }
 /// }
 /// ```
-#[allow(dead_code)] // Used in tests
+/// Also supports the simpler `{"block": {"transactions": [...]}}` form.
 pub fn parse_block_notification(notification: &serde_json::Value) -> Vec<TransactionData> {
+    // Try Kaspa wRPC format: params.BlockAdded.block.transactions
     let txs = notification
-        .get("block")
+        .get("BlockAdded")
+        .and_then(|ba| ba.get("block"))
         .and_then(|b| b.get("transactions"))
-        .and_then(|t| t.as_array());
+        .and_then(|t| t.as_array())
+        // Fallback: params.block.transactions
+        .or_else(|| {
+            notification
+                .get("block")
+                .and_then(|b| b.get("transactions"))
+                .and_then(|t| t.as_array())
+        });
 
     match txs {
         Some(arr) => arr
@@ -4355,25 +4366,22 @@ pub async fn run_continuous_with_ws(
     let mut cycle = 0u64;
     let mut spent_tracker = SpentTracker::new();
 
-    // Initialize chain scan cursor: start from the current sink (tip) hash.
-    // On the first cycle, this fetches the tip so we only scan forward.
-    let mut last_chain_hash: String = {
+    // Subscribe to BlockAdded notifications for event-driven scanning.
+    // This replaces the old getVirtualChainFromBlock polling loop.
+    let mut notif_rx = {
         let rpc_lock = rpc.lock().await;
-        match rpc_lock.get_sink_hash().await {
-            Ok(h) => {
-                info!("[SCAN-BLOCKS] Initialized chain cursor at {}", &h[..h.len().min(16)]);
-                h
-            }
-            Err(e) => {
-                warn!("[SCAN-BLOCKS] Failed to get initial sink hash: {}. Block scanning disabled until next attempt.", e);
-                String::new()
-            }
+        match rpc_lock.subscribe("BlockAdded").await {
+            Ok(_) => info!("[SUBSCRIBE] Subscribed to BlockAdded notifications"),
+            Err(e) => warn!("[SUBSCRIBE] Failed to subscribe to BlockAdded: {}. Will retry on reconnect.", e),
         }
+        rpc_lock.take_notification_receiver().await
+            .expect("notification receiver already taken")
     };
 
     while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
         // BUG 1 fix: Check RPC connection health at the top of each cycle.
         // If the connection is dead, attempt reconnection before any RPC calls.
+        // On reconnect, re-subscribe and take the new notification receiver.
         {
             let mut rpc_lock = rpc.lock().await;
             if rpc_lock.needs_reconnect() {
@@ -4385,51 +4393,114 @@ pub async fn run_continuous_with_ws(
                     continue;
                 }
                 info!("[RPC] Reconnected successfully");
+                // Re-subscribe after reconnect
+                match rpc_lock.subscribe("BlockAdded").await {
+                    Ok(_) => info!("[SUBSCRIBE] Re-subscribed to BlockAdded notifications"),
+                    Err(e) => warn!("[SUBSCRIBE] Failed to re-subscribe: {}", e),
+                }
+                if let Some(new_rx) = rpc_lock.take_notification_receiver().await {
+                    notif_rx = new_rx;
+                }
             }
         }
 
         cycle += 1;
-        info!("--- Scan cycle {} ---", cycle);
+        debug!("--- Scan cycle {} ---", cycle);
 
         // M-6: Age-based pruning of spent tracker entries every cycle.
-        // Entries older than 60 seconds are pruned (mempool should have caught up).
-        // Failed entries have their own cooldown via expire_failed().
-        //
-        // DAG UTXO conflict recovery (D-1): If a fill TX is invalidated by a
-        // competing TX in a parallel DAG block, the order's UTXO remains unspent.
-        // After prune (60s) the SpentTracker forgets it, and the scanner re-detects
-        // the unspent UTXO in the next cycle, automatically re-adding the order to
-        // the book. Worst-case recovery: ~90s (30s cooldown + 60s prune). No
-        // additional recovery code needed — the scanner loop handles it.
         spent_tracker.prune_spent(60);
         spent_tracker.expire_failed();
 
-        // Phase 0: Scan new L1 blocks for all product types
-        // Polls the virtual chain for blocks added since last_chain_hash,
-        // parses transactions, and routes new orders to appropriate books.
-        // This phase runs BEFORE matching to ensure newly deployed orders
-        // are available for immediate matching in the same cycle.
-        if !last_chain_hash.is_empty() {
-            let rpc_lock = rpc.lock().await;
-            let current_daa = rpc_lock.get_daa_score().await.unwrap_or(0);
-            let (new_hash, _scan_counters) = {
+        // Phase 0: Process block notifications (event-driven).
+        // Drain all pending blockAddedNotification messages and process
+        // their transactions. This replaces the old getVirtualChainFromBlock
+        // polling approach, reducing latency from 5s+ to sub-second.
+        {
+            let scanner = BlockScanner::new();
+            let mut blocks_processed = 0u64;
+            let mut total_counters = ScanCounters::default();
+
+            // Collect all queued block notifications first, then batch-process.
+            // This avoids per-block RPC calls and lock contention.
+            let mut block_txs_batch: Vec<Vec<TransactionData>> = Vec::new();
+            loop {
+                match notif_rx.try_recv() {
+                    Ok(notif) => {
+                        let method = notif.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                        if method != "blockAddedNotification" {
+                            continue;
+                        }
+                        // Extract block from params.BlockAdded.block
+                        // Kaspa wRPC format: {"params": {"BlockAdded": {"block": {...}}}}
+                        let block = match notif.get("params")
+                            .and_then(|p| p.get("BlockAdded").or_else(|| p.get("block")))
+                            .and_then(|ba| ba.get("block").or(Some(ba)))
+                        {
+                            Some(b) => b,
+                            None => continue,
+                        };
+                        let txs: Vec<TransactionData> = block
+                            .get("transactions")
+                            .and_then(|t| t.as_array())
+                            .map(|arr| arr.iter().filter_map(TransactionData::from_rpc_json).collect())
+                            .unwrap_or_default();
+
+                        if !txs.is_empty() {
+                            block_txs_batch.push(txs);
+                        }
+                        blocks_processed += 1;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        warn!("[NOTIFY] Notification channel disconnected");
+                        break;
+                    }
+                }
+            }
+
+            // Process all collected block TXs in one batch with a single DAA score fetch
+            if !block_txs_batch.is_empty() {
+                let rpc_lock = rpc.lock().await;
+                let current_daa = rpc_lock.get_daa_score().await.unwrap_or(0);
+                drop(rpc_lock);
+
                 let mut ob = order_book.lock().await;
                 let mut pb = shared_perp_book.lock().await;
                 let mut lb = shared_lending_book.lock().await;
                 let mut pred = shared_prediction_book.lock().await;
-                scan_new_blocks(
-                    &rpc_lock,
-                    &mut ob,
-                    &mut pb,
-                    &mut lb,
-                    &mut pred,
-                    &last_chain_hash,
-                    ws_tx.as_ref(),
-                    current_daa,
-                ).await
-            };
-            last_chain_hash = new_hash;
-            drop(rpc_lock);
+
+                for txs in &block_txs_batch {
+                    let counters = process_block_txs_all(
+                        txs, &mut ob, &scanner, &mut pb, &mut lb, &mut pred,
+                        ws_tx.as_ref(), current_daa,
+                    );
+                    total_counters.spot_added += counters.spot_added;
+                    total_counters.spot_removed += counters.spot_removed;
+                    total_counters.perp_added += counters.perp_added;
+                    total_counters.perp_removed += counters.perp_removed;
+                    total_counters.lending_added += counters.lending_added;
+                    total_counters.lending_removed += counters.lending_removed;
+                    total_counters.prediction_added += counters.prediction_added;
+                    total_counters.prediction_removed += counters.prediction_removed;
+                }
+            }
+
+            if blocks_processed > 0 {
+                let any_found = total_counters.spot_added > 0
+                    || total_counters.perp_added > 0
+                    || total_counters.lending_added > 0
+                    || total_counters.prediction_added > 0;
+                if any_found {
+                    info!(
+                        "[NOTIFY] Processed {} block(s): spot(+{}), perp(+{}), lending(+{}), prediction(+{})",
+                        blocks_processed,
+                        total_counters.spot_added, total_counters.perp_added,
+                        total_counters.lending_added, total_counters.prediction_added,
+                    );
+                } else {
+                    debug!("[NOTIFY] Processed {} block(s), no new orders", blocks_processed);
+                }
+            }
         }
 
         // F20: Periodically clear matched_outpoints to prevent unbounded growth.

@@ -204,11 +204,14 @@ impl BookOrder {
     /// `Blake2b(output.spk) == spk_hash` without the actual SPK bytes.
     pub fn resolve_counterparty_spk(&self) -> Option<(u16, Vec<u8>)> {
         let hex_spk = self.counterparty_spk.as_deref()?;
-        let script = hex::decode(hex_spk).ok()?;
-        if script.is_empty() {
+        let raw = hex::decode(hex_spk).ok()?;
+        // counterparty_spk is stored as version (2B LE) + script bytes
+        if raw.len() < 3 {
             return None;
         }
-        Some((0u16, script))
+        let version = u16::from_le_bytes([raw[0], raw[1]]);
+        let script = raw[2..].to_vec();
+        Some((version, script))
     }
 }
 
@@ -838,12 +841,15 @@ mod tests {
     // resolve_counterparty_spk: Some when counterparty_spk is set with valid hex.
     #[test]
     fn resolve_counterparty_spk_some_when_set() {
-        // Simulate a P2PK SPK: [0x20][pubkey32][0xac] = 34 bytes
-        let spk_bytes: Vec<u8> = std::iter::once(0x20u8)
+        // Simulate stored counterparty_spk: version (2B LE) + P2PK SPK [0x20][pubkey32][0xac]
+        let spk_script: Vec<u8> = std::iter::once(0x20u8)
             .chain([0xABu8; 32].iter().copied())
             .chain(std::iter::once(0xACu8))
             .collect();
-        let spk_hex = hex::encode(&spk_bytes);
+        // Stored format: version 0 (0x00, 0x00) + script bytes
+        let mut stored: Vec<u8> = vec![0x00, 0x00];
+        stored.extend_from_slice(&spk_script);
+        let spk_hex = hex::encode(&stored);
         let mut order = make_sell("b".repeat(64).as_str(), &"cd".repeat(32));
         order.counterparty_spk = Some(spk_hex.clone());
 
@@ -851,7 +857,7 @@ mod tests {
         assert!(result.is_some(), "must return Some when counterparty_spk is set");
         let (version, script) = result.unwrap();
         assert_eq!(version, 0, "version must be 0 (P2PK)");
-        assert_eq!(script, spk_bytes, "script must match the original SPK bytes");
+        assert_eq!(script, spk_script, "script must match the original SPK bytes (without version prefix)");
     }
 
     // resolve_counterparty_spk: None when counterparty_spk is an empty string.

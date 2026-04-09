@@ -62,6 +62,9 @@ members = [
     "metrics/core",
     "metrics/perf_monitor",
     "utils/alloc",
+    "kob/core",
+    "kob/cli",
+    "kob/engine",
 ]
 
 [workspace.package]

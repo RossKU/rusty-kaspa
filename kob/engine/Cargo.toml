@@ -1,0 +1,58 @@
+[package]
+name = "kob-engine"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kob_engine"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kob-engine"
+path = "src/main.rs"
+
+[dependencies]
+kob-core = { path = "../core" }
+tokio = { workspace = true, features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+futures-util = { workspace = true }
+url = "2"
+clap = { workspace = true, features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+rand = { workspace = true }
+anyhow = "1"
+zeroize = { workspace = true, features = ["derive"] }
+k256 = { version = "0.13", features = ["schnorr"] }
+axum = { version = "0.7", features = ["ws"] }
+tower-http = { workspace = true, features = ["cors"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+
+# ZK prover dependencies (optional — enable with `zk-prover` feature)
+ark-ff = { version = "0.5", default-features = false, features = ["std"], optional = true }
+ark-ec = { workspace = true, optional = true }
+ark-bn254 = { workspace = true, optional = true }
+ark-groth16 = { workspace = true, optional = true }
+ark-relations = { workspace = true, optional = true }
+ark-r1cs-std = { version = "0.5", default-features = false, optional = true }
+ark-serialize = { workspace = true, optional = true }
+ark-std = { version = "0.5", default-features = false, features = ["std"], optional = true }
+ark-crypto-primitives = { version = "0.5", default-features = false, features = ["std", "snark"], optional = true }
+
+[features]
+default = []
+zk-prover = [
+    "ark-ff",
+    "ark-ec",
+    "ark-bn254",
+    "ark-groth16",
+    "ark-relations",
+    "ark-r1cs-std",
+    "ark-serialize",
+    "ark-std",
+    "ark-crypto-primitives",
+]

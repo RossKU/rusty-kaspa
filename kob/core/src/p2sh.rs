@@ -1,4 +1,4 @@
-use crate::types::ScriptPublicKey;
+use kaspa_consensus_core::tx::ScriptPublicKey;
 
 /// Compute unkeyed Blake2b-256 hash.
 pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
@@ -43,10 +43,7 @@ pub fn build_p2sh(rs: &[u8]) -> ScriptPublicKey {
     script.push(0x20); // push 32 bytes
     script.extend_from_slice(&hash);
     script.push(0x87); // OpEqual
-    ScriptPublicKey {
-        version: 0,
-        script,
-    }
+    ScriptPublicKey::new(0, script.into())
 }
 
 /// Keyed Blake2b-256 hasher backed by blake2b_simd.
@@ -134,11 +131,11 @@ mod tests {
     fn build_p2sh_structure() {
         let rs = vec![0x51]; // minimal redeemScript: Op1
         let spk = build_p2sh(&rs);
-        assert_eq!(spk.version, 0);
-        assert_eq!(spk.script.len(), 35);
-        assert_eq!(spk.script[0], 0xaa, "first byte must be OpBlake2b");
-        assert_eq!(spk.script[1], 0x20, "second byte must be push32");
-        assert_eq!(spk.script[34], 0x87, "last byte must be OpEqual");
+        assert_eq!(spk.version(), 0);
+        assert_eq!(spk.script().len(), 35);
+        assert_eq!(spk.script()[0], 0xaa, "first byte must be OpBlake2b");
+        assert_eq!(spk.script()[1], 0x20, "second byte must be push32");
+        assert_eq!(spk.script()[34], 0x87, "last byte must be OpEqual");
     }
 
     /// Verify compute_p2pk_spk_hash produces consistent 32-byte hash.
@@ -176,10 +173,10 @@ mod tests {
         let rs = vec![0x75, 0x75, 0x75, 0x75, 0x51]; // trade_receipt body
         let spk1 = build_p2sh(&rs);
         let spk2 = build_p2sh(&rs);
-        assert_eq!(spk1.script, spk2.script, "P2SH must be deterministic");
+        assert_eq!(spk1.script(), spk2.script(), "P2SH must be deterministic");
 
         // The inner hash should match blake2b_256(rs)
         let expected_hash = blake2b_256(&rs);
-        assert_eq!(&spk1.script[2..34], &expected_hash);
+        assert_eq!(&spk1.script()[2..34], &expected_hash);
     }
 }

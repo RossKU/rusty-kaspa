@@ -1,0 +1,138 @@
+//! Core types and transaction building for KOB (Kaspa Order Book).
+
+#![allow(clippy::too_many_arguments)]
+
+pub mod contract;
+pub mod lab;
+pub mod error;
+pub mod mass;
+pub mod p2sh;
+pub mod primitives;
+pub mod sighash;
+pub mod signing;
+pub mod tx;
+pub mod types;
+pub mod wallet;
+pub use contract::perp;
+pub use contract::prediction;
+pub use contract::lending;
+pub use contract::insurance;
+pub use contract::auction;
+pub mod bech32;
+pub mod compat;
+pub mod listing;
+
+pub use error::KobError;
+pub type Result<T> = std::result::Result<T, KobError>;
+
+pub use contract::{
+    build_receipt_redeem_script, build_receipt_consume_sigscript,
+    build_buy_cancel_sigscript, build_sell_cancel_sigscript,
+    build_token_mint_redeem_script, build_token_unit_redeem_script,
+    build_token_mint_sigscript, build_token_burn_sigscript, build_token_unit_sigscript,
+    RECEIPT_BODY, TOKEN_RS,
+    TOKEN_MINT_BODY, TOKEN_UNIT_BODY,
+    OCO_PAIR_BODY,
+    build_oco_pair_redeem_script,
+    build_oco_pair_fill_sigscript, build_oco_pair_cbp_sigscript,
+    build_oco_pair_cancel_sigscript,
+    build_buy_redeem_script, build_sell_redeem_script,
+    build_buy_fill_sigscript, build_sell_fill_sigscript,
+    build_buy_partial_fill_sigscript, build_sell_partial_fill_sigscript,
+    build_buy_expire_sigscript, build_sell_expire_sigscript,
+    BUY_ORDER_BODY, SELL_ORDER_BODY,
+    build_order_payload, build_oco_order_payload, parse_order_payload,
+    KOB_PAYLOAD_PREFIX,
+    // Spot parse
+    ParsedOrder, parse_redeem_script, has_zk_opcode, OP_ZK_PRECOMPILE,
+    BUY_RS_SIZE, SELL_RS_SIZE,
+};
+pub use p2sh::{blake2b_256, build_p2sh, compute_spk_hash, compute_p2pk_spk_hash};
+pub use primitives::{push_data, u16_le, u32_le, u64_le};
+pub use sighash::{compute_covenant_id, compute_sighash};
+pub use signing::{schnorr_sign, schnorr_sign_secure, get_public_key, get_public_key_secure, schnorr_verify};
+pub use types::{Network, Order, OrderSide, Outpoint, Price};
+pub use tx::{select_utxos, select_utxos_mass_aware, select_utxos_mass_aware_simple, CoinSelection};
+pub use compat::{
+    parse_tx_id, tx_id_to_hex, parse_hash, hash_to_hex,
+    parse_subnetwork_id, subnetwork_id_to_hex,
+    parse_outpoint, outpoint_to_hex,
+    covenant_binding_from_hex,
+    kob_outpoint_to_kaspa, kaspa_outpoint_to_kob,
+};
+pub use wallet::{SecureKey, WalletFile};
+pub use wallet::{EncryptedWalletFile, encrypt_wallet, decrypt_wallet, save_encrypted, derive_key_public};
+pub use wallet::{HdWallet, WalletFileV2, AccountEntry, WatchOnlyExport, pubkey_to_address};
+pub use mass::{
+    compute_storage_mass, check_storage_mass, check_tx_storage_mass,
+    min_penalty_free_output, suggest_deploy_amount,
+    calc_compute_mass, calc_miner_fee, estimate_compute_mass,
+    estimate_tx_serialized_size,
+    MassError, STORAGE_MASS_PARAMETER, MAX_TX_MASS,
+    MASS_PER_TX_BYTE, MASS_PER_SCRIPT_PUB_KEY_BYTE, MASS_PER_SIG_OP,
+};
+pub use lending::{
+    KOB_LENDING_PAYLOAD_PREFIX, DAA_PER_YEAR,
+    build_lending_payload, parse_lending_payload,
+    LOAN_OFFER_BODY, LOAN_OFFER_STATE_SIZE,
+    build_loan_offer_redeem_script,
+    build_loan_offer_match_sigscript,
+    build_loan_offer_cancel_sigscript,
+    build_loan_offer_replace_sigscript,
+    BORROW_REQUEST_BODY, BORROW_REQUEST_STATE_SIZE,
+    build_borrow_request_redeem_script,
+    build_borrow_request_match_sigscript,
+    build_borrow_request_cancel_sigscript,
+    ACTIVE_LOAN_BODY, ACTIVE_LOAN_STATE_SIZE,
+    build_active_loan_redeem_script,
+    build_active_loan_repay_sigscript,
+    build_active_loan_default_sigscript,
+    build_active_loan_liquidate_sigscript,
+    calculate_interest, calculate_repay_total,
+    // Lending parse
+    ParsedLendingOrder, LendingOrderType, parse_lending_rs,
+    LOAN_OFFER_RS_SIZE, BORROW_REQUEST_RS_SIZE,
+};
+
+pub use auction::{
+    KOB_AUCTION_PAYLOAD_PREFIX,
+    build_auction_payload, parse_auction_payload,
+
+    ENGLISH_AUCTION_BODY, ENGLISH_AUCTION_STATE_SIZE,
+    build_english_auction_redeem_script,
+    build_english_bid_sigscript, build_english_expire_sigscript,
+    build_english_settle_sigscript, build_english_cancel_sigscript,
+
+    DUTCH_AUCTION_BODY, DUTCH_AUCTION_STATE_SIZE,
+    build_dutch_auction_redeem_script,
+    build_dutch_buy_sigscript, build_dutch_tick_sigscript, build_dutch_cancel_sigscript,
+
+    AUCTION_ESCROW_BODY, AUCTION_ESCROW_STATE_SIZE,
+    build_auction_escrow_redeem_script,
+    build_auction_escrow_release_sigscript, build_auction_escrow_cancel_sigscript,
+};
+
+/// Default matcher fee (10,000 sompi).
+///
+/// This is the maximum fee a matcher may extract from order surplus when
+/// executing a trade. It is NOT the miner fee. Miner fees are calculated
+/// from transaction mass via `mass::calc_miner_fee()`.
+pub const DEFAULT_MATCHER_FEE: u64 = 10_000;
+
+/// Legacy alias -- existing code that referenced `FEE` as a flat miner fee
+/// placeholder can still compile. New code should use `mass::calc_miner_fee()`
+/// for miner fees or `DEFAULT_MATCHER_FEE` for matcher fee thresholds.
+#[deprecated(note = "Use DEFAULT_MATCHER_FEE for matcher fee or mass::calc_miner_fee() for miner fee")]
+pub const FEE: u64 = DEFAULT_MATCHER_FEE;
+
+/// Minimum UTXO value to avoid storage mass rejection (~3M sompi).
+pub const MIN_UTXO_VALUE: u64 = 3_000_000;
+
+/// Dust value for trade_receipt outputs.
+pub const RECEIPT_DUST: u64 = 3_000_000;
+
+/// Receipt output value (1 KAS = 100M sompi).
+pub const RECEIPT_VALUE: u64 = 100_000_000;
+
+/// Default subnetwork ID (native, all zeros).
+pub const SUBNETWORK_ID: &str = "0000000000000000000000000000000000000000";

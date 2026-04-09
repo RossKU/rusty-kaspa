@@ -57,6 +57,11 @@ pub fn compute_storage_mass(input_values: &[u64], output_values: &[u64]) -> u64 
         return u64::MAX;
     }
 
+    // Empty outputs → no storage mass
+    if output_values.is_empty() {
+        return 0;
+    }
+
     // Filter zero-value inputs (no credit for zero amounts)
     let inputs: Vec<UtxoCell> = input_values
         .iter()
@@ -69,6 +74,16 @@ pub fn compute_storage_mass(input_values: &[u64], output_values: &[u64]) -> u64 
         .copied()
         .map(|v| UtxoCell::new(1, v))
         .collect();
+
+    // kaspad's calc_storage_mass divides by total input plurality, which panics
+    // when inputs are empty. Handle that case here: with no inputs the storage
+    // mass is purely the harmonic output sum (no input credit to subtract).
+    if inputs.is_empty() {
+        return outputs
+            .iter()
+            .map(|o| STORAGE_MASS_PARAMETER * o.plurality * o.plurality / o.amount)
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+    }
 
     kaspa_calc_storage_mass(
         false, // not coinbase

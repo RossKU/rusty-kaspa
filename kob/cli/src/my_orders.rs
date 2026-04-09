@@ -361,6 +361,9 @@ mod tests {
             p2sh_hash: format!("{}{:02x}", "dd".repeat(31), idx),
             value,
             cancel_pending: false,
+            token: None,
+            version: 13,
+            expiry_daa: 0,
         }
     }
 

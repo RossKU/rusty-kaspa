@@ -1803,6 +1803,9 @@ mod tests {
             p2sh_hash: "dd".repeat(32),
             value: 10_000_000,
             cancel_pending: false,
+            token: None,
+            version: 13,
+            expiry_daa: 0,
         });
 
         let path = &std::env::temp_dir().join("kob_test_order_cache.json");
@@ -1831,6 +1834,9 @@ mod tests {
             p2sh_hash: "dd".repeat(32),
             value: 10_000_000,
             cancel_pending: false,
+            token: None,
+            version: 13,
+            expiry_daa: 0,
         });
 
         let lookup = cache.by_p2sh_hash();
@@ -1854,6 +1860,9 @@ mod tests {
             p2sh_hash: "dd".repeat(32),
             value: 10_000_000,
             cancel_pending: false,
+            token: None,
+            version: 13,
+            expiry_daa: 0,
         });
         cache.orders.push(OrderCacheEntry {
             outpoint: "ee".repeat(32) + ":1",
@@ -1867,6 +1876,9 @@ mod tests {
             p2sh_hash: "ff".repeat(32),
             value: 10_000_000,
             cancel_pending: false,
+            token: None,
+            version: 13,
+            expiry_daa: 0,
         });
 
         assert_eq!(cache.orders.len(), 2);
@@ -1889,6 +1901,9 @@ mod tests {
             p2sh_hash: "33".repeat(32),
             value: 20_000_000,
             cancel_pending: false,
+            token: None,
+            version: 13,
+            expiry_daa: 0,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

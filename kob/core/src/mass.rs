@@ -1,21 +1,18 @@
 //! Storage mass calculation and pre-check for Kaspa transactions.
 //!
-//! Kaspa's storage mass formula (KIP-0009) penalizes dust UTXOs:
-//!
-//!   storage_mass = Σ(C / output_value) - Σ(C / input_value)
-//!
-//! Where C = 10^12 (the `STORAGE_MASS_PARAMETER` from Kaspa consensus).
-//! If the result is negative, storage mass is 0 (inputs "absorb" more than outputs create).
+//! Delegates to kaspad's `calc_storage_mass` (KIP-0009) for the core formula.
+//! KOB-specific helpers (fee estimation, deploy suggestions) wrap the kaspad
+//! calculation with unsigned-TX-aware logic.
 //!
 //! The effective TX mass is `max(transaction_mass, storage_mass)`.
 //! Kaspa nodes reject transactions whose effective mass exceeds `MAX_TX_MASS`.
 
 use std::fmt;
 
+use kaspa_consensus_core::mass::{calc_storage_mass as kaspa_calc_storage_mass, UtxoCell};
+
 /// Storage mass constant C = 10^12 (Kaspa KIP-0009).
-/// C = SOMPI_PER_KASPA * 10,000 = 100,000,000 * 10,000 = 1,000,000,000,000.
-/// Same value for mainnet and all testnets.
-pub const STORAGE_MASS_PARAMETER: u64 = 1_000_000_000_000;
+pub const STORAGE_MASS_PARAMETER: u64 = kaspa_consensus_core::constants::STORAGE_MASS_PARAMETER;
 
 /// Maximum block mass (Kaspa mainnet consensus, `max_block_mass` in params.rs).
 /// A single TX cannot exceed this. A 2M sompi output produces exactly 500K mass.
@@ -46,70 +43,40 @@ impl fmt::Display for MassError {
 
 impl std::error::Error for MassError {}
 
-/// Calculate storage mass for a transaction (matches Kaspad's `calc_storage_mass`).
+/// Calculate storage mass for a transaction via kaspad's `calc_storage_mass`.
 ///
 /// Returns 0 if inputs "absorb" more mass than outputs create (net negative).
-/// Zero-value outputs contribute `u64::MAX` mass (infinite penalty).
+/// Zero-value outputs produce `u64::MAX` mass (infinite penalty).
 /// Zero-value inputs are skipped (no credit).
 ///
-/// **Formula** (KIP-0009, with plurality=1 for standard UTXOs):
-///
-///   `storage_mass = max(0, harmonic_outs - input_credit)`
-///
-/// where `harmonic_outs = Σ(C / out_val)`, and `input_credit` depends on the
-/// relaxed formula condition:
-///
-/// - **Relaxed** (`|O|=1` or `|I|=1` or `|O|=|I|=2`): `input_credit = Σ(C / in_val)` (harmonic)
-/// - **Otherwise**: `input_credit = |I|² · C / Σ(in_val)` (arithmetic mean)
-///
-/// The arithmetic path gives LESS credit than harmonic when inputs have varying
-/// sizes, so Kaspad rejects TXs that a naive harmonic-only formula would accept.
+/// All standard KOB UTXOs have plurality=1 (33-byte SPK).
 pub fn compute_storage_mass(input_values: &[u64], output_values: &[u64]) -> u64 {
-    let c = STORAGE_MASS_PARAMETER as u128;
-
-    // Output harmonic: Σ(C / out_val)
-    let out_mass: u128 = output_values
-        .iter()
-        .map(|&v| {
-            if v == 0 {
-                u64::MAX as u128
-            } else {
-                c / v as u128
-            }
-        })
-        .sum();
-
-    let num_outs = output_values.len() as u64;
-    let non_zero_inputs: Vec<u64> = input_values.iter().copied().filter(|&v| v > 0).collect();
-    let num_ins = non_zero_inputs.len() as u64;
-
-    // Relaxed formula: |O|=1 or |I|=1 or (|O|=2 and |I|=2)
-    let relaxed = num_outs == 1
-        || num_ins == 1
-        || (num_outs == 2 && num_ins == 2);
-
-    let in_credit: u128 = if relaxed || num_ins == 0 {
-        // Harmonic: Σ(C / in_val)
-        non_zero_inputs.iter().map(|&v| c / v as u128).sum()
-    } else {
-        // Arithmetic: |I| · (C / mean_ins) where mean_ins = Σin / |I|
-        // Must match Kaspad's integer division order: divide first, then multiply.
-        let sum_in: u128 = non_zero_inputs.iter().map(|&v| v as u128).sum();
-        if sum_in == 0 {
-            0
-        } else {
-            let n = num_ins as u128;
-            let mean_ins = sum_in / n;
-            n.saturating_mul(c / mean_ins)
-        }
-    };
-
-    let net = out_mass.saturating_sub(in_credit);
-    if net > u64::MAX as u128 {
-        u64::MAX
-    } else {
-        net as u64
+    // Handle zero-value outputs: kaspad's calc_storage_mass requires non-zero amounts
+    // (it divides by amount). Return u64::MAX immediately for any zero output.
+    if output_values.iter().any(|&v| v == 0) {
+        return u64::MAX;
     }
+
+    // Filter zero-value inputs (no credit for zero amounts)
+    let inputs: Vec<UtxoCell> = input_values
+        .iter()
+        .copied()
+        .filter(|&v| v > 0)
+        .map(|v| UtxoCell::new(1, v))
+        .collect();
+    let outputs: Vec<UtxoCell> = output_values
+        .iter()
+        .copied()
+        .map(|v| UtxoCell::new(1, v))
+        .collect();
+
+    kaspa_calc_storage_mass(
+        false, // not coinbase
+        inputs.iter().copied(),
+        outputs.into_iter(),
+        STORAGE_MASS_PARAMETER,
+    )
+    .unwrap_or(u64::MAX)
 }
 
 /// Check storage mass for a transaction. Returns `Ok(mass)` if within limits,

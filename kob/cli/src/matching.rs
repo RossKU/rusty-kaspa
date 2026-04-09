@@ -164,7 +164,8 @@ pub async fn run(
         buy_price_den,
         buy_min_fill,
         &buy_owner_hash,
-        &buy_spk_hash, 0,
+        &buy_spk_hash,
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         0,
         buy_expiry,)?;
     let sell_rs = contract::build_sell_redeem_script(
@@ -172,7 +173,8 @@ pub async fn run(
         sell_price_den,
         sell_min_fill,
         &sell_owner_hash,
-        &sell_spk_hash, 0,
+        &sell_spk_hash,
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         0,
         sell_expiry,)?;
 
@@ -663,7 +665,8 @@ pub async fn run_cross_pair(
         buy_price_den,
         buy_min_fill,
         &buy_owner_hash,
-        &buy_spk_hash, 0,
+        &buy_spk_hash,
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         0,
         buy_expiry,)?;
     let sell_rs = contract::build_sell_redeem_script(
@@ -671,7 +674,8 @@ pub async fn run_cross_pair(
         sell_price_den,
         sell_min_fill,
         &sell_owner_hash,
-        &sell_spk_hash, 0,
+        &sell_spk_hash,
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         0,
         sell_expiry,)?;
 

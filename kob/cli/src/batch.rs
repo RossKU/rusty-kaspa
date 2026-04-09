@@ -384,7 +384,7 @@ async fn execute_operation(
                 fee,
                 false, // post_only not supported in batch mode
                 None,  // expiry_daa: None = GTC
-                0,     // max_matcher_fee
+                deploy::DEFAULT_MAX_MATCHER_FEE,
             )
             .await?;
             // deploy_buy prints the TXID; we return None since we don't capture it
@@ -412,7 +412,7 @@ async fn execute_operation(
                 fee,
                 false, // post_only not supported in batch mode
                 None,  // expiry_daa: None = GTC
-                0,     // max_matcher_fee
+                deploy::DEFAULT_MAX_MATCHER_FEE,
                 None,  // token_utxo: not supported in batch mode
                 None,  // fee_utxo: not supported in batch mode
             )

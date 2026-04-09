@@ -419,7 +419,7 @@ async fn build_signed_buy_tx_json(
         min_fill,
         &owner_hash,
         &buyer_spk_hash,
-        0, // max_matcher_fee
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         0, // cancel_pending
         0, // GTC
     )?;
@@ -533,7 +533,7 @@ async fn build_signed_sell_tx_json(
         min_fill,
         &owner_hash,
         &seller_spk_hash,
-        0, // max_matcher_fee
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         0, // cancel_pending
         0, // GTC
     )?;

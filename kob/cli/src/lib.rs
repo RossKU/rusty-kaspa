@@ -835,6 +835,12 @@ pub enum DeployCommands {
         /// the Matcher rejects it. Uses KOB:2: payload format.
         #[arg(long)]
         post_only: bool,
+
+        /// Maximum fee (in sompi) the matcher may extract per fill.
+        /// The on-chain F6 check enforces `kas_in - out[0].value <= mmfee`.
+        /// mmfee=0 makes partial fills impossible. Default: 10_000_000 (0.1 KAS).
+        #[arg(long, default_value = "10000000")]
+        max_matcher_fee: u64,
     },
 
     /// Deploy a sell order (lock tokens, request KAS).
@@ -913,6 +919,12 @@ pub enum DeployCommands {
         /// Useful when auto-selected UTXOs are stale (stuck in mempool).
         #[arg(long)]
         fee_utxo: Option<String>,
+
+        /// Maximum fee (in sompi) the matcher may extract per fill.
+        /// The on-chain F6 check enforces `kas_in - out[0].value <= mmfee`.
+        /// mmfee=0 makes partial fills impossible. Default: 10_000_000 (0.1 KAS).
+        #[arg(long, default_value = "10000000")]
+        max_matcher_fee: u64,
     },
 
     /// Deploy a bracket order (OTOCO: entry + take-profit + stop-loss).
@@ -1473,6 +1485,7 @@ pub async fn dispatch(
                 matcher_url,
                 expiry,
                 post_only,
+                max_matcher_fee,
             } => {
                 // Resolve token alias
                 let token = token::resolve_token(&token, None)?;
@@ -1520,6 +1533,9 @@ pub async fn dispatch(
                 if post_only {
                     println!("Post-only order: will be rejected if it would cross the spread.");
                 }
+                if max_matcher_fee == 0 {
+                    println!("WARNING: --max-matcher-fee=0 prevents partial fills (F6 constraint).");
+                }
                 let deploy_txid = deploy::deploy_buy(
                     wallet_path,
                     node,
@@ -1533,7 +1549,7 @@ pub async fn dispatch(
                     fee,
                     post_only,
                     expiry,
-                    0, // max_matcher_fee
+                    max_matcher_fee,
                 )
                 .await?;
                 if tif_policy != tif::TimeInForce::Gtc {
@@ -1573,6 +1589,7 @@ pub async fn dispatch(
                 post_only,
                 token_utxo,
                 fee_utxo,
+                max_matcher_fee,
             } => {
                 // Resolve token alias
                 let token = if let Some(t) = token {
@@ -1628,6 +1645,9 @@ pub async fn dispatch(
                 if post_only {
                     println!("Post-only order: will be rejected if it would cross the spread.");
                 }
+                if max_matcher_fee == 0 {
+                    println!("WARNING: --max-matcher-fee=0 prevents partial fills (F6 constraint).");
+                }
                 let deploy_txid = deploy::deploy_sell(
                     wallet_path,
                     node,
@@ -1641,7 +1661,7 @@ pub async fn dispatch(
                     fee,
                     post_only,
                     expiry,
-                    0, // max_matcher_fee
+                    max_matcher_fee,
                     token_utxo.as_deref(),
                     fee_utxo.as_deref(),
                 )

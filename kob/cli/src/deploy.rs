@@ -18,6 +18,14 @@ use kob_core::mass::{compute_storage_mass, min_penalty_free_output, MAX_TX_MASS}
 use kob_core::MIN_UTXO_VALUE;
 use kob_core::contract::{build_order_payload, build_order_payload_full};
 use std::path::Path;
+
+/// Default max_matcher_fee in sompi (0.1 KAS).
+///
+/// The on-chain F6 check enforces `kas_in - out[0].value <= mmfee`.  When
+/// mmfee = 0, partial fills are impossible because the contract requires all
+/// locked KAS to stay in the residual output.  A non-zero value lets the
+/// matcher extract a bounded fee to cover miner costs and earn a spread.
+pub const DEFAULT_MAX_MATCHER_FEE: u64 = 10_000_000;
 use tracing::info;
 
 /// GCD helper for simplifying fractions.
@@ -294,6 +302,7 @@ pub async fn deploy_buy(
         amount,
         amount as f64 / 1e8
     );
+    println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
     println!("Owner:      {}", wallet.public_key);
     println!("Owner Hash: {}", hex::encode(owner_hash));
     println!("Buyer SPK Hash: {}", hex::encode(buyer_spk_hash));
@@ -606,6 +615,7 @@ pub async fn deploy_sell(
         amount,
         amount as f64 / 1e8
     );
+    println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
     println!("Owner:      {}", wallet.public_key);
     println!("Owner Hash: {}", hex::encode(owner_hash));
     println!("Seller SPK Hash: {}", hex::encode(seller_spk_hash));

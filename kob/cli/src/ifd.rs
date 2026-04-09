@@ -255,7 +255,7 @@ pub async fn deploy_ifd(
         buy_min_fill,
         &owner_hash,
         &buyer_spk_hash,
-        0, // max_matcher_fee
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         0, // cancel_pending
         0, // GTC for entry order
     )?;
@@ -496,7 +496,7 @@ pub async fn deploy_ifo(
         buy_min_fill,
         &owner_hash,
         &buyer_spk_hash,
-        0, // max_matcher_fee
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         0, // cancel_pending
         0, // GTC
     )?;

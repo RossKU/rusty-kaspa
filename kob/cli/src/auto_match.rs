@@ -1252,7 +1252,7 @@ pub async fn run(
 
                     // Reconstruct the redeemScript (v6 canonical contracts)
                     // cancel_pending = 0 (active order).
-                    // max_matcher_fee = 10_000_000 sompi (matches deploy default).
+                    // max_matcher_fee = DEFAULT_MAX_MATCHER_FEE (10_000_000 sompi).
                     let rs = match side {
                         OrderSide::Buy => {
                             let pair_bytes = hex::decode(&cached.pair_id).unwrap_or_default();
@@ -1266,7 +1266,7 @@ pub async fn run(
                                 cached.min_fill,
                                 &owner_hash,
                                 &spk_hash,
-                                0, // max_matcher_fee
+                                crate::deploy::DEFAULT_MAX_MATCHER_FEE,
                                 0,
                                 0, // expiry_daa = 0 (GTC)
                             )?
@@ -1278,7 +1278,7 @@ pub async fn run(
                                 cached.min_fill,
                                 &owner_hash,
                                 &spk_hash,
-                                0, // max_matcher_fee
+                                crate::deploy::DEFAULT_MAX_MATCHER_FEE,
                                 0,
                                 0, // expiry_daa = 0 (GTC)
                             )?

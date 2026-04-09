@@ -261,13 +261,20 @@ fn compute_partial_fill_match(
         }
     };
 
-    // If full fill works, no need for partial
+    // If full fill works, no need for partial.
+    // Must replicate the EXACT same check as the full-fill path in find_crossing_pairs_for_token:
+    //   seller_kas = max(expected_kas, buy_kas - mmfee)
+    //   buyer_tokens = sell_tokens  (buyer receives ALL tokens in a full fill)
+    //   seller_kas + buyer_tokens <= total_in
     let total_in = buy_kas + sell_tokens;
-    if let Some(sum) = expected_kas.checked_add(expected_tokens) {
+    let mmfee_floor = buy_kas.saturating_sub(buy.max_matcher_fee);
+    let full_seller_kas = std::cmp::max(expected_kas, mmfee_floor);
+    let full_buyer_tokens = sell_tokens; // full fill: buyer gets all sell tokens
+    if let Some(sum) = full_seller_kas.checked_add(full_buyer_tokens) {
         if sum <= total_in {
             // surplus=0 is valid when mmfee=0 (matcher pays miner fee from fee UTXOs).
-            if expected_kas >= MIN_UTXO_VALUE
-                && expected_tokens >= MIN_UTXO_VALUE
+            if full_seller_kas >= MIN_UTXO_VALUE
+                && full_buyer_tokens >= MIN_UTXO_VALUE
             {
                 return None; // Full fill is better
             }

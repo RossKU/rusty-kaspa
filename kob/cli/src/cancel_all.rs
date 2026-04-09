@@ -10,6 +10,7 @@
 //! With `--dry-run`, previews orders that would be cancelled without submitting TXs.
 //! With `--token <cov_id>`, filters cancellations to a specific token pair.
 
+use crate::auto_match::{OrderCache, OrderCacheEntry};
 use crate::node::NodeClient;
 use crate::signing;
 use kob_core::contract;
@@ -66,8 +67,13 @@ pub struct CancelResult {
 /// Build a cancel transaction for a single order.
 ///
 /// Returns the (Transaction, sigscripts, output_value) tuple on success.
+///
+/// Uses a two-pass fee calculation: first build the TX with an estimated fee,
+/// then recompute using `calc_miner_fee` which takes `max(compute_mass,
+/// storage_mass)`. This avoids the TN12 rejection where storage mass exceeds
+/// the compute-only estimate.
 pub fn build_cancel_tx(
-    order: &CachedOrder,
+    order: &OrderCacheEntry,
     pubkey: &[u8; 32],
     privkey: &[u8; 32],
     order_value: u64,
@@ -82,9 +88,9 @@ pub fn build_cancel_tx(
     let p2sh = build_p2sh(&redeem_script);
 
     let total_in = order_value + fee_utxo_value;
-    // Cancel TX: 2 inputs (order + fee), 1 output. Use mass-based miner fee estimate.
-    let cancel_miner_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
-    let output_value = total_in - cancel_miner_fee;
+    // First pass: estimate fee to build a tentative TX.
+    let est_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
+    let tentative_output = total_in - est_fee;
 
     let mut tx = Transaction::new(0);
 
@@ -115,7 +121,12 @@ pub fn build_cancel_tx(
     });
 
     // Output 0: recovered funds to wallet
-    tx.outputs.push(TxOutput::new(output_value, fee_utxo_spk_version, fee_utxo_spk_bytes.to_vec(), None));
+    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo_spk_version, fee_utxo_spk_bytes.to_vec(), None));
+
+    // Second pass: compute exact fee from built TX (max of compute and storage mass).
+    let actual_fee = kob_core::mass::calc_miner_fee(&tx);
+    let output_value = total_in - actual_fee;
+    tx.outputs[0].value = output_value;
 
     // Sign input 0 (order cancel)
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -136,20 +147,18 @@ pub fn build_cancel_tx(
 }
 
 /// Load the orders cache from an orders.json file.
-pub fn load_orders_cache(cache_path: &Path) -> anyhow::Result<Vec<CachedOrder>> {
-    if !cache_path.exists() {
-        return Ok(Vec::new());
-    }
-    let contents = std::fs::read_to_string(cache_path)?;
-    let orders: Vec<CachedOrder> = serde_json::from_str(&contents)?;
-    Ok(orders)
+///
+/// Accepts both the canonical `OrderCache` format (`{"orders": [...]}`) and
+/// the legacy flat `CachedOrder` array. Returns unified `OrderCacheEntry` vec.
+pub fn load_orders_cache(cache_path: &Path) -> anyhow::Result<Vec<OrderCacheEntry>> {
+    let cache = OrderCache::load(cache_path);
+    Ok(cache.orders)
 }
 
-/// Save the orders cache to an orders.json file.
-pub fn save_orders_cache(cache_path: &Path, orders: &[CachedOrder]) -> anyhow::Result<()> {
-    let json = serde_json::to_string_pretty(orders)?;
-    std::fs::write(cache_path, json)?;
-    Ok(())
+/// Save the orders cache to an orders.json file (canonical `OrderCache` format).
+pub fn save_orders_cache(cache_path: &Path, orders: &[OrderCacheEntry]) -> anyhow::Result<()> {
+    let cache = OrderCache { orders: orders.to_vec() };
+    cache.save(cache_path)
 }
 
 /// Derive the orders.json cache path from a wallet file path.
@@ -202,7 +211,7 @@ pub async fn run(
     }
 
     // Filter by token if specified
-    let filtered: Vec<&CachedOrder> = orders
+    let filtered: Vec<&OrderCacheEntry> = orders
         .iter()
         .filter(|o| {
             if let Some(token) = token_filter {
@@ -308,8 +317,14 @@ pub async fn run(
         };
 
         let fee_spk_bytes = fee_utxo.script_bytes();
-        // Cancel TX: 2 inputs (order + fee), 1 output
-        let cancel_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
+        // Cancel TX: 2 inputs (order + fee), 1 output.
+        // Use max(compute_mass, storage_mass) to satisfy TN12 minimum fee.
+        let in_vals = [order_value, fee_utxo.utxo_entry.amount];
+        let est_out = order_value + fee_utxo.utxo_entry.amount
+            - kob_core::mass::estimate_compute_mass(2, 1, 0);
+        let storage_fee = kob_core::mass::compute_storage_mass(&in_vals, &[est_out]);
+        let compute_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
+        let cancel_fee = compute_fee.max(storage_fee);
         let output_value = order_value + fee_utxo.utxo_entry.amount - cancel_fee;
 
         println!("  Order Value: {} sompi", order_value);
@@ -395,7 +410,7 @@ pub async fn run(
 
 /// Build a redeemScript for a cached order (helper for verifying P2SH addresses).
 pub fn build_redeem_script_for_order(
-    order: &CachedOrder,
+    order: &OrderCacheEntry,
     pubkey: &[u8; 32],
 ) -> anyhow::Result<Vec<u8>> {
     let owner_hash = blake2b_256(pubkey);
@@ -522,7 +537,7 @@ mod tests {
     #[test]
     fn build_redeem_script_buy_v13() {
         let pubkey = [0x02u8; 32];
-        let order = CachedOrder {
+        let order = OrderCacheEntry::from(CachedOrder {
             outpoint: format!("{}:0", "ab".repeat(32)),
             side: "buy".into(),
             token: Some("ff".repeat(32)),
@@ -532,7 +547,7 @@ mod tests {
             value: 50_000_000,
             version: 13,
             expiry_daa: 0,
-        };
+        });
 
         let rs = build_redeem_script_for_order(&order, &pubkey).unwrap();
         assert!(!rs.is_empty(), "redeemScript must not be empty");
@@ -544,7 +559,7 @@ mod tests {
     #[test]
     fn build_redeem_script_sell_v13() {
         let pubkey = [0x02u8; 32];
-        let order = CachedOrder {
+        let order = OrderCacheEntry::from(CachedOrder {
             outpoint: format!("{}:0", "cd".repeat(32)),
             side: "sell".into(),
             token: None,
@@ -554,7 +569,7 @@ mod tests {
             value: 20_000_000,
             version: 13,
             expiry_daa: 0,
-        };
+        });
 
         let rs = build_redeem_script_for_order(&order, &pubkey).unwrap();
         assert!(!rs.is_empty());
@@ -566,7 +581,7 @@ mod tests {
     #[test]
     fn build_redeem_script_buy_requires_token() {
         let pubkey = [0x02u8; 32];
-        let order = CachedOrder {
+        let order = OrderCacheEntry::from(CachedOrder {
             outpoint: "abc:0".into(),
             side: "buy".into(),
             token: None,
@@ -576,7 +591,7 @@ mod tests {
             value: 1000,
             version: 13,
             expiry_daa: 0,
-        };
+        });
         let result = build_redeem_script_for_order(&order, &pubkey);
         assert!(result.is_err(), "buy order without token must fail");
     }
@@ -584,7 +599,7 @@ mod tests {
     #[test]
     fn build_redeem_script_unknown_side() {
         let pubkey = [0x02u8; 32];
-        let order = CachedOrder {
+        let order = OrderCacheEntry::from(CachedOrder {
             outpoint: "abc:0".into(),
             side: "unknown".into(),
             token: None,
@@ -594,7 +609,7 @@ mod tests {
             value: 1000,
             version: 13,
             expiry_daa: 0,
-        };
+        });
         let result = build_redeem_script_for_order(&order, &pubkey);
         assert!(result.is_err(), "unknown side must fail");
     }
@@ -673,13 +688,13 @@ mod tests {
     #[test]
     fn buy_v12_redeem_script_differs_by_price() {
         let pubkey = [0x02u8; 32];
-        let order1 = CachedOrder {
+        let order1 = OrderCacheEntry::from(CachedOrder {
             outpoint: "a:0".into(), side: "buy".into(),
             token: Some("ff".repeat(32)),
             price_num: 100, price_den: 1, min_fill: 1_000_000, value: 50_000_000,
             version: 13, expiry_daa: 0,
-        };
-        let order2 = CachedOrder { price_num: 200, ..order1.clone() };
+        });
+        let order2 = OrderCacheEntry { price_num: 200, ..order1.clone() };
 
         let rs1 = build_redeem_script_for_order(&order1, &pubkey).unwrap();
         let rs2 = build_redeem_script_for_order(&order2, &pubkey).unwrap();
@@ -689,13 +704,13 @@ mod tests {
     #[test]
     fn sell_v12_redeem_script_differs_by_price() {
         let pubkey = [0x02u8; 32];
-        let order1 = CachedOrder {
+        let order1 = OrderCacheEntry::from(CachedOrder {
             outpoint: "a:0".into(), side: "sell".into(),
             token: None,
             price_num: 5, price_den: 1, min_fill: 500_000, value: 20_000_000,
             version: 13, expiry_daa: 0,
-        };
-        let order2 = CachedOrder { price_num: 10, ..order1.clone() };
+        });
+        let order2 = OrderCacheEntry { price_num: 10, ..order1.clone() };
 
         let rs1 = build_redeem_script_for_order(&order1, &pubkey).unwrap();
         let rs2 = build_redeem_script_for_order(&order2, &pubkey).unwrap();

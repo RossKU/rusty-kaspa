@@ -4,7 +4,8 @@
 //!   - `--market` flag: deploys a market order (extreme price, immediate fill expected)
 //!   - `--expiry <daa_score>` flag: deploys a GTD (Good-Till-Date) order
 
-use crate::cancel_all::{self, CachedOrder};
+use crate::auto_match::{OrderCache, OrderCacheEntry};
+use crate::cancel_all;
 use crate::node::NodeClient;
 use crate::signing;
 use kob_core::contract;
@@ -482,31 +483,31 @@ pub async fn deploy_buy(
     println!();
     println!("Order deployed at output {}:0", tx_id);
 
-    // Append to orders cache
+    // Append to orders cache (unified OrderCache format)
     let cache_path = cancel_all::orders_cache_path(wallet_path);
-    let cached = CachedOrder {
+    let p2sh_hash = hex::encode(&p2sh.script()[2..34]);
+    let entry = OrderCacheEntry {
         outpoint: format!("{}:0", tx_id),
         side: "buy".into(),
-        token: Some(token_covenant_id.to_string()),
+        pair_id: token_covenant_id.to_string(),
         price_num,
         price_den,
         min_fill,
+        owner_hash: hex::encode(owner_hash),
+        spk_hash: hex::encode(buyer_spk_hash),
+        p2sh_hash,
         value: amount,
+        cancel_pending: false,
+        token: Some(token_covenant_id.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
     };
-    match cancel_all::load_orders_cache(&cache_path) {
-        Ok(mut orders) => {
-            orders.push(cached);
-            if let Err(e) = cancel_all::save_orders_cache(&cache_path, &orders) {
-                println!("WARNING: Failed to write orders cache: {}", e);
-            } else {
-                println!("Order cached in {}", cache_path.display());
-            }
-        }
-        Err(e) => {
-            println!("WARNING: Failed to load orders cache: {}", e);
-        }
+    let mut cache = OrderCache::load(&cache_path);
+    cache.orders.push(entry);
+    if let Err(e) = cache.save(&cache_path) {
+        println!("WARNING: Failed to write orders cache: {}", e);
+    } else {
+        println!("Order cached in {}", cache_path.display());
     }
 
     Ok(tx_id)
@@ -947,31 +948,31 @@ pub async fn deploy_sell(
     println!();
     println!("Order deployed at output {}:0", tx_id);
 
-    // Append to orders cache
+    // Append to orders cache (unified OrderCache format)
     let cache_path = cancel_all::orders_cache_path(wallet_path);
-    let cached = CachedOrder {
+    let p2sh_hash = hex::encode(&p2sh.script()[2..34]);
+    let entry = OrderCacheEntry {
         outpoint: format!("{}:0", tx_id),
         side: "sell".into(),
-        token: token_covenant_id.map(|s| s.to_string()),
+        pair_id: token_covenant_id.unwrap_or("00".repeat(32).as_str()).to_string(),
         price_num,
         price_den,
         min_fill,
+        owner_hash: hex::encode(owner_hash),
+        spk_hash: hex::encode(seller_spk_hash),
+        p2sh_hash,
         value: amount,
+        cancel_pending: false,
+        token: token_covenant_id.map(|s| s.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
     };
-    match cancel_all::load_orders_cache(&cache_path) {
-        Ok(mut orders) => {
-            orders.push(cached);
-            if let Err(e) = cancel_all::save_orders_cache(&cache_path, &orders) {
-                println!("WARNING: Failed to write orders cache: {}", e);
-            } else {
-                println!("Order cached in {}", cache_path.display());
-            }
-        }
-        Err(e) => {
-            println!("WARNING: Failed to load orders cache: {}", e);
-        }
+    let mut cache = OrderCache::load(&cache_path);
+    cache.orders.push(entry);
+    if let Err(e) = cache.save(&cache_path) {
+        println!("WARNING: Failed to write orders cache: {}", e);
+    } else {
+        println!("Order cached in {}", cache_path.display());
     }
 
     Ok(tx_id)

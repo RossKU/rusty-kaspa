@@ -602,12 +602,33 @@ impl RpcClient {
             "includeAcceptedTransactionIds": include_accepted_txs,
         });
         // This is a heavy RPC call that can take >30s on some nodes.
-        // Use 120s timeout to avoid spurious timeouts.
-        self.call_with_timeout(
-            "getVirtualChainFromBlock",
-            params,
+        // Retry up to 2 times with increasing timeout on failure (e.g.,
+        // connection drop before the 120s deadline).
+        let timeouts = [
             std::time::Duration::from_secs(120),
-        ).await
+            std::time::Duration::from_secs(180),
+            std::time::Duration::from_secs(240),
+        ];
+        let mut last_err = String::new();
+        for (attempt, timeout) in timeouts.iter().enumerate() {
+            match self.call_with_timeout(
+                "getVirtualChainFromBlock",
+                params.clone(),
+                *timeout,
+            ).await {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    tracing::warn!(
+                        "[RPC] getVirtualChainFromBlock attempt {} failed (timeout {:?}): {}",
+                        attempt + 1, timeout, e,
+                    );
+                    last_err = e;
+                    // Brief pause before retry to let the node recover.
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+            }
+        }
+        Err(last_err)
     }
 
     /// Get a block by hash with full transaction data (includeTransactions=true).

@@ -774,7 +774,7 @@ pub async fn recover_orders(
         cache.orders.push(OrderCacheEntry {
             outpoint: format!("{}:{}", order.tx_id, order.output_index),
             side: order.order.side.clone(),
-            pair_id,
+            pair_id: pair_id.clone(),
             price_num: order.order.price_num,
             price_den: order.order.price_den,
             min_fill: order.order.min_fill,
@@ -783,6 +783,9 @@ pub async fn recover_orders(
             p2sh_hash: order.order.p2sh_hash.clone(),
             value: order.value,
             cancel_pending: false,
+            token: if order.order.side == "buy" { Some(pair_id) } else { None },
+            version: 13,
+            expiry_daa: 0,
         });
     }
 
@@ -942,10 +945,11 @@ mod recover_orders_tests {
             &token_cov_id, 1000, 1, 3_000_000, &owner_hash, &spk_hash, 0, 0, 0,).unwrap();
         let parsed = parse_redeem_script(&rs).unwrap();
 
+        let pair_id = hex::encode(parsed.token_cov_id.unwrap());
         let entry = OrderCacheEntry {
             outpoint: "abcd1234:0".to_string(),
             side: parsed.side.clone(),
-            pair_id: hex::encode(parsed.token_cov_id.unwrap()),
+            pair_id: pair_id.clone(),
             price_num: parsed.price_num,
             price_den: parsed.price_den,
             min_fill: parsed.min_fill,
@@ -954,6 +958,9 @@ mod recover_orders_tests {
             p2sh_hash: parsed.p2sh_hash.clone(),
             value: 50_000_000,
             cancel_pending: false,
+            token: Some(pair_id),
+            version: 13,
+            expiry_daa: 0,
         };
 
         assert_eq!(entry.side, "buy");

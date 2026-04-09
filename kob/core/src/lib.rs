@@ -21,6 +21,7 @@ pub use contract::auction;
 pub mod bech32;
 pub mod compat;
 pub mod listing;
+pub mod rpc_types;
 
 pub use error::KobError;
 pub type Result<T> = std::result::Result<T, KobError>;

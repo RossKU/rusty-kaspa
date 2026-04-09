@@ -3,7 +3,7 @@
 //! Provides the same UTXO/TX operations as the WebSocket RPC client,
 //! but over HTTP REST. Used as a fallback when wRPC is unavailable.
 
-use crate::rpc::{RpcOutpoint, RpcSpk, RpcUtxo, RpcUtxoEntry};
+use crate::rpc::{RpcOutpoint, RpcUtxo, RpcUtxoEntry, parse_rest_spk};
 
 /// REST API client backed by `reqwest`.
 pub struct RestClient {
@@ -284,46 +284,6 @@ impl RestUtxoRaw {
     }
 }
 
-/// Parse REST scriptPublicKey which may be:
-/// - `{"scriptPublicKey": "hex"}` (no version)
-/// - `{"version": 0, "scriptPublicKey": "hex"}`
-/// - a flat string
-fn parse_rest_spk(v: &serde_json::Value) -> RpcSpk {
-    match v {
-        serde_json::Value::String(s) => {
-            if s.len() >= 4 {
-                let version = u16::from_str_radix(&s[..4], 16).unwrap_or(0);
-                RpcSpk {
-                    version,
-                    script: s[4..].to_string(),
-                }
-            } else {
-                RpcSpk {
-                    version: 0,
-                    script: s.clone(),
-                }
-            }
-        }
-        serde_json::Value::Object(obj) => {
-            let version = obj
-                .get("version")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u16;
-            let script = obj
-                .get("scriptPublicKey")
-                .or_else(|| obj.get("script"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            RpcSpk { version, script }
-        }
-        _ => RpcSpk {
-            version: 0,
-            script: String::new(),
-        },
-    }
-}
-
 // --- TX format translation: wRPC -> REST ---
 
 /// Translate a wRPC-format transaction payload to REST API format.
@@ -485,29 +445,7 @@ fn translate_wrpc_tx_to_rest(
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_parse_rest_spk_object_with_script_public_key() {
-        let v = serde_json::json!({"scriptPublicKey": "aa20abcd87"});
-        let spk = parse_rest_spk(&v);
-        assert_eq!(spk.version, 0);
-        assert_eq!(spk.script, "aa20abcd87");
-    }
-
-    #[test]
-    fn test_parse_rest_spk_object_with_version_and_script() {
-        let v = serde_json::json!({"version": 0, "script": "aa20abcd87"});
-        let spk = parse_rest_spk(&v);
-        assert_eq!(spk.version, 0);
-        assert_eq!(spk.script, "aa20abcd87");
-    }
-
-    #[test]
-    fn test_parse_rest_spk_flat_string() {
-        let v = serde_json::json!("0000aa20abcd87");
-        let spk = parse_rest_spk(&v);
-        assert_eq!(spk.version, 0);
-        assert_eq!(spk.script, "aa20abcd87");
-    }
+    // parse_rest_spk tests are in kob_core::rpc_types::tests
 
     #[test]
     fn test_translate_wrpc_tx_basic() {

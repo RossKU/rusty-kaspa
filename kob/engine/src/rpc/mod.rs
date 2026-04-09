@@ -2,6 +2,9 @@
 
 pub mod rest_client;
 
+// Re-export shared RPC types from kob-core so existing `use crate::rpc::RpcUtxo` works.
+pub use kob_core::rpc_types::{RpcUtxo, RpcOutpoint, RpcUtxoEntry, RpcSpk, parse_rest_spk};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -37,134 +40,6 @@ pub struct SubmitResult {
     pub ok: bool,
     pub tx_id: Option<String>,
     pub error: Option<String>,
-}
-
-/// UTXO from getUtxosByAddresses response
-#[derive(Debug, Clone, Deserialize)]
-pub struct RpcUtxo {
-    pub outpoint: RpcOutpoint,
-    #[serde(rename = "utxoEntry")]
-    pub utxo_entry: RpcUtxoEntry,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RpcOutpoint {
-    #[serde(rename = "transactionId")]
-    pub transaction_id: String,
-    pub index: u32,
-}
-
-/// scriptPublicKey — handles both flat hex string and `{version, script}` object.
-///
-/// TN12 nodes return scriptPublicKey as a flat hex string; mainnet/newer nodes
-/// return `{"version": u16, "script": "hex"}`. This custom deserializer accepts both.
-#[derive(Debug, Clone)]
-pub struct RpcSpk {
-    pub version: u16,
-    pub script: String,
-}
-
-impl<'de> serde::Deserialize<'de> for RpcSpk {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de;
-
-        struct RpcSpkVisitor;
-
-        impl<'de> de::Visitor<'de> for RpcSpkVisitor {
-            type Value = RpcSpk;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a string or {version, script} object for scriptPublicKey")
-            }
-
-            /// Plain hex string: first 4 hex chars = version (u16 LE), rest = script hex.
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<RpcSpk, E> {
-                if v.len() < 4 {
-                    return Err(E::custom(format!(
-                        "scriptPublicKey string too short: '{}'", v
-                    )));
-                }
-                let version = u16::from_str_radix(&v[..4], 16).map_err(E::custom)?;
-                Ok(RpcSpk {
-                    version,
-                    script: v[4..].to_string(),
-                })
-            }
-
-            /// Object form: {"version": u16, "script": "hex"}
-            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<RpcSpk, A::Error> {
-                let mut version: Option<u16> = None;
-                let mut script: Option<String> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "version" => version = Some(map.next_value()?),
-                        "script" | "scriptPublicKey" => script = Some(map.next_value()?),
-                        _ => { let _ = map.next_value::<serde_json::Value>(); }
-                    }
-                }
-                Ok(RpcSpk {
-                    version: version.unwrap_or(0),
-                    script: script.unwrap_or_default(),
-                })
-            }
-        }
-
-        deserializer.deserialize_any(RpcSpkVisitor)
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[allow(dead_code)] // Fields populated by serde; block_daa_score/is_coinbase used for filtering
-pub struct RpcUtxoEntry {
-    pub amount: u64,
-    #[serde(rename = "scriptPublicKey")]
-    pub script_public_key: RpcSpk,
-    #[serde(rename = "blockDaaScore", default)]
-    pub block_daa_score: u64,
-    #[serde(rename = "isCoinbase", default)]
-    pub is_coinbase: bool,
-}
-
-impl RpcUtxoEntry {
-    /// Extract script bytes from the hex script field.
-    pub fn script_bytes(&self) -> Vec<u8> {
-        hex::decode(&self.script_public_key.script).unwrap_or_default()
-    }
-
-    /// Extract version from script_public_key.
-    pub fn script_version(&self) -> u16 {
-        self.script_public_key.version
-    }
-
-    /// Check if this is a P2SH script (starts with 0xaa, ends with 0x87).
-    pub fn is_p2sh(&self) -> bool {
-        let bytes = self.script_bytes();
-        bytes.len() == 35 && bytes[0] == 0xaa && bytes[34] == 0x87
-    }
-}
-
-impl RpcUtxo {
-    /// Parse the scriptPublicKey into (version, script_bytes).
-    pub fn parse_spk(&self) -> (u16, Vec<u8>) {
-        let bytes = match hex::decode(&self.utxo_entry.script_public_key.script) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(
-                    "[RPC] Failed to hex-decode scriptPublicKey '{}': {}",
-                    self.utxo_entry.script_public_key.script, e
-                );
-                return (0, vec![]);
-            }
-        };
-        (self.utxo_entry.script_public_key.version, bytes)
-    }
-
-    pub fn outpoint_key(&self) -> String {
-        format!("{}:{}", self.outpoint.transaction_id, self.outpoint.index)
-    }
 }
 
 /// Configuration for retry behavior on transient RPC errors.
@@ -1008,93 +883,7 @@ mod tests {
         assert_eq!(config.backoff_multiplier, 3);
     }
 
-    #[test]
-    fn rpc_utxo_outpoint_key() {
-        let utxo = RpcUtxo {
-            outpoint: RpcOutpoint {
-                transaction_id: "abc123".to_string(),
-                index: 2,
-            },
-            utxo_entry: RpcUtxoEntry {
-                amount: 1000,
-                script_public_key: RpcSpk { version: 0, script: String::new() },
-                block_daa_score: 0,
-                is_coinbase: false,
-            },
-        };
-        assert_eq!(utxo.outpoint_key(), "abc123:2");
-    }
-
-    #[test]
-    fn rpc_utxo_parse_spk_empty() {
-        let utxo = RpcUtxo {
-            outpoint: RpcOutpoint {
-                transaction_id: "abc".to_string(),
-                index: 0,
-            },
-            utxo_entry: RpcUtxoEntry {
-                amount: 0,
-                script_public_key: RpcSpk { version: 0, script: String::new() },
-                block_daa_score: 0,
-                is_coinbase: false,
-            },
-        };
-        let (version, script) = utxo.parse_spk();
-        assert_eq!(version, 0);
-        assert!(script.is_empty());
-    }
-
-    #[test]
-    fn rpc_utxo_parse_spk_valid() {
-        // script = [0x20, 0xAA x 32, 0xAC] (34 bytes total)
-        let mut script_hex = String::from("20"); // push 32
-        script_hex.push_str(&"aa".repeat(32)); // 32 bytes pubkey
-        script_hex.push_str("ac"); // OpCheckSig
-        let utxo = RpcUtxo {
-            outpoint: RpcOutpoint {
-                transaction_id: "def".to_string(),
-                index: 1,
-            },
-            utxo_entry: RpcUtxoEntry {
-                amount: 5_000_000,
-                script_public_key: RpcSpk { version: 0, script: script_hex },
-                block_daa_score: 100,
-                is_coinbase: false,
-            },
-        };
-        let (version, script) = utxo.parse_spk();
-        assert_eq!(version, 0);
-        assert_eq!(script.len(), 34); // push32 + 32 bytes + opCheckSig
-        assert_eq!(script[0], 0x20);
-        assert_eq!(script[33], 0xac);
-    }
-
-    #[test]
-    fn rpc_spk_deserialize_flat_string() {
-        // TN12 returns scriptPublicKey as flat hex string: version(4 hex) + script
-        let json = r#""0000aa20bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb87""#;
-        let spk: RpcSpk = serde_json::from_str(json).unwrap();
-        assert_eq!(spk.version, 0);
-        assert!(spk.script.starts_with("aa20"));
-        assert!(spk.script.ends_with("87"));
-    }
-
-    #[test]
-    fn rpc_spk_deserialize_object() {
-        // Mainnet/newer nodes return {version, scriptPublicKey}
-        let json = r#"{"version": 0, "scriptPublicKey": "aa20bbbb87"}"#;
-        let spk: RpcSpk = serde_json::from_str(json).unwrap();
-        assert_eq!(spk.version, 0);
-        assert_eq!(spk.script, "aa20bbbb87");
-    }
-
-    #[test]
-    fn rpc_spk_deserialize_object_script_key() {
-        let json = r#"{"version": 1, "script": "deadbeef"}"#;
-        let spk: RpcSpk = serde_json::from_str(json).unwrap();
-        assert_eq!(spk.version, 1);
-        assert_eq!(spk.script, "deadbeef");
-    }
+    // RPC type tests (RpcUtxo, RpcSpk, etc.) are in kob_core::rpc_types::tests
 
     #[test]
     fn needs_reconnect_detects_dead_connection() {

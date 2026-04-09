@@ -3,6 +3,9 @@
 //! Mirrors the kob-engine RPC client pattern but is self-contained.
 //! Uses tokio-tungstenite for WebSocket, serde_json for messages.
 
+// Re-export shared RPC types from kob-core so existing `use crate::rpc::RpcUtxo` works.
+pub use kob_core::rpc_types::{RpcUtxo, RpcOutpoint, RpcUtxoEntry, RpcSpk, parse_rest_spk};
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -25,116 +28,6 @@ struct JsonRpcResponse {
     params: Option<serde_json::Value>,
     #[serde(default)]
     error: Option<serde_json::Value>,
-}
-
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RpcUtxo {
-    pub outpoint: RpcOutpoint,
-    #[serde(rename = "utxoEntry")]
-    pub utxo_entry: RpcUtxoEntry,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RpcOutpoint {
-    #[serde(rename = "transactionId")]
-    pub transaction_id: String,
-    pub index: u32,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct RpcUtxoEntry {
-    pub amount: u64,
-    #[serde(rename = "scriptPublicKey")]
-    pub script_public_key: RpcSpk,
-    #[serde(rename = "blockDaaScore", default)]
-    pub block_daa_score: u64,
-    #[serde(rename = "isCoinbase", default)]
-    pub is_coinbase: bool,
-}
-
-#[derive(Debug, Clone)]
-pub struct RpcSpk {
-    pub version: u16,
-    pub script: String,
-}
-
-impl<'de> serde::Deserialize<'de> for RpcSpk {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        use serde::de;
-
-        struct RpcSpkVisitor;
-
-        impl<'de> de::Visitor<'de> for RpcSpkVisitor {
-            type Value = RpcSpk;
-
-            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a string or {version, script} object for scriptPublicKey")
-            }
-
-            /// Plain hex string: first 2 bytes = version (u16 LE), rest = script hex.
-            fn visit_str<E: de::Error>(self, v: &str) -> Result<RpcSpk, E> {
-                if v.len() < 4 {
-                    return Err(E::custom(format!(
-                        "scriptPublicKey string too short: '{}'", v
-                    )));
-                }
-                let version = u16::from_str_radix(&v[..4], 16).map_err(E::custom)?;
-                Ok(RpcSpk {
-                    version,
-                    script: v[4..].to_string(),
-                })
-            }
-
-            /// Object form: {"version": u16, "script": "hex"}
-            fn visit_map<A: de::MapAccess<'de>>(self, mut map: A) -> Result<RpcSpk, A::Error> {
-                let mut version: Option<u16> = None;
-                let mut script: Option<String> = None;
-                while let Some(key) = map.next_key::<String>()? {
-                    match key.as_str() {
-                        "version" => version = Some(map.next_value()?),
-                        "script" | "scriptPublicKey" => script = Some(map.next_value()?),
-                        _ => { let _ = map.next_value::<serde_json::Value>(); }
-                    }
-                }
-                Ok(RpcSpk {
-                    version: version.unwrap_or(0),
-                    script: script.unwrap_or_default(),
-                })
-            }
-        }
-
-        deserializer.deserialize_any(RpcSpkVisitor)
-    }
-}
-
-impl RpcUtxo {
-    /// Script bytes (decoded from hex).
-    pub fn script_bytes(&self) -> Vec<u8> {
-        match hex::decode(&self.utxo_entry.script_public_key.script) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                tracing::warn!(
-                    "[RPC] Failed to hex-decode scriptPublicKey '{}': {}",
-                    self.utxo_entry.script_public_key.script, e
-                );
-                vec![]
-            }
-        }
-    }
-
-    /// Check if this is a P2SH UTXO (script starts with aa20).
-    pub fn is_p2sh(&self) -> bool {
-        self.utxo_entry.script_public_key.script.starts_with("aa20")
-    }
-
-    /// Outpoint key string "txid:index".
-    pub fn outpoint_key(&self) -> String {
-        format!("{}:{}", self.outpoint.transaction_id, self.outpoint.index)
-    }
 }
 
 

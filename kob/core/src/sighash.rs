@@ -1,10 +1,19 @@
 //! Kaspa transaction signing hash (sighash) computation.
+//!
+//! Delegates to kaspad's `calc_schnorr_signature_hash` via the compat layer.
+//! The KOB `Transaction` is converted to kaspad types, then kaspad computes
+//! the sighash. This guarantees exact hash compatibility with the network.
 
+use crate::compat;
 use crate::p2sh::Blake2bSimple;
 use crate::primitives::{u16_le, u32_le, u64_le};
 use crate::tx::{AuthOutput, Transaction};
 
-const SIGHASH_KEY: &[u8] = b"TransactionSigningHash";
+use kaspa_consensus_core::hashing::sighash::{
+    calc_schnorr_signature_hash, SigHashReusedValuesUnsync,
+};
+use kaspa_consensus_core::hashing::sighash_type::SIG_HASH_ALL;
+use kaspa_consensus_core::tx::PopulatedTransaction;
 
 /// Compute the Kaspa transaction signing hash for a specific input.
 ///
@@ -22,93 +31,13 @@ pub fn compute_sighash(tx: &Transaction, input_index: usize) -> crate::Result<[u
             input_index, tx.inputs.len()
         )));
     }
-    let inp = &tx.inputs[input_index];
 
-    // Hash all outpoints: for each input, hash(prevTxId || prevIndex)
-    let h_outpoints = {
-        let mut h = Blake2bSimple::new_keyed(SIGHASH_KEY);
-        for i in &tx.inputs {
-            h.update(&hex::decode(&i.prev_tx_id)?);
-            h.update(&u32_le(i.prev_index));
-        }
-        h.finalize()
-    };
+    let (kaspa_tx, entries) = compat::to_kaspa_transaction(tx)?;
+    let populated = PopulatedTransaction::new(&kaspa_tx, entries);
+    let reused = SigHashReusedValuesUnsync::new();
+    let hash = calc_schnorr_signature_hash(&populated, input_index, SIG_HASH_ALL, &reused);
 
-    // Hash all sequences
-    let h_sequences = {
-        let mut h = Blake2bSimple::new_keyed(SIGHASH_KEY);
-        for i in &tx.inputs {
-            h.update(&u64_le(i.sequence));
-        }
-        h.finalize()
-    };
-
-    // Hash all sig op counts
-    let h_sig_ops = {
-        let mut h = Blake2bSimple::new_keyed(SIGHASH_KEY);
-        for i in &tx.inputs {
-            h.update(&[i.sig_op_count]);
-        }
-        h.finalize()
-    };
-
-    // Hash all outputs (including covenant bindings for version >= 1)
-    let h_outputs = {
-        let mut h = Blake2bSimple::new_keyed(SIGHASH_KEY);
-        for o in &tx.outputs {
-            h.update(&u64_le(o.value));
-            h.update(&u16_le(o.script_version()));
-            h.update(&u64_le(o.script_bytes().len() as u64));
-            h.update(o.script_bytes());
-            if tx.version >= 1 {
-                if let Some(ref cov) = o.covenant {
-                    h.update(&[1u8]);
-                    h.update(&u16_le(cov.authorizing_input));
-                    h.update(&cov.covenant_id.as_bytes());
-                } else {
-                    h.update(&[0u8]);
-                }
-            }
-        }
-        h.finalize()
-    };
-
-    // Payload hash: when payload is non-empty, compute blake2b_keyed(KEY, write_var_bytes(payload))
-    // When empty (or native subnetwork with no payload), use ZERO_HASH.
-    // write_var_bytes = u64LE(len) + raw bytes
-    let payload_hash = if tx.payload.is_empty() {
-        [0u8; 32]
-    } else {
-        let mut h = Blake2bSimple::new_keyed(SIGHASH_KEY);
-        h.update(&u64_le(tx.payload.len() as u64));
-        h.update(&tx.payload);
-        h.finalize()
-    };
-
-    // Final hash: combine all sub-hashes with per-input data
-    let mut h = Blake2bSimple::new_keyed(SIGHASH_KEY);
-    h.update(&u16_le(tx.version));
-    h.update(&h_outpoints);
-    h.update(&h_sequences);
-    h.update(&h_sig_ops);
-    // Per-input fields
-    h.update(&hex::decode(&inp.prev_tx_id)?);
-    h.update(&u32_le(inp.prev_index));
-    h.update(&u16_le(inp.script_version));
-    h.update(&u64_le(inp.script_bytes.len() as u64));
-    h.update(&inp.script_bytes);
-    h.update(&u64_le(inp.value));
-    h.update(&u64_le(inp.sequence));
-    h.update(&[inp.sig_op_count]);
-    // Outputs hash
-    h.update(&h_outputs);
-    // Global fields
-    h.update(&u64_le(tx.lock_time));
-    h.update(&hex::decode(&tx.subnetwork_id)?);
-    h.update(&u64_le(tx.gas));
-    h.update(&payload_hash);
-    h.update(&[0x01]); // sighash type: SIGHASH_ALL
-    Ok(h.finalize())
+    Ok(hash.as_bytes())
 }
 
 /// Compute covenant ID from genesis outpoint and authorized outputs.
@@ -309,21 +238,74 @@ mod tests {
         assert_eq!(empty, empty2, "empty payload sighash must be deterministic");
     }
 
-    /// Test that payload hash uses correct format: blake2b_keyed(KEY, u64LE(len) + bytes).
+    /// Cross-verify: compute sighash via kaspad's known test vectors.
+    ///
+    /// This uses the same transaction from kaspad's own sighash test to verify
+    /// that KOB's conversion + delegation produces the correct hash.
     #[test]
-    fn sighash_payload_hash_correctness() {
-        // Verify the payload hash computation matches the expected format
-        let payload = b"KOB:1:TEST";
-        let expected_hash = {
-            let mut h = crate::p2sh::Blake2bSimple::new_keyed(b"TransactionSigningHash");
-            h.update(&crate::primitives::u64_le(payload.len() as u64));
-            h.update(payload);
-            h.finalize()
+    fn sighash_cross_verify_with_kaspad_test_vector() {
+        // Reproduce the native-all-0 test vector from kaspad's sighash.rs
+        let prev_tx_id = "880eb9819a31821d9d2399e2f35e2433b72637e393d71ecc9b8d0250f49153c3";
+        let spk1_hex = "208325613d2eeaf7176ac6c670b13c0043156c427438ed72d74b7800862ad884e8ac";
+        let spk2_hex = "20fcef4c106cf11135bbd70f02a726a92162d2fb8b22f0469126f800862ad884e8ac";
+        let spk1 = hex::decode(spk1_hex).unwrap();
+        let spk2 = hex::decode(spk2_hex).unwrap();
+
+        let tx = Transaction {
+            version: 0,
+            inputs: vec![
+                TxInput {
+                    prev_tx_id: prev_tx_id.to_string(),
+                    prev_index: 0,
+                    sequence: 0,
+                    sig_op_count: 0,
+                    script_version: 0,
+                    script_bytes: spk1.clone(),
+                    value: 100,
+                },
+                TxInput {
+                    prev_tx_id: prev_tx_id.to_string(),
+                    prev_index: 1,
+                    sequence: 1,
+                    sig_op_count: 0,
+                    script_version: 0,
+                    script_bytes: spk2.clone(),
+                    value: 200,
+                },
+                TxInput {
+                    prev_tx_id: prev_tx_id.to_string(),
+                    prev_index: 2,
+                    sequence: 2,
+                    sig_op_count: 0,
+                    script_version: 0,
+                    script_bytes: spk2.clone(),
+                    value: 300,
+                },
+            ],
+            outputs: vec![
+                TxOutput {
+                    value: 300,
+                    script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::new(0, spk2.clone().into()),
+                    covenant: None,
+                },
+                TxOutput {
+                    value: 300,
+                    script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::new(0, spk1.clone().into()),
+                    covenant: None,
+                },
+            ],
+            lock_time: 1615462089000,
+            subnetwork_id: "0000000000000000000000000000000000000000".to_string(),
+            gas: 0,
+            payload: vec![],
         };
-        // The payload hash should be non-zero
-        assert_ne!(expected_hash, [0u8; 32], "payload hash must not be zero");
-        // Verify different from zero hash (empty payload)
-        let zero_hash = [0u8; 32];
-        assert_ne!(expected_hash, zero_hash);
+
+        let hash = compute_sighash(&tx, 0).unwrap();
+        let hash_hex = hex::encode(hash);
+        assert_eq!(
+            hash_hex,
+            "03b7ac6927b2b67100734c3cc313ff8c2e8b3ce3e746d46dd660b706a916b1f5",
+            "KOB sighash must match kaspad's native-all-0 test vector"
+        );
     }
 }

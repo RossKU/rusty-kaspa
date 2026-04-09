@@ -106,6 +106,78 @@ pub fn kaspa_outpoint_to_kob(op: &TransactionOutpoint) -> crate::types::Outpoint
     }
 }
 
+/// Convert a KOB `Transaction` into a kaspad `Transaction` and a `Vec<UtxoEntry>`.
+///
+/// The kaspad `Transaction` is suitable for sighash computation (via
+/// `PopulatedTransaction`). The returned `UtxoEntry` vec contains one entry per
+/// input, built from the KOB input's `value`, `script_version`, and `script_bytes`.
+///
+/// Fields that are not relevant for sighash (`block_daa_score`, `is_coinbase`,
+/// `covenant_id`) are set to their zero/false/None defaults.
+pub fn to_kaspa_transaction(
+    tx: &crate::tx::Transaction,
+) -> crate::Result<(
+    kaspa_consensus_core::tx::Transaction,
+    Vec<kaspa_consensus_core::tx::UtxoEntry>,
+)> {
+    use kaspa_consensus_core::tx::{
+        Transaction as KaspaTransaction, TransactionInput, TransactionOutput,
+        TransactionOutpoint, UtxoEntry,
+    };
+
+    // Build kaspad inputs
+    let inputs: Vec<TransactionInput> = tx
+        .inputs
+        .iter()
+        .map(|inp| {
+            let tx_id = parse_tx_id(&inp.prev_tx_id)?;
+            Ok(TransactionInput::new(
+                TransactionOutpoint::new(tx_id, inp.prev_index),
+                vec![], // signature_script is empty at sighash time
+                inp.sequence,
+                inp.sig_op_count,
+            ))
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+
+    // Build kaspad outputs
+    let outputs: Vec<TransactionOutput> = tx
+        .outputs
+        .iter()
+        .map(|out| TransactionOutput::with_covenant(
+            out.value,
+            out.script_public_key.clone(),
+            out.covenant,
+        ))
+        .collect();
+
+    // Build UTXO entries from KOB input data
+    let entries: Vec<UtxoEntry> = tx
+        .inputs
+        .iter()
+        .map(|inp| UtxoEntry {
+            amount: inp.value,
+            script_public_key: ScriptPublicKey::new(inp.script_version, inp.script_bytes.clone().into()),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        })
+        .collect();
+
+    let subnetwork_id = parse_subnetwork_id(&tx.subnetwork_id)?;
+    let kaspa_tx = KaspaTransaction::new(
+        tx.version,
+        inputs,
+        outputs,
+        tx.lock_time,
+        subnetwork_id,
+        tx.gas,
+        tx.payload.clone(),
+    );
+
+    Ok((kaspa_tx, entries))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

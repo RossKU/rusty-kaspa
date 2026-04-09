@@ -308,26 +308,37 @@ fn translate_wrpc_tx_to_rest(
 
                     if let Some(spk) = out_val.get("scriptPublicKey") {
                         let mut spk_obj = serde_json::Map::new();
-                        let version = spk
-                            .get("version")
-                            .and_then(|v| {
-                                if let Some(s) = v.as_str() {
-                                    s.parse::<u64>().ok()
-                                } else {
-                                    v.as_u64()
-                                }
-                            })
-                            .unwrap_or(0);
-                        let script = spk
-                            .get("script")
-                            .or_else(|| spk.get("scriptPublicKey"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        spk_obj.insert("version".to_string(), serde_json::json!(version));
-                        spk_obj.insert(
-                            "scriptPublicKey".to_string(),
-                            serde_json::json!(script),
-                        );
+                        // TN12 returns scriptPublicKey as a flat hex string;
+                        // older nodes return {"version": N, "scriptPublicKey"/"script": "hex"}.
+                        if let Some(flat) = spk.as_str() {
+                            // Flat hex string: first 4 hex chars = version
+                            if flat.len() >= 4 {
+                                let version = u16::from_str_radix(&flat[..4], 16).unwrap_or(0);
+                                spk_obj.insert("version".to_string(), serde_json::json!(version));
+                                spk_obj.insert("scriptPublicKey".to_string(), serde_json::json!(&flat[4..]));
+                            } else {
+                                spk_obj.insert("version".to_string(), serde_json::json!(0));
+                                spk_obj.insert("scriptPublicKey".to_string(), serde_json::json!(flat));
+                            }
+                        } else {
+                            let version = spk
+                                .get("version")
+                                .and_then(|v| {
+                                    if let Some(s) = v.as_str() {
+                                        s.parse::<u64>().ok()
+                                    } else {
+                                        v.as_u64()
+                                    }
+                                })
+                                .unwrap_or(0);
+                            let script = spk
+                                .get("script")
+                                .or_else(|| spk.get("scriptPublicKey"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            spk_obj.insert("version".to_string(), serde_json::json!(version));
+                            spk_obj.insert("scriptPublicKey".to_string(), serde_json::json!(script));
+                        }
                         obj.insert(
                             "scriptPublicKey".to_string(),
                             serde_json::Value::Object(spk_obj),

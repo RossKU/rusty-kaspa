@@ -516,17 +516,34 @@ impl TransactionData {
             .map(|arr| {
                 arr.iter()
                     .filter_map(|out| {
-                        let value = out.get("amount").and_then(|v| v.as_u64())?;
+                        // TN12 uses "value", older nodes use "amount"
+                        let value = out.get("value").and_then(|v| v.as_u64())
+                            .or_else(|| out.get("amount").and_then(|v| v.as_u64()))?;
                         let spk = out.get("scriptPublicKey")?;
-                        let script_version = spk
-                            .get("version")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as u16;
-                        let script = spk
-                            .get("scriptPublicKey")
-                            .and_then(|v| v.as_str())
-                            .and_then(|s| hex::decode(s).ok())
-                            .unwrap_or_default();
+                        // TN12 returns scriptPublicKey as a flat hex string
+                        // "<version_4hex><script_hex>" (e.g. "0000" + script hex).
+                        // Older nodes return it as {"version": N, "scriptPublicKey": "<hex>"}.
+                        let (script_version, script) = if let Some(flat) = spk.as_str() {
+                            // Flat hex string: first 4 hex chars = version, rest = script
+                            if flat.len() >= 4 {
+                                let ver = u16::from_str_radix(&flat[..4], 16).unwrap_or(0);
+                                let scr = hex::decode(&flat[4..]).unwrap_or_default();
+                                (ver, scr)
+                            } else {
+                                (0u16, hex::decode(flat).unwrap_or_default())
+                            }
+                        } else {
+                            let script_version = spk
+                                .get("version")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0) as u16;
+                            let script = spk
+                                .get("scriptPublicKey")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| hex::decode(s).ok())
+                                .unwrap_or_default();
+                            (script_version, script)
+                        };
                         // Parse optional covenant binding on this output.
                         let covenant_id = out
                             .get("covenant")
@@ -2378,5 +2395,96 @@ mod tests {
         let spent = BlockScanner::find_spent_in_keys(&tx, &keys);
         assert_eq!(spent.len(), 1);
         assert_eq!(spent[0], format!("{}:0", "a".repeat(64)));
+    }
+
+    // Test from_rpc_json with TN12 flat scriptPublicKey format
+
+    #[test]
+    fn test_from_rpc_json_flat_spk() {
+        // TN12 format: scriptPublicKey is a flat hex string "0000<script_hex>"
+        let script_hex = "aa20".to_string() + &"bb".repeat(32) + "87";
+        let flat_spk = format!("0000{}", script_hex); // version 0 + script
+        let json = serde_json::json!({
+            "verboseData": {"transactionId": "a".repeat(64)},
+            "version": 0,
+            "inputs": [],
+            "outputs": [{
+                "value": 5_000_000u64,
+                "scriptPublicKey": flat_spk,
+                "covenant": null,
+            }],
+            "payload": "",
+        });
+
+        let td = TransactionData::from_rpc_json(&json).expect("Should parse TN12 format");
+        assert_eq!(td.tx_id, "a".repeat(64));
+        assert_eq!(td.outputs.len(), 1);
+        assert_eq!(td.outputs[0].value, 5_000_000);
+        assert_eq!(td.outputs[0].script_version, 0);
+        // Script should be the decoded script bytes (without version prefix)
+        let expected_script = hex::decode(&script_hex).unwrap();
+        assert_eq!(td.outputs[0].script, expected_script);
+    }
+
+    #[test]
+    fn test_from_rpc_json_object_spk() {
+        // Old format: scriptPublicKey is {"version": N, "scriptPublicKey": "hex"}
+        let script_hex = "aa20".to_string() + &"cc".repeat(32) + "87";
+        let json = serde_json::json!({
+            "verboseData": {"transactionId": "b".repeat(64)},
+            "version": 0,
+            "inputs": [],
+            "outputs": [{
+                "amount": 3_000_000u64,
+                "scriptPublicKey": {
+                    "version": 0,
+                    "scriptPublicKey": script_hex,
+                },
+            }],
+            "payload": "",
+        });
+
+        let td = TransactionData::from_rpc_json(&json).expect("Should parse object SPK format");
+        assert_eq!(td.outputs.len(), 1);
+        assert_eq!(td.outputs[0].value, 3_000_000);
+        assert_eq!(td.outputs[0].script_version, 0);
+        let expected_script = hex::decode(&script_hex).unwrap();
+        assert_eq!(td.outputs[0].script, expected_script);
+    }
+
+    #[test]
+    fn test_from_rpc_json_value_key() {
+        // TN12 uses "value" instead of "amount"
+        let json = serde_json::json!({
+            "verboseData": {"transactionId": "c".repeat(64)},
+            "version": 0,
+            "inputs": [],
+            "outputs": [{
+                "value": 7_777_777u64,
+                "scriptPublicKey": "000020aabbccdd",
+            }],
+            "payload": "",
+        });
+
+        let td = TransactionData::from_rpc_json(&json).unwrap();
+        assert_eq!(td.outputs[0].value, 7_777_777);
+    }
+
+    #[test]
+    fn test_from_rpc_json_amount_key() {
+        // Old format uses "amount"
+        let json = serde_json::json!({
+            "verboseData": {"transactionId": "d".repeat(64)},
+            "version": 0,
+            "inputs": [],
+            "outputs": [{
+                "amount": 9_999_999u64,
+                "scriptPublicKey": {"version": 0, "scriptPublicKey": "20aabbccdd"},
+            }],
+            "payload": "",
+        });
+
+        let td = TransactionData::from_rpc_json(&json).unwrap();
+        assert_eq!(td.outputs[0].value, 9_999_999);
     }
 }

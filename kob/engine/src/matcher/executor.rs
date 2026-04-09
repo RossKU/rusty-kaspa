@@ -2194,6 +2194,10 @@ async fn scan_new_blocks(
         &added_hashes
     };
 
+    // Track already-scanned block hashes to avoid duplicates (a merge set
+    // block may appear in multiple chain blocks' merge sets).
+    let mut scanned_blocks: HashSet<String> = HashSet::new();
+
     for block_hash in blocks_to_scan {
         let block_resp = match rpc.get_block(block_hash).await {
             Ok(b) => b,
@@ -2203,41 +2207,80 @@ async fn scan_new_blocks(
             }
         };
 
-        // Parse transactions from block
+        // Collect all block hashes to scan: the chain block itself + its merge set.
+        // TXs from parallel DAG blocks get accepted by a chain block but are only
+        // present in the merge set blocks, not in the chain block's transactions[].
+        let mut hashes_to_scan: Vec<String> = vec![block_hash.clone()];
         let block_data = block_resp.get("block").unwrap_or(&block_resp);
-        let txs: Vec<TransactionData> = block_data
-            .get("transactions")
-            .and_then(|t| t.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(TransactionData::from_rpc_json)
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if txs.is_empty() {
-            continue;
+        if let Some(vd) = block_data.get("verboseData") {
+            for key in &["mergeSetBluesHashes", "mergeSetRedsHashes"] {
+                if let Some(arr) = vd.get(*key).and_then(|v| v.as_array()) {
+                    for h in arr {
+                        if let Some(s) = h.as_str() {
+                            // Skip the chain block itself (already in the list)
+                            if s != block_hash {
+                                hashes_to_scan.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+            }
         }
 
-        let counters = process_block_txs_all(
-            &txs,
-            order_book,
-            &scanner,
-            perp_book,
-            lending_book,
-            prediction_book,
-            ws_tx,
-            current_daa,
-        );
+        for scan_hash in &hashes_to_scan {
+            if !scanned_blocks.insert(scan_hash.clone()) {
+                continue; // already scanned
+            }
 
-        total_counters.spot_added += counters.spot_added;
-        total_counters.spot_removed += counters.spot_removed;
-        total_counters.perp_added += counters.perp_added;
-        total_counters.perp_removed += counters.perp_removed;
-        total_counters.lending_added += counters.lending_added;
-        total_counters.lending_removed += counters.lending_removed;
-        total_counters.prediction_added += counters.prediction_added;
-        total_counters.prediction_removed += counters.prediction_removed;
+            // For the chain block we already have the response; for merge set
+            // blocks we need a separate getBlock call.
+            let resp = if scan_hash == block_hash {
+                block_resp.clone()
+            } else {
+                match rpc.get_block(scan_hash).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        debug!("[SCAN-BLOCKS] Failed to get merge-set block {}: {}", &scan_hash[..scan_hash.len().min(16)], e);
+                        continue;
+                    }
+                }
+            };
+
+            let bd = resp.get("block").unwrap_or(&resp);
+            let txs: Vec<TransactionData> = bd
+                .get("transactions")
+                .and_then(|t| t.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(TransactionData::from_rpc_json)
+                        .collect()
+                })
+                .unwrap_or_default();
+
+            if txs.is_empty() {
+                continue;
+            }
+
+            let counters = process_block_txs_all(
+                &txs,
+                order_book,
+                &scanner,
+                perp_book,
+                lending_book,
+                prediction_book,
+                ws_tx,
+                current_daa,
+            );
+
+            total_counters.spot_added += counters.spot_added;
+            total_counters.spot_removed += counters.spot_removed;
+            total_counters.perp_added += counters.perp_added;
+            total_counters.perp_removed += counters.perp_removed;
+            total_counters.lending_added += counters.lending_added;
+            total_counters.lending_removed += counters.lending_removed;
+            total_counters.prediction_added += counters.prediction_added;
+            total_counters.prediction_removed += counters.prediction_removed;
+        }
     }
 
     let any_found = total_counters.spot_added > 0

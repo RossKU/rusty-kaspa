@@ -4,7 +4,7 @@
 //!   - `--market` flag: deploys a market order (extreme price, immediate fill expected)
 //!   - `--expiry <daa_score>` flag: deploys a GTD (Good-Till-Date) order
 
-use crate::auto_match::{OrderCache, OrderCacheEntry};
+use crate::order_cache::{OrderCache, OrderCacheEntry};
 use crate::cancel_all;
 use crate::node::NodeClient;
 use crate::signing;
@@ -217,14 +217,6 @@ pub async fn deploy_buy(
     expiry_daa: Option<u64>,
     max_matcher_fee: u64,
 ) -> anyhow::Result<String> {
-    if version < 13 {
-        anyhow::bail!(
-            "Contract version {} is deprecated and deployment is blocked. \
-             Versions prior to v13 lack conservation check and output count limit. \
-             Use --version 13.",
-            version
-        );
-    }
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported for deployment.", version);
     }
@@ -257,6 +249,18 @@ pub async fn deploy_buy(
             (amount as u128) * (price_num as u128),
             i64::MAX
         );
+    }
+
+    // Warn about suboptimal UTXO economics for small buy orders.
+    const BUY_DEPLOY_MIN_RECOMMENDED: u64 = 500_000_000; // 5 KAS
+    if amount < BUY_DEPLOY_MIN_RECOMMENDED {
+        println!("WARNING: Amount {} sompi ({:.2} KAS) is below the recommended minimum of {} sompi ({} KAS).",
+            amount, amount as f64 / 1e8,
+            BUY_DEPLOY_MIN_RECOMMENDED, BUY_DEPLOY_MIN_RECOMMENDED / 100_000_000,
+        );
+        println!("         Small buy orders may have suboptimal UTXO economics.");
+        println!("         Consider using --amount {} or higher.", BUY_DEPLOY_MIN_RECOMMENDED);
+        println!();
     }
 
     let pubkey = wallet.public_key_bytes()?;
@@ -574,14 +578,6 @@ pub async fn deploy_sell(
     token_utxo_str: Option<&str>,
     fee_utxo_str: Option<&str>,
 ) -> anyhow::Result<String> {
-    if version < 13 {
-        anyhow::bail!(
-            "Contract version {} is deprecated and deployment is blocked. \
-             Versions prior to v13 lack conservation check and output count limit. \
-             Use --version 13.",
-            version
-        );
-    }
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported for deployment.", version);
     }
@@ -614,6 +610,22 @@ pub async fn deploy_sell(
             (amount as u128) * (price_num as u128),
             i64::MAX
         );
+    }
+
+    if token_covenant_id.is_none() {
+        anyhow::bail!("--token is required for sell orders. Specify the token covenant ID.");
+    }
+
+    // Warn about storage mass penalty for small sell orders.
+    const SELL_DEPLOY_MIN_RECOMMENDED: u64 = 1_000_000_000; // 10 KAS
+    if amount < SELL_DEPLOY_MIN_RECOMMENDED {
+        println!("WARNING: Amount {} sompi ({:.2} KAS) is below the recommended minimum of {} sompi ({} KAS).",
+            amount, amount as f64 / 1e8,
+            SELL_DEPLOY_MIN_RECOMMENDED, SELL_DEPLOY_MIN_RECOMMENDED / 100_000_000,
+        );
+        println!("         Small sell orders with covenant binding (version=1 TX) incur high storage mass and may get stuck in mempool.");
+        println!("         Consider using --amount {} or higher.", SELL_DEPLOY_MIN_RECOMMENDED);
+        println!();
     }
 
     let pubkey = wallet.public_key_bytes()?;

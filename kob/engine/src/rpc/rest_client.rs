@@ -378,14 +378,21 @@ fn translate_wrpc_tx_to_rest(
         .and_then(|v| v.as_str())
         .unwrap_or("0000000000000000000000000000000000000000");
 
+    let mut tx_obj = serde_json::json!({
+        "version": version,
+        "inputs": inputs,
+        "outputs": outputs,
+        "lockTime": lock_time,
+        "subnetworkId": subnetwork_id,
+    });
+
+    // Forward payload field for covenant TXs (redeem script data)
+    if let Some(payload) = tx.get("payload") {
+        tx_obj.as_object_mut().unwrap().insert("payload".to_string(), payload.clone());
+    }
+
     Ok(serde_json::json!({
-        "transaction": {
-            "version": version,
-            "inputs": inputs,
-            "outputs": outputs,
-            "lockTime": lock_time,
-            "subnetworkId": subnetwork_id,
-        },
+        "transaction": tx_obj,
         "allowOrphan": false,
     }))
 }
@@ -426,7 +433,7 @@ mod tests {
         assert_eq!(tx["inputs"][0]["sequence"], 0);
         assert_eq!(tx["inputs"][0]["sigOpCount"], 1);
         assert!(tx.get("gas").is_none());
-        assert!(tx.get("payload").is_none());
+        assert_eq!(tx["payload"], "4b4f42");
         assert_eq!(rest["allowOrphan"], false);
     }
 

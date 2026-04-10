@@ -319,9 +319,10 @@ pub fn build_deploy_plan(config: &MmConfig) -> MmDeployPlan {
     );
 
     let total_orders = buy_levels.len() + sell_levels.len();
-    // Each order needs amount + DEFAULT_MATCHER_FEE for deploy TX
+    // Each order needs amount + estimated deploy fee (1 input, 2 outputs, ~200B payload)
+    let deploy_fee_estimate = kob_core::mass::estimate_compute_mass(1, 2, 200);
     let total_kas_needed = match config.amount
-        .checked_add(kob_core::DEFAULT_MATCHER_FEE)
+        .checked_add(deploy_fee_estimate)
         .and_then(|per_order| per_order.checked_mul(total_orders as u64))
     {
         Some(v) => v,
@@ -1597,8 +1598,9 @@ mod tests {
         assert_eq!(plan.buy_levels.len(), 5);
         assert_eq!(plan.sell_levels.len(), 5);
         assert_eq!(plan.total_orders, 10);
-        // Each order: 10_000_000 + 10_000 DEFAULT_MATCHER_FEE = 10_010_000
-        assert_eq!(plan.total_kas_needed, 10 * (10_000_000 + kob_core::DEFAULT_MATCHER_FEE));
+        // Each order: 10_000_000 + deploy fee estimate
+        let deploy_fee = kob_core::mass::estimate_compute_mass(1, 2, 200);
+        assert_eq!(plan.total_kas_needed, 10 * (10_000_000 + deploy_fee));
     }
 
     #[test]
@@ -1639,7 +1641,8 @@ mod tests {
         };
         let plan = build_deploy_plan(&config);
         assert_eq!(plan.total_orders, 4); // 2 buy + 2 sell
-        let expected = 4 * (50_000_000u64 + kob_core::DEFAULT_MATCHER_FEE);
+        let deploy_fee = kob_core::mass::estimate_compute_mass(1, 2, 200);
+        let expected = 4 * (50_000_000u64 + deploy_fee);
         assert_eq!(plan.total_kas_needed, expected);
     }
 

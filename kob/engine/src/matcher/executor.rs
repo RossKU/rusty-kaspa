@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::config::AppConfig;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE, RECEIPT_VALUE};
+use kob_core::{MIN_UTXO_VALUE, RECEIPT_VALUE};
 use crate::matcher::deploy;
 use crate::matcher::matching::{self, CrossingPair, MatchType};
 use crate::matcher::order_book::{OrderBook, OrderSide};
@@ -551,10 +551,12 @@ fn select_fee_utxo<'a>(
     label: &str,
     spent_tracker: &SpentTracker,
 ) -> Option<&'a RpcUtxo> {
+    // Conservative budget: 3 inputs, 5 outputs, no payload
+    let min_fee_budget = kob_core::mass::estimate_compute_mass(3, 5, 0);
     let found = utxos
         .iter()
         .filter(|u| {
-            u.utxo_entry.amount >= DEFAULT_MATCHER_FEE
+            u.utxo_entry.amount >= min_fee_budget
                 && exclude_key.is_none_or(|k| u.outpoint_key() != k)
                 && !spent_tracker.is_spent(&u.outpoint_key())
         })
@@ -568,8 +570,8 @@ fn select_fee_utxo<'a>(
 /// Find the best fee UTXO for minimizing storage mass.
 ///
 /// Smaller UTXOs provide *more* storage mass credit (C / small_val > C / big_val).
-/// This function picks the smallest UTXO that is >= DEFAULT_MATCHER_FEE, which maximizes the
-/// input credit contribution and reduces net storage mass.
+/// This function picks the smallest UTXO that is >= the estimated compute mass,
+/// which maximizes the input credit contribution and reduces net storage mass.
 ///
 /// Falls back to the largest eligible UTXO if no small UTXO is available.
 fn select_fee_utxo_for_mass<'a>(
@@ -578,10 +580,12 @@ fn select_fee_utxo_for_mass<'a>(
     label: &str,
     spent_tracker: &SpentTracker,
 ) -> Option<&'a RpcUtxo> {
+    // Conservative budget: 3 inputs, 5 outputs, no payload
+    let min_fee_budget = kob_core::mass::estimate_compute_mass(3, 5, 0);
     let eligible: Vec<_> = utxos
         .iter()
         .filter(|u| {
-            u.utxo_entry.amount >= DEFAULT_MATCHER_FEE
+            u.utxo_entry.amount >= min_fee_budget
                 && exclude_key.is_none_or(|k| u.outpoint_key() != k)
                 && !spent_tracker.is_spent(&u.outpoint_key())
         })
@@ -611,8 +615,10 @@ fn select_fee_utxos_mass_aware<'a>(
 
     // Sort eligible UTXOs smallest-first for maximum credit per UTXO.
     // Exclude UTXOs already claimed by another match in this cycle.
+    // Conservative budget: 3 inputs, 5 outputs, no payload
+    let min_fee_budget = kob_core::mass::estimate_compute_mass(3, 5, 0);
     let mut eligible: Vec<&RpcUtxo> = utxos.iter()
-        .filter(|u| u.utxo_entry.amount >= DEFAULT_MATCHER_FEE && !spent_tracker.is_spent(&u.outpoint_key()))
+        .filter(|u| u.utxo_entry.amount >= min_fee_budget && !spent_tracker.is_spent(&u.outpoint_key()))
         .collect();
     eligible.sort_by_key(|u| u.utxo_entry.amount);
 
@@ -5508,7 +5514,7 @@ mod tests {
 
     #[test]
     fn cross_pair_value_balance_small_surplus() {
-        // When surplus is small, it still only needs to cover DEFAULT_MATCHER_FEE.
+        // When surplus is small, it still only needs to cover the mass-based miner fee.
         // Receipt is always funded by matcher wallet.
         let sell_value = 10_000_000u64;
         let buy_value = 10_050_000u64; // just 50K surplus

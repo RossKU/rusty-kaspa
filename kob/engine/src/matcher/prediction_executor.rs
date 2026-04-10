@@ -5,7 +5,8 @@ use crate::matcher::prediction_book::{
     BallotBoxEntry, BallotSide, RedemptionEntry, SplitMergeEntry,
 };
 
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::estimate_compute_mass;
+use kob_core::MIN_UTXO_VALUE;
 
 /// A constructed (unsigned) transaction ready for submission.
 #[derive(Debug, Clone)]
@@ -202,14 +203,20 @@ pub fn build_create_market_tx(
     // build_deploy_redemption_tx(). This eliminates the placeholder [0;32]
     // vulnerability where Redemption could never verify BallotBox identity.
 
+    // Build payload with all redeemScripts concatenated (needed for fee estimate)
+    let payload = kob_core::prediction::build_prediction_payload(&yes_ballot_rs);
+
     // Total required value (step 1: BallotBoxes + SplitMerge only, no Redemption)
     let total_output = params.ballot_box_initial_value
         .checked_add(params.ballot_box_initial_value)
         .and_then(|v| v.checked_add(params.split_merge_initial_value))
         .ok_or_else(|| PredictionTxError::Overflow("total output sum".to_string()))?;
 
+    // Mass-based fee estimate: 1 input, 4 outputs (3 covenants + change)
+    let estimated_fee = estimate_compute_mass(1, 4, payload.len());
+
     let total_required = total_output
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(estimated_fee)
         .ok_or_else(|| PredictionTxError::Overflow("total + fee".to_string()))?;
 
     if params.funding_value < total_required {
@@ -220,9 +227,6 @@ pub fn build_create_market_tx(
     }
 
     let change = params.funding_value - total_required;
-
-    // Build payload with all redeemScripts concatenated
-    let payload = kob_core::prediction::build_prediction_payload(&yes_ballot_rs);
 
     // Outputs (step 1: BallotBoxes + SplitMerge only)
     // Redemption is deployed in step 2 after BallotBox covenant IDs are known.
@@ -354,9 +358,13 @@ pub fn build_deploy_redemption_tx(
         &[0u8; 32],    // no_receipt_cid placeholder
     ).map_err(|e| PredictionTxError::MissingData(format!("Redemption RS: {e}")))?;
     let redemption_p2sh = kob_core::build_p2sh(&redemption_rs);
+    let payload = kob_core::prediction::build_prediction_payload(&redemption_rs);
+
+    // Mass-based fee estimate: 1 input, 2 outputs (redemption + change)
+    let estimated_fee = estimate_compute_mass(1, 2, payload.len());
 
     let total_required = params.redemption_initial_value
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(estimated_fee)
         .ok_or_else(|| PredictionTxError::Overflow("redemption + fee".to_string()))?;
 
     if params.funding_value < total_required {
@@ -367,8 +375,6 @@ pub fn build_deploy_redemption_tx(
     }
 
     let change = params.funding_value - total_required;
-
-    let payload = kob_core::prediction::build_prediction_payload(&redemption_rs);
 
     let mut outputs = vec![
         PredictionTxOutput {
@@ -550,6 +556,9 @@ pub struct SplitParams {
 pub fn build_split_tx(params: &SplitParams) -> Result<PredictionTxBlueprint, PredictionTxError> {
     let sm = &params.split_merge;
 
+    // Build payload early (needed for fee estimate)
+    let payload = kob_core::prediction::build_prediction_payload(&sm.redeem_script);
+
     // Each token gets token_value
     let token_output_total = params.token_value
         .checked_mul(2)
@@ -570,9 +579,12 @@ pub fn build_split_tx(params: &SplitParams) -> Result<PredictionTxBlueprint, Pre
         .checked_add(sm.unit_value)
         .ok_or_else(|| PredictionTxError::Overflow("sm + unit_value".to_string()))?;
 
+    // Mass-based fee estimate: 2 inputs, 4 outputs (yes + no + continuation + change)
+    let estimated_fee = estimate_compute_mass(2, 4, payload.len());
+
     let required = token_output_total
         .checked_add(continuation_value)
-        .and_then(|v| v.checked_add(DEFAULT_MATCHER_FEE))
+        .and_then(|v| v.checked_add(estimated_fee))
         .ok_or_else(|| PredictionTxError::Overflow("outputs + fee".to_string()))?;
 
     // Ensure user provides enough (sm provides sm.value, user provides the rest)
@@ -615,8 +627,6 @@ pub fn build_split_tx(params: &SplitParams) -> Result<PredictionTxBlueprint, Pre
             script: params.change_script.clone(),
         });
     }
-
-    let payload = kob_core::prediction::build_prediction_payload(&sm.redeem_script);
 
     Ok(PredictionTxBlueprint {
         inputs: vec![
@@ -710,9 +720,12 @@ pub fn build_merge_tx(params: &MergeParams) -> Result<PredictionTxBlueprint, Pre
         .and_then(|v| v.checked_add(params.no_token_value))
         .ok_or_else(|| PredictionTxError::Overflow("total inputs".to_string()))?;
 
+    // Mass-based fee estimate: 3 inputs, 2 outputs, no payload
+    let estimated_fee = estimate_compute_mass(3, 2, 0);
+
     let total_output = sm.unit_value
         .checked_add(continuation_value)
-        .and_then(|v| v.checked_add(DEFAULT_MATCHER_FEE))
+        .and_then(|v| v.checked_add(estimated_fee))
         .ok_or_else(|| PredictionTxError::Overflow("total outputs + fee".to_string()))?;
 
     if total_input < total_output {
@@ -997,10 +1010,13 @@ pub fn build_expire_ballot_tx(
         )));
     }
 
-    let payout = bb.value.checked_sub(DEFAULT_MATCHER_FEE).ok_or_else(|| {
+    // Mass-based fee: 1 input, 1 output, no payload
+    let estimated_fee = estimate_compute_mass(1, 1, 0);
+
+    let payout = bb.value.checked_sub(estimated_fee).ok_or_else(|| {
         PredictionTxError::InsufficientFunds {
             available: bb.value,
-            required: DEFAULT_MATCHER_FEE,
+            required: estimated_fee,
         }
     })?;
 
@@ -1067,10 +1083,13 @@ pub fn build_refund_split_merge_tx(
         )));
     }
 
-    let payout = sm.value.checked_sub(DEFAULT_MATCHER_FEE).ok_or_else(|| {
+    // Mass-based fee: 1 input, 1 output, no payload
+    let estimated_fee = estimate_compute_mass(1, 1, 0);
+
+    let payout = sm.value.checked_sub(estimated_fee).ok_or_else(|| {
         PredictionTxError::InsufficientFunds {
             available: sm.value,
-            required: DEFAULT_MATCHER_FEE,
+            required: estimated_fee,
         }
     })?;
 
@@ -1137,10 +1156,13 @@ pub fn build_refund_redemption_tx(
         )));
     }
 
-    let payout = r.value.checked_sub(DEFAULT_MATCHER_FEE).ok_or_else(|| {
+    // Mass-based fee: 1 input, 1 output, no payload
+    let estimated_fee = estimate_compute_mass(1, 1, 0);
+
+    let payout = r.value.checked_sub(estimated_fee).ok_or_else(|| {
         PredictionTxError::InsufficientFunds {
             available: r.value,
-            required: DEFAULT_MATCHER_FEE,
+            required: estimated_fee,
         }
     })?;
 
@@ -1395,7 +1417,7 @@ mod tests {
             split_merge: sm,
             user_tx_id: "user_tx".to_string(),
             user_index: 0,
-            user_value: 200_000_000 + DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE,
+            user_value: 200_000_000 + estimate_compute_mass(2, 4, 100) + MIN_UTXO_VALUE,
             user_sig_script: vec![0x01],
             user_sig_op_count: 1,
             yes_token_script: vec![0xaa],
@@ -1629,7 +1651,7 @@ mod tests {
         let bp = result.unwrap();
         assert_eq!(bp.inputs.len(), 1);
         assert_eq!(bp.outputs.len(), 1);
-        assert_eq!(bp.outputs[0].value, 10_000_000 - DEFAULT_MATCHER_FEE);
+        assert_eq!(bp.outputs[0].value, 10_000_000 - estimate_compute_mass(1, 1, 0));
         assert_eq!(bp.lock_time, 200_000);
         assert_eq!(bp.sig_op_counts[0], 1);
     }
@@ -1649,7 +1671,7 @@ mod tests {
 
     #[test]
     fn expire_ballot_value_too_low() {
-        let mut bb = dummy_ballot_box(BallotSide::Yes, DEFAULT_MATCHER_FEE + 1000);
+        let mut bb = dummy_ballot_box(BallotSide::Yes, estimate_compute_mass(1, 1, 0) + 1000);
         bb.expiry_daa = 1;
         let params = ExpireBallotParams {
             ballot_box: bb,
@@ -1676,7 +1698,7 @@ mod tests {
         let result = build_refund_split_merge_tx(&params);
         assert!(result.is_ok());
         let bp = result.unwrap();
-        assert_eq!(bp.outputs[0].value, 500_000_000 - DEFAULT_MATCHER_FEE);
+        assert_eq!(bp.outputs[0].value, 500_000_000 - estimate_compute_mass(1, 1, 0));
         assert_eq!(bp.lock_time, 200_000);
     }
 
@@ -1708,7 +1730,7 @@ mod tests {
         let result = build_refund_redemption_tx(&params);
         assert!(result.is_ok());
         let bp = result.unwrap();
-        assert_eq!(bp.outputs[0].value, 500_000_000 - DEFAULT_MATCHER_FEE);
+        assert_eq!(bp.outputs[0].value, 500_000_000 - estimate_compute_mass(1, 1, 0));
     }
 
     #[test]

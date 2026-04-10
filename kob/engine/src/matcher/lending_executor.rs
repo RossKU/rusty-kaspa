@@ -3,7 +3,8 @@
 use crate::matcher::lending_book::{BorrowRequest, LendingMatch, LendingOffer};
 use crate::matcher::lending_tracker::LoanPosition;
 
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::estimate_compute_mass;
+use kob_core::MIN_UTXO_VALUE;
 
 /// A constructed (unsigned) lending transaction ready for submission.
 ///
@@ -215,10 +216,15 @@ pub fn build_lending_match_tx(
         .checked_add(params.request.value)
         .ok_or_else(|| LendingTxError::Overflow("offer.value + request.value".to_string()))?;
 
+    // Build payload for L1 discovery (needed for fee estimation)
+    let payload = kob_core::lending::build_lending_payload(&rs);
+
     // Required = loan_value (collateral) + principal (to borrower) + fee
+    // Estimate fee from compute mass: 2 inputs, up to 3 outputs (loan + principal + change).
+    let est_fee = estimate_compute_mass(2, 3, payload.len());
     let required = loan_value
         .checked_add(params.principal)
-        .and_then(|v| v.checked_add(DEFAULT_MATCHER_FEE))
+        .and_then(|v| v.checked_add(est_fee))
         .ok_or_else(|| LendingTxError::Overflow("loan_value + principal + fee".to_string()))?;
 
     if total_input < required {
@@ -229,9 +235,6 @@ pub fn build_lending_match_tx(
     }
 
     let change = total_input - required;
-
-    // Build payload for L1 discovery
-    let payload = kob_core::lending::build_lending_payload(&rs);
 
     // Build sigscripts for the offer and request inputs
     let offer_sigscript =
@@ -392,8 +395,10 @@ pub fn build_liquidation_tx(
         .and_then(|v| v.checked_add(params.liquidator_payout))
         .ok_or_else(|| LendingTxError::Overflow("total payout".to_string()))?;
 
+    // Estimate fee from compute mass: 1 input, up to 3 outputs, no payload.
+    let est_fee = estimate_compute_mass(1, 3, 0);
     let total_with_fee = total_payout
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("total + fee".to_string()))?;
 
     if loan_value < total_with_fee {
@@ -484,7 +489,9 @@ pub fn build_default_claim_tx(
     );
 
     let loan_value = loan.collateral;
-    let payout = loan_value.saturating_sub(DEFAULT_MATCHER_FEE);
+    // Estimate fee from compute mass: 1 input (1 sig), 1 output, no payload.
+    let est_fee = estimate_compute_mass(1, 1, 0);
+    let payout = loan_value.saturating_sub(est_fee);
     if payout < MIN_UTXO_VALUE {
         return Err(LendingTxError::OutputBelowMinimum {
             output_idx: 0,
@@ -598,8 +605,11 @@ pub fn build_repay_tx(
         .ok_or_else(|| LendingTxError::Overflow("collateral + funding".to_string()))?;
 
     // Required: lender_amount + fee (borrower gets remainder)
+    // Estimate fee from compute mass: 1-2 inputs, up to 2 outputs, no payload.
+    let num_inputs = if params.funding_tx_id.is_some() { 2 } else { 1 };
+    let est_fee = estimate_compute_mass(num_inputs, 2, 0);
     let required = lender_amount
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("lender_amount + fee".to_string()))?;
 
     if total_input < required {
@@ -746,9 +756,11 @@ pub fn build_partial_repay_tx(
     );
 
     let loan_value = loan.collateral;
+    // Estimate fee from compute mass: 1 input, 2 outputs (continuation + lender), no payload.
+    let est_fee = estimate_compute_mass(1, 2, 0);
     let required = params
         .repay_amount
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("repay + fee".to_string()))?;
 
     if loan_value < required {
@@ -862,8 +874,10 @@ pub fn build_topup_tx(
         .checked_add(params.additional_collateral)
         .ok_or_else(|| LendingTxError::Overflow("collateral + additional".to_string()))?;
 
+    // Estimate fee from compute mass: 2 inputs, 1 output (continuation), no payload.
+    let est_fee = estimate_compute_mass(2, 1, 0);
     let required = new_value
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("new_value + fee".to_string()))?;
 
     if total_input < required {
@@ -996,9 +1010,11 @@ pub fn build_extend_tx(
     );
 
     let loan_value = loan.collateral;
+    // Estimate fee from compute mass: 1 input (2 sigs), up to 2 outputs, no payload.
+    let est_fee = estimate_compute_mass(1, 2, 0);
     let required = params
         .interest_payment
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("interest + fee".to_string()))?;
 
     if loan_value < required {
@@ -1138,9 +1154,11 @@ pub fn build_rebalance_tx(
     );
 
     let loan_value = loan.collateral;
+    // Estimate fee from compute mass: 2 inputs, up to 2 outputs, no payload.
+    let est_fee = estimate_compute_mass(2, 2, 0);
     let required = params
         .interest_payment
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("interest + fee".to_string()))?;
 
     if loan_value < required {
@@ -1260,8 +1278,10 @@ pub fn build_partial_liquidation_tx(
         .lender_payout
         .checked_add(params.liquidator_payout)
         .ok_or_else(|| LendingTxError::Overflow("lender + liquidator payout".to_string()))?;
+    // Estimate fee from compute mass: 1 input, up to 3 outputs, no payload.
+    let est_fee = estimate_compute_mass(1, 3, 0);
     let required = total_payout
-        .checked_add(DEFAULT_MATCHER_FEE)
+        .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("payout + fee".to_string()))?;
 
     if loan_value < required {
@@ -1387,7 +1407,9 @@ pub fn build_loan_transfer_tx(
     );
 
     let loan_value = loan.collateral;
-    let payout = loan_value.saturating_sub(DEFAULT_MATCHER_FEE);
+    // Estimate fee from compute mass: 1 input (1 sig), 1 output, no payload.
+    let est_fee = estimate_compute_mass(1, 1, 0);
+    let payout = loan_value.saturating_sub(est_fee);
     if payout < MIN_UTXO_VALUE {
         return Err(LendingTxError::OutputBelowMinimum {
             output_idx: 0,
@@ -1557,10 +1579,10 @@ mod tests {
 
     #[test]
     fn match_tx_basic() {
-        let mut offer = make_offer(10_010_000); // +10k to cover fee
+        let mut offer = make_offer(10_100_000); // enough to cover mass-based fee
         // Build real RS for the offer
         offer.redeem_script = kob_core::lending::build_loan_offer_redeem_script(
-            &[1; 32], 10_010_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
+            &[1; 32], 10_100_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
         ).unwrap();
         let mut request = make_request(20_000_000, 10_000_000);
         request.redeem_script = kob_core::lending::build_borrow_request_redeem_script(
@@ -1601,8 +1623,8 @@ mod tests {
             &[1; 32], 3_000_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
         ).unwrap();
         // Request collateral = 4M, desired_principal = 10M -> principal = min(3M, 10M) = 3M
-        // Required: 4M (collateral) + 3M (principal) + 10k (fee) = 7.01M
-        // Available: 3M + 4M = 7M < 7.01M
+        // Required: 4M (collateral) + 3M (principal) + fee > 7M
+        // Available: 3M + 4M = 7M < required
         let mut request = make_request(4_000_000, 10_000_000);
         request.redeem_script = kob_core::lending::build_borrow_request_redeem_script(
             &[2; 32], 10_000_000, 800, 10000, 31_000_000, &[0u8; 32], 0, 0,
@@ -1660,10 +1682,11 @@ mod tests {
         };
 
         let (blueprint, _) = build_lending_match_tx(&params).unwrap();
-        // Change: 15M + 20M - 20M(coll) - 10M(principal) - 10k(fee) = 4.99M -> output[2]
+        // Change: 15M + 20M - 20M(coll) - 10M(principal) - est_fee -> output[2]
         assert_eq!(blueprint.outputs.len(), 3);
         let change = blueprint.outputs[2].value;
-        assert_eq!(change, 4_990_000);
+        let est_fee = estimate_compute_mass(2, 3, blueprint.payload.len());
+        assert_eq!(change, 5_000_000 - est_fee);
     }
 
     // Liquidation TX tests
@@ -1737,7 +1760,8 @@ mod tests {
         let blueprint = build_default_claim_tx(&params).unwrap();
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 1);
-        assert_eq!(blueprint.outputs[0].value, 20_000_000 - DEFAULT_MATCHER_FEE);
+        let est_fee = estimate_compute_mass(1, 1, 0);
+        assert_eq!(blueprint.outputs[0].value, 20_000_000 - est_fee);
         // lock_time = expiry + grace = 32M + 1M = 33M
         assert_eq!(blueprint.lock_time, 33_000_000);
         assert_eq!(blueprint.sig_op_counts, vec![1]);
@@ -1844,8 +1868,9 @@ mod tests {
         let blueprint = build_partial_repay_tx(&params).unwrap();
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 2); // continuation + lender
-        // Continuation: 20M - 5M - 10k = 14.99M
-        assert_eq!(blueprint.outputs[0].value, 14_990_000);
+        // Continuation: 20M - 5M - est_fee
+        let est_fee = estimate_compute_mass(1, 2, 0);
+        assert_eq!(blueprint.outputs[0].value, 15_000_000 - est_fee);
         assert_eq!(blueprint.outputs[1].value, 5_000_000);
     }
 
@@ -1877,7 +1902,7 @@ mod tests {
             repay_amount: 5_000_000,
         };
 
-        // Continuation = 6M - 5M - 10k = 990k < MIN_UTXO (3M)
+        // Continuation = 6M - 5M - est_fee < MIN_UTXO (3M)
         let result = build_partial_repay_tx(&params);
         assert!(matches!(result, Err(LendingTxError::OutputBelowMinimum { .. })));
     }
@@ -1894,7 +1919,7 @@ mod tests {
             additional_collateral: 5_000_000,
             funding_tx_id: "funding_tx".to_string(),
             funding_index: 0,
-            funding_value: 5_010_000, // enough for additional + fee
+            funding_value: 5_100_000, // enough for additional + mass-based fee
             funding_sig_script: vec![0x00],
         };
 
@@ -1941,8 +1966,9 @@ mod tests {
         let blueprint = build_extend_tx(&params).unwrap();
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 2); // continuation + interest
-        // Continuation: 20M - 3M - 10k = 16.99M
-        assert_eq!(blueprint.outputs[0].value, 16_990_000);
+        // Continuation: 20M - 3M - est_fee
+        let est_fee = estimate_compute_mass(1, 2, 0);
+        assert_eq!(blueprint.outputs[0].value, 17_000_000 - est_fee);
         assert_eq!(blueprint.outputs[1].value, 3_000_000);
         assert_eq!(blueprint.sig_op_counts, vec![2]); // 2-of-2
     }
@@ -2026,8 +2052,9 @@ mod tests {
         let blueprint = build_partial_liquidation_tx(&params).unwrap();
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 3); // continuation + lender + liquidator
-        // Continuation: 20M - 5M - 3M - 10k = 11.99M
-        assert_eq!(blueprint.outputs[0].value, 11_990_000);
+        // Continuation: 20M - 5M - 3M - est_fee
+        let est_fee = estimate_compute_mass(1, 3, 0);
+        assert_eq!(blueprint.outputs[0].value, 12_000_000 - est_fee);
     }
 
     #[test]
@@ -2063,7 +2090,8 @@ mod tests {
         let blueprint = build_loan_transfer_tx(&params).unwrap();
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 1); // continuation with new lender
-        assert_eq!(blueprint.outputs[0].value, 20_000_000 - DEFAULT_MATCHER_FEE);
+        let est_fee = estimate_compute_mass(1, 1, 0);
+        assert_eq!(blueprint.outputs[0].value, 20_000_000 - est_fee);
         assert_eq!(blueprint.sig_op_counts, vec![1]);
     }
 
@@ -2138,9 +2166,9 @@ mod tests {
 
     #[test]
     fn match_tx_payload_starts_with_prefix() {
-        let mut offer = make_offer(10_010_000); // +10k to cover fee
+        let mut offer = make_offer(10_100_000); // enough to cover mass-based fee
         offer.redeem_script = kob_core::lending::build_loan_offer_redeem_script(
-            &[1; 32], 10_010_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
+            &[1; 32], 10_100_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
         ).unwrap();
         let mut request = make_request(20_000_000, 10_000_000);
         request.redeem_script = kob_core::lending::build_borrow_request_redeem_script(

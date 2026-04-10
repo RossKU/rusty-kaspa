@@ -67,7 +67,8 @@ pub use wallet::{HdWallet, WalletFileV2, AccountEntry, WatchOnlyExport, pubkey_t
 pub use mass::{
     compute_storage_mass, check_storage_mass, check_tx_storage_mass,
     min_penalty_free_output, suggest_deploy_amount,
-    calc_compute_mass, calc_miner_fee, estimate_compute_mass,
+    calc_compute_mass, calc_miner_fee, converge_fee,
+    calc_mass_with_sigscripts, estimate_compute_mass,
     estimate_tx_serialized_size,
     MassError, STORAGE_MASS_PARAMETER, MAX_TX_MASS,
     MASS_PER_TX_BYTE, MASS_PER_SCRIPT_PUB_KEY_BYTE, MASS_PER_SIG_OP,

@@ -336,6 +336,113 @@ pub fn calc_miner_fee(tx: &crate::tx::Transaction) -> u64 {
     compute_mass.max(storage_mass)
 }
 
+/// Iteratively converge on the correct fee for a transaction where one output
+/// absorbs the residual value (total_in - fixed_outputs - fee).
+///
+/// The circular dependency: reducing the variable output to pay fee causes
+/// `C / output_value` to increase, raising storage mass and thus the fee.
+/// This loop resolves that by iterating until stable (max 10 rounds).
+///
+/// # Arguments
+/// - `tx`: mutable transaction — `tx.outputs[adjust_idx].value` is updated each round.
+/// - `total_in`: sum of all input values (sompi).
+/// - `adjust_idx`: index of the output whose value absorbs the residual.
+/// - `min_fee_override`: floor fee (e.g. matcher fee or minimum relay fee).
+///
+/// # Returns
+/// `(converged_fee, final_output_value)` for the adjusted output.
+///
+/// # Panics
+/// Panics if `adjust_idx >= tx.outputs.len()`.
+pub fn converge_fee(
+    tx: &mut crate::tx::Transaction,
+    total_in: u64,
+    adjust_idx: usize,
+    min_fee_override: u64,
+) -> (u64, u64) {
+    assert!(adjust_idx < tx.outputs.len(), "adjust_idx out of bounds");
+
+    let compute_mass = calc_compute_mass(tx);
+
+    // Sum of all fixed outputs (everything except the adjustable one).
+    let fixed_sum: u64 = tx.outputs.iter().enumerate()
+        .filter(|(i, _)| *i != adjust_idx)
+        .map(|(_, o)| o.value)
+        .sum();
+
+    let mut fee = compute_mass.max(min_fee_override);
+
+    for _ in 0..10 {
+        let remaining = total_in.saturating_sub(fixed_sum + fee);
+        tx.outputs[adjust_idx].value = remaining;
+
+        let input_values: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let output_values: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        let storage_mass = compute_storage_mass(&input_values, &output_values);
+
+        let new_fee = compute_mass.max(storage_mass).max(min_fee_override);
+        if new_fee == fee {
+            break; // converged
+        }
+        fee = new_fee;
+    }
+
+    let final_value = total_in.saturating_sub(fixed_sum + fee);
+    tx.outputs[adjust_idx].value = final_value;
+    (fee, final_value)
+}
+
+/// Compute exact transaction mass using actual sigscript byte sizes (post-signing).
+///
+/// `calc_compute_mass` estimates signature script length as `sig_op_count * 100`
+/// bytes per input, which is deliberately conservative for unsigned TXs. After
+/// signing, the real sigscript bytes are known. This function substitutes the
+/// actual lengths for a precise mass calculation.
+///
+/// # Panics
+/// Panics if `sigscripts.len() != tx.inputs.len()`.
+pub fn calc_mass_with_sigscripts(
+    tx: &crate::tx::Transaction,
+    sigscripts: &[Vec<u8>],
+) -> u64 {
+    assert_eq!(
+        tx.inputs.len(),
+        sigscripts.len(),
+        "sigscripts length must match inputs length"
+    );
+
+    // Recompute serialized size using actual sigscript lengths instead of
+    // the 100-bytes-per-sig-op estimate.
+    let mut size: u64 = 0;
+    size += 2; // version (u16)
+    size += 8; // num_inputs (u64)
+    for (_input, ss) in tx.inputs.iter().zip(sigscripts.iter()) {
+        let outpoint_size = HASH_SIZE + 4; // tx_id + index
+        let sig_script_len = ss.len() as u64;
+        size += outpoint_size + 8 + sig_script_len + 8; // outpoint + len_field + sig_script + sequence
+    }
+    size += 8; // num_outputs (u64)
+    size += tx.outputs.iter().map(estimate_output_serialized_size).sum::<u64>();
+    size += 8; // lock_time (u64)
+    size += SUBNETWORK_ID_SIZE;
+    size += 8; // gas (u64)
+    size += HASH_SIZE; // payload hash
+    size += 8; // payload length (u64)
+    size += tx.payload.len() as u64;
+
+    let compute_mass_for_size = size * MASS_PER_TX_BYTE;
+
+    let total_spk_size: u64 = tx.outputs.iter().map(|o| {
+        2u64 /* script_version u16 */ + o.script_bytes().len() as u64
+    }).sum();
+    let total_spk_mass = total_spk_size * MASS_PER_SCRIPT_PUB_KEY_BYTE;
+
+    let total_sig_ops: u64 = tx.inputs.iter().map(|i| i.sig_op_count as u64).sum();
+    let total_sig_ops_mass = total_sig_ops * MASS_PER_SIG_OP;
+
+    compute_mass_for_size + total_spk_mass + total_sig_ops_mass
+}
+
 /// Estimate compute mass for a transaction with the given parameters,
 /// without building a full Transaction object. Useful for fee pre-estimation.
 ///
@@ -926,5 +1033,105 @@ mod tests {
         // Expected: 2 + 8 + (36+8+100+8) + 8 + (8+2+8+34) + 8 + 20 + 8 + 32 + 8 + 0
         //         = 2 + 8 + 152 + 8 + 52 + 8 + 20 + 8 + 32 + 8 = 298
         assert!(size > 200 && size < 500, "serialized size {} should be reasonable", size);
+    }
+
+
+    // --- converge_fee tests ---
+
+    fn make_test_tx(input_values: &[u64], output_values: &[u64]) -> crate::tx::Transaction {
+        let mut tx = crate::tx::Transaction::new(0);
+        for &v in input_values {
+            tx.inputs.push(crate::tx::TxInput {
+                prev_tx_id: "a".repeat(64),
+                prev_index: 0,
+                sequence: 0,
+                sig_op_count: 1,
+                script_version: 0,
+                script_bytes: vec![0u8; 34],
+                value: v,
+            });
+        }
+        for &v in output_values {
+            tx.outputs.push(crate::tx::TxOutput::new(v, 0, vec![0u8; 34], None));
+        }
+        tx
+    }
+
+    #[test]
+    fn converge_fee_basic() {
+        // 1 input of 100M, 2 outputs: fixed 30M + adjustable (should get ~70M - fee).
+        let mut tx = make_test_tx(&[100_000_000], &[30_000_000, 0]);
+        let (fee, final_val) = converge_fee(&mut tx, 100_000_000, 1, 0);
+        assert!(fee > 0, "fee should be positive");
+        assert_eq!(final_val + 30_000_000 + fee, 100_000_000, "values must sum to total_in");
+        assert_eq!(tx.outputs[1].value, final_val, "output should be updated");
+    }
+
+    #[test]
+    fn converge_fee_min_override() {
+        let mut tx = make_test_tx(&[100_000_000], &[30_000_000, 0]);
+        let (fee, _) = converge_fee(&mut tx, 100_000_000, 1, 50_000);
+        assert!(fee >= 50_000, "fee {} should respect min_fee_override", fee);
+    }
+
+    #[test]
+    fn converge_fee_adjust_first_output() {
+        // Adjust output 0, fixed output 1.
+        let mut tx = make_test_tx(&[100_000_000], &[0, 30_000_000]);
+        let (fee, final_val) = converge_fee(&mut tx, 100_000_000, 0, 0);
+        assert_eq!(final_val + 30_000_000 + fee, 100_000_000);
+    }
+
+    #[test]
+    fn converge_fee_large_value_low_mass() {
+        // Large values → low storage mass, so compute mass dominates.
+        let mut tx = make_test_tx(&[1_000_000_000], &[500_000_000, 0]);
+        let (fee, final_val) = converge_fee(&mut tx, 1_000_000_000, 1, 0);
+        assert_eq!(final_val + 500_000_000 + fee, 1_000_000_000);
+        // With large outputs, storage mass is trivial; compute mass is a few hundred.
+        assert!(fee < 10_000, "fee {} should be low for large values", fee);
+    }
+
+
+    // --- calc_mass_with_sigscripts tests ---
+
+    #[test]
+    fn mass_with_sigscripts_smaller_than_estimate() {
+        // Real Schnorr sig is ~66 bytes, estimate uses 100 per sig_op.
+        let tx = make_test_tx(&[100_000_000], &[50_000_000, 49_000_000]);
+        let estimated = calc_compute_mass(&tx);
+        let actual_ss = vec![vec![0u8; 66]]; // realistic sigscript
+        let exact = calc_mass_with_sigscripts(&tx, &actual_ss);
+        assert!(exact < estimated, "exact mass {} should be less than estimate {}", exact, estimated);
+    }
+
+    #[test]
+    fn mass_with_sigscripts_matches_estimate_at_100() {
+        // If sigscript is exactly 100 bytes (same as estimate), masses should match.
+        let tx = make_test_tx(&[100_000_000], &[50_000_000, 49_000_000]);
+        let estimated = calc_compute_mass(&tx);
+        let actual_ss = vec![vec![0u8; 100]];
+        let exact = calc_mass_with_sigscripts(&tx, &actual_ss);
+        assert_eq!(exact, estimated, "should match when sigscript is 100 bytes");
+    }
+
+    #[test]
+    fn mass_with_sigscripts_empty_sigscript() {
+        let tx = make_test_tx(&[100_000_000], &[50_000_000, 49_000_000]);
+        let actual_ss = vec![vec![]]; // empty sigscript
+        let exact = calc_mass_with_sigscripts(&tx, &actual_ss);
+        let estimated = calc_compute_mass(&tx);
+        assert!(exact < estimated);
+    }
+
+    #[test]
+    fn mass_with_sigscripts_multi_input() {
+        let tx = make_test_tx(&[50_000_000, 50_000_000], &[90_000_000]);
+        let estimated = calc_compute_mass(&tx);
+        let actual_ss = vec![vec![0u8; 66], vec![0u8; 66]];
+        let exact = calc_mass_with_sigscripts(&tx, &actual_ss);
+        assert!(exact < estimated);
+        // Difference should be (100-66)*2 = 68 bytes of size mass (1 mass/byte)
+        assert_eq!(estimated - exact, (100 - 66) * 2);
     }
 }

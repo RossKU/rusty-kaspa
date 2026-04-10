@@ -31,7 +31,6 @@ use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
 /// Actual miner fees are computed from TX mass after construction.
 const FEE_BUDGET: u64 = 10_000;
 pub use crate::order_cache::{OrderCache, OrderCacheEntry};
-use std::collections::HashMap;
 use std::path::Path;
 use tracing::{info, warn};
 

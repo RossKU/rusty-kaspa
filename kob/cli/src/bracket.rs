@@ -37,7 +37,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, Price};
 use kob_core::wallet::WalletFile;
-use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass, MAX_TX_MASS};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;

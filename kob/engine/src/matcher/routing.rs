@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE, RECEIPT_VALUE};
+use kob_core::{MIN_UTXO_VALUE, RECEIPT_VALUE};
 use crate::matcher::order_book::{BookOrder, OrderBook};
 #[cfg(test)]
 use crate::matcher::order_book::OrderSide;
@@ -446,6 +446,7 @@ pub fn find_triangular_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kob_core::DEFAULT_MATCHER_FEE;
 
     fn make_buy(
         tx_id_char: char,

@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::MIN_UTXO_VALUE;
 
 /// Order type (buy or sell) for batch matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

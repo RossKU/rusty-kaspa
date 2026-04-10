@@ -19,7 +19,8 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::estimate_compute_mass;
+use kob_core::MIN_UTXO_VALUE;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::info;
@@ -247,13 +248,13 @@ pub async fn run(
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let fee_utxos: Vec<_> = wallet_utxos
         .iter()
-        .filter(|u| !u.is_p2sh() && u.utxo_entry.amount >= DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE)
+        .filter(|u| !u.is_p2sh() && u.utxo_entry.amount >= estimate_compute_mass(2, 1, 0) + MIN_UTXO_VALUE)
         .collect();
 
     if fee_utxos.is_empty() {
         anyhow::bail!(
             "No P2PK UTXOs with >= {} sompi for fee payment.",
-            DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE
+            estimate_compute_mass(2, 1, 0) + MIN_UTXO_VALUE
         );
     }
 

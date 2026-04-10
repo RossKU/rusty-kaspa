@@ -20,7 +20,7 @@ use kob_core::insurance::{
     build_insurance_position_release_sigscript, build_insurance_position_timeout_sigscript,
 };
 use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass, MAX_TX_MASS};
-use kob_core::p2sh::{build_p2sh, compute_p2pk_spk_hash};
+use kob_core::p2sh::build_p2sh;
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{select_utxos_mass_aware, to_rpc_payload, CoinSelection, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, UtxoEntry};

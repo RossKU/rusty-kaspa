@@ -1,6 +1,6 @@
 //! Crossing pair detection and match output computation.
 
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE, RECEIPT_VALUE};
+use kob_core::{MIN_UTXO_VALUE, RECEIPT_VALUE};
 use crate::matcher::order_book::{BookOrder, OrderBook};
 use crate::matcher::routing;
 
@@ -695,6 +695,7 @@ pub fn find_triangular_batch_groups(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kob_core::mass::estimate_compute_mass;
     use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
 
     fn make_buy(value: u64, price_num: u64, price_den: u64, token_cov_id: &str) -> BookOrder {
@@ -1178,7 +1179,7 @@ mod tests {
             },
             seller_kas: 5_000_000,
             buyer_tokens: 5_000_000,
-            surplus: DEFAULT_MATCHER_FEE + 100_000,
+            surplus: estimate_compute_mass(3, 5, 0) + 100_000,
             expected_tokens: 5_000_000,
             expected_kas: 5_000_000,
             match_type: MatchType::Full,
@@ -1639,7 +1640,7 @@ mod tests {
         ));
         // Small sell: 20M tokens at 1/3 (expects ~6.67M KAS)
         // Buy expects 100M tokens but sell has only 20M -> PartialBuy
-        // Surplus = ~3.33M >= DEFAULT_MATCHER_FEE
+        // Surplus = ~3.33M >= estimated miner fee
         ob.add_sell_order(make_sell_e2e(
             &"c".repeat(64), 1, 20_000_000, 1, 3, token, &owner_b,
         ));
@@ -1658,7 +1659,7 @@ mod tests {
         assert!(fill_kas < pb.buy.value, "fill_kas < full buy amount");
         assert!(residual_kas > 0, "should have non-zero residual");
         assert_eq!(fill_kas + residual_kas, pb.buy.value, "fill + residual = buy value");
-        assert!(pb.surplus >= DEFAULT_MATCHER_FEE, "surplus must cover receipt + fee");
+        assert!(pb.surplus >= estimate_compute_mass(3, 5, 0), "surplus must cover mass-based miner fee");
     }
 
     /// E2E: Partial fill — large sell matched partially with small buy, remainder stays.

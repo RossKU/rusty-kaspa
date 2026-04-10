@@ -7,7 +7,8 @@
 //! **order-status**: Check whether a specific order UTXO is OPEN,
 //!   FILLED, CANCELLED, or PARTIALLY_FILLED.
 
-use crate::auto_match::{OrderCache, OrderCacheEntry, OrderSide};
+use crate::auto_match::OrderSide;
+use crate::order_cache::{OrderCache, OrderCacheEntry};
 use crate::cancel::kaspa_address_encode;
 use crate::node::NodeClient;
 use crate::scan::{extract_p2sh_hash, is_p2sh_utxo};

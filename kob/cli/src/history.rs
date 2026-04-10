@@ -9,7 +9,7 @@
 //!    previously OPEN but are now SPENT (filled/cancelled).
 //! 3. Supports `--limit N` for pagination.
 
-use crate::auto_match::OrderCache;
+use crate::order_cache::OrderCache;
 use crate::cancel::kaspa_address_encode;
 use crate::node::NodeClient;
 use kob_core::types::Network;

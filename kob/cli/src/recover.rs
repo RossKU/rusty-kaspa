@@ -404,7 +404,7 @@ mod tests {
 
 // --- recover_orders ---
 
-use crate::auto_match::{OrderCache, OrderCacheEntry};
+use crate::order_cache::{OrderCache, OrderCacheEntry};
 use crate::cancel::kaspa_address_encode;
 use crate::scan::extract_p2sh_hash;
 use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};

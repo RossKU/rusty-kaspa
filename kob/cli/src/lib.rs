@@ -20,6 +20,7 @@ pub mod mm;
 pub mod my_orders;
 pub mod node;
 pub mod oco;
+pub mod order_cache;
 pub mod options;
 pub mod orderbook;
 pub mod partial_fill;

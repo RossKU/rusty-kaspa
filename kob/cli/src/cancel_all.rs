@@ -10,7 +10,7 @@
 //! With `--dry-run`, previews orders that would be cancelled without submitting TXs.
 //! With `--token <cov_id>`, filters cancellations to a specific token pair.
 
-use crate::auto_match::{OrderCache, OrderCacheEntry};
+use crate::order_cache::{OrderCache, OrderCacheEntry};
 use crate::node::NodeClient;
 use crate::signing;
 use kob_core::contract;

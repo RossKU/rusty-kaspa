@@ -6,9 +6,9 @@
 //! For each live order, displays: outpoint, side (buy/sell), token_cov_id,
 //! price, amount, age (DAA score delta), and status.
 
-use crate::auto_match::OrderCache;
+use crate::order_cache::OrderCache;
 #[cfg(test)]
-use crate::auto_match::OrderCacheEntry;
+use crate::order_cache::OrderCacheEntry;
 use crate::cancel::kaspa_address_encode;
 use crate::node::NodeClient;
 use crate::scan::extract_p2sh_hash;

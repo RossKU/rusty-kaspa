@@ -24,7 +24,7 @@ use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
 use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
-use serde::{Deserialize, Serialize};
+pub use crate::order_cache::{OrderCache, OrderCacheEntry};
 use std::collections::HashMap;
 use std::path::Path;
 use tracing::{info, warn};
@@ -87,138 +87,6 @@ impl AutoMatchConfig {
             anyhow::bail!("Minimum spread must be >= 0.0");
         }
         Ok(())
-    }
-}
-
-/// Order cache entry for parameter-based matching.
-///
-/// Stored in `orders.json` alongside the wallet file. Each entry records the
-/// known parameters of a deployed order so the matcher can reconstruct the
-/// redeemScript when the order's P2SH UTXO is found on-chain.
-///
-/// Also carries cancel-specific fields (`token`, `version`, `expiry_daa`) so
-/// that the same cache file can drive `cancel`, `cancel-all`, `auto-match`,
-/// `my-orders`, `orderbook`, and `history` without format mismatches.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OrderCacheEntry {
-    pub outpoint: String,
-    pub side: String,
-    /// Pair identifier (token covenant ID hex, 64 chars).
-    /// Defaults to empty string for legacy entries.
-    #[serde(default)]
-    pub pair_id: String,
-    pub price_num: u64,
-    pub price_den: u64,
-    pub min_fill: u64,
-    /// Blake2b-256 hash of the owner pubkey (hex).
-    #[serde(default)]
-    pub owner_hash: String,
-    /// P2PK script-public-key hash of the owner (hex).
-    #[serde(default)]
-    pub spk_hash: String,
-    /// P2SH script hash of the deployed order UTXO (hex).
-    #[serde(default)]
-    pub p2sh_hash: String,
-    pub value: u64,
-    /// Whether the order was marked for cancellation (cpend=1).
-    /// Used as a heuristic: if cancel_pending was true when the order
-    /// was spent, it was likely cancelled rather than filled.
-    #[serde(default)]
-    pub cancel_pending: bool,
-    /// Token covenant ID (hex, 64 chars). Present for buy orders.
-    /// Used by cancel and cancel-all to reconstruct the redeemScript.
-    #[serde(default)]
-    pub token: Option<String>,
-    /// Contract version (only 13 supported).
-    #[serde(default = "default_cache_version")]
-    pub version: u8,
-    /// Expiry DAA score (v13 only, 0 = GTC).
-    #[serde(default)]
-    pub expiry_daa: u64,
-}
-
-fn default_cache_version() -> u8 {
-    13
-}
-
-/// Persistent order cache file.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct OrderCache {
-    pub orders: Vec<OrderCacheEntry>,
-}
-
-impl OrderCache {
-    /// Load order cache from a JSON file. Returns empty cache if file doesn't exist.
-    ///
-    /// Accepts two formats:
-    /// - `{"orders": [...]}` (canonical `OrderCache` format)
-    /// - `[...]` (legacy flat `CachedOrder` array written by older deploy)
-    ///
-    /// Legacy entries are converted on the fly; missing hash fields default to
-    /// empty strings.
-    pub fn load(path: &Path) -> Self {
-        if !path.exists() {
-            return Self::default();
-        }
-        let contents = match std::fs::read_to_string(path) {
-            Ok(c) => c,
-            Err(_) => return Self::default(),
-        };
-        // Try canonical format first.
-        if let Ok(cache) = serde_json::from_str::<OrderCache>(&contents) {
-            return cache;
-        }
-        // Try legacy flat array of CachedOrder (from cancel_all module).
-        if let Ok(legacy) = serde_json::from_str::<Vec<crate::cancel_all::CachedOrder>>(&contents) {
-            return Self {
-                orders: legacy.into_iter().map(OrderCacheEntry::from).collect(),
-            };
-        }
-        Self::default()
-    }
-
-    /// Save order cache to a JSON file.
-    pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        std::fs::write(path, json)?;
-        Ok(())
-    }
-
-    /// Build a lookup table: P2SH hash -> cache entry.
-    pub fn by_p2sh_hash(&self) -> HashMap<String, &OrderCacheEntry> {
-        self.orders.iter().map(|o| (o.p2sh_hash.clone(), o)).collect()
-    }
-
-    /// Remove entries for a given outpoint (order was matched or cancelled).
-    #[allow(dead_code)] // Public API: used by auto-match loop
-    pub fn remove_outpoint(&mut self, outpoint: &str) {
-        self.orders.retain(|o| o.outpoint != outpoint);
-    }
-}
-
-/// Convert a legacy `CachedOrder` into the unified `OrderCacheEntry`.
-///
-/// Hash fields (`owner_hash`, `spk_hash`, `p2sh_hash`) are left empty
-/// because the legacy format doesn't carry them. They can be recomputed
-/// from the wallet pubkey when needed.
-impl From<crate::cancel_all::CachedOrder> for OrderCacheEntry {
-    fn from(c: crate::cancel_all::CachedOrder) -> Self {
-        Self {
-            outpoint: c.outpoint,
-            side: c.side,
-            pair_id: c.token.clone().unwrap_or_else(|| "00".repeat(32)),
-            price_num: c.price_num,
-            price_den: c.price_den,
-            min_fill: c.min_fill,
-            owner_hash: String::new(),
-            spk_hash: String::new(),
-            p2sh_hash: String::new(),
-            value: c.value,
-            cancel_pending: false,
-            token: c.token,
-            version: c.version,
-            expiry_daa: c.expiry_daa,
-        }
     }
 }
 

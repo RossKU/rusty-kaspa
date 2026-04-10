@@ -71,7 +71,7 @@ pub async fn run(
         || price_den.is_none()
         || min_fill.is_none();
 
-    let cached: Option<crate::auto_match::OrderCacheEntry> = if needs_cache {
+    let cached: Option<crate::order_cache::OrderCacheEntry> = if needs_cache {
         let cache_path = cancel_all::orders_cache_path(wallet_path);
         let orders = cancel_all::load_orders_cache(&cache_path)?;
         orders.into_iter().find(|o| o.outpoint == outpoint_str)

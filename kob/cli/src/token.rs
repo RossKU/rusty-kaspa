@@ -1101,7 +1101,7 @@ pub async fn token_info(
 
     // Load order cache to find references to this token
     let cache_path = wallet_path.with_file_name("orders.json");
-    let cache = crate::auto_match::OrderCache::load(&cache_path);
+    let cache = crate::order_cache::OrderCache::load(&cache_path);
 
     let token_orders: Vec<_> = cache
         .orders

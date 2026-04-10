@@ -22,7 +22,8 @@ use kob_core::sighash::{compute_covenant_id, compute_sighash};
 use kob_core::tx::{to_rpc_payload, AuthOutput, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::{calc_mass_with_sigscripts, converge_fee};
+use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
 
@@ -217,7 +218,9 @@ pub async fn token_create(
     let rpc = NodeClient::connect(node_url).await?;
 
     let utxos = rpc.get_spendable_utxos(&wallet.address).await?;
-    let needed = amount + DEFAULT_MATCHER_FEE;
+    // Pre-estimate fee for UTXO selection (1 input, 2 outputs, small payload)
+    let est_fee_pre = kob_core::mass::estimate_compute_mass(1, 2, 0);
+    let needed = amount + est_fee_pre + MIN_UTXO_VALUE;
 
     // Pick smallest qualifying P2PK UTXO to avoid stale large UTXOs stuck in mempool.
     let mut candidates: Vec<_> = utxos
@@ -225,6 +228,14 @@ pub async fn token_create(
         .filter(|u| !u.is_p2sh() && u.utxo_entry.amount >= needed)
         .collect();
     candidates.sort_by(|a, b| a.utxo_entry.amount.cmp(&b.utxo_entry.amount));
+    // Fallback: if no UTXO covers amount + fee + MIN_UTXO_VALUE, try amount + fee only
+    if candidates.is_empty() {
+        candidates = utxos
+            .iter()
+            .filter(|u| !u.is_p2sh() && u.utxo_entry.amount >= amount + est_fee_pre)
+            .collect();
+        candidates.sort_by(|a, b| a.utxo_entry.amount.cmp(&b.utxo_entry.amount));
+    }
     let funding = candidates.first().copied()
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -255,8 +266,6 @@ pub async fn token_create(
     println!("Token ID:   {}", covenant_id_hex);
     println!();
 
-    let change = funding.utxo_entry.amount - amount - DEFAULT_MATCHER_FEE;
-
     // Build TX version 1 (CovenantBinding required for genesis)
     let mut tx = Transaction::new(1);
 
@@ -274,24 +283,68 @@ pub async fn token_create(
     // Output 0: token_mint P2SH with covenant binding
     tx.outputs.push(TxOutput::new(amount, p2sh.version, p2sh.script().to_vec(), Some(CovenantBinding::new(0, kob_core::compat::parse_hash(&covenant_id_hex.clone()).unwrap()))));
 
-    // Output 1: change back to wallet
-    if change >= MIN_UTXO_VALUE {
-        let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(change, funding.utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if change > 0 {
-        println!(
-            "Change {} sompi below MIN_UTXO_VALUE, donated as fee.",
-            change
-        );
+    // Output 1: tentative change back to wallet
+    let total_in_create = funding.utxo_entry.amount;
+    let tent_change = total_in_create.saturating_sub(amount + est_fee_pre);
+    let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
+    if tent_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tent_change, funding.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
     }
 
-    // Compute sighash and sign
+    // Phase 1: converge fee on change output
+    let has_change = tx.outputs.len() > 1;
+    let change_idx_create = tx.outputs.len().saturating_sub(1);
+    let (est_fee, _) = if has_change {
+        converge_fee(&mut tx, total_in_create - amount, change_idx_create, 0)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx);
+        (f, 0)
+    };
+
+    // Remove change if below threshold
+    if has_change && tx.outputs.last().unwrap().value < MIN_UTXO_VALUE {
+        let change_val = tx.outputs.last().unwrap().value;
+        tx.outputs.pop();
+        if change_val > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change_val);
+        }
+    }
+
+    // Sign (phase 1)
     let sighash = compute_sighash(&tx, 0)?;
     let signature = signing::schnorr_sign(&privkey, &sighash)?;
     let sigscript = signing::build_p2pk_sigscript(&signature);
 
-    println!("Sighash:    {}", hex::encode(sighash));
-    println!("Signature:  {}...", &hex::encode(signature)[..32]);
+    // Phase 2: exact mass check
+    let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
+    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
+        &tx.inputs.iter().map(|i| i.value).collect::<Vec<_>>(),
+        &tx.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
+    ));
+    let (sigscript, actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 1 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = total_in_create.saturating_sub(amount + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        let sighash = compute_sighash(&tx, 0)?;
+        let signature = signing::schnorr_sign(&privkey, &sighash)?;
+        (signing::build_p2pk_sigscript(&signature), exact_fee)
+    } else {
+        (sigscript, est_fee)
+    };
+
+    if total_in_create < 10_000_000_00 {
+        println!("WARNING: Token create with < 10 KAS funding. Consider using a larger UTXO.");
+    }
+
+    println!("Sighash:    {}", hex::encode(compute_sighash(&tx, 0)?));
+    println!("Fee:        {} sompi", actual_fee);
     println!();
 
     // Submit
@@ -432,8 +485,11 @@ pub async fn token_mint(
         mint_utxo.outpoint.transaction_id, mint_utxo.outpoint.index, mint_value
     );
 
-    // The mint continuation gets the original mint value minus a fee
-    let mint_continuation_value = mint_value.saturating_sub(DEFAULT_MATCHER_FEE);
+    // Pre-estimate fee for UTXO selection (2 inputs, 3 outputs)
+    let est_fee_mint_pre = kob_core::mass::estimate_compute_mass(2, 3, 0);
+
+    // The mint continuation gets the original mint value minus estimated fee
+    let mint_continuation_value = mint_value.saturating_sub(est_fee_mint_pre);
     if mint_continuation_value < MIN_UTXO_VALUE {
         anyhow::bail!(
             "Mint continuation value {} sompi would be below MIN_UTXO_VALUE. Mint authority nearly exhausted.",
@@ -443,7 +499,7 @@ pub async fn token_mint(
 
     // Find a fee UTXO from wallet (must also provide the token_amount)
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
-    let needed_from_fee = token_amount + DEFAULT_MATCHER_FEE;
+    let needed_from_fee = token_amount + est_fee_mint_pre;
     let fee_utxo = if let Some(fee_op_str) = fee_utxo_override {
         let fee_op = kob_core::types::Outpoint::parse(fee_op_str)?;
         wallet_utxos
@@ -473,8 +529,6 @@ pub async fn token_mint(
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
     );
 
-    let fee_change = fee_utxo.utxo_entry.amount - token_amount - DEFAULT_MATCHER_FEE;
-
     // Build TX version 1 (CovenantBinding for continuation + new token)
     let mut tx = Transaction::new(1);
 
@@ -502,24 +556,40 @@ pub async fn token_mint(
     });
 
     // Output 0: mint continuation (same P2SH, covenant binding)
-    // The contract checks: output[0].SPK == input[0].SPK (self-continuation)
     tx.outputs.push(TxOutput::new(mint_continuation_value, mint_p2sh.version, mint_p2sh.script().to_vec(), Some(CovenantBinding::new(0, kob_core::compat::parse_hash(&token_covenant_id.to_string()).unwrap()))));
 
     // Output 1: new token_unit (covenant binding)
     tx.outputs.push(TxOutput::new(token_amount, unit_p2sh.version, unit_p2sh.script().to_vec(), Some(CovenantBinding::new(0, kob_core::compat::parse_hash(&token_covenant_id.to_string()).unwrap()))));
 
-    // Output 2: change from fee UTXO back to wallet
-    if fee_change >= MIN_UTXO_VALUE {
-        let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(fee_change, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if fee_change > 0 {
-        println!(
-            "Fee change {} sompi below MIN_UTXO_VALUE, donated as fee.",
-            fee_change
-        );
+    // Output 2: tentative change from fee UTXO back to wallet
+    let total_in_mint = mint_value + fee_utxo.utxo_entry.amount;
+    let fixed_sum_mint = mint_continuation_value + token_amount;
+    let tent_fee_change = total_in_mint.saturating_sub(fixed_sum_mint + est_fee_mint_pre);
+    let wallet_spk_mint = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
+    if tent_fee_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tent_fee_change, fee_utxo.utxo_entry.script_public_key.version, wallet_spk_mint.clone(), None));
     }
 
-    // Sign input 0 (mint authority): mint sigscript [push sig(65B)] [Op1] [pushData(RS)]
+    // Phase 1: converge fee on change output (index 2 if it exists)
+    // The adjustable output is the change; mint_continuation and token_amount are fixed by contract.
+    let has_change_mint = tx.outputs.len() > 2;
+    let change_idx_mint = tx.outputs.len().saturating_sub(1);
+    let (est_fee_mint, _) = if has_change_mint {
+        converge_fee(&mut tx, total_in_mint - fixed_sum_mint, change_idx_mint, 0)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx);
+        (f, 0)
+    };
+
+    if has_change_mint && tx.outputs.last().unwrap().value < MIN_UTXO_VALUE {
+        let change_val = tx.outputs.last().unwrap().value;
+        tx.outputs.pop();
+        if change_val > 0 {
+            println!("Fee change {} sompi below MIN_UTXO_VALUE, donated as fee.", change_val);
+        }
+    }
+
+    // Sign input 0 (mint authority): mint sigscript
     let sighash_0 = compute_sighash(&tx, 0)?;
     let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
     let sigscript_0 = contract::build_token_mint_sigscript(&sig_0, &mint_rs);
@@ -529,9 +599,43 @@ pub async fn token_mint(
     let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
     let sigscript_1 = signing::build_p2pk_sigscript(&sig_1);
 
+    // Phase 2: exact mass check
+    let sigscripts_mint = vec![sigscript_0.clone(), sigscript_1.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_mint);
+    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
+        &tx.inputs.iter().map(|i| i.value).collect::<Vec<_>>(),
+        &tx.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
+    ));
+
+    let (sigscript_0, sigscript_1) = if exact_fee > est_fee_mint && tx.outputs.len() > 2 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = total_in_mint.saturating_sub(fixed_sum_mint + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Fee change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        let sighash_0 = compute_sighash(&tx, 0)?;
+        let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
+        let sigscript_0 = contract::build_token_mint_sigscript(&sig_0, &mint_rs);
+        let sighash_1 = compute_sighash(&tx, 1)?;
+        let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
+        let sigscript_1 = signing::build_p2pk_sigscript(&sig_1);
+        (sigscript_0, sigscript_1)
+    } else {
+        (sigscript_0, sigscript_1)
+    };
+
+    if mint_value < 5_000_000_00 {
+        println!("WARNING: Token mint with < 5 KAS mint authority. Consider refunding the mint UTXO.");
+    }
+
     println!("Mint SS:     {} bytes", sigscript_0.len());
-    println!("Sighash[0]:  {} (mint)", hex::encode(sighash_0));
-    println!("Sighash[1]:  {} (fee)", hex::encode(sighash_1));
+    println!("Sighash[0]:  {} (mint)", hex::encode(compute_sighash(&tx, 0)?));
+    println!("Sighash[1]:  {} (fee)", hex::encode(compute_sighash(&tx, 1)?));
     println!();
 
     // Submit
@@ -544,8 +648,8 @@ pub async fn token_mint(
     println!("TXID:          {}", tx_id);
     println!("Mint cont:     {}:0 ({} sompi)", tx_id, mint_continuation_value);
     println!("Token unit:    {}:1 ({} sompi)", tx_id, token_amount);
-    if fee_change >= MIN_UTXO_VALUE {
-        println!("Fee change:    {}:2 ({} sompi)", tx_id, fee_change);
+    if tx.outputs.len() > 2 {
+        println!("Fee change:    {}:2 ({} sompi)", tx_id, tx.outputs[2].value);
     }
     println!();
     println!("Next steps:");
@@ -616,17 +720,8 @@ pub async fn token_burn(
         })?;
 
     let mint_value = mint_utxo.utxo_entry.amount;
-    let output_value = mint_value.saturating_sub(DEFAULT_MATCHER_FEE);
-
-    if output_value < MIN_UTXO_VALUE {
-        anyhow::bail!(
-            "Output value {} sompi below MIN_UTXO_VALUE after fee deduction",
-            output_value
-        );
-    }
 
     println!("Mint Value:       {} sompi", mint_value);
-    println!("Reclaim:          {} sompi", output_value);
     println!();
 
     // Build TX version 0 (no continuation, burn path)
@@ -643,7 +738,7 @@ pub async fn token_burn(
         value: mint_value,
     });
 
-    // Output 0: reclaimed KAS to wallet
+    // Output 0: reclaimed KAS to wallet (tentative value, will be adjusted)
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let wallet_spk_utxo = wallet_utxos
         .iter()
@@ -651,15 +746,44 @@ pub async fn token_burn(
         .ok_or_else(|| anyhow::anyhow!("No spendable UTXOs in wallet. Fund the wallet first or run `kob wallet consolidate`."))?;
     let wallet_spk = hex::decode(&wallet_spk_utxo.utxo_entry.script_public_key.script)?;
 
-    tx.outputs.push(TxOutput::new(output_value, wallet_spk_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    let tent_output = mint_value.saturating_sub(kob_core::mass::estimate_compute_mass(1, 1, 0));
+    tx.outputs.push(TxOutput::new(tent_output, wallet_spk_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+
+    // Phase 1: converge fee on output 0
+    let (est_fee, _) = converge_fee(&mut tx, mint_value, 0, 0);
+    let output_value = tx.outputs[0].value;
+
+    if output_value < MIN_UTXO_VALUE {
+        anyhow::bail!(
+            "Output value {} sompi below MIN_UTXO_VALUE after fee deduction",
+            output_value
+        );
+    }
+
+    println!("Reclaim:          {} sompi", output_value);
 
     // Sign: burn sigscript [push sig(65B)] [Op0] [pushData(RS)]
     let sighash_0 = compute_sighash(&tx, 0)?;
     let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
     let sigscript_0 = contract::build_token_burn_sigscript(&sig_0, &mint_rs);
 
+    // Phase 2: exact mass check
+    let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript_0.clone()]);
+    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
+        &[mint_value], &[output_value],
+    ));
+    let sigscript_0 = if exact_fee > est_fee {
+        let new_output = mint_value.saturating_sub(exact_fee);
+        tx.outputs[0].value = new_output;
+        let sighash_0 = compute_sighash(&tx, 0)?;
+        let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
+        contract::build_token_burn_sigscript(&sig_0, &mint_rs)
+    } else {
+        sigscript_0
+    };
+
     println!("Burn SS:     {} bytes", sigscript_0.len());
-    println!("Sighash[0]:  {}", hex::encode(sighash_0));
+    println!("Sighash[0]:  {}", hex::encode(compute_sighash(&tx, 0)?));
     println!();
 
     // Submit
@@ -782,18 +906,29 @@ pub async fn token_transfer(
         );
     }
 
+    // Pre-estimate fee for UTXO selection (2 inputs, 3 outputs max)
+    let est_fee_send_pre = kob_core::mass::estimate_compute_mass(2, 3, 0);
+
     // Find a fee UTXO
     let fee_utxo = all_utxos
         .iter()
         .find(|u| {
             !u.is_p2sh()
-                && u.utxo_entry.amount >= DEFAULT_MATCHER_FEE
+                && u.utxo_entry.amount >= est_fee_send_pre + MIN_UTXO_VALUE
                 && !(u.outpoint.transaction_id == txid && u.outpoint.index == index)
+        })
+        .or_else(|| {
+            // Fallback: try without change headroom
+            all_utxos.iter().find(|u| {
+                !u.is_p2sh()
+                    && u.utxo_entry.amount >= est_fee_send_pre
+                    && !(u.outpoint.transaction_id == txid && u.outpoint.index == index)
+            })
         })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No P2PK UTXO with >= {} sompi for fees ({} UTXOs available)",
-                DEFAULT_MATCHER_FEE,
+                est_fee_send_pre,
                 all_utxos.len()
             )
         })?;
@@ -802,8 +937,6 @@ pub async fn token_transfer(
         "Fee UTXO:   {}:{} ({} sompi)",
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
     );
-
-    let fee_change = fee_utxo.utxo_entry.amount - DEFAULT_MATCHER_FEE;
 
     // Resolve recipient public key from address for the token_unit redeemScript.
     // For now, we create a token_unit owned by the recipient's address.
@@ -851,29 +984,73 @@ pub async fn token_transfer(
         tx.outputs.push(TxOutput::new(remainder, p2sh.version, p2sh.script().to_vec(), Some(CovenantBinding::new(0, kob_core::compat::parse_hash(&token_covenant_id.to_string()).unwrap()))));
     }
 
-    // Output N: fee change back to wallet
-    if fee_change >= MIN_UTXO_VALUE {
-        let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(fee_change, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if fee_change > 0 {
-        println!(
-            "Fee change {} sompi below MIN_UTXO_VALUE, donated as fee.",
-            fee_change
-        );
+    // Output N: tentative fee change back to wallet
+    let total_in_send = token_value + fee_utxo.utxo_entry.amount;
+    // Fixed sum = all outputs before fee change (amount + optional remainder)
+    let fixed_sum_send: u64 = tx.outputs.iter().map(|o| o.value).sum();
+    let tent_fee_change = total_in_send.saturating_sub(fixed_sum_send + est_fee_send_pre);
+    let wallet_spk_send = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
+    if tent_fee_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tent_fee_change, fee_utxo.utxo_entry.script_public_key.version, wallet_spk_send.clone(), None));
     }
 
-    // Sign input 0 (token_unit): covenant sigscript
-    let sighash_0 = compute_sighash(&tx, 0)?;
-    let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
-    let sigscript_0 = contract::build_token_unit_sigscript(&sig_0, &redeem_script);
+    // Phase 1: converge fee on change output
+    let has_change_send = tent_fee_change >= MIN_UTXO_VALUE;
+    let change_idx_send = tx.outputs.len().saturating_sub(1);
+    let (est_fee_send, _) = if has_change_send {
+        converge_fee(&mut tx, total_in_send - fixed_sum_send, change_idx_send, 0)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx);
+        (f, 0)
+    };
 
-    // Sign input 1 (fee): standard P2PK sigscript
-    let sighash_1 = compute_sighash(&tx, 1)?;
-    let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
-    let sigscript_1 = signing::build_p2pk_sigscript(&sig_1);
+    if has_change_send && tx.outputs.last().unwrap().value < MIN_UTXO_VALUE {
+        let change_val = tx.outputs.last().unwrap().value;
+        tx.outputs.pop();
+        if change_val > 0 {
+            println!("Fee change {} sompi below MIN_UTXO_VALUE, donated as fee.", change_val);
+        }
+    }
 
-    println!("Sighash[0]: {} (token)", hex::encode(sighash_0));
-    println!("Sighash[1]: {} (fee)", hex::encode(sighash_1));
+    // Helper: sign both inputs for token send
+    let sign_send = |tx: &Transaction| -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+        let sighash_0 = compute_sighash(tx, 0)?;
+        let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
+        let sigscript_0 = contract::build_token_unit_sigscript(&sig_0, &redeem_script);
+        let sighash_1 = compute_sighash(tx, 1)?;
+        let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
+        let sigscript_1 = signing::build_p2pk_sigscript(&sig_1);
+        Ok((sigscript_0, sigscript_1))
+    };
+
+    let (sigscript_0, sigscript_1) = sign_send(&tx)?;
+
+    // Phase 2: exact mass check
+    let sigscripts_send = vec![sigscript_0.clone(), sigscript_1.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_send);
+    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
+        &tx.inputs.iter().map(|i| i.value).collect::<Vec<_>>(),
+        &tx.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
+    ));
+
+    let (sigscript_0, sigscript_1) = if exact_fee > est_fee_send && tx.outputs.len() > 2 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = total_in_send.saturating_sub(fixed_sum_send + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Fee change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        sign_send(&tx)?
+    } else {
+        (sigscript_0, sigscript_1)
+    };
+
+    println!("Sighash[0]: {} (token)", hex::encode(compute_sighash(&tx, 0)?));
+    println!("Sighash[1]: {} (fee)", hex::encode(compute_sighash(&tx, 1)?));
     println!();
 
     // Submit
@@ -1111,7 +1288,9 @@ mod tests {
     fn token_mint_parameter_validation() {
         // Verify MIN_UTXO_VALUE constant is accessible
         assert_eq!(MIN_UTXO_VALUE, 3_000_000);
-        assert_eq!(DEFAULT_MATCHER_FEE, 10_000);
+        // Mass-based fee replaces DEFAULT_MATCHER_FEE; verify estimate is reasonable
+        let est = kob_core::mass::estimate_compute_mass(1, 2, 0);
+        assert!(est > 0 && est < 100_000, "estimate should be reasonable: {}", est);
     }
 
     #[test]

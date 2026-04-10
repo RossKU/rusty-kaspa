@@ -23,7 +23,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletFile;
-use kob_core::mass::{calc_miner_fee, compute_storage_mass, estimate_compute_mass, MAX_TX_MASS};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass, MAX_TX_MASS};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
@@ -267,14 +267,9 @@ pub async fn run(
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
     tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
 
-    // Two-pass: compute exact mass from built TX, then adjust output
-    let mass_fee = calc_miner_fee(&tx);
-    let actual_fee = if fee > 0 { fee.max(mass_fee) } else { mass_fee };
-    let output_value = total_in - actual_fee;
-    tx.outputs[0].value = output_value;
-
-    println!("Output Value:  {} sompi", output_value);
-    println!();
+    // Phase 1: converge fee using estimated sigscript sizes
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let (est_fee, _) = converge_fee(&mut tx, total_in, 0, min_fee_override);
 
     // Sign input 0 (order cancel -- the cancel path signature covers the order input)
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -287,9 +282,48 @@ pub async fn run(
         _ => unreachable!(),
     };
 
+    // Sign input 1 (fee UTXO, P2PK)
+    let sighash_1 = compute_sighash(&tx, 1)?;
+    let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
+    let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
+
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let storage_mass = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass).max(min_fee_override);
+
+    // If exact fee exceeds estimated fee, re-adjust output and re-sign
+    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+        let fixed_sum = 0u64; // no fixed outputs in cancel TX
+        let output_value = total_in.saturating_sub(fixed_sum + exact_fee);
+        tx.outputs[0].value = output_value;
+
+        // Re-sign with updated output value
+        let sighash_0 = compute_sighash(&tx, 0)?;
+        let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
+        let cancel_sigscript = match side {
+            "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
+            "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
+            _ => unreachable!(),
+        };
+        let sighash_1 = compute_sighash(&tx, 1)?;
+        let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
+        let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
+
+        (cancel_sigscript, fee_sigscript, exact_fee)
+    } else {
+        (cancel_sigscript, fee_sigscript, est_fee)
+    };
+
+    let output_value = tx.outputs[0].value;
+
     println!("Cancel SigScript: {} bytes", cancel_sigscript.len());
     if side == "buy" {
-        // v6 cancel sigscript threshold: RS is 348B so total SS > v5's T2=309
         println!(
             "  (>= T2=367 triggers cancel path: {})",
             if cancel_sigscript.len() >= 367 { "YES" } else { "NO -- ERROR" }
@@ -297,23 +331,15 @@ pub async fn run(
     } else {
         println!("  (selector Op0 at position triggers cancel path via Op5 OpRoll)");
     }
-
-    // Sign input 1 (fee UTXO, P2PK)
-    let sighash_1 = compute_sighash(&tx, 1)?;
-    let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
-    let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
-
-    println!("Sighash[0]:    {}", hex::encode(sighash_0));
-    println!("Sighash[1]:    {}", hex::encode(sighash_1));
+    println!("Output Value:  {} sompi", output_value);
     println!();
 
     // Fee transparency summary
     {
-        let mass_fee = calc_miner_fee(&tx);
         let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
         let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
         let storage_mass = compute_storage_mass(&in_vals, &out_vals);
-        let compute_mass = kob_core::mass::calc_compute_mass(&tx);
+        let exact_compute = calc_mass_with_sigscripts(&tx, &[cancel_sigscript.clone(), fee_sigscript.clone()]);
         println!("Fee Summary");
         println!("-----------");
         println!(
@@ -321,8 +347,11 @@ pub async fn run(
             storage_mass, MAX_TX_MASS,
             if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Compute mass:     {:>9}", compute_mass);
-        println!("Miner fee:        {:>9} sompi (mass: {})", actual_fee, mass_fee);
+        println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
+        println!("Miner fee:        {:>9} sompi", actual_fee);
+        if exact_fee > est_fee {
+            println!("  (phase-2 adjustment: est={} -> exact={})", est_fee, exact_fee);
+        }
         let surplus = fee_utxo.utxo_entry.amount.saturating_sub(actual_fee);
         if surplus > 0 && surplus < MIN_UTXO_VALUE {
             println!("Surplus:          {:>9} sompi (donated as fee)", surplus);
@@ -331,7 +360,7 @@ pub async fn run(
     }
 
     // Submit
-    let payload = to_rpc_payload(&tx, &[cancel_sigscript, fee_sigscript]);
+    let payload = to_rpc_payload(&tx, &[cancel_sigscript.clone(), fee_sigscript.clone()]);
     println!("Submitting cancel transaction...");
     let tx_id = rpc.submit_transaction(payload).await?;
 

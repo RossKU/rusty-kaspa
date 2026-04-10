@@ -39,7 +39,7 @@ pub struct MmConfig {
     pub interval_secs: u64,
     /// Print orders without deploying.
     pub dry_run: bool,
-    /// Contract version (v12 or v13).
+    /// Contract version (v13 only).
     pub version: u8,
     /// Min fill per order (sompi).
     pub min_fill: u64,
@@ -74,8 +74,8 @@ impl MmConfig {
         if self.interval_secs == 0 {
             anyhow::bail!("interval must be > 0");
         }
-        if self.version != 12 && self.version != 13 {
-            anyhow::bail!("version must be 12 or 13");
+        if self.version != 13 {
+            anyhow::bail!("version must be 13");
         }
         if self.min_fill == 0 {
             anyhow::bail!("min_fill must be > 0");
@@ -690,9 +690,11 @@ pub async fn run(
             println!("[MM] Requoting all orders...");
 
             // Cancel all existing orders on-chain before redeploying.
-            let orders_to_cancel = state.orders.clone();
+            // Track which indices were successfully cancelled so we only
+            // remove those from state (failed cancels stay in state).
+            let mut cancelled_indices: Vec<usize> = Vec::new();
             let mut cancel_failures = 0u32;
-            for order in &orders_to_cancel {
+            for (idx, order) in state.orders.iter().enumerate() {
                 println!(
                     "[MM] Cancelling {} L{} at {}:{}...",
                     order.side, order.level, order.tx_id, order.index
@@ -711,7 +713,10 @@ pub async fn run(
                 )
                 .await
                 {
-                    Ok(()) => println!("[MM] Cancelled {} L{}", order.side, order.level),
+                    Ok(()) => {
+                        println!("[MM] Cancelled {} L{}", order.side, order.level);
+                        cancelled_indices.push(idx);
+                    }
                     Err(e) => {
                         // Order may already be filled/spent -- log and continue
                         warn!("[MM] Cancel {} L{} failed (may already be filled): {}",
@@ -722,13 +727,18 @@ pub async fn run(
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
             if cancel_failures > 0 {
-                warn!("[MM] {} cancel(s) failed during requote", cancel_failures);
+                warn!("[MM] {} cancel(s) failed during requote; those orders remain in state", cancel_failures);
+            }
+
+            // Remove only successfully cancelled orders (iterate in
+            // reverse so that earlier indices remain valid).
+            for &idx in cancelled_indices.iter().rev() {
+                state.orders.remove(idx);
             }
 
             // Update mid price and redeploy
             state.mid_price_num = config.mid_price_num;
             state.mid_price_den = config.mid_price_den;
-            state.orders.clear();
 
             let new_plan = build_deploy_plan(config);
             for (i, level) in new_plan.buy_levels.iter().enumerate() {
@@ -843,8 +853,8 @@ async fn deploy_order(
 
     let _max_matcher_fee: u64 = 10_000_000;
 
-    if version != 12 && version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v12 and v13 are supported.", version);
+    if version != 13 {
+        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
     }
     let redeem_script = match side {
         "buy" => contract::build_buy_redeem_script(
@@ -964,9 +974,9 @@ async fn cancel_order(
 
     let _max_matcher_fee: u64 = 10_000_000;
 
-    // Reconstruct the redeem script (v12/v13)
-    if version != 12 && version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v12 and v13 are supported.", version);
+    // Reconstruct the redeem script (v13 only)
+    if version != 13 {
+        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
     }
     let redeem_script = match side {
         "buy" => contract::build_buy_redeem_script(
@@ -1433,7 +1443,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1451,7 +1461,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1469,7 +1479,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1487,7 +1497,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1523,7 +1533,7 @@ mod tests {
             amount: 500_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1541,7 +1551,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1559,7 +1569,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 0,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1579,7 +1589,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1602,7 +1612,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1623,7 +1633,7 @@ mod tests {
             amount: 50_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1938,7 +1948,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1956,7 +1966,7 @@ mod tests {
             amount: 0,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1974,7 +1984,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 0,
             requote_threshold_bps: 500,
         };
@@ -1992,7 +2002,7 @@ mod tests {
             amount: 1_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2011,7 +2021,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2020,7 +2030,7 @@ mod tests {
 
     #[test]
     fn config_validate_all_valid_versions() {
-        for v in [12] {
+        for v in [13] {
             let config = MmConfig {
                 token: "aa".repeat(32),
                 mid_price_num: 100,
@@ -2040,8 +2050,8 @@ mod tests {
 
     #[test]
     fn config_validate_version_boundaries() {
-        // Versions 0..=11, 14+ should all fail (12 and 13 are valid)
-        for v in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 255] {
+        // Only version 13 is valid; all others should fail
+        for v in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 255] {
             let config = MmConfig {
                 token: "aa".repeat(32),
                 mid_price_num: 100,
@@ -2070,7 +2080,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2088,7 +2098,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: true,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2397,7 +2407,7 @@ mod tests {
             amount: 5_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2420,7 +2430,7 @@ mod tests {
             amount: 50_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 5_000_000,
             requote_threshold_bps: 500,
         };
@@ -2440,7 +2450,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2467,7 +2477,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2693,7 +2703,7 @@ mod tests {
             amount: 1_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 100_000,
             requote_threshold_bps: 500,
         };
@@ -2759,7 +2769,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 12,
+            version: 13,
             min_fill: 1_000_000,
             requote_threshold_bps: 0,
         };

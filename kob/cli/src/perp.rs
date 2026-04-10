@@ -13,7 +13,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, select_utxos_mass_aware, Transaction, TxInput, TxOutput, CoinSelection};
 use kob_core::types::{Network, UtxoEntry, Outpoint};
 use kob_core::wallet::WalletFile;
-use kob_core::mass::{calc_miner_fee, compute_storage_mass, estimate_compute_mass, MAX_TX_MASS};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass, MAX_TX_MASS};
 use kob_core::MIN_UTXO_VALUE;
 
 /// Subcommands for `perp`.
@@ -468,8 +468,6 @@ async fn deploy_perp(
         );
     }
 
-    let change = total_input - margin - fee;
-
     // Build transaction
     let mut tx = Transaction::new(0);
 
@@ -500,31 +498,79 @@ async fn deploy_perp(
     let side_byte = if side == "long" { perp::PERP_SIDE_LONG } else { perp::PERP_SIDE_SHORT };
     tx.payload = perp::build_perp_deploy_payload(&redeem_script, side_byte);
 
-    // Output 1: change back to wallet (if > MIN_UTXO_VALUE)
-    if change >= MIN_UTXO_VALUE {
-        let first_rpc = p2pk_rpc
-            .iter()
-            .find(|u| {
-                u.outpoint.transaction_id == selected_utxos[0].outpoint.transaction_id
-                    && u.outpoint.index == selected_utxos[0].outpoint.index
-            })
-            .ok_or_else(|| anyhow::anyhow!("UTXO spent during TX construction, please retry."))?;
-        let wallet_spk = hex::decode(&first_rpc.utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(change, first_rpc.utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if change > 0 {
-        println!(
-            "Change {} sompi below MIN_UTXO_VALUE, donated as fee.",
-            change
-        );
+    // Output 1: tentative change
+    let tent_change = total_input.saturating_sub(margin + fee);
+    let first_rpc = p2pk_rpc
+        .iter()
+        .find(|u| {
+            u.outpoint.transaction_id == selected_utxos[0].outpoint.transaction_id
+                && u.outpoint.index == selected_utxos[0].outpoint.index
+        })
+        .ok_or_else(|| anyhow::anyhow!("UTXO spent during TX construction, please retry."))?;
+    let wallet_spk = hex::decode(&first_rpc.utxo_entry.script_public_key.script)?;
+    if tent_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tent_change, first_rpc.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
     }
 
-    // Sign each input
+    // Phase 1: converge fee on change output
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let has_change_deploy = tx.outputs.len() > 1;
+    let change_idx_deploy = tx.outputs.len().saturating_sub(1);
+    let (est_fee_deploy, _) = if has_change_deploy {
+        converge_fee(&mut tx, total_input - margin, change_idx_deploy, min_fee_override)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+        (f, 0)
+    };
+
+    if has_change_deploy && tx.outputs[change_idx_deploy].value < MIN_UTXO_VALUE {
+        let change_val = tx.outputs[change_idx_deploy].value;
+        tx.outputs.pop();
+        if change_val > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change_val);
+        }
+    } else if !has_change_deploy && tent_change > 0 {
+        println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", tent_change);
+    }
+
+    // Sign each input (phase 1)
     let mut sigscripts: Vec<Vec<u8>> = Vec::new();
     for i in 0..tx.inputs.len() {
         let sighash = compute_sighash(&tx, i)?;
         let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
         sigscripts.push(signing::build_p2pk_sigscript(&signature));
     }
+
+    // Phase 2: exact mass check
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val).max(min_fee_override);
+
+    let actual_fee = if exact_fee > est_fee_deploy && tx.outputs.len() > 1 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = total_input.saturating_sub(margin + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        sigscripts.clear();
+        for i in 0..tx.inputs.len() {
+            let sighash = compute_sighash(&tx, i)?;
+            let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
+            sigscripts.push(signing::build_p2pk_sigscript(&signature));
+        }
+        exact_fee
+    } else {
+        est_fee_deploy
+    };
 
     println!("Signed {} input(s)", sigscripts.len());
     println!();
@@ -543,19 +589,17 @@ async fn deploy_perp(
         let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
         let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
         let storage_mass = compute_storage_mass(&in_vals, &out_vals);
+        let exact_compute = calc_mass_with_sigscripts(&tx, &sigscripts);
         println!("Fee Summary");
         println!("-----------");
         println!(
             "Storage mass:     {:>9} / {:>9} ({})",
             storage_mass,
             MAX_TX_MASS,
-            if storage_mass <= MAX_TX_MASS {
-                "OK"
-            } else {
-                "OVER"
-            }
+            if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Miner fee:        {:>9} sompi", fee);
+        println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
+        println!("Miner fee:        {:>9} sompi", actual_fee);
         println!("Matcher fee cap:  {:>9} sompi", max_matcher_fee);
         println!();
     }
@@ -730,14 +774,9 @@ async fn cancel_perp(
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
     tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
 
-    // Two-pass: compute exact mass from built TX, then adjust output
-    let mass_fee = calc_miner_fee(&tx);
-    let actual_fee = if fee > 0 { fee.max(mass_fee) } else { mass_fee };
-    let output_value = total_in - actual_fee;
-    tx.outputs[0].value = output_value;
-
-    println!("Output Value:   {} sompi", output_value);
-    println!();
+    // Phase 1: converge fee on output 0
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let (est_fee, _) = converge_fee(&mut tx, total_in, 0, min_fee_override);
 
     // Sign input 0 (cancel path signature)
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -747,46 +786,60 @@ async fn cancel_perp(
     let cancel_sigscript =
         perp::build_perp_deploy_cancel_sigscript(&sig_0, &pubkey, &redeem_script);
 
-    println!("Cancel SigScript: {} bytes", cancel_sigscript.len());
-    println!(
-        "  (>= T2=251 triggers cancel path: {})",
-        if cancel_sigscript.len() >= 251 {
-            "YES"
-        } else {
-            "NO -- ERROR"
-        }
-    );
-
     // Sign input 1 (fee UTXO, P2PK)
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
     let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
 
-    println!("Sighash[0]:     {}", hex::encode(sighash_0));
-    println!("Sighash[1]:     {}", hex::encode(sighash_1));
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts_cancel = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
+    let storage_mass_cancel = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_cancel).max(min_fee_override);
+
+    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+        let output_value = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = output_value;
+        let sighash_0 = compute_sighash(&tx, 0)?;
+        let sig_0 = signing::schnorr_sign_secure(&privkey, &sighash_0)?;
+        let cancel_sigscript = perp::build_perp_deploy_cancel_sigscript(&sig_0, &pubkey, &redeem_script);
+        let sighash_1 = compute_sighash(&tx, 1)?;
+        let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
+        let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
+        (cancel_sigscript, fee_sigscript, exact_fee)
+    } else {
+        (cancel_sigscript, fee_sigscript, est_fee)
+    };
+
+    let output_value = tx.outputs[0].value;
+
+    println!("Cancel SigScript: {} bytes", cancel_sigscript.len());
+    println!(
+        "  (>= T2=251 triggers cancel path: {})",
+        if cancel_sigscript.len() >= 251 { "YES" } else { "NO -- ERROR" }
+    );
+    println!("Output Value:   {} sompi", output_value);
     println!();
 
     // Fee transparency summary
     {
-        let mass_fee = calc_miner_fee(&tx);
         let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
         let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
         let storage_mass = compute_storage_mass(&in_vals, &out_vals);
-        let compute_mass = kob_core::mass::calc_compute_mass(&tx);
+        let exact_compute = calc_mass_with_sigscripts(&tx, &[cancel_sigscript.clone(), fee_sigscript.clone()]);
         println!("Fee Summary");
         println!("-----------");
         println!(
             "Storage mass:     {:>9} / {:>9} ({})",
-            storage_mass,
-            MAX_TX_MASS,
-            if storage_mass <= MAX_TX_MASS {
-                "OK"
-            } else {
-                "OVER"
-            }
+            storage_mass, MAX_TX_MASS,
+            if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Compute mass:     {:>9}", compute_mass);
-        println!("Miner fee:        {:>9} sompi (mass: {})", actual_fee, mass_fee);
+        println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
+        println!("Miner fee:        {:>9} sompi", actual_fee);
         let surplus = fee_utxo.utxo_entry.amount.saturating_sub(actual_fee);
         if surplus > 0 && surplus < MIN_UTXO_VALUE {
             println!("Surplus:          {:>9} sompi (donated as fee)", surplus);
@@ -1047,10 +1100,14 @@ async fn liquidate_perp(
     };
 
     let total_in = position_value + fee_utxo.utxo_entry.amount;
-    let output_value = total_in - fee;
-    if output_value >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(output_value, 0, keeper_spk, None));
+    let tent_output = total_in.saturating_sub(estimate_compute_mass(2, 1, 0));
+    if tent_output >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tent_output, 0, keeper_spk, None));
     }
+
+    // Phase 1: converge fee on output 0
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let (est_fee_liq, _) = converge_fee(&mut tx, total_in, 0, min_fee_override);
 
     // Build liquidation sigscript (selector=3, permissionless)
     let liq_sigscript = perp::build_perp_liquidation_sigscript(&redeem_script);
@@ -1062,6 +1119,29 @@ async fn liquidate_perp(
     let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
     let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
 
+    // Phase 2: exact mass check
+    let sigscripts_liq = vec![liq_sigscript.clone(), fee_sigscript.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_liq);
+    let storage_mass_liq = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_liq).max(min_fee_override);
+
+    let (liq_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee_liq {
+        let output_value = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = output_value;
+        let liq_sigscript = perp::build_perp_liquidation_sigscript(&redeem_script);
+        let sighash_1 = compute_sighash(&tx, 1)?;
+        let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
+        let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
+        (liq_sigscript, fee_sigscript, exact_fee)
+    } else {
+        (liq_sigscript, fee_sigscript, est_fee_liq)
+    };
+
+    let output_value = tx.outputs[0].value;
     println!();
 
     // Fee transparency summary
@@ -1069,19 +1149,16 @@ async fn liquidate_perp(
         let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
         let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
         let storage_mass = compute_storage_mass(&in_vals, &out_vals);
+        let exact_compute = calc_mass_with_sigscripts(&tx, &[liq_sigscript.clone(), fee_sigscript.clone()]);
         println!("Fee Summary");
         println!("-----------");
         println!(
             "Liquidation TX mass: {:>9} / {:>9} ({})",
-            storage_mass,
-            MAX_TX_MASS,
-            if storage_mass <= MAX_TX_MASS {
-                "OK"
-            } else {
-                "OVER"
-            }
+            storage_mass, MAX_TX_MASS,
+            if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Miner fee:           {:>9} sompi", fee);
+        println!("Compute mass:        {:>9} (exact, post-sign)", exact_compute);
+        println!("Miner fee:           {:>9} sompi", actual_fee);
         println!();
     }
 
@@ -1251,40 +1328,81 @@ async fn add_margin_perp(
     // Output 0: self-continuation (same P2SH covenant, higher value)
     tx.outputs.push(TxOutput::new(new_position_value, p2sh.version, p2sh.script().to_vec(), None));
 
-    // Output 1: change back to wallet (if any)
-    let change = funding_total.saturating_sub(amount + fee);
-    if change >= MIN_UTXO_VALUE {
+    // Output 1: tentative change back to wallet
+    let tent_change_am = funding_total.saturating_sub(amount + fee);
+    if tent_change_am >= MIN_UTXO_VALUE {
         let wallet_spk = hex::decode(&funding_utxos[0].utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(change, funding_utxos[0].utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if change > 0 {
-        println!(
-            "Change {} sompi below MIN_UTXO_VALUE, donated as fee.",
-            change
-        );
+        tx.outputs.push(TxOutput::new(tent_change_am, funding_utxos[0].utxo_entry.script_public_key.version, wallet_spk, None));
     }
 
-    // Sign input 0 (position, add-margin path)
-    let sighash_0 = compute_sighash(&tx, 0)?;
-    let sig_0 = signing::schnorr_sign_secure(&privkey, &sighash_0)?;
+    // Phase 1: converge fee on change output
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let has_change_am = tx.outputs.len() > 1;
+    let change_idx_am = tx.outputs.len().saturating_sub(1);
+    let (est_fee_am, _) = if has_change_am {
+        converge_fee(&mut tx, funding_total - amount, change_idx_am, min_fee_override)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+        (f, 0)
+    };
 
-    // Build add-margin sigscript (selector=5, owner sig)
-    let mut sig_arr = [0u8; 64];
-    sig_arr.copy_from_slice(&sig_0);
-    let mut pk_arr = [0u8; 32];
-    pk_arr.copy_from_slice(&pubkey);
-    let add_margin_sigscript =
-        perp::build_perp_add_margin_sigscript(&sig_arr, &pk_arr, &redeem_script);
-
-    println!("Add-Margin SigScript: {} bytes", add_margin_sigscript.len());
-
-    // Sign funding UTXO inputs
-    let mut all_sigscripts = vec![add_margin_sigscript];
-    for i in 1..tx.inputs.len() {
-        let sighash_i = compute_sighash(&tx, i)?;
-        let sig_i = signing::schnorr_sign_secure(&privkey, &sighash_i)?;
-        all_sigscripts.push(signing::build_p2pk_sigscript(&sig_i));
+    if has_change_am && tx.outputs[change_idx_am].value < MIN_UTXO_VALUE {
+        let change_val = tx.outputs[change_idx_am].value;
+        tx.outputs.pop();
+        if change_val > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change_val);
+        }
+    } else if !has_change_am && tent_change_am > 0 {
+        println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", tent_change_am);
     }
 
+    // Helper: sign all inputs for add-margin
+    let sign_add_margin = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
+        let sighash_0 = compute_sighash(tx, 0)?;
+        let sig_0 = signing::schnorr_sign_secure(&privkey, &sighash_0)?;
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig_0);
+        let mut pk_arr = [0u8; 32];
+        pk_arr.copy_from_slice(&pubkey);
+        let add_margin_sigscript = perp::build_perp_add_margin_sigscript(&sig_arr, &pk_arr, &redeem_script);
+        let mut all_sigscripts = vec![add_margin_sigscript];
+        for i in 1..tx.inputs.len() {
+            let sighash_i = compute_sighash(tx, i)?;
+            let sig_i = signing::schnorr_sign_secure(&privkey, &sighash_i)?;
+            all_sigscripts.push(signing::build_p2pk_sigscript(&sig_i));
+        }
+        Ok(all_sigscripts)
+    };
+
+    let mut all_sigscripts = sign_add_margin(&tx)?;
+
+    // Phase 2: exact mass check
+    let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
+    let storage_mass_am = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_am).max(min_fee_override);
+
+    let actual_fee = if exact_fee > est_fee_am && tx.outputs.len() > 1 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = funding_total.saturating_sub(amount + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        all_sigscripts = sign_add_margin(&tx)?;
+        exact_fee
+    } else {
+        est_fee_am
+    };
+
+    println!("Add-Margin SigScript: {} bytes", all_sigscripts[0].len());
     println!();
 
     // Fee transparency summary
@@ -1292,19 +1410,16 @@ async fn add_margin_perp(
         let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
         let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
         let storage_mass = compute_storage_mass(&in_vals, &out_vals);
+        let exact_compute = calc_mass_with_sigscripts(&tx, &all_sigscripts);
         println!("Fee Summary");
         println!("-----------");
         println!(
             "Add-Margin TX mass: {:>9} / {:>9} ({})",
-            storage_mass,
-            MAX_TX_MASS,
-            if storage_mass <= MAX_TX_MASS {
-                "OK"
-            } else {
-                "OVER"
-            }
+            storage_mass, MAX_TX_MASS,
+            if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Miner fee:          {:>9} sompi", fee);
+        println!("Compute mass:       {:>9} (exact, post-sign)", exact_compute);
+        println!("Miner fee:          {:>9} sompi", actual_fee);
         println!();
     }
 
@@ -1479,19 +1594,36 @@ async fn settle_perp(
     }
 
     // Change from fee UTXO (if present)
+    let total_in_settle: u64 = tx.inputs.iter().map(|i| i.value).sum();
+    let fixed_sum_settle: u64 = tx.outputs.iter().map(|o| o.value).sum();
     if let Some(fu) = fee_utxo {
-        let fee_change = fu.utxo_entry.amount.saturating_sub(fee);
-        if fee_change >= MIN_UTXO_VALUE {
+        let tent_fee_change = fu.utxo_entry.amount.saturating_sub(fee);
+        if tent_fee_change >= MIN_UTXO_VALUE {
             let wallet_spk = hex::decode(&fu.utxo_entry.script_public_key.script)?;
-            tx.outputs.push(TxOutput::new(fee_change, fu.utxo_entry.script_public_key.version, wallet_spk, None));
+            tx.outputs.push(TxOutput::new(tent_fee_change, fu.utxo_entry.script_public_key.version, wallet_spk, None));
         }
+    }
+
+    // Phase 1: converge fee on change output if present
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let has_change_settle = fee_utxo.is_some() && tx.outputs.len() > 2; // payout outputs + change
+    let change_idx_settle = tx.outputs.len().saturating_sub(1);
+    let (est_fee_settle, _) = if has_change_settle {
+        converge_fee(&mut tx, total_in_settle - fixed_sum_settle, change_idx_settle, min_fee_override)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+        (f, 0)
+    };
+
+    if has_change_settle && tx.outputs[change_idx_settle].value < MIN_UTXO_VALUE {
+        tx.outputs.pop();
     }
 
     // Build maturity settle sigscript (selector=4, permissionless)
     let settle_sigscript = perp::build_perp_maturity_settle_sigscript(&redeem_script);
     println!("Settle SigScript: {} bytes", settle_sigscript.len());
 
-    let mut all_sigscripts = vec![settle_sigscript];
+    let mut all_sigscripts = vec![settle_sigscript.clone()];
 
     // Sign fee UTXO input if present
     if fee_utxo.is_some() {
@@ -1500,6 +1632,35 @@ async fn settle_perp(
         all_sigscripts.push(signing::build_p2pk_sigscript(&sig_1));
     }
 
+    // Phase 2: exact mass check
+    let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
+    let storage_mass_settle = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_settle).max(min_fee_override);
+
+    let actual_fee = if exact_fee > est_fee_settle && has_change_settle && tx.outputs.len() > 2 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = total_in_settle.saturating_sub(fixed_sum_settle + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+        }
+        // Re-sign fee UTXO
+        all_sigscripts = vec![settle_sigscript];
+        if fee_utxo.is_some() {
+            let sighash_1 = compute_sighash(&tx, 1)?;
+            let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
+            all_sigscripts.push(signing::build_p2pk_sigscript(&sig_1));
+        }
+        exact_fee
+    } else {
+        est_fee_settle
+    };
+
     println!();
 
     // Fee transparency summary
@@ -1507,19 +1668,16 @@ async fn settle_perp(
         let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
         let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
         let storage_mass = compute_storage_mass(&in_vals, &out_vals);
+        let exact_compute = calc_mass_with_sigscripts(&tx, &all_sigscripts);
         println!("Fee Summary");
         println!("-----------");
         println!(
             "Settle TX mass:   {:>9} / {:>9} ({})",
-            storage_mass,
-            MAX_TX_MASS,
-            if storage_mass <= MAX_TX_MASS {
-                "OK"
-            } else {
-                "OVER"
-            }
+            storage_mass, MAX_TX_MASS,
+            if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Miner fee:        {:>9} sompi", fee);
+        println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
+        println!("Miner fee:        {:>9} sompi", actual_fee);
         println!();
     }
 

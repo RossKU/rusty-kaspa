@@ -33,7 +33,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletFile;
-use kob_core::mass::{calc_miner_fee, calc_compute_mass, compute_storage_mass, MAX_TX_MASS};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, MAX_TX_MASS};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
 use std::path::Path;
 use tracing::info;
@@ -430,43 +430,79 @@ pub async fn run(
             tx.outputs.push(TxOutput::new(tentative_matcher_change, wallet_spk_version, wallet_spk.clone(), None));
         }
 
-        // Compute mass-based miner fee from the tentative TX
-        let mass_fee = calc_miner_fee(&tx);
-        let actual_fee = if fee > 0 { fee.max(mass_fee) } else { mass_fee };
+        // Phase 1: converge fee on change output (index 3 if it exists, else fold into seller)
+        let min_fee_override = if fee > 0 { fee } else { 0 };
+        let has_change_output = tx.outputs.len() > 3;
+        let change_idx_m = tx.outputs.len().saturating_sub(1);
+        let (est_fee_m, _) = if has_change_output {
+            converge_fee(&mut tx, tentative_change, change_idx_m, min_fee_override)
+        } else {
+            let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+            (f, 0)
+        };
 
-        // Adjust change to deduct the miner fee
-        let adj_change = tentative_change.saturating_sub(actual_fee);
+        let adj_change = tentative_change.saturating_sub(est_fee_m);
         let (adj_seller_kas, adj_matcher_change) = if adj_change >= MIN_UTXO_VALUE {
             (seller_kas, adj_change)
         } else {
-            // Fold small change into seller KAS to avoid dust
             (seller_kas + adj_change, 0u64)
         };
 
-        // Update outputs with final values
         tx.outputs[0].value = adj_seller_kas;
-        // Handle change output: add, update, or remove
-        let has_change_output = tx.outputs.len() > 3;
+        let has_co = tx.outputs.len() > 3;
         if adj_matcher_change >= MIN_UTXO_VALUE {
-            if has_change_output {
-                tx.outputs[3].value = adj_matcher_change;
-            } else {
-                tx.outputs.push(TxOutput::new(adj_matcher_change, wallet_spk_version, wallet_spk.clone(), None));
-            }
-        } else if has_change_output {
-            tx.outputs.pop(); // Remove dust change output
+            if has_co { tx.outputs[3].value = adj_matcher_change; }
+            else { tx.outputs.push(TxOutput::new(adj_matcher_change, wallet_spk_version, wallet_spk.clone(), None)); }
+        } else if has_co {
+            tx.outputs.pop();
         }
 
         // Sign fee input (index 2) -- must sign AFTER final output adjustment
         let sighash_fee = compute_sighash(&tx, 2)?;
         let sig_fee = signing::schnorr_sign(&privkey, &sighash_fee)?;
         let fee_ss = signing::build_p2pk_sigscript(&sig_fee);
-        sigscripts.push(fee_ss);
+        sigscripts.push(fee_ss.clone());
+
+        // Phase 2: exact mass check with real sigscripts
+        let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+        let sm_val = {
+            let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+            let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+            compute_storage_mass(&iv, &ov)
+        };
+        let exact_fee = exact_mass.max(sm_val).max(min_fee_override);
+
+        if exact_fee > est_fee_m {
+            let adj_change2 = tentative_change.saturating_sub(exact_fee);
+            let (adj_sk2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
+                (seller_kas, adj_change2)
+            } else {
+                (seller_kas + adj_change2, 0u64)
+            };
+            tx.outputs[0].value = adj_sk2;
+            let has_co2 = tx.outputs.len() > 3;
+            if adj_mc2 >= MIN_UTXO_VALUE {
+                if has_co2 { tx.outputs[3].value = adj_mc2; }
+                else { tx.outputs.push(TxOutput::new(adj_mc2, wallet_spk_version, wallet_spk.clone(), None)); }
+            } else if has_co2 {
+                tx.outputs.pop();
+            }
+            // Re-sign fee input
+            let sh = compute_sighash(&tx, 2)?;
+            let sf = signing::schnorr_sign(&privkey, &sh)?;
+            *sigscripts.last_mut().unwrap() = signing::build_p2pk_sigscript(&sf);
+        }
+
+        let actual_fee = {
+            let ti: u64 = tx.inputs.iter().map(|i| i.value).sum();
+            let to: u64 = tx.outputs.iter().map(|o| o.value).sum();
+            ti.saturating_sub(to)
+        };
 
         println!();
         println!("Fee UTXO:     {}:{} ({} sompi)", fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo_value);
-        println!("Adjusted seller KAS:   {}", adj_seller_kas);
-        println!("Adjusted change:       {}", adj_matcher_change);
+        println!("Adjusted seller KAS:   {}", tx.outputs[0].value);
+        println!("Adjusted change:       {}", if tx.outputs.len() > 3 { tx.outputs[3].value } else { 0 });
         println!("Mass-based miner fee:  {}", actual_fee);
     } else {
         // No fee input, build outputs from surplus only
@@ -483,7 +519,7 @@ pub async fn run(
         let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
         let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
         let storage_mass = compute_storage_mass(&in_vals, &out_vals);
-        let compute_mass = calc_compute_mass(&tx);
+        let exact_compute = calc_mass_with_sigscripts(&tx, &sigscripts);
         let total_out: u64 = out_vals.iter().sum();
         let total_in_actual: u64 = in_vals.iter().sum();
         let actual_fee = total_in_actual.saturating_sub(total_out);
@@ -494,8 +530,8 @@ pub async fn run(
             storage_mass, MAX_TX_MASS,
             if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Compute mass:     {:>9}", compute_mass);
-        println!("Miner fee:        {:>9} sompi (mass: {})", actual_fee, actual_fee.max(storage_mass));
+        println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
+        println!("Miner fee:        {:>9} sompi", actual_fee);
     }
 
     // Submit
@@ -936,28 +972,30 @@ pub async fn run_cross_pair(
         tx.outputs.push(TxOutput::new(tentative_matcher_change, wallet_spk_version, wallet_spk.clone(), None));
     }
 
-    // Compute mass-based miner fee from the tentative TX
-    let mass_fee = calc_miner_fee(&tx);
-    let actual_fee = if fee > 0 { fee.max(mass_fee) } else { mass_fee };
+    // Phase 1: converge fee
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let has_change_output = tx.outputs.len() > 3;
+    let change_idx_m2 = tx.outputs.len().saturating_sub(1);
+    let (est_fee_m2, _) = if has_change_output {
+        converge_fee(&mut tx, tentative_change, change_idx_m2, min_fee_override)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+        (f, 0)
+    };
 
-    // Adjust change to deduct the miner fee
-    let adj_change = tentative_change.saturating_sub(actual_fee);
+    let adj_change = tentative_change.saturating_sub(est_fee_m2);
     let (final_seller_kas, matcher_change) = if adj_change >= MIN_UTXO_VALUE {
         (seller_kas, adj_change)
     } else {
         (seller_kas + adj_change, 0u64)
     };
 
-    // Update outputs with final values
     tx.outputs[0].value = final_seller_kas;
-    let has_change_output = tx.outputs.len() > 3;
+    let has_co = tx.outputs.len() > 3;
     if matcher_change >= MIN_UTXO_VALUE {
-        if has_change_output {
-            tx.outputs[3].value = matcher_change;
-        } else {
-            tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk, None));
-        }
-    } else if has_change_output {
+        if has_co { tx.outputs[3].value = matcher_change; }
+        else { tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk, None)); }
+    } else if has_co {
         tx.outputs.pop();
     }
 
@@ -972,14 +1010,45 @@ pub async fn run_cross_pair(
     let fee_ss = signing::build_p2pk_sigscript(&sig_3);
 
     // Sigscripts: [sell_fill, buy_fill, token_sign, fee_sign]
-    let sigscripts = vec![sell_fill_ss, buy_fill_ss, token_ss, fee_ss];
+    let mut sigscripts = vec![sell_fill_ss, buy_fill_ss, token_ss, fee_ss];
+
+    // Phase 2: exact mass check
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let sm_val2 = {
+        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&iv, &ov)
+    };
+    let exact_fee = exact_mass.max(sm_val2).max(min_fee_override);
+    if exact_fee > est_fee_m2 {
+        let adj_change2 = tentative_change.saturating_sub(exact_fee);
+        let (fsk2, mc2) = if adj_change2 >= MIN_UTXO_VALUE {
+            (seller_kas, adj_change2)
+        } else {
+            (seller_kas + adj_change2, 0u64)
+        };
+        tx.outputs[0].value = fsk2;
+        let has_co2 = tx.outputs.len() > 3;
+        if mc2 >= MIN_UTXO_VALUE {
+            if has_co2 { tx.outputs[3].value = mc2; }
+        } else if has_co2 {
+            tx.outputs.pop();
+        }
+        // Re-sign inputs 2 and 3
+        let sh2 = compute_sighash(&tx, 2)?;
+        let s2 = signing::schnorr_sign(&privkey, &sh2)?;
+        sigscripts[2] = signing::build_p2pk_sigscript(&s2);
+        let sh3 = compute_sighash(&tx, 3)?;
+        let s3 = signing::schnorr_sign(&privkey, &sh3)?;
+        sigscripts[3] = signing::build_p2pk_sigscript(&s3);
+    }
 
     // Fee transparency summary
     {
         let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
         let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
         let storage_mass = compute_storage_mass(&in_vals, &out_vals);
-        let compute_mass = calc_compute_mass(&tx);
+        let exact_compute = calc_mass_with_sigscripts(&tx, &sigscripts);
         let total_out: u64 = out_vals.iter().sum();
         let total_in_actual: u64 = in_vals.iter().sum();
         let actual_miner_fee = total_in_actual.saturating_sub(total_out);
@@ -990,8 +1059,8 @@ pub async fn run_cross_pair(
             storage_mass, MAX_TX_MASS,
             if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Compute mass:     {:>9}", compute_mass);
-        println!("Miner fee:        {:>9} sompi (mass: {})", actual_miner_fee, actual_miner_fee.max(storage_mass));
+        println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
+        println!("Miner fee:        {:>9} sompi", actual_miner_fee);
     }
 
     // Submit

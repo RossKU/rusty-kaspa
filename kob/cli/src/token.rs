@@ -295,7 +295,7 @@ pub async fn token_create(
     let has_change = tx.outputs.len() > 1;
     let change_idx_create = tx.outputs.len().saturating_sub(1);
     let (est_fee, _) = if has_change {
-        converge_fee(&mut tx, total_in_create - amount, change_idx_create, 0)
+        converge_fee(&mut tx, total_in_create, change_idx_create, 0)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx);
         (f, 0)
@@ -575,7 +575,7 @@ pub async fn token_mint(
     let has_change_mint = tx.outputs.len() > 2;
     let change_idx_mint = tx.outputs.len().saturating_sub(1);
     let (est_fee_mint, _) = if has_change_mint {
-        converge_fee(&mut tx, total_in_mint - fixed_sum_mint, change_idx_mint, 0)
+        converge_fee(&mut tx, total_in_mint, change_idx_mint, 0)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx);
         (f, 0)
@@ -998,7 +998,7 @@ pub async fn token_transfer(
     let has_change_send = tent_fee_change >= MIN_UTXO_VALUE;
     let change_idx_send = tx.outputs.len().saturating_sub(1);
     let (est_fee_send, _) = if has_change_send {
-        converge_fee(&mut tx, total_in_send - fixed_sum_send, change_idx_send, 0)
+        converge_fee(&mut tx, total_in_send, change_idx_send, 0)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx);
         (f, 0)

@@ -393,7 +393,7 @@ pub async fn run(
     // Phase 1: converge fee on change output
     let deploy_change_idx = if has_deploy_change { deploy_tx.outputs.len() - 1 } else { 0 };
     let (deploy_est_fee, _) = if has_deploy_change {
-        converge_fee(&mut deploy_tx, deploy_total_input - new_params.amount, deploy_change_idx, 0)
+        converge_fee(&mut deploy_tx, deploy_total_input, deploy_change_idx, 0)
     } else {
         let f = kob_core::mass::calc_miner_fee(&deploy_tx);
         (f, 0)

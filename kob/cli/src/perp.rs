@@ -517,7 +517,7 @@ async fn deploy_perp(
     let has_change_deploy = tx.outputs.len() > 1;
     let change_idx_deploy = tx.outputs.len().saturating_sub(1);
     let (est_fee_deploy, _) = if has_change_deploy {
-        converge_fee(&mut tx, total_input - margin, change_idx_deploy, min_fee_override)
+        converge_fee(&mut tx, total_input, change_idx_deploy, min_fee_override)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
         (f, 0)
@@ -1340,7 +1340,7 @@ async fn add_margin_perp(
     let has_change_am = tx.outputs.len() > 1;
     let change_idx_am = tx.outputs.len().saturating_sub(1);
     let (est_fee_am, _) = if has_change_am {
-        converge_fee(&mut tx, funding_total - amount, change_idx_am, min_fee_override)
+        converge_fee(&mut tx, funding_total, change_idx_am, min_fee_override)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
         (f, 0)
@@ -1609,7 +1609,7 @@ async fn settle_perp(
     let has_change_settle = fee_utxo.is_some() && tx.outputs.len() > 2; // payout outputs + change
     let change_idx_settle = tx.outputs.len().saturating_sub(1);
     let (est_fee_settle, _) = if has_change_settle {
-        converge_fee(&mut tx, total_in_settle - fixed_sum_settle, change_idx_settle, min_fee_override)
+        converge_fee(&mut tx, total_in_settle, change_idx_settle, min_fee_override)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
         (f, 0)

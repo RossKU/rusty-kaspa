@@ -230,7 +230,7 @@ pub async fn run(
     let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
 
     let (phase1_fee, _) = if has_change {
-        converge_fee(&mut tx, total_in - amount_sompi, change_idx, min_fee_override)
+        converge_fee(&mut tx, total_in, change_idx, min_fee_override)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
         (f, 0)

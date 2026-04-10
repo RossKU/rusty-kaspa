@@ -439,7 +439,7 @@ async fn deploy_call(
     let has_change = tentative_change >= MIN_UTXO_VALUE;
     let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
     let (est_fee, _) = if has_change {
-        converge_fee(&mut tx, total_input - amount, change_idx, 0)
+        converge_fee(&mut tx, total_input, change_idx, 0)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx);
         (f, 0)
@@ -666,7 +666,7 @@ async fn deploy_put(
     let has_change = tentative_change >= MIN_UTXO_VALUE;
     let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
     let (est_fee, _) = if has_change {
-        converge_fee(&mut tx, total_input - amount, change_idx, 0)
+        converge_fee(&mut tx, total_input, change_idx, 0)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx);
         (f, 0)
@@ -944,7 +944,7 @@ async fn exercise(
         let has_change = tentative_change >= MIN_UTXO_VALUE;
         let (est_fee, _) = if has_change {
             let change_idx = tx.outputs.len() - 1;
-            converge_fee(&mut tx, total_in - fixed_out, change_idx, 0)
+            converge_fee(&mut tx, total_in, change_idx, 0)
         } else {
             let f = kob_core::mass::calc_miner_fee(&tx);
             (f, 0)

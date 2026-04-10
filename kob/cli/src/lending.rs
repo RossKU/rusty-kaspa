@@ -236,7 +236,7 @@ pub async fn deploy_offer(
     let has_change = tx.outputs.len() > 1;
     let change_idx = tx.outputs.len().saturating_sub(1);
     let (est_fee, _) = if has_change {
-        converge_fee(&mut tx, total_input - amount, change_idx, min_fee_override)
+        converge_fee(&mut tx, total_input, change_idx, min_fee_override)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
         (f, 0)
@@ -536,7 +536,7 @@ pub async fn deploy_request(
     let has_change = tx.outputs.len() > 1;
     let change_idx = tx.outputs.len().saturating_sub(1);
     let (est_fee, _) = if has_change {
-        converge_fee(&mut tx, total_input - collateral, change_idx, min_fee_override)
+        converge_fee(&mut tx, total_input, change_idx, min_fee_override)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
         (f, 0)
@@ -1125,7 +1125,7 @@ pub async fn repay(
     let has_borrower_out = tx.outputs.len() > 1;
     let change_idx_repay = tx.outputs.len().saturating_sub(1);
     let (est_fee_repay, _) = if has_borrower_out {
-        converge_fee(&mut tx, total_in - repay_total, change_idx_repay, min_fee_override)
+        converge_fee(&mut tx, total_in, change_idx_repay, min_fee_override)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
         (f, 0)

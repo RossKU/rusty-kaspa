@@ -917,7 +917,7 @@ async fn deploy_order(
     let has_change = tentative_change >= MIN_UTXO_VALUE;
     if has_change {
         tx.outputs.push(TxOutput::new(tentative_change, funding.utxo_entry.script_version(), wallet_spk.clone(), None));
-        let _ = converge_fee(&mut tx, total_in - amount, 1, 0);
+        let _ = converge_fee(&mut tx, total_in, 1, 0);
     }
 
     // Sign

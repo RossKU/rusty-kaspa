@@ -459,7 +459,7 @@ async fn deploy_offer(
     let has_change = tx.outputs.len() > 1;
     let change_idx = tx.outputs.len().saturating_sub(1);
     let (est_fee, _) = if has_change {
-        converge_fee(&mut tx, total_input - value, change_idx, min_fee_override)
+        converge_fee(&mut tx, total_input, change_idx, min_fee_override)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
         (f, 0)

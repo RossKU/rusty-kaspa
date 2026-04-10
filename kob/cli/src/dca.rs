@@ -424,7 +424,7 @@ async fn deploy(
     let has_change = tx.outputs.len() > 1;
     let (phase1_fee, _) = if has_change {
         let change_idx = tx.outputs.len() - 1;
-        converge_fee(&mut tx, funding.utxo_entry.amount - total_value, change_idx, 0)
+        converge_fee(&mut tx, funding.utxo_entry.amount, change_idx, 0)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx);
         (f, 0)

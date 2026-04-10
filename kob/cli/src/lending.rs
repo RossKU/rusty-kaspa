@@ -260,12 +260,7 @@ pub async fn deploy_offer(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
     let actual_fee = if exact_fee > est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_input.saturating_sub(amount + exact_fee);
@@ -560,12 +555,7 @@ pub async fn deploy_request(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
     let actual_fee = if exact_fee > est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_input.saturating_sub(collateral + exact_fee);
@@ -838,12 +828,7 @@ pub async fn cancel(
     // Phase 2: exact mass check
     let sigscripts_cancel = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
-    let storage_mass_cancel = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_cancel).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1162,12 +1147,7 @@ pub async fn repay(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass_repay = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_repay).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let actual_fee = if exact_fee > est_fee_repay && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
@@ -1394,9 +1374,7 @@ pub async fn claim_default(
     // Phase 2: exact mass check
     let sigscripts_claim = vec![default_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_claim);
-    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
-        &[collateral], &[claim_amount],
-    )).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let (sigscripts, actual_fee) = if exact_fee > est_fee_claim {
         let new_claim = collateral.saturating_sub(exact_fee);
@@ -1711,12 +1689,7 @@ pub async fn liquidate(
 
     // Phase 2 check: verify fee covers exact mass
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass_liq = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_liq);
+    let exact_fee = exact_mass;
     let total_in_liq: u64 = tx.inputs.iter().map(|i| i.value).sum();
     let total_out_liq: u64 = tx.outputs.iter().map(|o| o.value).sum();
     let implicit_fee = total_in_liq.saturating_sub(total_out_liq);
@@ -1726,13 +1699,16 @@ pub async fn liquidate(
 
     // Fee transparency
     {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        let storage_mass_display = compute_storage_mass(&in_vals, &out_vals);
         let exact_compute = calc_mass_with_sigscripts(&tx, &sigscripts);
         println!("Fee Summary");
         println!("-----------");
         println!(
             "Liquidate TX mass: {:>9} / {:>9} ({})",
-            storage_mass_liq, MAX_TX_MASS,
-            if storage_mass_liq <= MAX_TX_MASS { "OK" } else { "OVER" }
+            storage_mass_display, MAX_TX_MASS,
+            if storage_mass_display <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
         println!("Compute mass:      {:>9} (exact, post-sign)", exact_compute);
         println!("Miner fee:         {:>9} sompi", implicit_fee);

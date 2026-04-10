@@ -9,7 +9,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee};
+use kob_core::mass::{calc_mass_with_sigscripts, converge_fee};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
@@ -260,12 +260,7 @@ pub async fn run(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let actual_fee = if exact_fee > phase1_fee && tx.outputs.len() > 1 {
         // Re-adjust change output

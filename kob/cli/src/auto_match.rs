@@ -23,7 +23,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::mass::{calc_miner_fee, calc_mass_with_sigscripts, compute_storage_mass};
+use kob_core::mass::{calc_miner_fee, calc_mass_with_sigscripts};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
 
 /// Conservative fee estimate (10,000 sompi) used for UTXO selection budgets
@@ -377,12 +377,7 @@ pub async fn submit_match(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let sm_val = {
-        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&iv, &ov)
-    };
-    let exact_fee = exact_mass.max(sm_val);
+    let exact_fee = exact_mass;
 
     if exact_fee > est_fee_p1 {
         // Re-adjust outputs with exact fee
@@ -599,12 +594,7 @@ pub async fn submit_partial_buy_fill(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let sm_val = {
-        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&iv, &ov)
-    };
-    let exact_fee = exact_mass.max(sm_val);
+    let exact_fee = exact_mass;
 
     if exact_fee > est_fee_p1 {
         let adj_change2 = total_in.saturating_sub(fixed_outputs + expected_tokens + exact_fee);
@@ -782,12 +772,7 @@ pub async fn submit_partial_sell_fill(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let sm_val = {
-        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&iv, &ov)
-    };
-    let exact_fee = exact_mass.max(sm_val);
+    let exact_fee = exact_mass;
 
     if exact_fee > est_fee_p1 {
         let adj_change2 = total_in.saturating_sub(fixed_outputs + seller_kas + exact_fee);
@@ -1121,12 +1106,7 @@ pub async fn submit_cross_pair_match(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let sm_val = {
-        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&iv, &ov)
-    };
-    let exact_fee = exact_mass.max(sm_val);
+    let exact_fee = exact_mass;
 
     if exact_fee > est_fee_p1 {
         // Re-adjust fee_change output

@@ -543,12 +543,7 @@ async fn deploy_perp(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let actual_fee = if exact_fee > est_fee_deploy && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
@@ -794,12 +789,7 @@ async fn cancel_perp(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_cancel = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
-    let storage_mass_cancel = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_cancel).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1122,12 +1112,7 @@ async fn liquidate_perp(
     // Phase 2: exact mass check
     let sigscripts_liq = vec![liq_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_liq);
-    let storage_mass_liq = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_liq).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let (liq_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee_liq {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1378,12 +1363,7 @@ async fn add_margin_perp(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
-    let storage_mass_am = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_am).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let actual_fee = if exact_fee > est_fee_am && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
@@ -1634,12 +1614,7 @@ async fn settle_perp(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
-    let storage_mass_settle = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_settle).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     let actual_fee = if exact_fee > est_fee_settle && has_change_settle && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;

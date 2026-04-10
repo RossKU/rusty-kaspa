@@ -37,7 +37,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, Price};
 use kob_core::wallet::WalletFile;
-use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
@@ -356,12 +356,7 @@ pub async fn deploy_bracket_v4(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_vec = vec![sigscript];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val);
+    let exact_fee = exact_mass;
 
     let (sigscript, actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
@@ -746,12 +741,7 @@ pub async fn fill_bracket_v4(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_fill = vec![bracket_fill_ss.clone(), fee_sigscript.clone(), receipt_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_fill);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val);
+    let exact_fee = exact_mass;
 
     let (bracket_fill_ss, fee_sigscript, receipt_sigscript, actual_fee) = if exact_fee > est_fee {
         // Re-adjust change or seller output
@@ -939,12 +929,7 @@ pub async fn cancel_bracket_v4(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_cancel = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val);
+    let exact_fee = exact_mass;
 
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1232,12 +1217,7 @@ pub async fn run(
     // Phase 2: exact mass check
     let sigscripts_vec = vec![sigscript];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val);
+    let exact_fee = exact_mass;
 
     let (sigscript, _actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;

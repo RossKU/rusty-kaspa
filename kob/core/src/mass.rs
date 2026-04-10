@@ -319,21 +319,12 @@ pub fn calc_compute_mass(tx: &crate::tx::Transaction) -> u64 {
 
 /// Calculate the miner fee for a transaction based on its mass.
 ///
-/// `effective_mass = max(compute_mass, storage_mass)` and
-/// `miner_fee = effective_mass * 1 sompi/gram`.
+/// Compute the minimum miner fee for a transaction.
 ///
-/// This is the minimum fee the network will accept. The storage mass is
-/// computed from input/output values; the compute mass is estimated from
-/// the TX structure (with conservative signature size estimates).
+/// Mempool only enforces compute mass. Storage mass affects block template
+/// priority only. Fee = compute_mass * 1 sompi/gram.
 pub fn calc_miner_fee(tx: &crate::tx::Transaction) -> u64 {
-    let compute_mass = calc_compute_mass(tx);
-
-    let input_values: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-    let output_values: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-    let storage_mass = compute_storage_mass(&input_values, &output_values);
-
-    // effective_mass = max(compute_mass, storage_mass), fee = 1 sompi/gram
-    compute_mass.max(storage_mass)
+    calc_compute_mass(tx)
 }
 
 /// Iteratively converge on the correct fee for a transaction where one output
@@ -370,23 +361,7 @@ pub fn converge_fee(
         .map(|(_, o)| o.value)
         .sum();
 
-    let mut fee = compute_mass.max(min_fee_override);
-
-    for _ in 0..10 {
-        let remaining = total_in.saturating_sub(fixed_sum + fee);
-        tx.outputs[adjust_idx].value = remaining;
-
-        let input_values: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let output_values: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        let storage_mass = compute_storage_mass(&input_values, &output_values);
-
-        let new_fee = compute_mass.max(storage_mass).max(min_fee_override);
-        if new_fee == fee {
-            break; // converged
-        }
-        fee = new_fee;
-    }
-
+    let fee = compute_mass.max(min_fee_override);
     let final_value = total_in.saturating_sub(fixed_sum + fee);
     tx.outputs[adjust_idx].value = final_value;
     (fee, final_value)

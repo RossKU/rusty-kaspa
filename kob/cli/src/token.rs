@@ -317,10 +317,7 @@ pub async fn token_create(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
-    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
-        &tx.inputs.iter().map(|i| i.value).collect::<Vec<_>>(),
-        &tx.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
-    ));
+    let exact_fee = exact_mass;
     let (sigscript, actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_in_create.saturating_sub(amount + exact_fee);
@@ -602,10 +599,7 @@ pub async fn token_mint(
     // Phase 2: exact mass check
     let sigscripts_mint = vec![sigscript_0.clone(), sigscript_1.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_mint);
-    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
-        &tx.inputs.iter().map(|i| i.value).collect::<Vec<_>>(),
-        &tx.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
-    ));
+    let exact_fee = exact_mass;
 
     let (sigscript_0, sigscript_1) = if exact_fee > est_fee_mint && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;
@@ -769,9 +763,7 @@ pub async fn token_burn(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript_0.clone()]);
-    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
-        &[mint_value], &[output_value],
-    ));
+    let exact_fee = exact_mass;
     let sigscript_0 = if exact_fee > est_fee {
         let new_output = mint_value.saturating_sub(exact_fee);
         tx.outputs[0].value = new_output;
@@ -1028,10 +1020,7 @@ pub async fn token_transfer(
     // Phase 2: exact mass check
     let sigscripts_send = vec![sigscript_0.clone(), sigscript_1.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_send);
-    let exact_fee = exact_mass.max(kob_core::mass::compute_storage_mass(
-        &tx.inputs.iter().map(|i| i.value).collect::<Vec<_>>(),
-        &tx.outputs.iter().map(|o| o.value).collect::<Vec<_>>(),
-    ));
+    let exact_fee = exact_mass;
 
     let (sigscript_0, sigscript_1) = if exact_fee > est_fee_send && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;

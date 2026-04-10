@@ -289,12 +289,7 @@ pub async fn run(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {

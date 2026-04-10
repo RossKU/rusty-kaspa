@@ -458,12 +458,7 @@ pub async fn run(
 
         // Phase 2: exact mass check with real sigscripts
         let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-        let sm_val = {
-            let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-            let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-            compute_storage_mass(&iv, &ov)
-        };
-        let exact_fee = exact_mass.max(sm_val).max(min_fee_override);
+        let exact_fee = exact_mass.max(min_fee_override);
 
         if exact_fee > est_fee_m {
             let adj_change2 = tentative_change.saturating_sub(exact_fee);
@@ -1000,12 +995,7 @@ pub async fn run_cross_pair(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let sm_val2 = {
-        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&iv, &ov)
-    };
-    let exact_fee = exact_mass.max(sm_val2).max(min_fee_override);
+    let exact_fee = exact_mass.max(min_fee_override);
     if exact_fee > est_fee_m2 {
         let adj_change2 = tentative_change.saturating_sub(exact_fee);
         let (fsk2, mc2) = if adj_change2 >= MIN_UTXO_VALUE {

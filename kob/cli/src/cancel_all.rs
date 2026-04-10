@@ -70,9 +70,7 @@ pub struct CancelResult {
 /// Returns the (Transaction, sigscripts, output_value) tuple on success.
 ///
 /// Uses a two-pass fee calculation: first build the TX with an estimated fee,
-/// then recompute using `calc_miner_fee` which takes `max(compute_mass,
-/// storage_mass)`. This avoids the TN12 rejection where storage mass exceeds
-/// the compute-only estimate.
+/// then recompute using the exact compute mass after signing.
 pub fn build_cancel_tx(
     order: &OrderCacheEntry,
     pubkey: &[u8; 32],
@@ -319,13 +317,8 @@ pub async fn run(
 
         let fee_spk_bytes = fee_utxo.script_bytes();
         // Cancel TX: 2 inputs (order + fee), 1 output.
-        // Use max(compute_mass, storage_mass) to satisfy TN12 minimum fee.
-        let in_vals = [order_value, fee_utxo.utxo_entry.amount];
-        let est_out = order_value + fee_utxo.utxo_entry.amount
-            - kob_core::mass::estimate_compute_mass(2, 1, 0);
-        let storage_fee = kob_core::mass::compute_storage_mass(&in_vals, &[est_out]);
-        let compute_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
-        let cancel_fee = compute_fee.max(storage_fee);
+        // Mempool only enforces compute mass; storage mass affects block template priority only.
+        let cancel_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
         let output_value = order_value + fee_utxo.utxo_entry.amount - cancel_fee;
 
         println!("  Order Value: {} sompi", order_value);

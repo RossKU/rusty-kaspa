@@ -19,7 +19,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletFile;
-use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST};
 use std::path::Path;
 use tracing::info;
@@ -372,12 +372,7 @@ pub async fn receipt_create(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
-    let storage_mass_val = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass_val);
+    let exact_fee = exact_mass;
 
     let sigscript = if exact_fee > est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
@@ -567,12 +562,7 @@ pub async fn receipt_consume(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass);
+    let exact_fee = exact_mass;
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
@@ -771,12 +761,7 @@ pub async fn receipt_trigger(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass);
+    let exact_fee = exact_mass;
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
@@ -953,12 +938,7 @@ pub async fn receipt_consume_v1(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let storage_mass = {
-        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&in_vals, &out_vals)
-    };
-    let exact_fee = exact_mass.max(storage_mass);
+    let exact_fee = exact_mass;
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {

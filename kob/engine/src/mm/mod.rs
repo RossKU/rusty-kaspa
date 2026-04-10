@@ -836,7 +836,7 @@ async fn deploy_order(
     use kob_core::sighash::compute_sighash;
     use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
     use kob_core::wallet::WalletFile;
-    use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+    use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
     use kob_core::MIN_UTXO_VALUE;
     use zeroize::Zeroize;
 
@@ -927,12 +927,7 @@ async fn deploy_order(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
-    let sm = {
-        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&iv, &ov)
-    };
-    let exact_fee = exact_mass.max(sm);
+    let exact_fee = exact_mass;
     let current_fee = total_in - tx.outputs.iter().map(|o| o.value).sum::<u64>();
 
     let sigscript = if exact_fee > current_fee {
@@ -985,7 +980,7 @@ async fn cancel_order(
     use kob_core::sighash::compute_sighash;
     use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
     use kob_core::wallet::WalletFile;
-    use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+    use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
     use kob_core::MIN_UTXO_VALUE;
     use zeroize::Zeroize;
 
@@ -1103,12 +1098,7 @@ async fn cancel_order(
     // Phase 2: exact mass check
     let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let sm = {
-        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-        compute_storage_mass(&iv, &ov)
-    };
-    let exact_fee = exact_mass.max(sm);
+    let exact_fee = exact_mass;
 
     let current_fee = total_in - tx.outputs.iter().map(|o| o.value).sum::<u64>();
     let (cancel_sigscript, fee_sigscript) = if exact_fee > current_fee {

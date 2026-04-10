@@ -112,6 +112,10 @@ pub enum Commands {
         /// Use --cpend 1 to cancel an order that was previously cancel-marked.
         #[arg(long, default_value_t = 0)]
         cpend: u8,
+
+        /// Max matcher fee (sompi) embedded in the redeemScript. Overrides cache value.
+        #[arg(long)]
+        max_matcher_fee: Option<u64>,
     },
 
     /// Mark an order for cancellation (cpend 0 -> 1).
@@ -158,6 +162,10 @@ pub enum Commands {
         /// Fee UTXO outpoint (txid:index). Auto-selected from wallet if omitted.
         #[arg(long)]
         fee_utxo: Option<String>,
+
+        /// Max matcher fee (sompi) embedded in the redeemScript.
+        #[arg(long, default_value = "10000000")]
+        max_matcher_fee: u64,
     },
 
     /// Partially fill a buy or sell order.
@@ -221,6 +229,10 @@ pub enum Commands {
         /// Expiry DAA score (required for v13 RS reconstruction). 0 = GTC.
         #[arg(long, default_value = "0")]
         expiry: u64,
+
+        /// Max matcher fee (sompi) embedded in the redeemScript.
+        #[arg(long, default_value = "10000000")]
+        max_matcher_fee: u64,
     },
 
     /// List active orders (query UTXOs at known P2SH addresses).
@@ -582,6 +594,14 @@ pub enum Commands {
         /// Fee UTXO outpoint (txid:index). Auto-selected from wallet if omitted.
         #[arg(long)]
         fee_utxo: Option<String>,
+
+        /// Max matcher fee (sompi) for the old order's redeemScript.
+        #[arg(long, default_value = "10000000")]
+        old_max_matcher_fee: u64,
+
+        /// Max matcher fee (sompi) for the new order's redeemScript.
+        #[arg(long, default_value = "10000000")]
+        new_max_matcher_fee: u64,
     },
 
     /// Cancel all open orders owned by the wallet.
@@ -1794,6 +1814,7 @@ pub async fn dispatch(
             expiry,
             fee_utxo,
             cpend,
+            max_matcher_fee,
         } => {
             let token = if let Some(t) = token {
                 Some(token::resolve_token(&t, None)?)
@@ -1816,6 +1837,7 @@ pub async fn dispatch(
                 expiry,
                 fee_utxo.as_deref(),
                 cpend,
+                max_matcher_fee,
             )
             .await?;
         }
@@ -1830,6 +1852,7 @@ pub async fn dispatch(
             version,
             expiry,
             fee_utxo,
+            max_matcher_fee,
         } => {
             let token = if let Some(t) = token {
                 Some(token::resolve_token(&t, None)?)
@@ -1851,6 +1874,7 @@ pub async fn dispatch(
                 version,
                 expiry,
                 fee_utxo.as_deref(),
+                max_matcher_fee,
             )
             .await?;
         }
@@ -1869,6 +1893,7 @@ pub async fn dispatch(
             fee_input,
             version,
             expiry,
+            max_matcher_fee,
         } => {
             let token = token::resolve_token(&token, None)?;
             partial_fill::run(
@@ -1890,6 +1915,7 @@ pub async fn dispatch(
                 version,
                 fee,
                 expiry,
+                max_matcher_fee,
             )
             .await?;
         }
@@ -2420,6 +2446,8 @@ pub async fn dispatch(
             new_expiry,
             no_wait,
             fee_utxo,
+            old_max_matcher_fee,
+            new_max_matcher_fee,
         } => {
             let old_token = if let Some(t) = old_token {
                 Some(token::resolve_token(&t, None)?)
@@ -2453,6 +2481,8 @@ pub async fn dispatch(
                 new_expiry,
                 no_wait,
                 fee_utxo.as_deref(),
+                old_max_matcher_fee,
+                new_max_matcher_fee,
             )
             .await?;
         }

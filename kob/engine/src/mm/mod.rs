@@ -859,9 +859,9 @@ async fn deploy_order(
     let redeem_script = match side {
         "buy" => contract::build_buy_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
-            &owner_hash, &spk_hash, 0, 0, 0,)?,
+            &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE, 0, 0,)?,
         "sell" => contract::build_sell_redeem_script(
-            price_num, price_den, min_fill, &owner_hash, &spk_hash, 0, 0, 0,)?,
+            price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE, 0, 0,)?,
         _ => anyhow::bail!("Unknown order side '{}'. Use 'buy' or 'sell'.", side),
     };
 
@@ -1009,9 +1009,9 @@ async fn cancel_order(
     let redeem_script = match side {
         "buy" => contract::build_buy_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
-            &owner_hash, &spk_hash, 0, 0, 0,)?,
+            &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE, 0, 0,)?,
         "sell" => contract::build_sell_redeem_script(
-            price_num, price_den, min_fill, &owner_hash, &spk_hash, 0, 0, 0,)?,
+            price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE, 0, 0,)?,
         _ => anyhow::bail!("Unknown order side '{}'. Use 'buy' or 'sell'.", side),
     };
 

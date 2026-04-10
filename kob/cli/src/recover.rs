@@ -786,6 +786,7 @@ pub async fn recover_orders(
             token: if order.order.side == "buy" { Some(pair_id) } else { None },
             version: 13,
             expiry_daa: 0,
+            max_matcher_fee: crate::deploy::DEFAULT_MAX_MATCHER_FEE,
         });
     }
 
@@ -961,6 +962,7 @@ mod recover_orders_tests {
             token: Some(pair_id),
             version: 13,
             expiry_daa: 0,
+            max_matcher_fee: 10_000_000,
         };
 
         assert_eq!(entry.side, "buy");

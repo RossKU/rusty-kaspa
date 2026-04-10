@@ -431,12 +431,12 @@ pub fn build_redeem_script_for_order(
             tcid.copy_from_slice(&token_bytes);
             Ok(contract::build_buy_redeem_script(
                 &tcid, order.price_num, order.price_den, order.min_fill,
-                &owner_hash, &spk_hash, 0, 0, order.expiry_daa,)?)
+                &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
         }
         "sell" => {
             Ok(contract::build_sell_redeem_script(
                 order.price_num, order.price_den, order.min_fill,
-                &owner_hash, &spk_hash, 0, 0, order.expiry_daa,)?)
+                &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
         }
         _ => anyhow::bail!("Unknown order side '{}'. Expected 'buy' or 'sell'.", order.side),
     }

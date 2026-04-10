@@ -72,6 +72,8 @@ pub async fn run(
     new_expiry: u64,
     no_wait: bool,
     fee_utxo_override: Option<&str>,
+    old_max_matcher_fee: u64,
+    new_max_matcher_fee: u64,
 ) -> anyhow::Result<()> {
     let wallet = WalletFile::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
@@ -111,11 +113,11 @@ pub async fn run(
             let tcid = parse_old_token(old_token)?;
             contract::build_buy_redeem_script(
                 &tcid, old_price_num, old_price_den, old_min_fill,
-                &owner_hash, &spk_hash, 0, 0, old_expiry,)?
+                &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
         }
         "sell" => {
             contract::build_sell_redeem_script(
-                old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, 0, 0, old_expiry,)?
+                old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
         }
         other => anyhow::bail!("Unknown old side '{}'. Use 'buy' or 'sell'.", other),
     };
@@ -347,10 +349,10 @@ pub async fn run(
     let new_redeem_script = match new_params.side.as_str() {
         "buy" => contract::build_buy_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &spk_hash, 0, 0, new_expiry,)?,
+            new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         "sell" => contract::build_sell_redeem_script(
             new_params.price_num, new_params.price_den, new_params.min_fill,
-            &owner_hash, &spk_hash, 0, 0, new_expiry,)?,
+            &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         other => anyhow::bail!("Unknown new side '{}'. Use 'buy' or 'sell'.", other),
     };
 

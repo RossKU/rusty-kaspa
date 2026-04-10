@@ -547,6 +547,7 @@ pub async fn deploy_buy(
         token: Some(token_covenant_id.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
+        max_matcher_fee,
     };
     let mut cache = OrderCache::load(&cache_path);
     cache.orders.push(entry);
@@ -1056,6 +1057,7 @@ pub async fn deploy_sell(
         token: token_covenant_id.map(|s| s.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
+        max_matcher_fee,
     };
     let mut cache = OrderCache::load(&cache_path);
     cache.orders.push(entry);

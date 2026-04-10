@@ -52,10 +52,18 @@ pub struct OrderCacheEntry {
     /// Expiry DAA score (v13 only, 0 = GTC).
     #[serde(default)]
     pub expiry_daa: u64,
+    /// Max matcher fee embedded in the redeemScript (sompi).
+    /// Defaults to 10_000_000 for backwards compatibility with existing cache entries.
+    #[serde(default = "default_max_matcher_fee")]
+    pub max_matcher_fee: u64,
 }
 
 fn default_cache_version() -> u8 {
     13
+}
+
+fn default_max_matcher_fee() -> u64 {
+    10_000_000
 }
 
 /// Persistent order cache file.
@@ -137,6 +145,7 @@ impl From<crate::cancel_all::CachedOrder> for OrderCacheEntry {
             token: c.token,
             version: c.version,
             expiry_daa: c.expiry_daa,
+            max_matcher_fee: 10_000_000,
         }
     }
 }
@@ -173,6 +182,7 @@ mod tests {
             version: 13,
             expiry_daa: 0,
             cancel_pending: false,
+            max_matcher_fee: 10_000_000,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: OrderCacheEntry = serde_json::from_str(&json).unwrap();
@@ -226,6 +236,7 @@ mod tests {
             version: 13,
             expiry_daa: 0,
             cancel_pending: false,
+            max_matcher_fee: 10_000_000,
         });
 
         let path = &std::env::temp_dir().join("kob_test_order_cache.json");
@@ -280,6 +291,7 @@ mod tests {
             version: 13,
             expiry_daa: 0,
             cancel_pending: false,
+            max_matcher_fee: 10_000_000,
         });
 
         let lookup = cache.by_p2sh_hash();
@@ -306,6 +318,7 @@ mod tests {
             version: 13,
             expiry_daa: 0,
             cancel_pending: false,
+            max_matcher_fee: 10_000_000,
         });
         cache.orders.push(OrderCacheEntry {
             outpoint: "ee".repeat(32) + ":1",
@@ -322,6 +335,7 @@ mod tests {
             version: 13,
             expiry_daa: 0,
             cancel_pending: false,
+            max_matcher_fee: 10_000_000,
         });
 
         assert_eq!(cache.orders.len(), 2);

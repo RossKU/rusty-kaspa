@@ -1904,6 +1904,7 @@ mod tests {
             token: None,
             version: 13,
             expiry_daa: 0,
+            max_matcher_fee: 10_000_000,
         });
 
         let path = &std::env::temp_dir().join("kob_test_order_cache.json");
@@ -1935,6 +1936,7 @@ mod tests {
             token: None,
             version: 13,
             expiry_daa: 0,
+            max_matcher_fee: 10_000_000,
         });
 
         let lookup = cache.by_p2sh_hash();
@@ -1961,6 +1963,7 @@ mod tests {
             token: None,
             version: 13,
             expiry_daa: 0,
+            max_matcher_fee: 10_000_000,
         });
         cache.orders.push(OrderCacheEntry {
             outpoint: "ee".repeat(32) + ":1",
@@ -1977,6 +1980,7 @@ mod tests {
             token: None,
             version: 13,
             expiry_daa: 0,
+            max_matcher_fee: 10_000_000,
         });
 
         assert_eq!(cache.orders.len(), 2);
@@ -2002,6 +2006,7 @@ mod tests {
             token: None,
             version: 13,
             expiry_daa: 0,
+            max_matcher_fee: 10_000_000,
         };
 
         let json = serde_json::to_string(&entry).unwrap();

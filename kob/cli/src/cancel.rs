@@ -57,6 +57,7 @@ pub async fn run(
     expiry_daa: Option<u64>,
     fee_utxo_override: Option<&str>,
     cancel_pending: u8,
+    max_matcher_fee_override: Option<u64>,
 ) -> anyhow::Result<()> {
     let wallet = WalletFile::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
@@ -137,13 +138,18 @@ pub async fn run(
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
     }
+    // Resolve max_matcher_fee: CLI override > cache > default.
+    let max_matcher_fee = max_matcher_fee_override.unwrap_or_else(|| {
+        cached.as_ref().map_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE, |c| c.max_matcher_fee)
+    });
+
     let redeem_script = match side {
         "buy" => {
             let tcid = parse_token_cov_id(token_cov_id_resolved.as_deref())?;
-            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, 0, cancel_pending, expiry_daa)?
+            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
         }
         "sell" => {
-            contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, 0, cancel_pending, expiry_daa)?
+            contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
         }
         other => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", other),
     };

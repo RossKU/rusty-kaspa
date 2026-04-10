@@ -1217,6 +1217,7 @@ mod tests {
             token: None,
             version: 13,
             expiry_daa: 0,
+            max_matcher_fee: 10_000_000,
         }
     }
 

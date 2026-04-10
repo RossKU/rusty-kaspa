@@ -3772,6 +3772,30 @@ async fn run_scan_cycle(
             let perp_maturity_daa = perp_current_daa.saturating_add(100_000);
             let perp_emergency_daa = perp_current_daa.saturating_add(1_000_000);
 
+            // Compute matcher SPK hash for canonical settlement spot orders.
+            let matcher_spk_hash = kob_core::compute_spk_hash(0, &perp_wallet_spk);
+
+            // Get the token_cov_id from the spot order book (first tracked pair).
+            // The perp book is single-instrument; the spot pair provides the underlying.
+            let settlement_token_cov_id: Option<[u8; 32]> = order_book
+                .pair_books
+                .keys()
+                .next()
+                .and_then(|hex_id| {
+                    let bytes = hex::decode(hex_id).ok()?;
+                    if bytes.len() == 32 {
+                        let mut arr = [0u8; 32];
+                        arr.copy_from_slice(&bytes);
+                        Some(arr)
+                    } else {
+                        None
+                    }
+                });
+
+            if settlement_token_cov_id.is_none() {
+                warn!("[PERP] No spot pair in order book — cannot compute settlement SPK hashes; skipping perp crossings");
+            }
+
             for crossing in &crossings {
                 info!(
                     "[PERP] Long {}:{} @ {}/{} x Short {}:{} @ {}/{} -> entry {}/{}",
@@ -3783,6 +3807,37 @@ async fn run_scan_cycle(
                     crossing.short_order.price_num, crossing.short_order.price_den,
                     crossing.entry_price_num, crossing.entry_price_den,
                 );
+
+                // Compute canonical settlement spot SPK hashes for atomic settle
+                // paths (2,3,4). Uses deterministic buy/sell RSes with canonical
+                // parameters (entry price, matcher as owner, no expiry).
+                let (spot_sell_spkh, spot_buy_spkh) = match &settlement_token_cov_id {
+                    Some(tcid) => {
+                        match kob_core::perp::compute_settlement_spot_spk_hashes(
+                            tcid,
+                            crossing.entry_price_num,
+                            crossing.entry_price_den,
+                            &matcher_spk_hash,
+                        ) {
+                            Some(hashes) => hashes,
+                            None => {
+                                warn!(
+                                    "[PERP] Failed to build settlement RS for entry={}/{}",
+                                    crossing.entry_price_num, crossing.entry_price_den,
+                                );
+                                spent_tracker.mark_failed(&crossing.long_order.outpoint_key());
+                                spent_tracker.mark_failed(&crossing.short_order.outpoint_key());
+                                continue;
+                            }
+                        }
+                    }
+                    None => {
+                        // No spot pair — already warned above; skip all crossings.
+                        spent_tracker.mark_failed(&crossing.long_order.outpoint_key());
+                        spent_tracker.mark_failed(&crossing.short_order.outpoint_key());
+                        continue;
+                    }
+                };
 
                 // Build open-position TX blueprint.
                 // Size = minimum of both margins (equal-size matching).
@@ -3803,8 +3858,8 @@ async fn run_scan_cycle(
                     0,          // min_price
                     u64::MAX,   // max_price
                     perp_wallet_spk.clone(), // matcher_script
-                    [0u8; 32],  // spot_sell_spkh — TODO: populate from BuySell covenant SPK
-                    [0u8; 32],  // spot_buy_spkh  — TODO: populate from BuySell covenant SPK
+                    spot_sell_spkh,
+                    spot_buy_spkh,
                 );
 
                 match crate::matcher::perp_executor::build_open_position_tx(&params) {

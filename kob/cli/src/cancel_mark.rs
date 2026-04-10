@@ -46,6 +46,7 @@ pub async fn run(
     version: u8,
     expiry_daa: u64,
     fee_utxo_override: Option<&str>,
+    max_matcher_fee: u64,
 ) -> anyhow::Result<()> {
     let wallet = WalletFile::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
@@ -75,9 +76,9 @@ pub async fn run(
     let current_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, 0, 0, expiry_daa)?
+            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
         }
-        "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, 0, 0, expiry_daa)?,
+        "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?,
         _ => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", side),
     };
 
@@ -85,9 +86,9 @@ pub async fn run(
     let target_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, 0, 1, expiry_daa)?
+            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
         }
-        "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, 0, 1, expiry_daa)?,
+        "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?,
         _ => unreachable!(),
     };
 

@@ -389,7 +389,7 @@ pub fn compute_order_b_scripts(
             params.price_den,
             params.min_fill,
             owner_hash,
-            owner_spk_hash, 0,
+            owner_spk_hash, crate::DEFAULT_MAX_MATCHER_FEE,
             0, // cancel_pending
             params.expiry_daa,).map_err(|e| e.to_string())?,
         IfdSide::Sell => kob_core::contract::build_sell_redeem_script(
@@ -397,7 +397,7 @@ pub fn compute_order_b_scripts(
             params.price_den,
             params.min_fill,
             owner_hash,
-            owner_spk_hash, 0,
+            owner_spk_hash, crate::DEFAULT_MAX_MATCHER_FEE,
             0, // cancel_pending
             params.expiry_daa,).map_err(|e| e.to_string())?,
     };

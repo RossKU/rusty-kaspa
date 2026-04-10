@@ -1332,7 +1332,7 @@ async fn handle_submit_ifd(
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh_bytes, 0,
+                &a_bspkh_bytes, crate::DEFAULT_MAX_MATCHER_FEE,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1345,7 +1345,7 @@ async fn handle_submit_ifd(
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh_bytes, 0,
+                &a_bspkh_bytes, crate::DEFAULT_MAX_MATCHER_FEE,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1479,7 +1479,7 @@ async fn handle_submit_ifo(
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh, 0,
+                &a_bspkh, crate::DEFAULT_MAX_MATCHER_FEE,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1492,7 +1492,7 @@ async fn handle_submit_ifo(
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh, 0,
+                &a_bspkh, crate::DEFAULT_MAX_MATCHER_FEE,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,

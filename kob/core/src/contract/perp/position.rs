@@ -837,6 +837,77 @@ pub fn build_perp_emergency_sigscript(redeem_script: &[u8]) -> Vec<u8> {
     ss
 }
 
+/// Compute deterministic SPK hashes for the canonical settlement spot orders.
+///
+/// The perp position RS embeds `spot_sell_spkh` and `spot_buy_spkh` so that
+/// atomic settlement paths (2, 3, 4) can verify co-spent spot order UTXOs.
+/// These hashes must match the P2SH SPK of the spot buy/sell orders that
+/// will be co-spent at settlement time.
+///
+/// The matcher creates "settlement spot orders" with canonical, deterministic
+/// parameters at settlement time. Since the RS construction is deterministic,
+/// the SPK hashes can be computed at position-open time and embedded in the
+/// position RS. At settlement, the matcher deploys (or reuses) spot orders
+/// built with the same canonical parameters.
+///
+/// # Arguments
+/// * `token_cov_id`    - 32B covenant ID of the token being traded
+/// * `entry_price_num` - Entry price numerator (will be GCD-normalized)
+/// * `entry_price_den` - Entry price denominator
+/// * `matcher_spk_hash`- 32B Blake2b hash of the matcher's SPK
+///
+/// # Returns
+/// `(spot_sell_spkh, spot_buy_spkh)` — both are `[u8; 32]`.
+///
+/// Returns `None` if the canonical RS construction fails (e.g., zero price).
+pub fn compute_settlement_spot_spk_hashes(
+    token_cov_id: &[u8; 32],
+    entry_price_num: u64,
+    entry_price_den: u64,
+    matcher_spk_hash: &[u8; 32],
+) -> Option<([u8; 32], [u8; 32])> {
+    // Canonical parameters for settlement spot orders:
+    //   - price = entry price (matches the position's entry)
+    //   - min_fill = 1 (minimal, allows any fill amount)
+    //   - owner_hash = matcher (matcher controls the settlement orders)
+    //   - buyer/seller_spk_hash = matcher (matcher receives proceeds)
+    //   - max_matcher_fee = u64::MAX (no fee restriction)
+    //   - cancel_pending = 0 (fillable)
+    //   - expiry_daa = 0 (GTC, no expiry)
+    use crate::contract::spot::order::{build_buy_redeem_script, build_sell_redeem_script};
+
+    let buy_rs = build_buy_redeem_script(
+        token_cov_id,
+        entry_price_num,
+        entry_price_den,
+        1,                  // min_fill
+        matcher_spk_hash,   // owner_hash
+        matcher_spk_hash,   // buyer_spk_hash
+        u64::MAX,           // max_matcher_fee
+        0,                  // cancel_pending
+        0,                  // expiry_daa
+    ).ok()?;
+
+    let sell_rs = build_sell_redeem_script(
+        entry_price_num,
+        entry_price_den,
+        1,                  // min_fill
+        matcher_spk_hash,   // owner_hash
+        matcher_spk_hash,   // seller_spk_hash
+        u64::MAX,           // max_matcher_fee
+        0,                  // cancel_pending
+        0,                  // expiry_daa
+    ).ok()?;
+
+    let buy_p2sh = crate::build_p2sh(&buy_rs);
+    let sell_p2sh = crate::build_p2sh(&sell_rs);
+
+    let spot_buy_spkh = crate::compute_spk_hash(0, buy_p2sh.script());
+    let spot_sell_spkh = crate::compute_spk_hash(0, sell_p2sh.script());
+
+    Some((spot_sell_spkh, spot_buy_spkh))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

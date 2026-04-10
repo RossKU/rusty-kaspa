@@ -2,6 +2,10 @@
 
 #![allow(clippy::too_many_arguments)]
 
+/// Default maximum matcher fee (in sompi) embedded in deploy redeemScripts.
+/// Must match `kob-cli`'s `DEFAULT_MAX_MATCHER_FEE` to avoid P2SH mismatch.
+pub const DEFAULT_MAX_MATCHER_FEE: u64 = 10_000_000;
+
 pub mod config;
 pub mod matcher;
 pub mod mm;

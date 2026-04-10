@@ -56,6 +56,7 @@ pub async fn run(
     version: u8,
     fee: u64,
     expiry_daa: u64,
+    max_matcher_fee: u64,
 ) -> anyhow::Result<()> {
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
@@ -107,7 +108,7 @@ pub async fn run(
             price_den,
             min_fill,
             &owner_hash,
-            &spk_hash, 0,
+            &spk_hash, max_matcher_fee,
             0, // cancel_pending = 0
             expiry_daa,)?,
         "sell" => contract::build_sell_redeem_script(
@@ -115,7 +116,7 @@ pub async fn run(
             price_den,
             min_fill,
             &owner_hash,
-            &spk_hash, 0,
+            &spk_hash, max_matcher_fee,
             0, // cancel_pending = 0
             expiry_daa,)?,
         _ => unreachable!(),

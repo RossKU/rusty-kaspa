@@ -134,13 +134,6 @@ pub async fn run(
 
     // Reconstruct the redeemScript using the specified contract version.
     // cancel_pending: 0 for normal orders, 1 after cancel-mark transition.
-    if version < 13 {
-        anyhow::bail!(
-            "Contract version {} is deprecated. Versions prior to v13 cannot be cancelled \
-             via this command. Use --version 13.",
-            version
-        );
-    }
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
     }

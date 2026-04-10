@@ -148,13 +148,6 @@ pub async fn run(
     // Reconstruct redeemScripts (v6 or v8 depending on version flag).
     // max_matcher_fee default matches the deploy default (10_000_000 sompi).
     // cancel_pending = 0 (active, not pending cancel).
-    if version < 13 {
-        anyhow::bail!(
-            "Contract version {} is deprecated. Versions prior to v13 cannot be matched \
-             via this command. Use --version 13.",
-            version
-        );
-    }
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
     }
@@ -685,13 +678,6 @@ pub async fn run_cross_pair(
     };
 
     // Reconstruct redeemScripts (v13 only)
-    if version < 13 {
-        anyhow::bail!(
-            "Contract version {} is deprecated. Versions prior to v13 cannot be matched. \
-             Use --version 13.",
-            version
-        );
-    }
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
     }

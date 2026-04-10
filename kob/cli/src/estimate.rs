@@ -758,9 +758,8 @@ fn validate_version(version: u8) {
         error!("unsupported contract version {}. Use 6, 8, 9, 10, 11, 12, or 13.", version);
         std::process::exit(1);
     }
-    if version < 13 {
-        eprintln!("WARNING: Contract version {} is deprecated. Only v13 should be deployed. \
-                   Estimation of old versions is for analysis only.", version);
+    if version != 13 {
+        eprintln!("WARNING: Only contract version 13 is supported. Got v{}.", version);
     }
 }
 

@@ -96,21 +96,8 @@ pub async fn run(
             new_params.min_fill
         );
     }
-    if new_params.version < 13 {
-        anyhow::bail!(
-            "New contract version {} is deprecated. Versions prior to v13 cannot be deployed. \
-             Use --version 13.",
-            new_params.version
-        );
-    }
     if new_params.version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", new_params.version);
-    }
-    if old_version < 13 {
-        anyhow::bail!(
-            "Old contract version {} is deprecated. Requoting from pre-v13 orders is not supported.",
-            old_version
-        );
     }
     if old_version != 13 {
         anyhow::bail!("Unsupported old contract version {}. Only v13 is supported.", old_version);

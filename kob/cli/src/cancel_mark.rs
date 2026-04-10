@@ -67,12 +67,6 @@ pub async fn run(
         Ok(tcid)
     };
 
-    if version < 13 {
-        anyhow::bail!(
-            "Contract version {} is deprecated. Cancel-mark requires v13 or later.",
-            version
-        );
-    }
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
     }

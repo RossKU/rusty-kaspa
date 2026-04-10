@@ -417,13 +417,6 @@ pub fn build_redeem_script_for_order(
     let spk_hash = compute_p2pk_spk_hash(pubkey);
 
 
-    if order.version < 13 {
-        anyhow::bail!(
-            "Contract version {} is deprecated. Orders with versions prior to v13 \
-             cannot be batch-cancelled. Cancel individually if needed.",
-            order.version
-        );
-    }
     if order.version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", order.version);
     }

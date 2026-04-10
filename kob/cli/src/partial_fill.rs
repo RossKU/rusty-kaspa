@@ -57,12 +57,6 @@ pub async fn run(
     fee: u64,
     expiry_daa: u64,
 ) -> anyhow::Result<()> {
-    if version < 13 {
-        anyhow::bail!(
-            "Contract version {} is deprecated. Partial fill requires v13 or later.",
-            version
-        );
-    }
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
     }

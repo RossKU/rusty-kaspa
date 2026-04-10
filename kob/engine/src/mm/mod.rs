@@ -836,7 +836,8 @@ async fn deploy_order(
     use kob_core::sighash::compute_sighash;
     use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
     use kob_core::wallet::WalletFile;
-    use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+    use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+    use kob_core::MIN_UTXO_VALUE;
     use zeroize::Zeroize;
 
     let wallet = WalletFile::load(wallet_path)?;
@@ -851,8 +852,6 @@ async fn deploy_order(
     }
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_bytes);
-
-    let _max_matcher_fee: u64 = 10_000_000;
 
     if version != 13 {
         anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
@@ -873,7 +872,8 @@ async fn deploy_order(
 
     let rpc = RpcClient::connect(node_url).await.map_err(|e| anyhow::anyhow!(e))?;
     let utxos = rpc.get_spendable_utxos(&wallet.address, None).await.map_err(|e| anyhow::anyhow!(e))?;
-    let needed = amount + DEFAULT_MATCHER_FEE;
+    let est_fee = estimate_compute_mass(1, 2, redeem_script.len()) + 500;
+    let needed = amount + est_fee;
 
     let funding = utxos
         .iter()
@@ -885,8 +885,6 @@ async fn deploy_order(
                 side
             )
         })?;
-
-    let change = funding.utxo_entry.amount - amount - DEFAULT_MATCHER_FEE;
 
     let tx_version = if side == "sell" { 1 } else { 0 };
     let mut tx = Transaction::new(tx_version);
@@ -912,15 +910,45 @@ async fn deploy_order(
 
     tx.payload = build_order_payload(&redeem_script, false);
 
-    if change >= MIN_UTXO_VALUE {
-        let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(change, funding.utxo_entry.script_version(), wallet_spk, None));
+    // Phase 1: converge fee
+    let total_in = funding.utxo_entry.amount;
+    let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
+    let tentative_change = total_in.saturating_sub(amount + est_fee);
+    let has_change = tentative_change >= MIN_UTXO_VALUE;
+    if has_change {
+        tx.outputs.push(TxOutput::new(tentative_change, funding.utxo_entry.script_version(), wallet_spk.clone(), None));
+        let _ = converge_fee(&mut tx, total_in - amount, 1, 0);
     }
 
+    // Sign
     let sighash = compute_sighash(&tx, 0)?;
     let signature = utils::schnorr_sign(&privkey, &sighash)?;
-    privkey.zeroize();
     let sigscript = utils::build_p2pk_sigscript(&signature);
+
+    // Phase 2: exact mass check
+    let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
+    let sm = {
+        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&iv, &ov)
+    };
+    let exact_fee = exact_mass.max(sm);
+    let current_fee = total_in - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+
+    let sigscript = if exact_fee > current_fee {
+        let adj_change = total_in.saturating_sub(amount + exact_fee);
+        if adj_change >= MIN_UTXO_VALUE {
+            if tx.outputs.len() > 1 { tx.outputs[1].value = adj_change; }
+        } else if tx.outputs.len() > 1 {
+            tx.outputs.pop();
+        }
+        let sighash = compute_sighash(&tx, 0)?;
+        let signature = utils::schnorr_sign(&privkey, &sighash)?;
+        utils::build_p2pk_sigscript(&signature)
+    } else {
+        sigscript
+    };
+    privkey.zeroize();
 
     let payload = to_rpc_payload(&tx, &[sigscript]);
     let result = rpc.submit_transaction(payload).await.map_err(|e| anyhow::anyhow!(e))?;
@@ -957,7 +985,8 @@ async fn cancel_order(
     use kob_core::sighash::compute_sighash;
     use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
     use kob_core::wallet::WalletFile;
-    use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+    use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+    use kob_core::MIN_UTXO_VALUE;
     use zeroize::Zeroize;
 
     let wallet = WalletFile::load(wallet_path)?;
@@ -972,8 +1001,6 @@ async fn cancel_order(
     }
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_bytes);
-
-    let _max_matcher_fee: u64 = 10_000_000;
 
     // Reconstruct the redeem script (v13 only)
     if version != 13 {
@@ -1012,18 +1039,18 @@ async fn cancel_order(
 
     // Get a fee UTXO from the wallet
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address, None).await.map_err(|e| anyhow::anyhow!(e))?;
+    let est_cancel_fee = estimate_compute_mass(2, 1, 0) + 500;
     let fee_utxo = wallet_utxos
         .iter()
-        .find(|u| !u.utxo_entry.is_p2sh() && u.utxo_entry.amount >= DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE)
+        .find(|u| !u.utxo_entry.is_p2sh() && u.utxo_entry.amount >= est_cancel_fee + MIN_UTXO_VALUE)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No P2PK UTXO with >= {} sompi for cancel fee",
-                DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE
+                est_cancel_fee + MIN_UTXO_VALUE
             )
         })?;
 
     let total_in = order_value + fee_utxo.utxo_entry.amount;
-    let output_value = total_in - DEFAULT_MATCHER_FEE;
 
     // Build the cancel transaction
     let mut tx = Transaction::new(0);
@@ -1053,7 +1080,11 @@ async fn cancel_order(
 
     // Output 0: recovered funds to wallet
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    tx.outputs.push(TxOutput::new(output_value, fee_utxo.utxo_entry.script_version(), wallet_spk, None));
+    let tentative_output = total_in.saturating_sub(est_cancel_fee);
+    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_version(), wallet_spk, None));
+
+    // Phase 1: converge fee
+    let _ = converge_fee(&mut tx, total_in, 0, 0);
 
     // Sign input 0 (order cancel path)
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -1067,8 +1098,37 @@ async fn cancel_order(
     // Sign input 1 (fee UTXO, P2PK)
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = utils::schnorr_sign(&privkey, &sighash_1)?;
-    privkey.zeroize();
     let fee_sigscript = utils::build_p2pk_sigscript(&sig_1);
+
+    // Phase 2: exact mass check
+    let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let sm = {
+        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&iv, &ov)
+    };
+    let exact_fee = exact_mass.max(sm);
+
+    let current_fee = total_in - tx.outputs.iter().map(|o| o.value).sum::<u64>();
+    let (cancel_sigscript, fee_sigscript) = if exact_fee > current_fee {
+        let adj_output = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = adj_output;
+        let sighash_0 = compute_sighash(&tx, 0)?;
+        let sig_0 = utils::schnorr_sign(&privkey, &sighash_0)?;
+        let cancel_sigscript = match side {
+            "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
+            "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
+            _ => unreachable!(),
+        };
+        let sighash_1 = compute_sighash(&tx, 1)?;
+        let sig_1 = utils::schnorr_sign(&privkey, &sighash_1)?;
+        let fee_sigscript = utils::build_p2pk_sigscript(&sig_1);
+        (cancel_sigscript, fee_sigscript)
+    } else {
+        (cancel_sigscript, fee_sigscript)
+    };
+    privkey.zeroize();
 
     let payload = to_rpc_payload(&tx, &[cancel_sigscript, fee_sigscript]);
     let result = rpc.submit_transaction(payload).await.map_err(|e| anyhow::anyhow!(e))?;

@@ -23,7 +23,8 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
 
@@ -163,6 +164,9 @@ pub async fn run(
 
     // Get fee UTXO for cancel (or use override)
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
+    // Estimate fee for UTXO selection (will be refined after TX construction).
+    let est_fee_budget = estimate_compute_mass(2, 1, 0) + 500;
+
     let fee_utxo = if let Some(fee_op_str) = fee_utxo_override {
         let fee_op = Outpoint::parse(fee_op_str)?;
         wallet_utxos
@@ -177,11 +181,11 @@ pub async fn run(
     } else {
         wallet_utxos
             .iter()
-            .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE)
+            .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= est_fee_budget + MIN_UTXO_VALUE)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No P2PK UTXO with >= {} sompi for cancel fee payment. Use --fee-utxo to specify.",
-                    DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE
+                    est_fee_budget + MIN_UTXO_VALUE
                 )
             })?
     };
@@ -192,7 +196,7 @@ pub async fn run(
     );
 
     let total_in = order_value + fee_utxo.utxo_entry.amount;
-    let cancel_output_value = total_in - DEFAULT_MATCHER_FEE;
+    let tentative_cancel_output = total_in.saturating_sub(est_fee_budget);
 
     // Build cancel TX
     let mut cancel_tx = Transaction::new(0);
@@ -218,7 +222,10 @@ pub async fn run(
     });
 
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    cancel_tx.outputs.push(TxOutput::new(cancel_output_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    cancel_tx.outputs.push(TxOutput::new(tentative_cancel_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+
+    // Phase 1: converge fee using estimated sigscript sizes
+    let (est_fee, _) = converge_fee(&mut cancel_tx, total_in, 0, 0);
 
     // Sign cancel TX
     let sighash_0 = compute_sighash(&cancel_tx, 0)?;
@@ -233,6 +240,38 @@ pub async fn run(
     let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
     let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
 
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&cancel_tx, &sigscripts);
+    let storage_mass = {
+        let in_vals: Vec<u64> = cancel_tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = cancel_tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass);
+
+    // If exact fee exceeds estimated fee, re-adjust output and re-sign
+    let (cancel_sigscript, fee_sigscript) = if exact_fee > est_fee {
+        let output_value = total_in.saturating_sub(exact_fee);
+        cancel_tx.outputs[0].value = output_value;
+
+        let sighash_0 = compute_sighash(&cancel_tx, 0)?;
+        let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
+        let cancel_sigscript = match old_side {
+            "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
+            "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
+            _ => unreachable!(),
+        };
+        let sighash_1 = compute_sighash(&cancel_tx, 1)?;
+        let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
+        let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
+
+        (cancel_sigscript, fee_sigscript)
+    } else {
+        (cancel_sigscript, fee_sigscript)
+    };
+
+    let cancel_output_value = cancel_tx.outputs[0].value;
     let cancel_payload = to_rpc_payload(&cancel_tx, &[cancel_sigscript, fee_sigscript]);
     println!("Submitting cancel transaction...");
     let cancel_tx_id = rpc.submit_transaction(cancel_payload).await?;
@@ -279,7 +318,8 @@ pub async fn run(
     info!(side = %new_params.side, amount = new_params.amount, "requote: deploy phase");
 
     let deploy_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
-    let deploy_needed = new_params.amount + DEFAULT_MATCHER_FEE;
+    let deploy_est_fee = estimate_compute_mass(1, 2, 100) + 500;
+    let deploy_needed = new_params.amount + deploy_est_fee;
 
     let funding = deploy_utxos
         .iter()
@@ -315,7 +355,8 @@ pub async fn run(
     };
 
     let new_p2sh = build_p2sh(&new_redeem_script);
-    let deploy_change = funding.utxo_entry.amount - new_params.amount - DEFAULT_MATCHER_FEE;
+    let deploy_total_input = funding.utxo_entry.amount;
+    let tentative_deploy_change = deploy_total_input.saturating_sub(new_params.amount + deploy_est_fee);
 
     let tx_version = if new_params.side == "sell" { 1 } else { 0 };
     let mut deploy_tx = Transaction::new(tx_version);
@@ -341,16 +382,63 @@ pub async fn run(
 
     deploy_tx.payload = build_order_payload(&new_redeem_script, false);
 
-    if deploy_change >= MIN_UTXO_VALUE {
-        let wallet_spk_deploy = hex::decode(&funding.utxo_entry.script_public_key.script)?;
-        deploy_tx.outputs.push(TxOutput::new(deploy_change, funding.utxo_entry.script_public_key.version, wallet_spk_deploy, None));
-    } else if deploy_change > 0 {
+    let wallet_spk_deploy = hex::decode(&funding.utxo_entry.script_public_key.script)?;
+    let has_deploy_change = tentative_deploy_change >= MIN_UTXO_VALUE;
+    if has_deploy_change {
+        deploy_tx.outputs.push(TxOutput::new(tentative_deploy_change, funding.utxo_entry.script_public_key.version, wallet_spk_deploy.clone(), None));
+    }
+
+    // Phase 1: converge fee on change output
+    let deploy_change_idx = if has_deploy_change { deploy_tx.outputs.len() - 1 } else { 0 };
+    let (deploy_est_fee, _) = if has_deploy_change {
+        converge_fee(&mut deploy_tx, deploy_total_input - new_params.amount, deploy_change_idx, 0)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&deploy_tx);
+        (f, 0)
+    };
+
+    let deploy_change = if has_deploy_change { deploy_tx.outputs[deploy_change_idx].value } else { deploy_total_input.saturating_sub(new_params.amount + deploy_est_fee) };
+    if has_deploy_change && deploy_change < MIN_UTXO_VALUE {
+        deploy_tx.outputs.pop();
+        if deploy_change > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", deploy_change);
+        }
+    } else if !has_deploy_change && deploy_change > 0 {
         println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", deploy_change);
     }
 
+    // Sign
     let deploy_sighash = compute_sighash(&deploy_tx, 0)?;
     let deploy_sig = signing::schnorr_sign(&privkey, &deploy_sighash)?;
     let deploy_sigscript = signing::build_p2pk_sigscript(&deploy_sig);
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_deploy_mass = calc_mass_with_sigscripts(&deploy_tx, &[deploy_sigscript.clone()]);
+    let deploy_storage_mass = {
+        let in_vals: Vec<u64> = deploy_tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = deploy_tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_deploy_fee = exact_deploy_mass.max(deploy_storage_mass);
+
+    let deploy_sigscript = if exact_deploy_fee > deploy_est_fee && deploy_tx.outputs.len() > 1 {
+        let change_idx = deploy_tx.outputs.len() - 1;
+        let new_change = deploy_total_input.saturating_sub(new_params.amount + exact_deploy_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            deploy_tx.outputs[change_idx].value = new_change;
+        } else {
+            deploy_tx.outputs.pop();
+            if new_change > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        // Re-sign
+        let deploy_sighash = compute_sighash(&deploy_tx, 0)?;
+        let deploy_sig = signing::schnorr_sign(&privkey, &deploy_sighash)?;
+        signing::build_p2pk_sigscript(&deploy_sig)
+    } else {
+        deploy_sigscript
+    };
 
     let deploy_payload = to_rpc_payload(&deploy_tx, &[deploy_sigscript]);
     println!("Submitting deploy transaction...");
@@ -431,28 +519,34 @@ mod tests {
     }
 
     #[test]
-    fn cancel_output_value_calculation() {
+    fn cancel_output_uses_mass_based_fee() {
+        let est_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
+        assert!(est_fee > 0, "mass-based fee must be > 0");
+        assert!(est_fee < 10_000, "mass-based fee should be well below old 10_000 constant");
+
         let order_value = 50_000_000u64;
         let fee_value = 10_000_000u64;
         let total = order_value + fee_value;
-        let output = total - kob_core::DEFAULT_MATCHER_FEE;
-        assert_eq!(output, 59_990_000);
+        let output = total - est_fee;
+        assert!(output > 59_990_000, "mass-based fee should be smaller than old fixed 10_000");
     }
 
     #[test]
-    fn deploy_change_calculation() {
+    fn deploy_change_uses_mass_based_fee() {
+        let est_fee = kob_core::mass::estimate_compute_mass(1, 2, 100);
         let funding_value = 100_000_000u64;
         let amount = 50_000_000u64;
-        let change = funding_value - amount - kob_core::DEFAULT_MATCHER_FEE;
-        assert_eq!(change, 49_990_000);
+        let change = funding_value - amount - est_fee;
+        assert!(change > 49_990_000, "mass-based fee should be smaller than old fixed 10_000");
         assert!(change >= kob_core::MIN_UTXO_VALUE);
     }
 
     #[test]
     fn deploy_change_below_min_utxo() {
-        let funding_value = 50_010_000u64;
+        let est_fee = kob_core::mass::estimate_compute_mass(1, 2, 100);
         let amount = 50_000_000u64;
-        let change = funding_value - amount - kob_core::DEFAULT_MATCHER_FEE;
+        let funding_value = amount + est_fee;
+        let change = funding_value - amount - est_fee;
         assert_eq!(change, 0);
     }
 
@@ -563,9 +657,11 @@ mod tests {
     }
 
     #[test]
-    fn deploy_needed_calculation() {
+    fn deploy_needed_uses_mass_based_fee() {
+        let est_fee = kob_core::mass::estimate_compute_mass(1, 2, 100) + 500;
         let amount = 50_000_000u64;
-        let needed = amount + kob_core::DEFAULT_MATCHER_FEE;
-        assert_eq!(needed, 50_010_000);
+        let needed = amount + est_fee;
+        assert!(needed > amount, "needed must exceed order amount");
+        assert!(needed < amount + 10_000, "mass-based fee budget should be well below old 10_000 constant");
     }
 }

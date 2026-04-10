@@ -39,7 +39,8 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
 
@@ -354,7 +355,9 @@ async fn deploy(
     println!();
 
     let total_amount = buy_amount + sell_amount;
-    let needed = total_amount + DEFAULT_MATCHER_FEE;
+    // Conservative fee estimate for 1-in/3-out OCO deploy TX
+    let est_fee_budget = estimate_compute_mass(1, 3, 0) + 500;
+    let needed = total_amount + est_fee_budget;
 
     info!(
         nonce = %hex::encode(nonce),
@@ -383,7 +386,7 @@ async fn deploy(
         funding.outpoint.transaction_id, funding.outpoint.index, funding.utxo_entry.amount
     );
 
-    let change = funding.utxo_entry.amount - total_amount - DEFAULT_MATCHER_FEE;
+    let total_input = funding.utxo_entry.amount;
 
     // Build transaction
     let mut tx = Transaction::new(0);
@@ -410,25 +413,69 @@ async fn deploy(
     // Format: KOB:1:<buy_rs_len_u16_LE><buy_rs><sell_rs>
     tx.payload = build_oco_order_payload(&buy_rs, &sell_rs, false);
 
-    // Output 2: change
-    if change >= MIN_UTXO_VALUE {
-        let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(change, funding.utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if change > 0 {
-        println!(
-            "Change {} sompi below MIN_UTXO_VALUE, donated as fee.",
-            change
-        );
+    // Output 2: tentative change for mass calculation
+    let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
+    let tentative_change = total_input.saturating_sub(total_amount + est_fee_budget);
+    if tentative_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tentative_change, funding.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
     }
 
-    // Sign
+    // Phase 1: converge fee
+    let has_change = tentative_change >= MIN_UTXO_VALUE;
+    let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
+
+    let (est_fee, _) = if has_change {
+        converge_fee(&mut tx, total_input - total_amount, change_idx, 0)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx);
+        (f, 0)
+    };
+
+    let change = if has_change { tx.outputs[change_idx].value } else { total_input.saturating_sub(total_amount + est_fee) };
+
+    if has_change && change < MIN_UTXO_VALUE {
+        tx.outputs.pop();
+        if change > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
+        }
+    } else if !has_change && change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(change, funding.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+    } else if !has_change && change > 0 {
+        println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
+    }
+
+    // Phase 1: sign
     let sighash = compute_sighash(&tx, 0)?;
     let signature = signing::schnorr_sign(&privkey, &sighash)?;
     let sigscript = signing::build_p2pk_sigscript(&signature);
 
-    println!("Sighash:     {}", hex::encode(sighash));
-    println!("Signature:   {}...", &hex::encode(signature)[..32]);
-    println!();
+    // Phase 2: exact mass check
+    let sigscripts_vec = vec![sigscript];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val);
+
+    let (sigscript, _actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 2 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = total_input.saturating_sub(total_amount + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        let sighash = compute_sighash(&tx, 0)?;
+        let signature = signing::schnorr_sign(&privkey, &sighash)?;
+        (signing::build_p2pk_sigscript(&signature), exact_fee)
+    } else {
+        (sigscripts_vec.into_iter().next().unwrap(), est_fee)
+    };
 
     // Submit
     let payload = to_rpc_payload(&tx, &[sigscript]);
@@ -574,12 +621,14 @@ async fn fill(
     // Fill TX: two covenant inputs (sigOpCount=0 each), no separate fee input needed
     // output[0] = filler gets filling-leg value minus fee
     // output[1] = owner gets partner-leg value (cbp refund)
-    let (out0_value, out1_value) = if fill_role == "buy" {
+    // Use tentative fee estimate; will be refined after building TX
+    let est_fee_budget = estimate_compute_mass(2, 2, 0) + 500;
+    let (mut out0_value, out1_value) = if fill_role == "buy" {
         // Fill buy: filler takes buy-leg KAS, owner gets sell-leg refund
-        (buy_value - DEFAULT_MATCHER_FEE, sell_value)
+        (buy_value.saturating_sub(est_fee_budget), sell_value)
     } else {
         // Fill sell: filler takes sell-leg value, owner gets buy-leg refund
-        (sell_value - DEFAULT_MATCHER_FEE, buy_value)
+        (sell_value.saturating_sub(est_fee_budget), buy_value)
     };
 
     // Make sure output values are valid
@@ -597,20 +646,6 @@ async fn fill(
             MIN_UTXO_VALUE
         );
     }
-
-    println!(
-        "Output[0]:     {} sompi (filler)",
-        out0_value
-    );
-    println!(
-        "Output[1]:     {} sompi (owner cbp refund)",
-        out1_value
-    );
-    println!(
-        "Fee:           {} sompi",
-        total_in - out0_value - out1_value
-    );
-    println!();
 
     // Build fill TX
     // Both legs must be spent in the same TX.
@@ -676,15 +711,49 @@ async fn fill(
         spk
     };
 
-    // Output 0: filler gets value
+    // Output 0: filler gets value (tentative, adjusted after exact mass calc)
     tx.outputs.push(TxOutput::new(out0_value, 0, wallet_spk_bytes.clone(), None));
 
     // Output 1: owner gets cbp refund
     tx.outputs.push(TxOutput::new(out1_value, 0, wallet_spk_bytes, None));
 
-    // Build sigscripts (v4 only)
+    // Build sigscripts (v4 only, data-only -- no signature dependency)
     let fill_ss = contract::build_oco_pair_fill_sigscript(1, fill_rs);
     let cbp_ss = contract::build_oco_pair_cbp_sigscript(0, cbp_rs);
+
+    // Exact mass calculation with real sigscripts (no re-sign needed for data-only sigscripts)
+    let exact_mass = calc_mass_with_sigscripts(&tx, &[fill_ss.clone(), cbp_ss.clone()]);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val);
+
+    // Adjust output[0] with exact fee
+    let fill_leg_value = if fill_role == "buy" { buy_value } else { sell_value };
+    out0_value = fill_leg_value.saturating_sub(exact_fee);
+    tx.outputs[0].value = out0_value;
+
+    if out0_value < MIN_UTXO_VALUE {
+        anyhow::bail!(
+            "Filler output {} sompi below MIN_UTXO_VALUE ({}) after exact fee {}. Increase order value.",
+            out0_value, MIN_UTXO_VALUE, exact_fee
+        );
+    }
+
+    println!(
+        "Output[0]:     {} sompi (filler)",
+        out0_value
+    );
+    println!(
+        "Output[1]:     {} sompi (owner cbp refund)",
+        out1_value
+    );
+    println!(
+        "Miner fee:     {} sompi",
+        exact_fee
+    );
 
     println!("Fill SigScript:  {} bytes", fill_ss.len());
     println!("CBP SigScript:   {} bytes", cbp_ss.len());
@@ -777,14 +846,15 @@ async fn cancel(
     println!("Sell Value:    {} sompi", sell_value);
 
     // Need a fee UTXO (cancel path has sigOpCount=1 per input -> need P2PK for fee)
+    let est_fee_budget = estimate_compute_mass(3, 1, 0) + 500;
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let fee_utxo = wallet_utxos
         .iter()
-        .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE)
+        .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= est_fee_budget + MIN_UTXO_VALUE)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No P2PK UTXO with >= {} sompi for fee payment",
-                DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE
+                est_fee_budget + MIN_UTXO_VALUE
             )
         })?;
 
@@ -794,10 +864,6 @@ async fn cancel(
     );
 
     let total_in = buy_value + sell_value + fee_utxo.utxo_entry.amount;
-    let output_value = total_in - DEFAULT_MATCHER_FEE;
-
-    println!("Output Value:  {} sompi", output_value);
-    println!();
 
     // Build cancel transaction
     let mut tx = Transaction::new(0);
@@ -836,9 +902,13 @@ async fn cancel(
         value: fee_utxo.utxo_entry.amount,
     });
 
-    // Output 0: all recovered funds to wallet
+    // Output 0: all recovered funds to wallet (tentative, adjusted by converge_fee)
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    tx.outputs.push(TxOutput::new(output_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    let tentative_output = total_in.saturating_sub(est_fee_budget);
+    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+
+    // Phase 1: converge fee on output[0]
+    let (est_fee, _) = converge_fee(&mut tx, total_in, 0, 0);
 
     // Sign input 0 (buy leg cancel) -- version-aware
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -855,9 +925,43 @@ async fn cancel(
     let sig_2 = signing::schnorr_sign(&privkey, &sighash_2)?;
     let fee_ss = signing::build_p2pk_sigscript(&sig_2);
 
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts_cancel = vec![buy_cancel_ss.clone(), sell_cancel_ss.clone(), fee_ss.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val);
+
+    let (buy_cancel_ss, sell_cancel_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+        let output_value = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = output_value;
+
+        // Re-sign all inputs with updated output value
+        let sighash_0 = compute_sighash(&tx, 0)?;
+        let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
+        let buy_cancel_ss = contract::build_oco_pair_cancel_sigscript(&sig_0, &pubkey, &buy_rs);
+        let sighash_1 = compute_sighash(&tx, 1)?;
+        let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
+        let sell_cancel_ss = contract::build_oco_pair_cancel_sigscript(&sig_1, &pubkey, &sell_rs);
+        let sighash_2 = compute_sighash(&tx, 2)?;
+        let sig_2 = signing::schnorr_sign(&privkey, &sighash_2)?;
+        let fee_ss = signing::build_p2pk_sigscript(&sig_2);
+
+        (buy_cancel_ss, sell_cancel_ss, fee_ss, exact_fee)
+    } else {
+        (buy_cancel_ss, sell_cancel_ss, fee_ss, est_fee)
+    };
+
+    let output_value = tx.outputs[0].value;
+
     println!("Buy Cancel SS:  {} bytes", buy_cancel_ss.len());
     println!("Sell Cancel SS: {} bytes", sell_cancel_ss.len());
     println!("Fee SS:         {} bytes", fee_ss.len());
+    println!("Output Value:  {} sompi", output_value);
+    println!("Miner fee:     {} sompi", actual_fee);
     println!();
 
     // Submit

@@ -14,7 +14,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::DEFAULT_MATCHER_FEE;
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
 use std::path::Path;
 use tracing::info;
 
@@ -381,16 +381,16 @@ pub fn plan_consolidation_filtered(
     batches
 }
 
-/// Compute the fee for a consolidation TX.
+/// Compute the estimated fee for a consolidation TX based on mass.
 ///
-/// Base fee is 10,000 sompi (DEFAULT_MATCHER_FEE constant). For many inputs, add a small
-/// per-input overhead to account for increased transaction mass.
-/// Fee = DEFAULT_MATCHER_FEE + (num_inputs - 1) * 1000 + (num_outputs - 1) * 500
+/// Uses `estimate_compute_mass` for compute mass, plus per-output storage mass
+/// estimate. The actual fee is finalized with `converge_fee` at submission time.
 pub fn compute_consolidation_fee(num_inputs: usize, num_outputs: usize) -> u64 {
-    let base = DEFAULT_MATCHER_FEE;
-    let input_overhead = (num_inputs.saturating_sub(1) as u64) * 1_000;
-    let output_overhead = (num_outputs.saturating_sub(1) as u64) * 500;
-    base + input_overhead + output_overhead
+    let compute_mass = estimate_compute_mass(num_inputs, num_outputs, 0);
+    // Storage mass estimate: for N-to-1 consolidation, storage mass is typically
+    // dominated by output term (C / out_value), which we cannot know here.
+    // Use compute mass as the planning estimate; converge_fee corrects at submission.
+    compute_mass
 }
 
 /// Run the `wallet consolidate` command.
@@ -566,22 +566,17 @@ pub async fn cmd_consolidate(
 /// TX structure (version 0, no covenants):
 ///   inputs:  N P2PK UTXOs (all from the same wallet address)
 ///   outputs: target_count P2PK outputs to the same wallet address
+///
+/// Uses 2-phase sign + converge_fee for exact mass-based fee.
 async fn submit_consolidation_tx(
     rpc: &NodeClient,
     _wallet: &WalletFile,
     privkey: &[u8; 32],
     input_utxos: &[&RpcUtxo],
     target_count: usize,
-    fee: u64,
+    _est_fee: u64,
 ) -> anyhow::Result<String> {
     let total_input: u64 = input_utxos.iter().map(|u| u.utxo_entry.amount).sum();
-    let output_value = total_input
-        .checked_sub(fee)
-        .ok_or_else(|| anyhow::anyhow!("Transaction fee ({} sompi) exceeds total input ({} sompi). The UTXOs are too small to consolidate.", fee, total_input))?;
-
-    if output_value == 0 {
-        anyhow::bail!("Cannot consolidate: the combined UTXO value equals the fee, leaving nothing to send. Add more UTXOs.");
-    }
 
     // Use the SPK from the first UTXO (they are all the same wallet address)
     let wallet_spk_version = input_utxos[0].utxo_entry.script_public_key.version;
@@ -602,9 +597,15 @@ async fn submit_consolidation_tx(
         });
     }
 
-    // Split output value across target_count outputs
-    let per_output = output_value / target_count as u64;
-    let remainder = output_value - per_output * target_count as u64;
+    // Create tentative outputs (split evenly, adjusted by converge_fee)
+    let tentative_fee = estimate_compute_mass(input_utxos.len(), target_count, 0);
+    let tentative_output = total_input.saturating_sub(tentative_fee);
+    if tentative_output == 0 {
+        anyhow::bail!("Cannot consolidate: the combined UTXO value is too small to cover the fee. Add more UTXOs.");
+    }
+
+    let per_output = tentative_output / target_count as u64;
+    let remainder = tentative_output - per_output * target_count as u64;
 
     for i in 0..target_count {
         let val = if i == 0 {
@@ -615,12 +616,61 @@ async fn submit_consolidation_tx(
         tx.outputs.push(TxOutput::new(val, wallet_spk_version, wallet_spk_bytes.clone(), None));
     }
 
-    // Sign each input
+    // Phase 1: converge fee on the first output (it absorbs the remainder)
+    let (est_fee, _) = converge_fee(&mut tx, total_input, 0, 0);
+
+    // Re-split: output[0] got adjusted by converge_fee; redistribute evenly
+    if target_count > 1 {
+        let actual_output = total_input.saturating_sub(est_fee);
+        let per_out = actual_output / target_count as u64;
+        let rem = actual_output - per_out * target_count as u64;
+        for i in 0..target_count {
+            tx.outputs[i].value = if i == 0 { per_out + rem } else { per_out };
+        }
+    }
+
+    // Verify outputs are above dust
+    for (i, out) in tx.outputs.iter().enumerate() {
+        if out.value < kob_core::MIN_UTXO_VALUE {
+            anyhow::bail!(
+                "Consolidation output {} value {} sompi below MIN_UTXO_VALUE. The UTXOs are too small to consolidate.",
+                i, out.value
+            );
+        }
+    }
+
+    // Sign each input (phase 1)
     let mut sigscripts = Vec::with_capacity(tx.inputs.len());
     for i in 0..tx.inputs.len() {
         let sighash = compute_sighash(&tx, i)?;
         let signature = signing::schnorr_sign(privkey, &sighash)?;
         sigscripts.push(signing::build_p2pk_sigscript(&signature));
+    }
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val);
+
+    if exact_fee > est_fee {
+        // Re-adjust outputs
+        let actual_output = total_input.saturating_sub(exact_fee);
+        let per_out = actual_output / target_count as u64;
+        let rem = actual_output - per_out * target_count as u64;
+        for i in 0..target_count {
+            tx.outputs[i].value = if i == 0 { per_out + rem } else { per_out };
+        }
+        // Re-sign
+        sigscripts.clear();
+        for i in 0..tx.inputs.len() {
+            let sighash = compute_sighash(&tx, i)?;
+            let signature = signing::schnorr_sign(privkey, &sighash)?;
+            sigscripts.push(signing::build_p2pk_sigscript(&signature));
+        }
     }
 
     // Submit
@@ -760,21 +810,26 @@ mod tests {
     #[test]
     fn fee_single_input_single_output() {
         let fee = compute_consolidation_fee(1, 1);
-        assert_eq!(fee, DEFAULT_MATCHER_FEE); // base fee only (no overhead for 1/1)
+        let expected = estimate_compute_mass(1, 1, 0);
+        assert_eq!(fee, expected);
     }
 
     #[test]
     fn fee_many_inputs_single_output() {
         let fee = compute_consolidation_fee(84, 1);
-        // DEFAULT_MATCHER_FEE + 83 * 1000 + 0 * 500 = 10_000 + 83_000 = 93_000
-        assert_eq!(fee, DEFAULT_MATCHER_FEE + 83_000);
+        let expected = estimate_compute_mass(84, 1, 0);
+        assert_eq!(fee, expected);
+        // More inputs => higher fee
+        assert!(fee > compute_consolidation_fee(1, 1));
     }
 
     #[test]
     fn fee_many_inputs_multiple_outputs() {
         let fee = compute_consolidation_fee(10, 3);
-        // DEFAULT_MATCHER_FEE + 9 * 1000 + 2 * 500 = 10_000 + 9_000 + 1_000 = 20_000
-        assert_eq!(fee, DEFAULT_MATCHER_FEE + 9_000 + 1_000);
+        let expected = estimate_compute_mass(10, 3, 0);
+        assert_eq!(fee, expected);
+        // More outputs => higher fee than same inputs with 1 output
+        assert!(fee > compute_consolidation_fee(10, 1));
     }
 
 
@@ -802,7 +857,7 @@ mod tests {
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].utxo_indices.len(), 2);
         assert_eq!(batches[0].total_input, 10_000_000);
-        // fee = DEFAULT_MATCHER_FEE + 1 * 1000 = 11_000
+        // fee = estimate_compute_mass(2, 1, 0)
         let expected_fee = compute_consolidation_fee(2, 1);
         assert_eq!(batches[0].fee, expected_fee);
         assert_eq!(batches[0].output_value, 10_000_000 - expected_fee);

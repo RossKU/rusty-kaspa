@@ -19,7 +19,8 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::estimate_compute_mass;
+use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
 
@@ -1018,10 +1019,12 @@ async fn create_market(
     println!("Step 1: Deploying BallotBoxes + SplitMerge...");
 
     let utxos = rpc.get_spendable_utxos(&wallet.address).await?;
+    // Estimate fee: 1-in, ~4-out TX (2 BallotBoxes + SplitMerge + change)
+    let step1_est_fee = estimate_compute_mass(1, 4, 0);
     let step1_total = ballot_box_value
         .checked_mul(2).ok_or_else(|| anyhow::anyhow!("overflow"))?
         .checked_add(split_merge_value).ok_or_else(|| anyhow::anyhow!("overflow"))?
-        .checked_add(DEFAULT_MATCHER_FEE).ok_or_else(|| anyhow::anyhow!("overflow"))?;
+        .checked_add(step1_est_fee).ok_or_else(|| anyhow::anyhow!("overflow"))?;
 
     let funding = utxos
         .iter()
@@ -1132,8 +1135,10 @@ async fn create_market(
     }
 
     let utxos2 = rpc.get_spendable_utxos(&wallet.address).await?;
+    // Estimate fee: 1-in, ~2-out TX (Redemption + change)
+    let step2_est_fee = estimate_compute_mass(1, 2, 0);
     let step2_total = redemption_value
-        .checked_add(DEFAULT_MATCHER_FEE).ok_or_else(|| anyhow::anyhow!("overflow"))?;
+        .checked_add(step2_est_fee).ok_or_else(|| anyhow::anyhow!("overflow"))?;
 
     let funding2 = utxos2
         .iter()
@@ -1357,8 +1362,10 @@ async fn split(
     // Find funding UTXO
     let utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     // Split TX deposits unit_value into the pool, plus miner fee, plus dust margin.
+    // Estimate fee: 2-in (SM + funding), ~4-out TX (yes_token + no_token + continuation + change)
+    let split_est_fee = estimate_compute_mass(2, 4, 0);
     let needed = unit_value
-        .checked_add(DEFAULT_MATCHER_FEE).ok_or_else(|| anyhow::anyhow!("overflow"))?
+        .checked_add(split_est_fee).ok_or_else(|| anyhow::anyhow!("overflow"))?
         .checked_add(MIN_UTXO_VALUE).ok_or_else(|| anyhow::anyhow!("overflow"))?;
 
     let (user_tx_id, user_index, user_value, user_spk) = if let Some(fo) = funding_utxo_str {
@@ -1900,7 +1907,7 @@ async fn expire_ballot(
     let payload = to_rpc_payload(&real_tx, &sigscripts);
     let tx_id = rpc.submit_transaction(payload).await?;
 
-    let payout = value.saturating_sub(DEFAULT_MATCHER_FEE);
+    let payout = real_bp.outputs.first().map(|o| o.value).unwrap_or(0);
     println!("SUCCESS! BallotBox expired.");
     println!("TXID:    {}", tx_id);
     println!("Reclaimed: {}:0 ({})", tx_id, fmt_sompi(payout));
@@ -2012,7 +2019,7 @@ async fn refund_pool(
             let payload = to_rpc_payload(&real_tx, &sigscripts);
             let tx_id = rpc.submit_transaction(payload).await?;
 
-            let payout = value.saturating_sub(DEFAULT_MATCHER_FEE);
+            let payout = real_bp.outputs.first().map(|o| o.value).unwrap_or(0);
             println!("SUCCESS! SplitMerge pool refunded.");
             println!("TXID:    {}", tx_id);
             println!("Reclaimed: {}:0 ({})", tx_id, fmt_sompi(payout));
@@ -2072,7 +2079,7 @@ async fn refund_pool(
             let payload = to_rpc_payload(&real_tx, &sigscripts);
             let tx_id = rpc.submit_transaction(payload).await?;
 
-            let payout = value.saturating_sub(DEFAULT_MATCHER_FEE);
+            let payout = real_bp.outputs.first().map(|o| o.value).unwrap_or(0);
             println!("SUCCESS! Redemption pool refunded.");
             println!("TXID:    {}", tx_id);
             println!("Reclaimed: {}:0 ({})", tx_id, fmt_sompi(payout));

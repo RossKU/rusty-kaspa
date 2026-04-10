@@ -29,7 +29,8 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
 
@@ -375,7 +376,8 @@ async fn deploy(
 
     // Find funding UTXO
     let utxos = rpc.get_spendable_utxos(&wallet.address).await?;
-    let needed = total_value + DEFAULT_MATCHER_FEE;
+    let est_fee = estimate_compute_mass(1, 2, redeem_script.len() + 2);
+    let needed = total_value + est_fee;
     let funding = utxos
         .iter()
         .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= needed)
@@ -391,8 +393,6 @@ async fn deploy(
         "Funding UTXO: {}:{} ({} sompi)",
         funding.outpoint.transaction_id, funding.outpoint.index, funding.utxo_entry.amount
     );
-
-    let change = funding.utxo_entry.amount - total_value - DEFAULT_MATCHER_FEE;
 
     let mut tx = Transaction::new(0);
 
@@ -413,28 +413,79 @@ async fn deploy(
     // TX payload
     tx.payload = build_order_payload(&redeem_script, false);
 
-    // Output 1: change
-    if change >= MIN_UTXO_VALUE {
-        let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(change, funding.utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if change > 0 {
-        println!(
-            "Change {} sompi below MIN_UTXO_VALUE, donated as fee.",
-            change
-        );
+    // Output 1: tentative change
+    let tentative_change = funding.utxo_entry.amount.saturating_sub(total_value + est_fee);
+    let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
+    if tentative_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tentative_change, funding.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
     }
 
-    // Sign
+    // Phase 1: converge fee on change output (output 0 = P2SH is fixed)
+    let has_change = tx.outputs.len() > 1;
+    let (phase1_fee, _) = if has_change {
+        let change_idx = tx.outputs.len() - 1;
+        converge_fee(&mut tx, funding.utxo_entry.amount - total_value, change_idx, 0)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx);
+        (f, 0)
+    };
+
+    let change = if has_change {
+        tx.outputs[tx.outputs.len() - 1].value
+    } else {
+        funding.utxo_entry.amount.saturating_sub(total_value + phase1_fee)
+    };
+
+    // Remove change output if below MIN_UTXO_VALUE
+    if has_change && change < MIN_UTXO_VALUE {
+        tx.outputs.pop();
+        if change > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
+        }
+    } else if !has_change && change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(change, funding.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+    } else if !has_change && change > 0 {
+        println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
+    }
+
+    // Sign (phase 1)
     let sighash = compute_sighash(&tx, 0)?;
     let signature = signing::schnorr_sign(&privkey, &sighash)?;
-    let sigscript = signing::build_p2pk_sigscript(&signature);
+    let mut sigscripts = vec![signing::build_p2pk_sigscript(&signature)];
 
-    println!("Sighash:    {}", hex::encode(sighash));
-    println!("Signature:  {}...", &hex::encode(signature)[..32]);
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val);
+
+    if exact_fee > phase1_fee && tx.outputs.len() > 1 {
+        let cidx = tx.outputs.len() - 1;
+        let residual = funding.utxo_entry.amount.saturating_sub(total_value);
+        let new_change = residual.saturating_sub(exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[cidx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        // Re-sign
+        let sighash = compute_sighash(&tx, 0)?;
+        let signature = signing::schnorr_sign(&privkey, &sighash)?;
+        sigscripts = vec![signing::build_p2pk_sigscript(&signature)];
+    }
+
+    println!("Sighash:    {}", hex::encode(&compute_sighash(&tx, 0)?));
+    println!("Signature:  (signed)");
     println!();
 
     // Submit
-    let payload = to_rpc_payload(&tx, &[sigscript]);
+    let payload = to_rpc_payload(&tx, &sigscripts);
     println!("Submitting DCA deploy transaction...");
     let tx_id = rpc.submit_transaction(payload).await?;
 
@@ -556,15 +607,16 @@ async fn fill(
         )?
     };
 
-    // Need a fee UTXO
+    // Need a fee UTXO (estimate: 2-in, 2-out TX)
+    let fill_est_fee = estimate_compute_mass(2, 2, 0);
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let fee_utxo = wallet_utxos
         .iter()
-        .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE)
+        .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= fill_est_fee + MIN_UTXO_VALUE)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No P2PK UTXO with >= {} sompi for fee payment",
-                DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE
+                fill_est_fee + MIN_UTXO_VALUE
             )
         })?;
 
@@ -602,14 +654,17 @@ async fn fill(
     let total_in = order_value + fee_utxo.utxo_entry.amount;
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
 
+    // Determine filler output index for converge_fee
+    let filler_output_idx: usize;
+
     if is_final_fill {
         // Final fill: no continuation. All funds to filler (minus fee).
-        let output_value = total_in - DEFAULT_MATCHER_FEE;
-        tx.outputs.push(TxOutput::new(output_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
-        println!("Final fill output:  {} sompi", output_value);
+        // Use tentative value; converge_fee will adjust.
+        let tentative_value = total_in.saturating_sub(fill_est_fee);
+        tx.outputs.push(TxOutput::new(tentative_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+        filler_output_idx = 0;
     } else {
         // Continuation: D&R pattern
-        // Output[continuation_output_idx]: continuation UTXO with new RS
         let new_p2sh = build_p2sh(&new_rs);
         let continuation_value = order_value - amount_per_period;
         if continuation_value < MIN_UTXO_VALUE {
@@ -621,38 +676,58 @@ async fn fill(
             );
         }
 
-        // Filler receives amount_per_period + fee change
-        let filler_value = amount_per_period + fee_utxo.utxo_entry.amount - DEFAULT_MATCHER_FEE;
+        // Tentative filler value (adjusted by converge_fee)
+        let tentative_filler = total_in.saturating_sub(continuation_value + fill_est_fee);
 
         if continuation_output_idx == 0 {
-            // Output 0: continuation
+            // Output 0: continuation (fixed)
             tx.outputs.push(TxOutput::new(continuation_value, 0, new_p2sh.script().to_vec(), None));
-            // Output 1: filler payment
-            if filler_value >= MIN_UTXO_VALUE {
-                tx.outputs.push(TxOutput::new(filler_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+            // Output 1: filler payment (adjustable)
+            if tentative_filler >= MIN_UTXO_VALUE {
+                tx.outputs.push(TxOutput::new(tentative_filler, fee_utxo.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+                filler_output_idx = 1;
+            } else {
+                filler_output_idx = 0; // no filler output, fee absorbs all
             }
         } else {
-            // Output 0: filler payment
-            if filler_value >= MIN_UTXO_VALUE {
-                tx.outputs.push(TxOutput::new(filler_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+            // Output 0: filler payment (adjustable)
+            if tentative_filler >= MIN_UTXO_VALUE {
+                tx.outputs.push(TxOutput::new(tentative_filler, fee_utxo.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
             } else {
-                // Filler value below dust — continuation index shifts.
-                // Reject to avoid output index mismatch with sigscript.
                 anyhow::bail!(
                     "Filler value {} sompi below dust threshold {}. \
                      Use continuation_output_idx=0 or increase fee UTXO.",
-                    filler_value, MIN_UTXO_VALUE
+                    tentative_filler, MIN_UTXO_VALUE
                 );
             }
-            // Output at continuation_output_idx: continuation
+            // Output at continuation_output_idx: continuation (fixed)
             tx.outputs.push(TxOutput::new(continuation_value, 0, new_p2sh.script().to_vec(), None));
+            filler_output_idx = 0;
         }
+    }
 
+    // Phase 1: converge fee on filler output
+    let (phase1_fee, _) = if filler_output_idx < tx.outputs.len() {
+        converge_fee(&mut tx, total_in, filler_output_idx, 0)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx);
+        (f, 0)
+    };
+
+    if !is_final_fill {
+        let continuation_value = order_value - amount_per_period;
+        let filler_value = if filler_output_idx < tx.outputs.len() {
+            tx.outputs[filler_output_idx].value
+        } else {
+            0
+        };
         println!("Continuation value: {} sompi", continuation_value);
         println!("Filler value:       {} sompi", filler_value);
         println!("New next_exec DAA:  {}", next_execution_daa + interval_daa);
         println!("New periods:        {}", periods_remaining - 1);
         println!("New RS:             {}", hex::encode(&new_rs));
+    } else {
+        println!("Final fill output:  {} sompi", tx.outputs[0].value);
     }
     println!();
 
@@ -669,12 +744,50 @@ async fn fill(
     let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
     let fee_ss = signing::build_p2pk_sigscript(&sig_1);
 
-    println!("Fill SS:  {} bytes", fill_ss.len());
-    println!("Fee SS:   {} bytes", fee_ss.len());
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts_check = vec![fill_ss.clone(), fee_ss.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_check);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val);
+
+    let (fill_ss_final, fee_ss_final) = if exact_fee > phase1_fee && filler_output_idx < tx.outputs.len() {
+        // Re-adjust filler output
+        let fixed_sum: u64 = tx.outputs.iter().enumerate()
+            .filter(|(i, _)| *i != filler_output_idx)
+            .map(|(_, o)| o.value)
+            .sum();
+        let new_filler = total_in.saturating_sub(fixed_sum + exact_fee);
+        if new_filler >= MIN_UTXO_VALUE {
+            tx.outputs[filler_output_idx].value = new_filler;
+        } else if new_filler > 0 {
+            println!("Filler value {} sompi below dust after fee adjustment, donated as fee.", new_filler);
+            tx.outputs[filler_output_idx].value = 0;
+        }
+        // Re-build sigscripts (sighash changed)
+        let fill_ss2 = contract::build_dca_order_fill_sigscript(
+            continuation_output_idx,
+            &old_rs,
+            &new_rs,
+            &old_rs,
+        );
+        let sighash_1b = compute_sighash(&tx, 1)?;
+        let sig_1b = signing::schnorr_sign(&privkey, &sighash_1b)?;
+        let fee_ss2 = signing::build_p2pk_sigscript(&sig_1b);
+        (fill_ss2, fee_ss2)
+    } else {
+        (fill_ss, fee_ss)
+    };
+
+    println!("Fill SS:  {} bytes", fill_ss_final.len());
+    println!("Fee SS:   {} bytes", fee_ss_final.len());
     println!();
 
     // Submit
-    let payload = to_rpc_payload(&tx, &[fill_ss, fee_ss]);
+    let payload = to_rpc_payload(&tx, &[fill_ss_final, fee_ss_final]);
     println!("Submitting DCA fill transaction...");
     let tx_id = rpc.submit_transaction(payload).await?;
 
@@ -750,15 +863,16 @@ async fn cancel(
     };
     println!("Order Value: {} sompi", order_value);
 
-    // Need a fee UTXO
+    // Need a fee UTXO (estimate: 2-in, 1-out cancel TX)
+    let cancel_est_fee = estimate_compute_mass(2, 1, 0);
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let fee_utxo = wallet_utxos
         .iter()
-        .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE)
+        .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= cancel_est_fee + MIN_UTXO_VALUE)
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No P2PK UTXO with >= {} sompi for fee payment",
-                DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE
+                cancel_est_fee + MIN_UTXO_VALUE
             )
         })?;
 
@@ -768,10 +882,6 @@ async fn cancel(
     );
 
     let total_in = order_value + fee_utxo.utxo_entry.amount;
-    let output_value = total_in - DEFAULT_MATCHER_FEE;
-
-    println!("Output Value: {} sompi", output_value);
-    println!();
 
     // Cancel TX layout:
     //   input[0]: DCA UTXO (sigOpCount=1, cancel sigscript)
@@ -802,9 +912,17 @@ async fn cancel(
         value: fee_utxo.utxo_entry.amount,
     });
 
-    // Output 0: all recovered funds to wallet
+    // Output 0: all recovered funds to wallet (tentative, adjusted by converge_fee)
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    tx.outputs.push(TxOutput::new(output_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    let tentative_output = total_in.saturating_sub(cancel_est_fee);
+    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+
+    // Phase 1: converge fee on output 0
+    let (phase1_fee, _) = converge_fee(&mut tx, total_in, 0, 0);
+    let output_value = tx.outputs[0].value;
+
+    println!("Output Value: {} sompi", output_value);
+    println!();
 
     // Sign input 0 (cancel sigscript)
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -823,12 +941,44 @@ async fn cancel(
     let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
     let fee_ss = signing::build_p2pk_sigscript(&sig_1);
 
-    println!("Cancel SS:  {} bytes", cancel_ss.len());
-    println!("Fee SS:     {} bytes", fee_ss.len());
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts_check = vec![cancel_ss.clone(), fee_ss.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_check);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val);
+
+    let (cancel_ss_final, fee_ss_final) = if exact_fee > phase1_fee {
+        // Re-adjust output
+        let new_output = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = new_output;
+        // Re-sign
+        let sighash_0b = compute_sighash(&tx, 0)?;
+        let sig_0b = signing::schnorr_sign(&privkey, &sighash_0b)?;
+        let mut owner_sig2 = [0u8; 64];
+        owner_sig2.copy_from_slice(&sig_0b);
+        let cancel_ss2 = contract::build_dca_order_cancel_sigscript(
+            &owner_sig2,
+            &pubkey,
+            &redeem_script,
+        );
+        let sighash_1b = compute_sighash(&tx, 1)?;
+        let sig_1b = signing::schnorr_sign(&privkey, &sighash_1b)?;
+        let fee_ss2 = signing::build_p2pk_sigscript(&sig_1b);
+        (cancel_ss2, fee_ss2)
+    } else {
+        (cancel_ss, fee_ss)
+    };
+
+    println!("Cancel SS:  {} bytes", cancel_ss_final.len());
+    println!("Fee SS:     {} bytes", fee_ss_final.len());
     println!();
 
     // Submit
-    let payload = to_rpc_payload(&tx, &[cancel_ss, fee_ss]);
+    let payload = to_rpc_payload(&tx, &[cancel_ss_final, fee_ss_final]);
     println!("Submitting DCA cancel transaction...");
     let tx_id = rpc.submit_transaction(payload).await?;
 
@@ -836,7 +986,7 @@ async fn cancel(
     println!("SUCCESS! DCA order cancelled.");
     println!("TXID: {}", tx_id);
     println!();
-    println!("Recovered {} sompi to wallet.", output_value);
+    println!("Recovered {} sompi to wallet.", tx.outputs[0].value);
 
     Ok(())
 }

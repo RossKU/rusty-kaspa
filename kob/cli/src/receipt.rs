@@ -19,7 +19,8 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE, RECEIPT_DUST};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass};
+use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST};
 use std::path::Path;
 use tracing::info;
 
@@ -300,7 +301,8 @@ pub async fn receipt_create(
     let rpc = NodeClient::connect(node_url).await?;
 
     let utxos = rpc.get_spendable_utxos(&wallet.address).await?;
-    let needed = amount + DEFAULT_MATCHER_FEE;
+    let est_fee = estimate_compute_mass(1, 2, 0) + 500;
+    let needed = amount + est_fee;
 
     let funding = utxos
         .iter()
@@ -317,8 +319,6 @@ pub async fn receipt_create(
         "Funding UTXO: {}:{} ({} sompi)",
         funding.outpoint.transaction_id, funding.outpoint.index, funding.utxo_entry.amount
     );
-
-    let change = funding.utxo_entry.amount - amount - DEFAULT_MATCHER_FEE;
 
     // Build deploy TX (version 0, no covenant binding needed for receipt)
     let mut tx = Transaction::new(0);
@@ -337,19 +337,67 @@ pub async fn receipt_create(
     // Output 0: receipt P2SH
     tx.outputs.push(TxOutput::new(amount, p2sh.version, p2sh.script().to_vec(), None));
 
-    // Output 1: change back to wallet
-    if change >= MIN_UTXO_VALUE {
-        let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(change, funding.utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if change > 0 {
+    // Output 1: tentative change back to wallet
+    let total_input = funding.utxo_entry.amount;
+    let tentative_change = total_input.saturating_sub(amount + est_fee);
+    let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;
+    let has_change = tentative_change >= MIN_UTXO_VALUE;
+    if has_change {
+        tx.outputs.push(TxOutput::new(tentative_change, funding.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+    }
+
+    // Phase 1: converge fee on change output
+    let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
+    let (est_fee, _) = if has_change {
+        converge_fee(&mut tx, total_input - amount, change_idx, 0)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx);
+        (f, 0)
+    };
+
+    let change = if has_change { tx.outputs[change_idx].value } else { total_input.saturating_sub(amount + est_fee) };
+    if has_change && change < MIN_UTXO_VALUE {
+        tx.outputs.pop();
+        if change > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
+        }
+    } else if !has_change && change > 0 {
         println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
     }
 
+    // Sign
     let sighash = compute_sighash(&tx, 0)?;
     let sig = signing::schnorr_sign(&privkey, &sighash)?;
     let sigscript = signing::build_p2pk_sigscript(&sig);
 
-    println!("Sighash:    {}", hex::encode(sighash));
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val);
+
+    let sigscript = if exact_fee > est_fee && tx.outputs.len() > 1 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = total_input.saturating_sub(amount + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        // Re-sign
+        let sighash = compute_sighash(&tx, 0)?;
+        let sig = signing::schnorr_sign(&privkey, &sighash)?;
+        signing::build_p2pk_sigscript(&sig)
+    } else {
+        sigscript
+    };
+
     println!();
 
     let payload = to_rpc_payload(&tx, &[sigscript]);
@@ -437,12 +485,15 @@ pub async fn receipt_consume(
 
     println!("Receipt Value: {} sompi", receipt_value);
 
+    // Estimate fee for UTXO selection (will be refined after TX construction).
+    let est_fee_budget = estimate_compute_mass(2, 1, 0) + 500;
+
     // Find fee UTXO
     let fee_utxo = find_fee_utxo(
         &rpc,
         &wallet.address,
         fee_outpoint.as_ref(),
-        DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE,
+        est_fee_budget + MIN_UTXO_VALUE,
     )
     .await?;
 
@@ -452,18 +503,15 @@ pub async fn receipt_consume(
     );
 
     let total_in = receipt_value + fee_utxo.utxo_entry.amount;
-    let output_value = total_in.saturating_sub(DEFAULT_MATCHER_FEE);
+    let tentative_output = total_in.saturating_sub(est_fee_budget);
 
-    if output_value < MIN_UTXO_VALUE {
+    if tentative_output < MIN_UTXO_VALUE {
         anyhow::bail!(
             "Output value {} sompi below MIN_UTXO_VALUE {}",
-            output_value,
+            tentative_output,
             MIN_UTXO_VALUE
         );
     }
-
-    println!("Output Value:  {} sompi", output_value);
-    println!();
 
     // Build the consume TX
     // Receipt v3 consume: sigOpCount=1 (has OpCheckSig in consume path)
@@ -494,7 +542,10 @@ pub async fn receipt_consume(
 
     // Output 0: wallet
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    tx.outputs.push(TxOutput::new(output_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+
+    // Phase 1: converge fee using estimated sigscript sizes
+    let (est_fee, _) = converge_fee(&mut tx, total_in, 0, 0);
 
     // Sign the receipt input (index 0) -- recipient's signature
     let receipt_sighash = compute_sighash(&tx, 0)?;
@@ -513,8 +564,41 @@ pub async fn receipt_consume(
     let fee_sig = signing::schnorr_sign(&privkey, &fee_sighash)?;
     let fee_ss = signing::build_p2pk_sigscript(&fee_sig);
 
-    println!("Sighash[0]:    {} (receipt)", hex::encode(receipt_sighash));
-    println!("Sighash[1]:    {} (fee)", hex::encode(fee_sighash));
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let storage_mass = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass);
+
+    // If exact fee exceeds estimated fee, re-adjust output and re-sign
+    let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+        let output_value = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = output_value;
+
+        // Re-sign with updated output value
+        let receipt_sighash = compute_sighash(&tx, 0)?;
+        let receipt_sig = signing::schnorr_sign(&privkey, &receipt_sighash)?;
+        let receipt_ss = contract::build_receipt_consume_sigscript(
+            &receipt_sig,
+            &pubkey,
+            &receipt_rs,
+        );
+        let fee_sighash = compute_sighash(&tx, 1)?;
+        let fee_sig = signing::schnorr_sign(&privkey, &fee_sighash)?;
+        let fee_ss = signing::build_p2pk_sigscript(&fee_sig);
+
+        (receipt_ss, fee_ss, exact_fee)
+    } else {
+        (receipt_ss, fee_ss, est_fee)
+    };
+
+    let output_value = tx.outputs[0].value;
+    println!("Output Value:  {} sompi", output_value);
+    println!("Miner fee:     {} sompi", actual_fee);
     println!();
 
     // Submit
@@ -606,12 +690,15 @@ pub async fn receipt_trigger(
 
     println!("Receipt Value: {} sompi", receipt_value);
 
+    // Estimate fee for UTXO selection (will be refined after TX construction).
+    let est_fee_budget = estimate_compute_mass(2, 1, 0) + 500;
+
     // Find fee UTXO
     let fee_utxo = find_fee_utxo(
         &rpc,
         &wallet.address,
         fee_outpoint.as_ref(),
-        DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE,
+        est_fee_budget + MIN_UTXO_VALUE,
     )
     .await?;
 
@@ -621,18 +708,15 @@ pub async fn receipt_trigger(
     );
 
     let total_in = receipt_value + fee_utxo.utxo_entry.amount;
-    let output_value = total_in.saturating_sub(DEFAULT_MATCHER_FEE);
+    let tentative_output = total_in.saturating_sub(est_fee_budget);
 
-    if output_value < MIN_UTXO_VALUE {
+    if tentative_output < MIN_UTXO_VALUE {
         anyhow::bail!(
             "Output value {} sompi below MIN_UTXO_VALUE {}",
-            output_value,
+            tentative_output,
             MIN_UTXO_VALUE
         );
     }
-
-    println!("Output Value:  {} sompi", output_value);
-    println!();
 
     // Build the consume TX (v4: always requires recipient signature)
     let mut tx = Transaction::new(0);
@@ -662,7 +746,10 @@ pub async fn receipt_trigger(
 
     // Output 0: wallet
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    tx.outputs.push(TxOutput::new(output_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+
+    // Phase 1: converge fee using estimated sigscript sizes
+    let (est_fee, _) = converge_fee(&mut tx, total_in, 0, 0);
 
     // Sign the receipt input (index 0) -- recipient's signature (v4: always required)
     let receipt_sighash = compute_sighash(&tx, 0)?;
@@ -681,8 +768,41 @@ pub async fn receipt_trigger(
     let fee_sig = signing::schnorr_sign(&privkey, &fee_sighash)?;
     let fee_ss = signing::build_p2pk_sigscript(&fee_sig);
 
-    println!("Sighash[0]:    {} (receipt)", hex::encode(receipt_sighash));
-    println!("Sighash[1]:    {} (fee)", hex::encode(fee_sighash));
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let storage_mass = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass);
+
+    // If exact fee exceeds estimated fee, re-adjust output and re-sign
+    let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+        let output_value = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = output_value;
+
+        // Re-sign with updated output value
+        let receipt_sighash = compute_sighash(&tx, 0)?;
+        let receipt_sig = signing::schnorr_sign(&privkey, &receipt_sighash)?;
+        let receipt_ss = contract::build_receipt_consume_sigscript(
+            &receipt_sig,
+            &pubkey,
+            &receipt_rs,
+        );
+        let fee_sighash = compute_sighash(&tx, 1)?;
+        let fee_sig = signing::schnorr_sign(&privkey, &fee_sighash)?;
+        let fee_ss = signing::build_p2pk_sigscript(&fee_sig);
+
+        (receipt_ss, fee_ss, exact_fee)
+    } else {
+        (receipt_ss, fee_ss, est_fee)
+    };
+
+    let output_value = tx.outputs[0].value;
+    println!("Output Value:  {} sompi", output_value);
+    println!("Miner fee:     {} sompi", actual_fee);
     println!();
 
     // Submit
@@ -756,12 +876,15 @@ pub async fn receipt_consume_v1(
 
     println!("Receipt Value: {} sompi", receipt_value);
 
+    // Estimate fee for UTXO selection (will be refined after TX construction).
+    let est_fee_budget = estimate_compute_mass(2, 1, 0) + 500;
+
     // Find fee UTXO
     let fee_utxo = find_fee_utxo(
         &rpc,
         &wallet.address,
         fee_outpoint.as_ref(),
-        DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE,
+        est_fee_budget + MIN_UTXO_VALUE,
     )
     .await?;
 
@@ -771,18 +894,15 @@ pub async fn receipt_consume_v1(
     );
 
     let total_in = receipt_value + fee_utxo.utxo_entry.amount;
-    let output_value = total_in.saturating_sub(DEFAULT_MATCHER_FEE);
+    let tentative_output = total_in.saturating_sub(est_fee_budget);
 
-    if output_value < MIN_UTXO_VALUE {
+    if tentative_output < MIN_UTXO_VALUE {
         anyhow::bail!(
             "Output value {} sompi below MIN_UTXO_VALUE {}",
-            output_value,
+            tentative_output,
             MIN_UTXO_VALUE
         );
     }
-
-    println!("Output Value:  {} sompi", output_value);
-    println!();
 
     // Build the consume TX
     let mut tx = Transaction::new(0);
@@ -812,7 +932,10 @@ pub async fn receipt_consume_v1(
 
     // Output 0: wallet
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    tx.outputs.push(TxOutput::new(output_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+
+    // Phase 1: converge fee using estimated sigscript sizes
+    let (est_fee, _) = converge_fee(&mut tx, total_in, 0, 0);
 
     // Sign receipt input (index 0) -- recipient's signature
     let receipt_sighash = compute_sighash(&tx, 0)?;
@@ -827,7 +950,37 @@ pub async fn receipt_consume_v1(
     let fee_sig = signing::schnorr_sign(&privkey, &fee_sighash)?;
     let fee_ss = signing::build_p2pk_sigscript(&fee_sig);
 
-    println!("Sighash[1]:    {}", hex::encode(fee_sighash));
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let storage_mass = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass);
+
+    // If exact fee exceeds estimated fee, re-adjust output and re-sign
+    let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+        let output_value = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = output_value;
+
+        // Re-sign with updated output value
+        let receipt_sighash = compute_sighash(&tx, 0)?;
+        let receipt_sig = signing::schnorr_sign(&privkey, &receipt_sighash)?;
+        let receipt_ss = contract::build_receipt_consume_sigscript(&receipt_sig, &pubkey, &receipt_rs);
+        let fee_sighash = compute_sighash(&tx, 1)?;
+        let fee_sig = signing::schnorr_sign(&privkey, &fee_sighash)?;
+        let fee_ss = signing::build_p2pk_sigscript(&fee_sig);
+
+        (receipt_ss, fee_ss, exact_fee)
+    } else {
+        (receipt_ss, fee_ss, est_fee)
+    };
+
+    let output_value = tx.outputs[0].value;
+    println!("Output Value:  {} sompi", output_value);
+    println!("Miner fee:     {} sompi", actual_fee);
     println!();
 
     // Submit
@@ -904,12 +1057,17 @@ mod tests {
     }
 
     #[test]
-    fn output_value_calculation() {
+    fn output_value_uses_mass_based_fee() {
+        // Mass-based fee for a 2-input, 1-output receipt consume TX
+        let est_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
+        assert!(est_fee > 0, "mass-based fee must be > 0");
+        assert!(est_fee < 10_000, "mass-based fee should be well below old 10_000 constant");
+
         let receipt_val = 3_000_000u64;
         let fee_val = 10_000_000u64;
         let total_in = receipt_val + fee_val;
-        let output = total_in.saturating_sub(kob_core::DEFAULT_MATCHER_FEE);
-        assert_eq!(output, 12_990_000);
+        let output = total_in.saturating_sub(est_fee);
+        assert!(output > 12_990_000, "mass-based fee should be smaller than old fixed 10_000");
         assert!(output >= kob_core::MIN_UTXO_VALUE);
     }
 }

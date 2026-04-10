@@ -9,7 +9,8 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee};
+use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
 
@@ -106,7 +107,6 @@ pub async fn run(
     let wallet = WalletFile::load(wallet_path)?;
     let _pubkey = wallet.public_key_bytes()?;
     let privkey = wallet.private_key_bytes()?;
-    let fee = fee_override.unwrap_or(DEFAULT_MATCHER_FEE);
 
     // Validate amount
     if amount_sompi == 0 {
@@ -132,10 +132,14 @@ pub async fn run(
         amount_sompi,
         amount_sompi as f64 / 1e8
     );
-    println!("Fee:     {} sompi", fee);
     println!();
 
-    let needed = amount_sompi + fee;
+    // Use a conservative estimate for UTXO selection (actual fee computed after TX construction).
+    let est_fee = fee_override.unwrap_or_else(|| {
+        // 1-in 2-out P2PK TX estimate
+        kob_core::mass::estimate_compute_mass(1, 2, 0)
+    });
+    let needed = amount_sompi + est_fee;
 
     // Connect and fetch UTXOs
     info!(address = %wallet.address, to = %to_address, amount = amount_sompi, "wallet send");
@@ -185,17 +189,12 @@ pub async fn run(
         total_in = acc;
     }
 
-    let change = total_in - amount_sompi - fee;
-
     println!("Selected {} input UTXO(s), total {} sompi", selected.len(), total_in);
     for u in &selected {
         println!(
             "  {}:{} ({} sompi)",
             u.outpoint.transaction_id, u.outpoint.index, u.utxo_entry.amount
         );
-    }
-    if change > 0 {
-        println!("Change:  {} sompi ({:.8} KAS)", change, change as f64 / 1e8);
     }
     println!();
 
@@ -218,24 +217,82 @@ pub async fn run(
     // Output 0: recipient
     tx.outputs.push(TxOutput::new(amount_sompi, recipient_spk_version, recipient_spk, None));
 
-    // Output 1: change back to wallet (if >= MIN_UTXO_VALUE)
-    if change >= MIN_UTXO_VALUE {
-        let wallet_spk = hex::decode(&selected[0].utxo_entry.script_public_key.script)?;
-        tx.outputs.push(TxOutput::new(change, selected[0].utxo_entry.script_public_key.version, wallet_spk, None));
-    } else if change > 0 {
-        println!(
-            "Change {} sompi below MIN_UTXO_VALUE, donated as additional fee.",
-            change
-        );
+    // Output 1: tentative change
+    let tentative_change = total_in.saturating_sub(amount_sompi + est_fee);
+    let wallet_spk = hex::decode(&selected[0].utxo_entry.script_public_key.script)?;
+    let has_change = tentative_change >= MIN_UTXO_VALUE;
+    if has_change {
+        tx.outputs.push(TxOutput::new(tentative_change, selected[0].utxo_entry.script_public_key.version, wallet_spk.clone(), None));
     }
 
-    // Sign all inputs
+    // Phase 1: converge fee on change output
+    let min_fee_override = fee_override.unwrap_or(0);
+    let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
+
+    let (phase1_fee, _) = if has_change {
+        converge_fee(&mut tx, total_in - amount_sompi, change_idx, min_fee_override)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+        (f, 0)
+    };
+
+    let change = if has_change { tx.outputs[change_idx].value } else { total_in.saturating_sub(amount_sompi + phase1_fee) };
+
+    // Remove change output if below MIN_UTXO_VALUE
+    if has_change && change < MIN_UTXO_VALUE {
+        tx.outputs.pop();
+        if change > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
+        }
+    } else if !has_change && change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(change, selected[0].utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+    } else if !has_change && change > 0 {
+        println!("Change {} sompi below MIN_UTXO_VALUE, donated as additional fee.", change);
+    }
+
+    // Sign all inputs (phase 1)
     let mut sigscripts = Vec::with_capacity(selected.len());
     for i in 0..selected.len() {
         let sighash = compute_sighash(&tx, i)?;
         let sig = signing::schnorr_sign(&privkey, &sighash)?;
         sigscripts.push(signing::build_p2pk_sigscript(&sig));
     }
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let storage_mass_val = {
+        let in_vals: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&in_vals, &out_vals)
+    };
+    let exact_fee = exact_mass.max(storage_mass_val).max(min_fee_override);
+
+    let actual_fee = if exact_fee > phase1_fee && tx.outputs.len() > 1 {
+        // Re-adjust change output
+        let cidx = tx.outputs.len() - 1;
+        let new_change = total_in.saturating_sub(amount_sompi + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[cidx].value = new_change;
+        } else {
+            tx.outputs.pop();
+            if new_change > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+            }
+        }
+        // Re-sign
+        sigscripts.clear();
+        for i in 0..tx.inputs.len() {
+            let sighash = compute_sighash(&tx, i)?;
+            let sig = signing::schnorr_sign(&privkey, &sighash)?;
+            sigscripts.push(signing::build_p2pk_sigscript(&sig));
+        }
+        exact_fee
+    } else {
+        phase1_fee
+    };
+
+    println!("Fee:     {} sompi", actual_fee);
+    println!();
 
     // Submit
     let payload = to_rpc_payload(&tx, &sigscripts);
@@ -303,24 +360,23 @@ mod tests {
     fn change_calculation() {
         let total_in: u64 = 100_000_000;
         let amount: u64 = 50_000_000;
-        let fee: u64 = DEFAULT_MATCHER_FEE;
+        // With mass-based fees, fee depends on TX structure. Use estimate for test.
+        let fee = kob_core::mass::estimate_compute_mass(1, 2, 0);
         let change = total_in - amount - fee;
-        assert_eq!(change, 49_990_000);
+        assert!(change > 0);
         assert!(change >= MIN_UTXO_VALUE);
     }
 
     #[test]
     fn change_below_min_utxo_donated() {
-        let total_in: u64 = 53_010_000; // amount + fee + tiny change
+        let total_in: u64 = 100_000_000;
         let amount: u64 = 50_000_000;
-        let fee: u64 = DEFAULT_MATCHER_FEE;
+        let fee = kob_core::mass::estimate_compute_mass(1, 2, 0);
         let change = total_in - amount - fee;
-        assert_eq!(change, 3_000_000);
-        // 3_000_000 == MIN_UTXO_VALUE, so this is exactly at the boundary
         assert!(change >= MIN_UTXO_VALUE);
 
-        // Below boundary
-        let total_in2: u64 = 50_010_001;
+        // Tiny total_in: change below dust
+        let total_in2: u64 = amount + fee + 1;
         let change2 = total_in2 - amount - fee;
         assert_eq!(change2, 1);
         assert!(change2 < MIN_UTXO_VALUE);
@@ -330,7 +386,8 @@ mod tests {
     fn multi_utxo_selection_logic() {
         // Simulate UTXO selection: need 100M, have 3 UTXOs of 40M each
         let utxo_values = vec![40_000_000u64, 40_000_000, 40_000_000];
-        let needed = 100_000_000u64 + DEFAULT_MATCHER_FEE;
+        let est_fee = kob_core::mass::estimate_compute_mass(1, 2, 0);
+        let needed = 100_000_000u64 + est_fee;
 
         let mut acc = 0u64;
         let mut count = 0;
@@ -346,12 +403,13 @@ mod tests {
     }
 
     #[test]
-    fn fee_override() {
-        let default_fee = DEFAULT_MATCHER_FEE;
-        assert_eq!(default_fee, 10_000);
+    fn fee_override_respected() {
         let custom_fee: u64 = 50_000;
-        let fee = Some(custom_fee).unwrap_or(DEFAULT_MATCHER_FEE);
+        let fee = Some(custom_fee).unwrap_or(0);
         assert_eq!(fee, 50_000);
+        // None case falls back to 0 (converge_fee handles actual computation)
+        let fee2: Option<u64> = None;
+        assert_eq!(fee2.unwrap_or(0), 0);
     }
 
     #[test]

@@ -23,7 +23,13 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::{DEFAULT_MATCHER_FEE, MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
+use kob_core::mass::{calc_miner_fee, calc_mass_with_sigscripts, compute_storage_mass};
+use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
+
+/// Conservative fee estimate (10,000 sompi) used for UTXO selection budgets
+/// and pre-filter profitability checks where the TX is not yet built.
+/// Actual miner fees are computed from TX mass after construction.
+const FEE_BUDGET: u64 = 10_000;
 pub use crate::order_cache::{OrderCache, OrderCacheEntry};
 use std::collections::HashMap;
 use std::path::Path;
@@ -131,9 +137,14 @@ pub fn find_crossing_pairs(orders: &[DetectedOrder], min_spread: f64) -> Vec<Cro
 }
 
 /// Compute expected match outputs for a crossing pair.
+///
+/// `miner_fee` is the estimated or exact miner fee in sompi. Pass
+/// `FEE_BUDGET` for pre-TX-build estimates; pass the mass-based fee
+/// after the TX is constructed for exact accounting.
 pub fn compute_match_outputs(
     buy: &DetectedOrder,
     sell: &DetectedOrder,
+    miner_fee: u64,
 ) -> anyhow::Result<MatchOutputs> {
     let expected_tokens = (buy.value as u128 * buy.price_num as u128 / buy.price_den as u128) as u64;
     let expected_kas = (sell.value as u128 * sell.price_num as u128 / sell.price_den as u128) as u64;
@@ -153,12 +164,12 @@ pub fn compute_match_outputs(
 
     let surplus = total_in - expected_kas - expected_tokens;
 
-    if surplus < DEFAULT_MATCHER_FEE {
+    if surplus < miner_fee {
         anyhow::bail!(
             "Match surplus too small: {} sompi available, but need {} sompi for fee. \
              Try matching orders with a larger price spread.",
             surplus,
-            DEFAULT_MATCHER_FEE
+            miner_fee
         );
     }
 
@@ -177,7 +188,7 @@ pub fn compute_match_outputs(
 
     // Receipt value (1 KAS) funded by matcher wallet, not from surplus
     let receipt_value = RECEIPT_VALUE;
-    let raw_change = surplus - DEFAULT_MATCHER_FEE;
+    let raw_change = surplus - miner_fee;
     let (final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
         (expected_kas, raw_change)
     } else {
@@ -276,8 +287,12 @@ pub async fn submit_match(
     let buyer_tokens = outputs.buyer_tokens;
     let receipt_value = outputs.receipt_value;
     let new_surplus = total_in - seller_kas_base - buyer_tokens;
-    let raw_change = new_surplus - receipt_value - DEFAULT_MATCHER_FEE;
-    let (final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
+
+    // Phase 1: build TX with estimated fee, then converge
+    // Use FEE_BUDGET as initial estimate; will be refined after signing.
+    let est_fee = FEE_BUDGET;
+    let raw_change = new_surplus.saturating_sub(receipt_value + est_fee);
+    let (mut final_seller_kas, mut matcher_change) = if raw_change >= MIN_UTXO_VALUE {
         (seller_kas_base, raw_change)
     } else {
         (seller_kas_base + raw_change, 0u64)
@@ -330,15 +345,69 @@ pub async fn submit_match(
 
     // Output 3: matcher change (optional)
     if matcher_change >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk, None));
+        tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk.clone(), None));
     }
+
+    // Phase 1 fee: estimate from unsigned TX mass
+    let est_fee_p1 = calc_miner_fee(&tx);
+
+    // Re-adjust outputs if estimated fee differs from initial estimate
+    let adj_change = new_surplus.saturating_sub(receipt_value + est_fee_p1);
+    let (adj_seller, adj_mc) = if adj_change >= MIN_UTXO_VALUE {
+        (seller_kas_base, adj_change)
+    } else {
+        (seller_kas_base + adj_change, 0u64)
+    };
+    tx.outputs[0].value = adj_seller;
+    // Handle matcher change output (index 3)
+    if adj_mc >= MIN_UTXO_VALUE {
+        if tx.outputs.len() > 3 { tx.outputs[3].value = adj_mc; }
+        else { tx.outputs.push(TxOutput::new(adj_mc, wallet_spk_version, wallet_spk.clone(), None)); }
+    } else if tx.outputs.len() > 3 {
+        tx.outputs.pop();
+    }
+    final_seller_kas = adj_seller;
+    matcher_change = adj_mc;
 
     // Sign fee input (index 2)
     let sighash = compute_sighash(&tx, 2)?;
     let sig = signing::schnorr_sign(privkey, &sighash)?;
     let fee_ss = signing::build_p2pk_sigscript(&sig);
 
-    let sigscripts = vec![buy_fill_ss, sell_fill_ss, fee_ss];
+    let mut sigscripts = vec![buy_fill_ss, sell_fill_ss, fee_ss];
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let sm_val = {
+        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&iv, &ov)
+    };
+    let exact_fee = exact_mass.max(sm_val);
+
+    if exact_fee > est_fee_p1 {
+        // Re-adjust outputs with exact fee
+        let adj_change2 = new_surplus.saturating_sub(receipt_value + exact_fee);
+        let (adj_sk2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
+            (seller_kas_base, adj_change2)
+        } else {
+            (seller_kas_base + adj_change2, 0u64)
+        };
+        tx.outputs[0].value = adj_sk2;
+        if adj_mc2 >= MIN_UTXO_VALUE {
+            if tx.outputs.len() > 3 { tx.outputs[3].value = adj_mc2; }
+            else { tx.outputs.push(TxOutput::new(adj_mc2, wallet_spk_version, wallet_spk.clone(), None)); }
+        } else if tx.outputs.len() > 3 {
+            tx.outputs.pop();
+        }
+        final_seller_kas = adj_sk2;
+        matcher_change = adj_mc2;
+        // Re-sign fee input
+        let sh = compute_sighash(&tx, 2)?;
+        let sf = signing::schnorr_sign(privkey, &sh)?;
+        *sigscripts.last_mut().unwrap() = signing::build_p2pk_sigscript(&sf);
+    }
+
     let payload = to_rpc_payload(&tx, &sigscripts);
 
     let tx_id = rpc.submit_transaction(payload).await?;
@@ -435,13 +504,14 @@ pub async fn submit_partial_buy_fill(
 
     let receipt_value = RECEIPT_VALUE;
     let total_in = buy.value + token_value + fee_value;
-    let needed = residual_value + expected_tokens + receipt_value + DEFAULT_MATCHER_FEE;
+    let fixed_outputs = residual_value + receipt_value;
+    let needed = fixed_outputs + expected_tokens + FEE_BUDGET;
     if total_in < needed {
         anyhow::bail!("Insufficient funds: total input ({} sompi) cannot cover required outputs ({} sompi). \
              Add more funding UTXOs or reduce the fill amount.", total_in, needed);
     }
-    let raw_change = total_in - needed;
-    let (final_buyer_tokens, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
+    let raw_change = total_in - fixed_outputs - expected_tokens - FEE_BUDGET;
+    let (mut final_buyer_tokens, mut matcher_change) = if raw_change >= MIN_UTXO_VALUE {
         (expected_tokens, raw_change)
     } else {
         (expected_tokens + raw_change, 0u64)
@@ -493,7 +563,27 @@ pub async fn submit_partial_buy_fill(
 
     // Output 3: matcher change (optional)
     if matcher_change >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk, None));
+        tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk.clone(), None));
+    }
+
+    // Phase 1: estimate fee from unsigned TX mass
+    let est_fee_p1 = calc_miner_fee(&tx);
+    {
+        let adj_change = total_in.saturating_sub(fixed_outputs + expected_tokens + est_fee_p1);
+        let (adj_bt, adj_mc) = if adj_change >= MIN_UTXO_VALUE {
+            (expected_tokens, adj_change)
+        } else {
+            (expected_tokens + adj_change, 0u64)
+        };
+        tx.outputs[1].value = adj_bt;
+        if adj_mc >= MIN_UTXO_VALUE {
+            if tx.outputs.len() > 3 { tx.outputs[3].value = adj_mc; }
+            else { tx.outputs.push(TxOutput::new(adj_mc, wallet_spk_version, wallet_spk.clone(), None)); }
+        } else if tx.outputs.len() > 3 {
+            tx.outputs.pop();
+        }
+        final_buyer_tokens = adj_bt;
+        matcher_change = adj_mc;
     }
 
     // Sign input 1 (token UTXO)
@@ -506,7 +596,42 @@ pub async fn submit_partial_buy_fill(
     let sig_2 = signing::schnorr_sign(privkey, &sighash_2)?;
     let fee_ss = signing::build_p2pk_sigscript(&sig_2);
 
-    let sigscripts = vec![buy_pf_ss, token_ss, fee_ss];
+    let mut sigscripts = vec![buy_pf_ss, token_ss, fee_ss];
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let sm_val = {
+        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&iv, &ov)
+    };
+    let exact_fee = exact_mass.max(sm_val);
+
+    if exact_fee > est_fee_p1 {
+        let adj_change2 = total_in.saturating_sub(fixed_outputs + expected_tokens + exact_fee);
+        let (adj_bt2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
+            (expected_tokens, adj_change2)
+        } else {
+            (expected_tokens + adj_change2, 0u64)
+        };
+        tx.outputs[1].value = adj_bt2;
+        if adj_mc2 >= MIN_UTXO_VALUE {
+            if tx.outputs.len() > 3 { tx.outputs[3].value = adj_mc2; }
+            else { tx.outputs.push(TxOutput::new(adj_mc2, wallet_spk_version, wallet_spk.clone(), None)); }
+        } else if tx.outputs.len() > 3 {
+            tx.outputs.pop();
+        }
+        final_buyer_tokens = adj_bt2;
+        matcher_change = adj_mc2;
+        // Re-sign inputs 1 and 2
+        let sh1 = compute_sighash(&tx, 1)?;
+        let sf1 = signing::schnorr_sign(privkey, &sh1)?;
+        sigscripts[1] = signing::build_p2pk_sigscript(&sf1);
+        let sh2 = compute_sighash(&tx, 2)?;
+        let sf2 = signing::schnorr_sign(privkey, &sh2)?;
+        sigscripts[2] = signing::build_p2pk_sigscript(&sf2);
+    }
+
     let payload = to_rpc_payload(&tx, &sigscripts);
     let tx_id = rpc.submit_transaction(payload).await?;
 
@@ -578,13 +703,14 @@ pub async fn submit_partial_sell_fill(
 
     let receipt_value = RECEIPT_VALUE;
     let total_in = sell.value + fee_value;
-    let needed = seller_kas + residual_value + receipt_value + DEFAULT_MATCHER_FEE;
+    let fixed_outputs = residual_value + receipt_value;
+    let needed = seller_kas + fixed_outputs + FEE_BUDGET;
     if total_in < needed {
         anyhow::bail!("Insufficient funds: total input ({} sompi) cannot cover required outputs ({} sompi). \
              Add more funding UTXOs or reduce the fill amount.", total_in, needed);
     }
     let raw_change = total_in - needed;
-    let (final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
+    let (mut final_seller_kas, mut matcher_change) = if raw_change >= MIN_UTXO_VALUE {
         (seller_kas, raw_change)
     } else {
         (seller_kas + raw_change, 0u64)
@@ -625,7 +751,27 @@ pub async fn submit_partial_sell_fill(
 
     // Output 3: matcher change (optional)
     if matcher_change >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk, None));
+        tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk.clone(), None));
+    }
+
+    // Phase 1: estimate fee from unsigned TX mass
+    let est_fee_p1 = calc_miner_fee(&tx);
+    {
+        let adj_change = total_in.saturating_sub(fixed_outputs + seller_kas + est_fee_p1);
+        let (adj_sk, adj_mc) = if adj_change >= MIN_UTXO_VALUE {
+            (seller_kas, adj_change)
+        } else {
+            (seller_kas + adj_change, 0u64)
+        };
+        tx.outputs[0].value = adj_sk;
+        if adj_mc >= MIN_UTXO_VALUE {
+            if tx.outputs.len() > 3 { tx.outputs[3].value = adj_mc; }
+            else { tx.outputs.push(TxOutput::new(adj_mc, wallet_spk_version, wallet_spk.clone(), None)); }
+        } else if tx.outputs.len() > 3 {
+            tx.outputs.pop();
+        }
+        final_seller_kas = adj_sk;
+        matcher_change = adj_mc;
     }
 
     // Sign input 1 (fee UTXO)
@@ -633,7 +779,39 @@ pub async fn submit_partial_sell_fill(
     let sig = signing::schnorr_sign(privkey, &sighash)?;
     let fee_ss = signing::build_p2pk_sigscript(&sig);
 
-    let sigscripts = vec![sell_pf_ss, fee_ss];
+    let mut sigscripts = vec![sell_pf_ss, fee_ss];
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let sm_val = {
+        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&iv, &ov)
+    };
+    let exact_fee = exact_mass.max(sm_val);
+
+    if exact_fee > est_fee_p1 {
+        let adj_change2 = total_in.saturating_sub(fixed_outputs + seller_kas + exact_fee);
+        let (adj_sk2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
+            (seller_kas, adj_change2)
+        } else {
+            (seller_kas + adj_change2, 0u64)
+        };
+        tx.outputs[0].value = adj_sk2;
+        if adj_mc2 >= MIN_UTXO_VALUE {
+            if tx.outputs.len() > 3 { tx.outputs[3].value = adj_mc2; }
+            else { tx.outputs.push(TxOutput::new(adj_mc2, wallet_spk_version, wallet_spk.clone(), None)); }
+        } else if tx.outputs.len() > 3 {
+            tx.outputs.pop();
+        }
+        final_seller_kas = adj_sk2;
+        matcher_change = adj_mc2;
+        // Re-sign fee input
+        let sh = compute_sighash(&tx, 1)?;
+        let sf = signing::schnorr_sign(privkey, &sh)?;
+        *sigscripts.last_mut().unwrap() = signing::build_p2pk_sigscript(&sf);
+    }
+
     let payload = to_rpc_payload(&tx, &sigscripts);
     let tx_id = rpc.submit_transaction(payload).await?;
 
@@ -675,11 +853,13 @@ pub struct CrossPairOutputs {
 ///   Output KAS: seller_kas + receipt + matcher_change + fee
 ///   Token A: sell.value -> token_a_forward (1:1, required by sell_v8 F4)
 ///   Token B: token_b_value -> buyer_tokens (from matcher inventory)
+/// `miner_fee` is the estimated or exact miner fee in sompi.
 pub fn compute_cross_pair_outputs(
     sell: &DetectedOrder,
     buy: &DetectedOrder,
     sell_kas_out: u64,
     buy_tokens: u64,
+    miner_fee: u64,
 ) -> anyhow::Result<CrossPairOutputs> {
     // Seller KAS = sell.value * sell.price_num / sell.price_den
     // This is the KAS the seller demands for their Token A.
@@ -706,11 +886,11 @@ pub fn compute_cross_pair_outputs(
     }
     let surplus = buy.value - sell_kas_out;
 
-    if surplus < DEFAULT_MATCHER_FEE {
+    if surplus < miner_fee {
         anyhow::bail!(
             "Match surplus too small: {} sompi available, but need {} sompi for fee. \
              Try matching orders with a larger price spread.",
-            surplus, DEFAULT_MATCHER_FEE,
+            surplus, miner_fee,
         );
     }
 
@@ -719,7 +899,7 @@ pub fn compute_cross_pair_outputs(
     let receipt_value = RECEIPT_VALUE;
     let include_receipt = true;
 
-    let raw_change = surplus.saturating_sub(DEFAULT_MATCHER_FEE);
+    let raw_change = surplus.saturating_sub(miner_fee);
     let (final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
         (sell_kas_out, raw_change)
     } else {
@@ -826,14 +1006,14 @@ pub async fn submit_cross_pair_match(
         + outputs.token_a_forward
         + outputs.receipt_value
         + outputs.matcher_change;
-    if total_in < total_out + DEFAULT_MATCHER_FEE {
+    if total_in < total_out + FEE_BUDGET {
         anyhow::bail!(
             "Insufficient funds: total input ({} sompi) cannot cover outputs ({} sompi) + fee ({} sompi). \
              Add more funding UTXOs.",
-            total_in, total_out, DEFAULT_MATCHER_FEE,
+            total_in, total_out, FEE_BUDGET,
         );
     }
-    let fee_change = total_in - total_out - DEFAULT_MATCHER_FEE;
+    let mut fee_change = total_in - total_out - FEE_BUDGET;
 
     // Buyer gets all of token_b (buy_v8 checks >=, so giving more is fine)
     let buyer_tokens_final = token_b_value;
@@ -907,9 +1087,30 @@ pub async fn submit_cross_pair_match(
         tx.outputs.push(TxOutput::new(outputs.matcher_change, wallet_spk_version, wallet_spk.clone(), None));
     }
 
-    // Output 5: fee UTXO change (optional)
-    if fee_change >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(fee_change, wallet_spk_version, wallet_spk, None));
+    // Track fee_change output index for Phase 2 adjustments
+    let fee_change_idx = if fee_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(fee_change, wallet_spk_version, wallet_spk.clone(), None));
+        Some(tx.outputs.len() - 1)
+    } else {
+        None
+    };
+
+    // Phase 1: estimate fee from unsigned TX mass
+    let est_fee_p1 = calc_miner_fee(&tx);
+    // Re-adjust fee_change with computed fee
+    {
+        let new_fee_change = total_in.saturating_sub(total_out + est_fee_p1);
+        if new_fee_change >= MIN_UTXO_VALUE {
+            if let Some(idx) = fee_change_idx {
+                tx.outputs[idx].value = new_fee_change;
+            } else {
+                tx.outputs.push(TxOutput::new(new_fee_change, wallet_spk_version, wallet_spk.clone(), None));
+            }
+            fee_change = new_fee_change;
+        } else if let Some(idx) = fee_change_idx {
+            tx.outputs.remove(idx);
+            fee_change = 0;
+        }
     }
 
     // Sign fee input (index 3)
@@ -917,7 +1118,37 @@ pub async fn submit_cross_pair_match(
     let sig = signing::schnorr_sign(privkey, &sighash)?;
     let fee_ss = signing::build_p2pk_sigscript(&sig);
 
-    let sigscripts = vec![sell_fill_ss, buy_fill_ss, token_ss, fee_ss];
+    let mut sigscripts = vec![sell_fill_ss, buy_fill_ss, token_ss, fee_ss];
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let sm_val = {
+        let iv: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
+        let ov: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+        compute_storage_mass(&iv, &ov)
+    };
+    let exact_fee = exact_mass.max(sm_val);
+
+    if exact_fee > est_fee_p1 {
+        // Re-adjust fee_change output
+        let new_fc = total_in.saturating_sub(total_out + exact_fee);
+        // Find fee_change output (last non-covenant, non-receipt output)
+        let last_idx = tx.outputs.len() - 1;
+        if new_fc >= MIN_UTXO_VALUE {
+            if fee_change > 0 { tx.outputs[last_idx].value = new_fc; }
+            else { tx.outputs.push(TxOutput::new(new_fc, wallet_spk_version, wallet_spk.clone(), None)); }
+        } else if fee_change > 0 {
+            tx.outputs.remove(last_idx);
+        }
+        fee_change = new_fc;
+        // Re-sign fee input
+        let sh = compute_sighash(&tx, 3)?;
+        let sf = signing::schnorr_sign(privkey, &sh)?;
+        *sigscripts.last_mut().unwrap() = signing::build_p2pk_sigscript(&sf);
+    }
+
+    let _ = fee_change; // suppress unused warning
+
     let payload = to_rpc_payload(&tx, &sigscripts);
 
     let tx_id = rpc.submit_transaction(payload).await?;
@@ -1052,7 +1283,7 @@ pub async fn run(
         let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
         let fee_utxo = wallet_utxos
             .iter()
-            .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= DEFAULT_MATCHER_FEE + MIN_UTXO_VALUE);
+            .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= FEE_BUDGET + MIN_UTXO_VALUE);
 
         if fee_utxo.is_none() && !dry_run {
             println!("  WARNING: No P2PK UTXO for fee payment. Skipping round.");
@@ -1215,7 +1446,7 @@ pub async fn run(
                     pair.spread,
                 );
 
-                match compute_match_outputs(&pair.buy, &pair.sell) {
+                match compute_match_outputs(&pair.buy, &pair.sell, FEE_BUDGET) {
                     Ok(outputs) => {
                         println!(
                             "         seller_kas={} buyer_tokens={} receipt={} change={}",
@@ -1314,7 +1545,7 @@ pub async fn run(
                         continue;
                     }
                     let surplus = buy_kas_in - sell_kas_out;
-                    if surplus < DEFAULT_MATCHER_FEE {
+                    if surplus < FEE_BUDGET {
                         continue;
                     }
 
@@ -1350,7 +1581,7 @@ pub async fn run(
                         }
                     } else if let Some(fee) = fee_utxo {
                         // Compute cross-pair output amounts
-                        match compute_cross_pair_outputs(sell, buy, sell_kas, buy_tokens) {
+                        match compute_cross_pair_outputs(sell, buy, sell_kas, buy_tokens, FEE_BUDGET) {
                             Ok(cp_outputs) => {
                                 // Find Token B UTXO from wallet (TOKEN_RS P2SH with sufficient value)
                                 let token_p2sh = build_p2sh(kob_core::TOKEN_RS);
@@ -1555,7 +1786,7 @@ mod tests {
     fn compute_match_outputs_basic() {
         let buy = make_test_order(OrderSide::Buy, 1, 2, 20_000_000);
         let sell = make_test_order(OrderSide::Sell, 1, 2, 20_000_000);
-        let outputs = compute_match_outputs(&buy, &sell).unwrap();
+        let outputs = compute_match_outputs(&buy, &sell, FEE_BUDGET).unwrap();
         // expected_tokens = 20M * 1 / 2 = 10M
         // expected_kas = 20M * 1 / 2 = 10M
         // total_in = 40M, surplus = 40M - 10M - 10M = 20M
@@ -1568,7 +1799,7 @@ mod tests {
     fn compute_match_outputs_no_crossing() {
         let buy = make_test_order(OrderSide::Buy, 1, 10, 10_000_000);
         let sell = make_test_order(OrderSide::Sell, 5, 1, 10_000_000);
-        let result = compute_match_outputs(&buy, &sell);
+        let result = compute_match_outputs(&buy, &sell, FEE_BUDGET);
         assert!(result.is_err(), "Non-crossing prices should fail");
     }
 
@@ -1860,7 +2091,7 @@ mod tests {
         let sell_kas = 20_000_000u64; // sell.value * sell.price_num / sell.price_den
         let buy_tokens = 30_000_000u64; // buy.value * buy.price_num / buy.price_den
 
-        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens).unwrap();
+        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens, FEE_BUDGET).unwrap();
 
         assert_eq!(outputs.token_a_forward, 10_000_000, "Token A forward = sell.value");
         assert!(outputs.seller_kas >= 20_000_000, "Seller gets at least sell_kas");
@@ -1875,17 +2106,17 @@ mod tests {
     fn cross_pair_outputs_minimal_surplus() {
         // Sell: 10M at price 1/1 -> wants 10M KAS
         let sell = make_cross_pair_order(OrderSide::Sell, 1, 1, 10_000_000, &"aa".repeat(32));
-        // Buy: 10_010_000 KAS (surplus = 10_000 = DEFAULT_MATCHER_FEE exactly)
+        // Buy: 10_010_000 KAS (surplus = 10_000 = FEE_BUDGET exactly)
         let buy = make_cross_pair_order(OrderSide::Buy, 1, 1, 10_010_000, &"bb".repeat(32));
 
         let sell_kas = 10_000_000u64;
         let buy_tokens = 10_010_000u64;
 
-        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens).unwrap();
+        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens, FEE_BUDGET).unwrap();
 
         assert!(outputs.include_receipt);
         assert_eq!(outputs.receipt_value, RECEIPT_VALUE);
-        // surplus = 10_000 = DEFAULT_MATCHER_FEE; raw_change = 0
+        // surplus = 10_000 = FEE_BUDGET; raw_change = 0
         // raw_change < MIN_UTXO_VALUE, so folded into seller_kas
         assert_eq!(outputs.matcher_change, 0, "Dust change folded into seller");
         assert_eq!(outputs.seller_kas, sell_kas, "No dust to fold when raw_change=0");
@@ -1894,13 +2125,13 @@ mod tests {
     #[test]
     fn cross_pair_outputs_insufficient_surplus() {
         let sell = make_cross_pair_order(OrderSide::Sell, 1, 1, 10_000_000, &"aa".repeat(32));
-        // Buy: 10_005_000 KAS -> surplus = 5_000 < DEFAULT_MATCHER_FEE (10_000)
+        // Buy: 10_005_000 KAS -> surplus = 5_000 < FEE_BUDGET (10_000)
         let buy = make_cross_pair_order(OrderSide::Buy, 1, 1, 10_005_000, &"bb".repeat(32));
 
         let sell_kas = 10_000_000u64;
         let buy_tokens = 10_005_000u64;
 
-        let result = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens);
+        let result = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens, FEE_BUDGET);
         assert!(result.is_err(), "Should fail with insufficient surplus");
     }
 
@@ -1913,7 +2144,7 @@ mod tests {
         let buy_tokens = 5_000_000u64;
 
         // buy.value (5M) < sell_kas (10M) -> should fail
-        let result = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens);
+        let result = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens, FEE_BUDGET);
         assert!(result.is_err(), "Should fail when buy value < seller kas");
     }
 
@@ -1923,7 +2154,7 @@ mod tests {
         let buy = make_cross_pair_order(OrderSide::Buy, 1, 1, 50_000_000, &"bb".repeat(32));
 
         // seller_kas = 1M < MIN_UTXO_VALUE (3M)
-        let result = compute_cross_pair_outputs(&sell, &buy, 1_000_000, 50_000_000);
+        let result = compute_cross_pair_outputs(&sell, &buy, 1_000_000, 50_000_000, FEE_BUDGET);
         assert!(result.is_err(), "Should fail when seller_kas < MIN_UTXO_VALUE");
     }
 
@@ -1933,7 +2164,7 @@ mod tests {
         let buy = make_cross_pair_order(OrderSide::Buy, 1, 1, 50_000_000, &"bb".repeat(32));
 
         // buyer_tokens = 1M < MIN_UTXO_VALUE (3M)
-        let result = compute_cross_pair_outputs(&sell, &buy, 10_000_000, 1_000_000);
+        let result = compute_cross_pair_outputs(&sell, &buy, 10_000_000, 1_000_000, FEE_BUDGET);
         assert!(result.is_err(), "Should fail when buyer_tokens < MIN_UTXO_VALUE");
     }
 
@@ -1947,10 +2178,10 @@ mod tests {
         let sell_kas = 15_000_000u64; // 5M * 3/1
         let buy_tokens = 25_000_000u64;
 
-        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens).unwrap();
+        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens, FEE_BUDGET).unwrap();
 
         // Surplus balance: buy.value = seller_kas + change + fee
-        let surplus_total = outputs.seller_kas + outputs.matcher_change + DEFAULT_MATCHER_FEE;
+        let surplus_total = outputs.seller_kas + outputs.matcher_change + FEE_BUDGET;
         assert_eq!(surplus_total, buy.value, "KAS surplus must balance: buy.value = seller_kas + change + fee");
 
         // Token A conservation
@@ -1965,15 +2196,15 @@ mod tests {
         let sell_kas = 10_000_000u64;
         let buy_tokens = 100_000_000u64;
 
-        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens).unwrap();
+        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens, FEE_BUDGET).unwrap();
 
         // surplus = 90M; fee = 10K; change = 89_990_000 (receipt funded by matcher, not surplus)
         assert!(outputs.matcher_change >= MIN_UTXO_VALUE, "Large surplus should produce change");
         assert!(outputs.include_receipt);
 
-        // Verify surplus balance: seller_kas + matcher_change + DEFAULT_MATCHER_FEE = buy.value
+        // Verify surplus balance: seller_kas + matcher_change + FEE_BUDGET = buy.value
         // (Receipt value comes from fee UTXOs, not from surplus)
-        let surplus_total = outputs.seller_kas + outputs.matcher_change + DEFAULT_MATCHER_FEE;
+        let surplus_total = outputs.seller_kas + outputs.matcher_change + FEE_BUDGET;
         assert_eq!(surplus_total, buy.value);
     }
 
@@ -1985,7 +2216,7 @@ mod tests {
         let sell_kas = 20_000_000u64;
         let buy_tokens = 25_000_000u64;
 
-        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens).unwrap();
+        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens, FEE_BUDGET).unwrap();
 
         // CrossPairOutputs should have all expected fields
         let _ = outputs.seller_kas;
@@ -2015,14 +2246,14 @@ mod tests {
         let sell_kas = 10_000_000u64;
         let buy_tokens = 11_010_000u64;
 
-        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens).unwrap();
+        let outputs = compute_cross_pair_outputs(&sell, &buy, sell_kas, buy_tokens, FEE_BUDGET).unwrap();
 
         assert_eq!(outputs.matcher_change, 0, "Dust change should be folded");
         // raw_change (1M) is added to seller_kas
         assert_eq!(outputs.seller_kas, sell_kas + 1_000_000, "Dust folded into seller_kas");
 
         // Surplus balance check (receipt from fee UTXOs, not surplus)
-        let surplus_total = outputs.seller_kas + outputs.matcher_change + DEFAULT_MATCHER_FEE;
+        let surplus_total = outputs.seller_kas + outputs.matcher_change + FEE_BUDGET;
         assert_eq!(surplus_total, buy.value);
     }
 }

@@ -189,8 +189,8 @@ pub const INSURANCE_OFFER_BODY: &[u8] = &[
     // stack: min_cov(0) ... owner(4) pk(5) sig(6) new_prem(7) [8]
     //
     // Sig verify
-    0x57, 0x7a,                   // Op7 OpRoll -> sig to top                               [2B]
-    0x57, 0x7a,                   // Op7 OpRoll -> pk to top                                [2B]
+    0x56, 0x7a,                   // Op6 OpRoll -> sig to top                               [2B]
+    0x56, 0x7a,                   // Op6 OpRoll -> pk to top                                [2B]
     0xad,                         // OpCheckSigVerify                                        [1B]
     // stack: min_cov(0) ... owner(4) new_prem(5) [6]
     //

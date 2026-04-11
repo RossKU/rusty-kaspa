@@ -949,23 +949,12 @@ pub async fn deploy_sell(
             if token_input_value > 0 && i == 0 {
                 let mint_rs = contract::build_token_mint_redeem_script(pubkey);
                 let unit_rs = contract::build_token_unit_redeem_script(pubkey);
-                let token_rs = if tx.inputs[0].script_bytes == build_p2sh(&mint_rs).script() {
-                    mint_rs
+                let is_mint = tx.inputs[0].script_bytes == build_p2sh(&mint_rs).script();
+                if is_mint {
+                    sigscripts.push(contract::build_token_mint_sigscript(&signature, &mint_rs));
                 } else {
-                    unit_rs
-                };
-                let mut ss = Vec::with_capacity(66 + 2 + token_rs.len());
-                ss.push(65);
-                ss.extend_from_slice(&signature);
-                ss.push(0x01);
-                if token_rs.len() < 76 {
-                    ss.push(token_rs.len() as u8);
-                } else {
-                    ss.push(0x4c);
-                    ss.push(token_rs.len() as u8);
+                    sigscripts.push(contract::build_token_unit_sigscript(&signature, &unit_rs));
                 }
-                ss.extend_from_slice(&token_rs);
-                sigscripts.push(ss);
             } else {
                 sigscripts.push(signing::build_p2pk_sigscript(&signature));
             }

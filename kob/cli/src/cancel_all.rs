@@ -19,7 +19,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletFile;
-use kob_core::mass::estimate_compute_mass;
+use kob_core::mass::{estimate_compute_mass, calc_mass_with_sigscripts};
 use kob_core::MIN_UTXO_VALUE;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -122,12 +122,7 @@ pub fn build_cancel_tx(
     // Output 0: recovered funds to wallet
     tx.outputs.push(TxOutput::new(tentative_output, fee_utxo_spk_version, fee_utxo_spk_bytes.to_vec(), None));
 
-    // Second pass: compute exact fee from built TX (max of compute and storage mass).
-    let actual_fee = kob_core::mass::calc_miner_fee(&tx);
-    let output_value = total_in - actual_fee;
-    tx.outputs[0].value = output_value;
-
-    // Sign input 0 (order cancel)
+    // Phase 1: sign with estimated fee
     let sighash_0 = compute_sighash(&tx, 0)?;
     let sig_0 = signing::schnorr_sign(privkey, &sighash_0)?;
 
@@ -137,10 +132,38 @@ pub fn build_cancel_tx(
         _ => anyhow::bail!("Unknown order side '{}'. Expected 'buy' or 'sell'.", order.side),
     };
 
-    // Sign input 1 (fee UTXO)
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = signing::schnorr_sign(privkey, &sighash_1)?;
     let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
+
+    // Phase 2: exact mass with real sigscripts
+    let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
+    let exact_mass = kob_core::mass::calc_mass_with_sigscripts(&tx, &sigscripts);
+    let exact_fee = exact_mass;
+
+    let (cancel_sigscript, fee_sigscript, output_value) = if exact_fee > est_fee {
+        // Re-adjust output and re-sign
+        let output_value = total_in.saturating_sub(exact_fee);
+        tx.outputs[0].value = output_value;
+
+        let sighash_0 = compute_sighash(&tx, 0)?;
+        let sig_0 = signing::schnorr_sign(privkey, &sighash_0)?;
+        let cancel_sigscript = match order.side.as_str() {
+            "buy" => contract::build_buy_cancel_sigscript(&sig_0, pubkey, &redeem_script),
+            "sell" => contract::build_sell_cancel_sigscript(&sig_0, pubkey, &redeem_script),
+            _ => unreachable!(),
+        };
+
+        let sighash_1 = compute_sighash(&tx, 1)?;
+        let sig_1 = signing::schnorr_sign(privkey, &sighash_1)?;
+        let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
+
+        (cancel_sigscript, fee_sigscript, output_value)
+    } else {
+        let output_value = total_in.saturating_sub(est_fee);
+        tx.outputs[0].value = output_value;
+        (cancel_sigscript, fee_sigscript, output_value)
+    };
 
     Ok((tx, vec![cancel_sigscript, fee_sigscript], output_value))
 }

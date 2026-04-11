@@ -1120,6 +1120,21 @@ async fn cancel(
     let expiry_daa = u64::from_le_bytes(expiry_bytes);
     println!("Expiry DAA:   {}", expiry_daa);
 
+    // Verify the option has expired (CLTV requires lockTime >= expiry_daa,
+    // and consensus requires lockTime < current_daa for finalization).
+    let current_daa = rpc.get_daa_score().await?;
+    println!("Current DAA:  {}", current_daa);
+    if current_daa <= expiry_daa {
+        anyhow::bail!(
+            "Option has not expired yet. Current DAA score {} <= expiry_daa {}. \
+             The cancel path uses CLTV which requires the option to have expired. \
+             Use 'option expire' after DAA score {}.",
+            current_daa,
+            expiry_daa,
+            expiry_daa + 1
+        );
+    }
+
     // Cancel TX layout:
     //   input[0]: option UTXO (sigOpCount=1, cancel sigscript)
     //   input[1]: fee UTXO (P2PK, signed)

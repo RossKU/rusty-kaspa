@@ -651,7 +651,7 @@ async fn submit_consolidation_tx(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass;
 
-    if exact_fee > est_fee {
+    if exact_fee != est_fee {
         // Re-adjust outputs
         let actual_output = total_input.saturating_sub(exact_fee);
         let per_out = actual_output / target_count as u64;

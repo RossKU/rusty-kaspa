@@ -318,7 +318,7 @@ pub async fn token_create(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
     let exact_fee = exact_mass;
-    let (sigscript, actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let (sigscript, actual_fee) = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_in_create.saturating_sub(amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE {
@@ -601,7 +601,7 @@ pub async fn token_mint(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_mint);
     let exact_fee = exact_mass;
 
-    let (sigscript_0, sigscript_1) = if exact_fee > est_fee_mint && tx.outputs.len() > 2 {
+    let (sigscript_0, sigscript_1) = if exact_fee != est_fee_mint && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_in_mint.saturating_sub(fixed_sum_mint + exact_fee);
         if new_change >= MIN_UTXO_VALUE {
@@ -764,7 +764,7 @@ pub async fn token_burn(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript_0.clone()]);
     let exact_fee = exact_mass;
-    let sigscript_0 = if exact_fee > est_fee {
+    let sigscript_0 = if exact_fee != est_fee {
         let new_output = mint_value.saturating_sub(exact_fee);
         tx.outputs[0].value = new_output;
         let sighash_0 = compute_sighash(&tx, 0)?;
@@ -1029,7 +1029,7 @@ pub async fn token_transfer(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_send);
     let exact_fee = exact_mass;
 
-    let (sigscript_0, sigscript_1) = if exact_fee > est_fee_send && tx.outputs.len() > 2 {
+    let (sigscript_0, sigscript_1) = if exact_fee != est_fee_send && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_in_send.saturating_sub(fixed_sum_send + exact_fee);
         if new_change >= MIN_UTXO_VALUE {

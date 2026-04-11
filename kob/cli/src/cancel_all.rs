@@ -141,8 +141,8 @@ pub fn build_cancel_tx(
     let exact_mass = kob_core::mass::calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass;
 
-    let (cancel_sigscript, fee_sigscript, output_value) = if exact_fee > est_fee {
-        // Re-adjust output and re-sign
+    let (cancel_sigscript, fee_sigscript, output_value) = if exact_fee != est_fee {
+        // Re-adjust output and re-sign (handles both over- and under-estimate)
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
 

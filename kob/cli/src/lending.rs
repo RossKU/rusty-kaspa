@@ -261,7 +261,7 @@ pub async fn deploy_offer(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
-    let actual_fee = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_input.saturating_sub(amount + exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -556,7 +556,7 @@ pub async fn deploy_request(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
-    let actual_fee = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_input.saturating_sub(collateral + exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -830,7 +830,7 @@ pub async fn cancel(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
         let sighash_0 = compute_sighash(&tx, 0)?;
@@ -1149,7 +1149,7 @@ pub async fn repay(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > est_fee_repay && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee_repay && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_in.saturating_sub(repay_total + exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -1376,7 +1376,7 @@ pub async fn claim_default(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_claim);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let (sigscripts, actual_fee) = if exact_fee > est_fee_claim {
+    let (sigscripts, actual_fee) = if exact_fee != est_fee_claim {
         let new_claim = collateral.saturating_sub(exact_fee);
         tx.outputs[0].value = new_claim;
         let sighash_0 = compute_sighash(&tx, 0)?;

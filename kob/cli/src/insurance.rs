@@ -483,7 +483,7 @@ async fn deploy_offer(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
-    let actual_fee = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_input.saturating_sub(value + exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -705,7 +705,7 @@ async fn cancel_offer(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
         let sighash_0 = compute_sighash(&tx, 0)?;
@@ -924,7 +924,7 @@ async fn replace_offer(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_rep);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let (replace_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee_rep && tx.outputs.len() > 1 {
+    let (replace_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_rep && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = fee_utxo.utxo_entry.amount.saturating_sub(exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -1108,7 +1108,7 @@ async fn claim_payout(
     let ss = vec![payout_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &ss);
     let exact_fee = exact_mass.max(min_fee_override);
-    let (payout_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee_po {
+    let (payout_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_po {
         tx.outputs[0].value = total_in.saturating_sub(exact_fee);
         let sh0 = compute_sighash(&tx, 0)?; let s0 = signing::schnorr_sign_secure(&privkey, &sh0)?;
         let ps = build_insurance_position_payout_sigscript(&s0, &pubkey, &redeem_script);
@@ -1303,7 +1303,7 @@ async fn release(
     let ss = vec![release_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &ss);
     let exact_fee = exact_mass.max(min_fee_override);
-    let (release_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee_rel && tx.outputs.len() > 1 {
+    let (release_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_rel && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = fee_utxo.utxo_entry.amount.saturating_sub(exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else { tx.outputs.pop(); }
@@ -1503,7 +1503,7 @@ async fn mutual_cancel(
     let ss = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &ss);
     let exact_fee = exact_mass.max(min_fee_override);
-    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee_mc {
+    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_mc {
         tx.outputs[0].value = total_in.saturating_sub(exact_fee);
         // cancel_sigscript doesn't depend on sighash, only fee input needs re-sign
         let sh1 = compute_sighash(&tx, 1)?; let s1 = signing::schnorr_sign_secure(&privkey, &sh1)?;
@@ -1674,7 +1674,7 @@ async fn timeout(
     let ss = vec![timeout_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &ss);
     let exact_fee = exact_mass.max(min_fee_override);
-    let (timeout_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee_to {
+    let (timeout_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_to {
         tx.outputs[0].value = total_in.saturating_sub(exact_fee);
         let sh0 = compute_sighash(&tx, 0)?; let s0 = signing::schnorr_sign_secure(&privkey, &sh0)?;
         let ts = build_insurance_position_timeout_sigscript(&s0, &pubkey, &redeem_script);

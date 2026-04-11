@@ -458,9 +458,9 @@ pub async fn deploy_buy(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > est_fee {
+    let actual_fee = if exact_fee != est_fee {
         if tx.outputs.len() > 1 {
-            // Re-adjust change output
+            // Re-adjust change output (upward if exact < est, downward if exact > est)
             let change_idx = tx.outputs.len() - 1;
             let new_change = total_input.saturating_sub(amount + exact_fee);
             if new_change >= MIN_UTXO_VALUE {
@@ -472,7 +472,7 @@ pub async fn deploy_buy(
                 }
             }
         } else {
-            // No change output — reduce order output by exact fee
+            // No change output — adjust order output by exact fee
             tx.outputs[0].value = total_input.saturating_sub(exact_fee);
         }
         // Re-sign
@@ -968,7 +968,7 @@ pub async fn deploy_sell(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > est_fee_sell {
+    let actual_fee = if exact_fee != est_fee_sell {
         if tx.outputs.len() > 1 {
             let change_idx = tx.outputs.len() - 1;
             let new_change = total_input.saturating_sub(amount + exact_fee);
@@ -981,7 +981,7 @@ pub async fn deploy_sell(
                 }
             }
         } else {
-            // No change output — reduce order output by exact fee
+            // No change output — adjust order output by exact fee
             tx.outputs[0].value = total_input.saturating_sub(exact_fee);
         }
         sigscripts = sign_all_inputs(&tx, &privkey, &pubkey, token_input_value)?;

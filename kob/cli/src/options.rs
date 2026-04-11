@@ -463,7 +463,7 @@ async fn deploy_call(
     let sigscripts_vec = vec![sigscript];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
     let exact_fee = exact_mass;
-    let sigscript = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let sigscript = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE { tx.outputs[change_idx].value = new_change; }
@@ -685,7 +685,7 @@ async fn deploy_put(
     let sigscripts_vec = vec![sigscript];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
     let exact_fee = exact_mass;
-    let sigscript = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let sigscript = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE { tx.outputs[change_idx].value = new_change; }
@@ -979,7 +979,7 @@ async fn exercise(
         let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_ex);
         let exact_fee = exact_mass;
 
-        let (exercise_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+        let (exercise_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
             // Re-adjust change output
             if tx.outputs.len() > 2 {
                 let change_idx = tx.outputs.len() - 1;
@@ -1202,7 +1202,7 @@ async fn cancel(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
     let exact_fee = exact_mass;
 
-    let (cancel_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+    let (cancel_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
 
@@ -1431,7 +1431,7 @@ async fn expire(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_expire);
     let exact_fee = exact_mass;
 
-    let (expire_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+    let (expire_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
 

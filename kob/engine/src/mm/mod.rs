@@ -930,7 +930,7 @@ async fn deploy_order(
     let exact_fee = exact_mass;
     let current_fee = total_in - tx.outputs.iter().map(|o| o.value).sum::<u64>();
 
-    let sigscript = if exact_fee > current_fee {
+    let sigscript = if exact_fee != current_fee {
         let adj_change = total_in.saturating_sub(amount + exact_fee);
         if adj_change >= MIN_UTXO_VALUE {
             if tx.outputs.len() > 1 { tx.outputs[1].value = adj_change; }
@@ -1101,7 +1101,7 @@ async fn cancel_order(
     let exact_fee = exact_mass;
 
     let current_fee = total_in - tx.outputs.iter().map(|o| o.value).sum::<u64>();
-    let (cancel_sigscript, fee_sigscript) = if exact_fee > current_fee {
+    let (cancel_sigscript, fee_sigscript) = if exact_fee != current_fee {
         let adj_output = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = adj_output;
         let sighash_0 = compute_sighash(&tx, 0)?;

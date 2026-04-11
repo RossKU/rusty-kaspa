@@ -358,7 +358,7 @@ pub async fn deploy_bracket_v4(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
     let exact_fee = exact_mass;
 
-    let (sigscript, actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let (sigscript, actual_fee) = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE {
@@ -743,7 +743,7 @@ pub async fn fill_bracket_v4(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_fill);
     let exact_fee = exact_mass;
 
-    let (bracket_fill_ss, fee_sigscript, receipt_sigscript, actual_fee) = if exact_fee > est_fee {
+    let (bracket_fill_ss, fee_sigscript, receipt_sigscript, actual_fee) = if exact_fee != est_fee {
         // Re-adjust change or seller output
         if tx.outputs.len() > 4 {
             let change_idx = tx.outputs.len() - 1;
@@ -931,7 +931,7 @@ pub async fn cancel_bracket_v4(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
     let exact_fee = exact_mass;
 
-    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
 
@@ -1219,7 +1219,7 @@ pub async fn run(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
     let exact_fee = exact_mass;
 
-    let (sigscript, _actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let (sigscript, _actual_fee) = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE {

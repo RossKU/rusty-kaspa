@@ -248,7 +248,7 @@ pub async fn run(
     let exact_fee = exact_mass;
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
-    let (cancel_sigscript, fee_sigscript) = if exact_fee > est_fee {
+    let (cancel_sigscript, fee_sigscript) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         cancel_tx.outputs[0].value = output_value;
 

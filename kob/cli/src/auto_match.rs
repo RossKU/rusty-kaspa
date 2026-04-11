@@ -379,7 +379,7 @@ pub async fn submit_match(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass;
 
-    if exact_fee > est_fee_p1 {
+    if exact_fee != est_fee_p1 {
         // Re-adjust outputs with exact fee
         let adj_change2 = new_surplus.saturating_sub(receipt_value + exact_fee);
         let (adj_sk2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
@@ -596,7 +596,7 @@ pub async fn submit_partial_buy_fill(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass;
 
-    if exact_fee > est_fee_p1 {
+    if exact_fee != est_fee_p1 {
         let adj_change2 = total_in.saturating_sub(fixed_outputs + expected_tokens + exact_fee);
         let (adj_bt2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
             (expected_tokens, adj_change2)
@@ -774,7 +774,7 @@ pub async fn submit_partial_sell_fill(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass;
 
-    if exact_fee > est_fee_p1 {
+    if exact_fee != est_fee_p1 {
         let adj_change2 = total_in.saturating_sub(fixed_outputs + seller_kas + exact_fee);
         let (adj_sk2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
             (seller_kas, adj_change2)
@@ -1108,7 +1108,7 @@ pub async fn submit_cross_pair_match(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass;
 
-    if exact_fee > est_fee_p1 {
+    if exact_fee != est_fee_p1 {
         // Re-adjust fee_change output
         let new_fc = total_in.saturating_sub(total_out + exact_fee);
         // Find fee_change output (last non-covenant, non-receipt output)

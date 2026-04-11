@@ -454,7 +454,7 @@ async fn deploy(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
     let exact_fee = exact_mass;
 
-    let (sigscript, _actual_fee) = if exact_fee > est_fee && tx.outputs.len() > 2 {
+    let (sigscript, _actual_fee) = if exact_fee != est_fee && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(total_amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE {
@@ -920,7 +920,7 @@ async fn cancel(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
     let exact_fee = exact_mass;
 
-    let (buy_cancel_ss, sell_cancel_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+    let (buy_cancel_ss, sell_cancel_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
 

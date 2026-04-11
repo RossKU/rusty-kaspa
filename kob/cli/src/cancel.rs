@@ -292,7 +292,7 @@ pub async fn run(
     let exact_fee = exact_mass.max(min_fee_override);
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
-    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         let fixed_sum = 0u64; // no fixed outputs in cancel TX
         let output_value = total_in.saturating_sub(fixed_sum + exact_fee);
         tx.outputs[0].value = output_value;
@@ -343,7 +343,7 @@ pub async fn run(
         );
         println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
         println!("Miner fee:        {:>9} sompi", actual_fee);
-        if exact_fee > est_fee {
+        if exact_fee != est_fee {
             println!("  (phase-2 adjustment: est={} -> exact={})", est_fee, exact_fee);
         }
         let surplus = fee_utxo.utxo_entry.amount.saturating_sub(actual_fee);

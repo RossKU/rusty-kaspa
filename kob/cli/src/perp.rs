@@ -545,7 +545,7 @@ async fn deploy_perp(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > est_fee_deploy && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee_deploy && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(margin + exact_fee);
         if new_change >= MIN_UTXO_VALUE {
@@ -791,7 +791,7 @@ async fn cancel_perp(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+    let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
         let sighash_0 = compute_sighash(&tx, 0)?;
@@ -1114,7 +1114,7 @@ async fn liquidate_perp(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_liq);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let (liq_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee_liq {
+    let (liq_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_liq {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
         let liq_sigscript = perp::build_perp_liquidation_sigscript(&redeem_script);
@@ -1365,7 +1365,7 @@ async fn add_margin_perp(
     let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > est_fee_am && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee_am && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = funding_total.saturating_sub(amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE {
@@ -1616,7 +1616,7 @@ async fn settle_perp(
     let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > est_fee_settle && has_change_settle && tx.outputs.len() > 2 {
+    let actual_fee = if exact_fee != est_fee_settle && has_change_settle && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_in_settle.saturating_sub(fixed_sum_settle + exact_fee);
         if new_change >= MIN_UTXO_VALUE {

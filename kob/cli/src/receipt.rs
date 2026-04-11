@@ -374,7 +374,7 @@ pub async fn receipt_create(
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
     let exact_fee = exact_mass;
 
-    let sigscript = if exact_fee > est_fee && tx.outputs.len() > 1 {
+    let sigscript = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE {
@@ -565,7 +565,7 @@ pub async fn receipt_consume(
     let exact_fee = exact_mass;
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
-    let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+    let (receipt_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
 
@@ -764,7 +764,7 @@ pub async fn receipt_trigger(
     let exact_fee = exact_mass;
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
-    let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+    let (receipt_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
 
@@ -941,7 +941,7 @@ pub async fn receipt_consume_v1(
     let exact_fee = exact_mass;
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
-    let (receipt_ss, fee_ss, actual_fee) = if exact_fee > est_fee {
+    let (receipt_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = output_value;
 

@@ -302,7 +302,7 @@ pub async fn run(
     let exact_fee = exact_mass.max(min_fee_override);
 
     // If exact fee exceeds estimated fee, re-adjust and re-sign
-    let (cancel_mark_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+    let (cancel_mark_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         // Re-adjust change output or absorb into fee
         if tx.outputs.len() > 1 {
             let change_idx = tx.outputs.len() - 1;

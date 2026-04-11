@@ -851,18 +851,25 @@ pub async fn token_transfer(
     println!("Connecting to {}...", node_url);
     let rpc = NodeClient::connect(node_url).await?;
 
-    // Fetch the token UTXO by querying the wallet address
+    // Token UTXOs live at the P2SH address derived from token_unit_redeem_script,
+    // not the wallet's P2PK address. Query the P2SH address.
+    let p2sh_address = crate::cancel::p2sh_to_address(&p2sh.script(), _network.address_prefix());
+    println!("Token P2SH Address: {}", p2sh_address);
+    let p2sh_utxos = rpc.get_utxos_by_addresses(&[&p2sh_address]).await?;
+
+    // Also get wallet UTXOs for fee payment
     let all_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
 
-    // Find the specific token UTXO
-    let token_utxo = all_utxos
+    // Find the specific token UTXO at the P2SH address
+    let token_utxo = p2sh_utxos
         .iter()
         .find(|u| u.outpoint.transaction_id == txid && u.outpoint.index == index)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "Token UTXO {}:{} not found in wallet UTXOs. It may have been spent or belongs to a different address.",
+                "Token UTXO {}:{} not found at P2SH address {}. It may have been spent.",
                 txid,
-                index
+                index,
+                p2sh_address
             )
         })?;
 

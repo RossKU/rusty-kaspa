@@ -280,9 +280,7 @@ pub async fn run(
         // Verify the order UTXO still exists on-chain
         let redeem_script = build_redeem_script_for_order(order, &pubkey)?;
         let p2sh = build_p2sh(&redeem_script);
-        let p2sh_address = crate::cancel::kaspa_address_encode(
-            network.address_prefix(), 1, &p2sh.script()[2..34],
-        );
+        let p2sh_address = crate::cancel::p2sh_to_address(&p2sh.script(), network.address_prefix());
 
         let parts: Vec<&str> = order.outpoint.split(':').collect();
         let order_txid = parts[0];

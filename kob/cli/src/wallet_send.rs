@@ -262,7 +262,7 @@ pub async fn run(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > phase1_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != phase1_fee && tx.outputs.len() > 1 {
         // Re-adjust change output
         let cidx = tx.outputs.len() - 1;
         let new_change = total_in.saturating_sub(amount_sompi + exact_fee);

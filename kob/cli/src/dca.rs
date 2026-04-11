@@ -457,7 +457,7 @@ async fn deploy(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass;
 
-    if exact_fee > phase1_fee && tx.outputs.len() > 1 {
+    if exact_fee != phase1_fee && tx.outputs.len() > 1 {
         let cidx = tx.outputs.len() - 1;
         let residual = funding.utxo_entry.amount.saturating_sub(total_value);
         let new_change = residual.saturating_sub(exact_fee);
@@ -744,7 +744,7 @@ async fn fill(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_check);
     let exact_fee = exact_mass;
 
-    let (fill_ss_final, fee_ss_final) = if exact_fee > phase1_fee && filler_output_idx < tx.outputs.len() {
+    let (fill_ss_final, fee_ss_final) = if exact_fee != phase1_fee && filler_output_idx < tx.outputs.len() {
         // Re-adjust filler output
         let fixed_sum: u64 = tx.outputs.iter().enumerate()
             .filter(|(i, _)| *i != filler_output_idx)
@@ -936,7 +936,7 @@ async fn cancel(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_check);
     let exact_fee = exact_mass;
 
-    let (cancel_ss_final, fee_ss_final) = if exact_fee > phase1_fee {
+    let (cancel_ss_final, fee_ss_final) = if exact_fee != phase1_fee {
         // Re-adjust output
         let new_output = total_in.saturating_sub(exact_fee);
         tx.outputs[0].value = new_output;

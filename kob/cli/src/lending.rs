@@ -1693,8 +1693,8 @@ pub async fn liquidate(
     let total_in_liq: u64 = tx.inputs.iter().map(|i| i.value).sum();
     let total_out_liq: u64 = tx.outputs.iter().map(|o| o.value).sum();
     let implicit_fee = total_in_liq.saturating_sub(total_out_liq);
-    if exact_fee > implicit_fee {
-        println!("WARNING: Exact mass fee {} exceeds implicit fee {}. TX may be rejected.", exact_fee, implicit_fee);
+    if exact_fee != implicit_fee {
+        println!("WARNING: Exact mass fee {} differs from implicit fee {}. TX may be rejected.", exact_fee, implicit_fee);
     }
 
     // Fee transparency

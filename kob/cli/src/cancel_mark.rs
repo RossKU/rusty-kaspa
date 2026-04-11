@@ -21,6 +21,7 @@ use crate::cancel;
 use crate::node::NodeClient;
 use crate::signing;
 use kob_core::contract;
+use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
@@ -138,6 +139,9 @@ pub async fn run(
 
     println!("Order Value:    {} sompi", order_value);
 
+    // Estimate fee for UTXO selection
+    let est_fee = estimate_compute_mass(2, 2, 0) + 500;
+
     // Get a fee UTXO from the wallet (or use override)
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let fee_utxo = if let Some(fee_op_str) = fee_utxo_override {
@@ -155,13 +159,16 @@ pub async fn run(
                 )
             })?
     } else {
-        wallet_utxos
+        let mut candidates: Vec<_> = wallet_utxos
             .iter()
-            .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= fee + MIN_UTXO_VALUE)
+            .filter(|u| !u.is_p2sh() && u.utxo_entry.amount >= est_fee + MIN_UTXO_VALUE)
+            .collect();
+        candidates.sort_by(|a, b| a.utxo_entry.amount.cmp(&b.utxo_entry.amount));
+        candidates.first().copied()
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No P2PK UTXO with >= {} sompi for fee payment. Use --fee-utxo to specify.",
-                    fee + MIN_UTXO_VALUE
+                    est_fee + MIN_UTXO_VALUE
                 )
             })?
     };
@@ -176,31 +183,9 @@ pub async fn run(
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
     let wallet_spk_version = fee_utxo.utxo_entry.script_public_key.version;
 
-    // Compute output amounts
-    // The order value stays the same (moved to new P2SH with cpend=1).
-    // Fee UTXO covers the fee; remainder goes back to wallet as change.
-    let _total_in = order_value + fee_value;
-    let change = fee_value.checked_sub(fee).ok_or_else(|| {
-        anyhow::anyhow!("Fee UTXO value ({}) < fee ({})", fee_value, fee)
-    })?;
-
-    println!();
-    println!("Cancel-Mark TX Outputs:");
-    println!("  output[0]: order (cpend=1) {} sompi (P2SH)", order_value);
-    if change >= MIN_UTXO_VALUE {
-        println!("  output[1]: fee change      {} sompi", change);
-    } else if change > 0 {
-        // Add dust change to order output
-        println!(
-            "  (change {} < MIN_UTXO, added to order output: {})",
-            change,
-            order_value + change
-        );
-    }
-    println!("  fee:                       {} sompi", fee);
-    println!();
-
-    // Build the cancel-mark transaction
+    // Build the cancel-mark transaction with tentative output values
+    let total_in = order_value + fee_value;
+    let tentative_change = fee_value.saturating_sub(est_fee);
     let mut tx = Transaction::new(0);
 
     // Input 0: order UTXO (P2SH, cancel-mark sigscript, sigOpCount=1)
@@ -225,20 +210,44 @@ pub async fn run(
         value: fee_value,
     });
 
-    // Output 0: order with cpend=1 (new P2SH address)
-    let order_out_value = if change >= MIN_UTXO_VALUE {
-        order_value
-    } else {
-        // Absorb dust change into order output
-        order_value + change
-    };
-
-    tx.outputs.push(TxOutput::new(order_out_value, target_p2sh.version, target_p2sh.script().to_vec(), None));
+    // Output 0: order with cpend=1 (new P2SH address) — value stays the same
+    tx.outputs.push(TxOutput::new(order_value, target_p2sh.version, target_p2sh.script().to_vec(), None));
 
     // Output 1: fee change (if above dust threshold)
-    if change >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(change, wallet_spk_version, wallet_spk, None));
+    if tentative_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tentative_change, wallet_spk_version, wallet_spk, None));
     }
+
+    // Phase 1: converge fee on change output
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let has_change = tentative_change >= MIN_UTXO_VALUE;
+    let (est_fee, _) = if has_change {
+        let change_idx = tx.outputs.len() - 1;
+        converge_fee(&mut tx, total_in, change_idx, min_fee_override)
+    } else {
+        // No change output — fee is total_in - order_value
+        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+        (f, 0)
+    };
+
+    let change = if has_change { tx.outputs[tx.outputs.len() - 1].value } else { 0 };
+
+    // Remove change output if below MIN_UTXO_VALUE
+    if has_change && change < MIN_UTXO_VALUE {
+        tx.outputs.pop();
+        if change > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
+        }
+    }
+
+    println!();
+    println!("Cancel-Mark TX Outputs:");
+    println!("  output[0]: order (cpend=1) {} sompi (P2SH)", tx.outputs[0].value);
+    if tx.outputs.len() > 1 {
+        println!("  output[1]: fee change      {} sompi", tx.outputs[1].value);
+    }
+    println!("  fee (est):                 {} sompi", est_fee);
+    println!();
 
     // Sign input 0 (order cancel-mark -- requires owner signature)
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -287,8 +296,68 @@ pub async fn run(
     let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
     let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
 
-    println!("Sighash[0]:     {}", hex::encode(sighash_0));
-    println!("Sighash[1]:     {}", hex::encode(sighash_1));
+    // Phase 2: exact mass check with real sigscripts
+    let sigscripts = vec![cancel_mark_sigscript.clone(), fee_sigscript.clone()];
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let exact_fee = exact_mass.max(min_fee_override);
+
+    // If exact fee exceeds estimated fee, re-adjust and re-sign
+    let (cancel_mark_sigscript, fee_sigscript, actual_fee) = if exact_fee > est_fee {
+        // Re-adjust change output or absorb into fee
+        if tx.outputs.len() > 1 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_in.saturating_sub(order_value + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+                if new_change > 0 {
+                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+                }
+            }
+        }
+
+        // Re-sign with updated output values
+        let sighash_0 = compute_sighash(&tx, 0)?;
+        let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
+        let cancel_mark_sigscript = match side {
+            "buy" => {
+                let mut ss = Vec::new();
+                ss.push(0x51);
+                let mut sig_typed = sig_0.to_vec();
+                sig_typed.push(0x01);
+                ss.push(sig_typed.len() as u8);
+                ss.extend_from_slice(&sig_typed);
+                ss.push(pubkey.len() as u8);
+                ss.extend_from_slice(&pubkey);
+                ss.extend_from_slice(&kob_core::push_data(&current_rs));
+                ss
+            }
+            "sell" => {
+                let mut ss = Vec::new();
+                let mut sig_typed = sig_0.to_vec();
+                sig_typed.push(0x01);
+                ss.push(sig_typed.len() as u8);
+                ss.extend_from_slice(&sig_typed);
+                ss.push(pubkey.len() as u8);
+                ss.extend_from_slice(&pubkey);
+                ss.push(0x53);
+                ss.extend_from_slice(&kob_core::push_data(&current_rs));
+                ss
+            }
+            _ => unreachable!(),
+        };
+        let sighash_1 = compute_sighash(&tx, 1)?;
+        let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
+        let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
+        (cancel_mark_sigscript, fee_sigscript, exact_fee)
+    } else {
+        (cancel_mark_sigscript, fee_sigscript, est_fee)
+    };
+
+    let order_out_value = tx.outputs[0].value;
+    println!("Compute mass:   {}", actual_fee);
+    println!("Miner fee:      {} sompi", actual_fee);
     println!();
 
     // Submit

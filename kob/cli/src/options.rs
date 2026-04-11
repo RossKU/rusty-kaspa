@@ -1124,6 +1124,13 @@ async fn cancel(
     // and consensus requires lockTime < current_daa for finalization).
     let current_daa = rpc.get_daa_score().await?;
     println!("Current DAA:  {}", current_daa);
+    if expiry_daa == u64::MAX {
+        anyhow::bail!(
+            "Option has no expiry (expiry_daa = u64::MAX). \
+             The cancel path uses CLTV which requires the option to have expired. \
+             A no-expiry option cannot be cancelled by the writer."
+        );
+    }
     if current_daa <= expiry_daa {
         anyhow::bail!(
             "Option has not expired yet. Current DAA score {} <= expiry_daa {}. \
@@ -1131,7 +1138,7 @@ async fn cancel(
              Use 'option expire' after DAA score {}.",
             current_daa,
             expiry_daa,
-            expiry_daa + 1
+            expiry_daa.saturating_add(1)
         );
     }
 

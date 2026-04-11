@@ -454,23 +454,33 @@ async fn deploy(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
     let exact_fee = exact_mass;
 
-    let (sigscript, _actual_fee) = if exact_fee != est_fee && tx.outputs.len() > 2 {
-        let change_idx = tx.outputs.len() - 1;
-        let new_change = total_input.saturating_sub(total_amount + exact_fee);
-        if new_change >= MIN_UTXO_VALUE {
-            tx.outputs[change_idx].value = new_change;
-        } else {
-            tx.outputs.pop();
-            if new_change > 0 {
-                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+    let (sigscript, actual_fee) = if exact_fee != est_fee {
+        if tx.outputs.len() > 2 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_input.saturating_sub(total_amount + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+                if new_change > 0 {
+                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+                }
             }
+            let sighash = compute_sighash(&tx, 0)?;
+            let signature = signing::schnorr_sign(&privkey, &sighash)?;
+            (signing::build_p2pk_sigscript(&signature), exact_fee)
+        } else {
+            (sigscripts_vec.into_iter().next().unwrap(), exact_fee)
         }
-        let sighash = compute_sighash(&tx, 0)?;
-        let signature = signing::schnorr_sign(&privkey, &sighash)?;
-        (signing::build_p2pk_sigscript(&signature), exact_fee)
     } else {
         (sigscripts_vec.into_iter().next().unwrap(), est_fee)
     };
+
+    // Fee transparency
+    let deploy_exact_compute = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
+    println!("Compute mass:     {:>9} (exact, post-sign)", deploy_exact_compute);
+    println!("Miner fee:        {:>9} sompi", actual_fee);
+    println!();
 
     // Submit
     let payload = to_rpc_payload(&tx, &[sigscript]);
@@ -740,8 +750,12 @@ async fn fill(
         "Output[1]:     {} sompi (owner cbp refund)",
         out1_value
     );
+    let fill_exact_compute = calc_mass_with_sigscripts(&tx, &[fill_ss.clone(), cbp_ss.clone()]);
     println!(
-        "Miner fee:     {} sompi",
+        "Compute mass:  {:>9} (exact, post-sign)", fill_exact_compute
+    );
+    println!(
+        "Miner fee:     {:>9} sompi",
         exact_fee
     );
 
@@ -946,7 +960,9 @@ async fn cancel(
     println!("Sell Cancel SS: {} bytes", sell_cancel_ss.len());
     println!("Fee SS:         {} bytes", fee_ss.len());
     println!("Output Value:  {} sompi", output_value);
-    println!("Miner fee:     {} sompi", actual_fee);
+    let cancel_exact_compute = calc_mass_with_sigscripts(&tx, &[buy_cancel_ss.clone(), sell_cancel_ss.clone(), fee_ss.clone()]);
+    println!("Compute mass:  {:>9} (exact, post-sign)", cancel_exact_compute);
+    println!("Miner fee:     {:>9} sompi", actual_fee);
     println!();
 
     // Submit

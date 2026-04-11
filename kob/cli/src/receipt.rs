@@ -374,6 +374,7 @@ pub async fn receipt_create(
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
     let exact_fee = exact_mass;
 
+    let _actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
     let sigscript = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(amount + exact_fee);

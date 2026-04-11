@@ -261,7 +261,8 @@ pub async fn deploy_offer(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
-    let actual_fee = if exact_fee != est_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
+    if exact_fee != est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_input.saturating_sub(amount + exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -274,8 +275,7 @@ pub async fn deploy_offer(
             let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
             sigscripts.push(signing::build_p2pk_sigscript(&signature));
         }
-        exact_fee
-    } else { est_fee };
+    }
 
     println!("Signed {} input(s)", sigscripts.len());
     println!();
@@ -556,7 +556,8 @@ pub async fn deploy_request(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
-    let actual_fee = if exact_fee != est_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
+    if exact_fee != est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_input.saturating_sub(collateral + exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -569,8 +570,7 @@ pub async fn deploy_request(
             let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
             sigscripts.push(signing::build_p2pk_sigscript(&signature));
         }
-        exact_fee
-    } else { est_fee };
+    }
 
     println!("Signed {} input(s)", sigscripts.len());
     println!();
@@ -1149,7 +1149,8 @@ pub async fn repay(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee != est_fee_repay && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee_repay { exact_fee } else { est_fee_repay };
+    if exact_fee != est_fee_repay && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_in.saturating_sub(repay_total + exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -1157,8 +1158,7 @@ pub async fn repay(
             if nc > 0 { println!("Borrower return {} sompi below MIN_UTXO_VALUE, donated as fee.", nc); }
         }
         sigscripts = sign_repay(&tx)?;
-        exact_fee
-    } else { est_fee_repay };
+    }
 
     println!("Repay SigScript:   {} bytes", sigscripts[0].len());
     println!();

@@ -545,22 +545,24 @@ async fn deploy_perp(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee != est_fee_deploy && tx.outputs.len() > 1 {
-        let change_idx = tx.outputs.len() - 1;
-        let new_change = total_input.saturating_sub(margin + exact_fee);
-        if new_change >= MIN_UTXO_VALUE {
-            tx.outputs[change_idx].value = new_change;
-        } else {
-            tx.outputs.pop();
-            if new_change > 0 {
-                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+    let actual_fee = if exact_fee != est_fee_deploy {
+        if tx.outputs.len() > 1 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_input.saturating_sub(margin + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+                if new_change > 0 {
+                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+                }
             }
-        }
-        sigscripts.clear();
-        for i in 0..tx.inputs.len() {
-            let sighash = compute_sighash(&tx, i)?;
-            let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
-            sigscripts.push(signing::build_p2pk_sigscript(&signature));
+            sigscripts.clear();
+            for i in 0..tx.inputs.len() {
+                let sighash = compute_sighash(&tx, i)?;
+                let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
+                sigscripts.push(signing::build_p2pk_sigscript(&signature));
+            }
         }
         exact_fee
     } else {
@@ -1365,18 +1367,20 @@ async fn add_margin_perp(
     let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee != est_fee_am && tx.outputs.len() > 1 {
-        let change_idx = tx.outputs.len() - 1;
-        let new_change = funding_total.saturating_sub(amount + exact_fee);
-        if new_change >= MIN_UTXO_VALUE {
-            tx.outputs[change_idx].value = new_change;
-        } else {
-            tx.outputs.pop();
-            if new_change > 0 {
-                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+    let actual_fee = if exact_fee != est_fee_am {
+        if tx.outputs.len() > 1 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = funding_total.saturating_sub(amount + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+                if new_change > 0 {
+                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+                }
             }
+            all_sigscripts = sign_add_margin(&tx)?;
         }
-        all_sigscripts = sign_add_margin(&tx)?;
         exact_fee
     } else {
         est_fee_am
@@ -1616,20 +1620,22 @@ async fn settle_perp(
     let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee != est_fee_settle && has_change_settle && tx.outputs.len() > 2 {
-        let change_idx = tx.outputs.len() - 1;
-        let new_change = total_in_settle.saturating_sub(fixed_sum_settle + exact_fee);
-        if new_change >= MIN_UTXO_VALUE {
-            tx.outputs[change_idx].value = new_change;
-        } else {
-            tx.outputs.pop();
-        }
-        // Re-sign fee UTXO
-        all_sigscripts = vec![settle_sigscript];
-        if fee_utxo.is_some() {
-            let sighash_1 = compute_sighash(&tx, 1)?;
-            let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
-            all_sigscripts.push(signing::build_p2pk_sigscript(&sig_1));
+    let actual_fee = if exact_fee != est_fee_settle {
+        if has_change_settle && tx.outputs.len() > 2 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_in_settle.saturating_sub(fixed_sum_settle + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+            }
+            // Re-sign fee UTXO
+            all_sigscripts = vec![settle_sigscript];
+            if fee_utxo.is_some() {
+                let sighash_1 = compute_sighash(&tx, 1)?;
+                let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
+                all_sigscripts.push(signing::build_p2pk_sigscript(&sig_1));
+            }
         }
         exact_fee
     } else {

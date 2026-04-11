@@ -475,8 +475,10 @@ async fn deploy(
         sigscripts = vec![signing::build_p2pk_sigscript(&signature)];
     }
 
-    println!("Sighash:    {}", hex::encode(&compute_sighash(&tx, 0)?));
-    println!("Signature:  (signed)");
+    let deploy_exact_compute = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let deploy_actual_fee = exact_fee;
+    println!("Compute mass:     {:>9} (exact, post-sign)", deploy_exact_compute);
+    println!("Miner fee:        {:>9} sompi", deploy_actual_fee);
     println!();
 
     // Submit
@@ -772,6 +774,9 @@ async fn fill(
         (fill_ss, fee_ss)
     };
 
+    let fill_exact_compute = calc_mass_with_sigscripts(&tx, &[fill_ss_final.clone(), fee_ss_final.clone()]);
+    println!("Compute mass:     {:>9} (exact, post-sign)", fill_exact_compute);
+    println!("Miner fee:        {:>9} sompi", exact_fee);
     println!("Fill SS:  {} bytes", fill_ss_final.len());
     println!("Fee SS:   {} bytes", fee_ss_final.len());
     println!();
@@ -958,6 +963,9 @@ async fn cancel(
         (cancel_ss, fee_ss)
     };
 
+    let cancel_exact_compute = calc_mass_with_sigscripts(&tx, &[cancel_ss_final.clone(), fee_ss_final.clone()]);
+    println!("Compute mass:     {:>9} (exact, post-sign)", cancel_exact_compute);
+    println!("Miner fee:        {:>9} sompi", exact_fee);
     println!("Cancel SS:  {} bytes", cancel_ss_final.len());
     println!("Fee SS:     {} bytes", fee_ss_final.len());
     println!();

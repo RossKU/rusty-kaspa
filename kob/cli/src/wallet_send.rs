@@ -262,7 +262,8 @@ pub async fn run(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee != phase1_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != phase1_fee { exact_fee } else { phase1_fee };
+    if exact_fee != phase1_fee && tx.outputs.len() > 1 {
         // Re-adjust change output
         let cidx = tx.outputs.len() - 1;
         let new_change = total_in.saturating_sub(amount_sompi + exact_fee);
@@ -281,10 +282,7 @@ pub async fn run(
             let sig = signing::schnorr_sign(&privkey, &sighash)?;
             sigscripts.push(signing::build_p2pk_sigscript(&sig));
         }
-        exact_fee
-    } else {
-        phase1_fee
-    };
+    }
 
     println!("Fee:     {} sompi", actual_fee);
     println!();

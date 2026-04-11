@@ -483,7 +483,8 @@ async fn deploy_offer(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
-    let actual_fee = if exact_fee != est_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
+    if exact_fee != est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = total_input.saturating_sub(value + exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -496,8 +497,7 @@ async fn deploy_offer(
             let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
             sigscripts.push(signing::build_p2pk_sigscript(&signature));
         }
-        exact_fee
-    } else { est_fee };
+    }
 
     println!("Signed {} input(s)", sigscripts.len());
     println!();
@@ -924,7 +924,8 @@ async fn replace_offer(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_rep);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let (replace_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_rep && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee_rep { exact_fee } else { est_fee_rep };
+    let (replace_sigscript, fee_sigscript) = if exact_fee != est_fee_rep && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = fee_utxo.utxo_entry.amount.saturating_sub(exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else {
@@ -937,9 +938,9 @@ async fn replace_offer(
         let sighash_1 = compute_sighash(&tx, 1)?;
         let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
         let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
-        (replace_sigscript, fee_sigscript, exact_fee)
+        (replace_sigscript, fee_sigscript)
     } else {
-        (replace_sigscript, fee_sigscript, est_fee_rep)
+        (replace_sigscript, fee_sigscript)
     };
 
     println!("Replace SigScript: {} bytes", replace_sigscript.len());
@@ -1303,15 +1304,16 @@ async fn release(
     let ss = vec![release_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &ss);
     let exact_fee = exact_mass.max(min_fee_override);
-    let (release_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_rel && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee_rel { exact_fee } else { est_fee_rel };
+    let (release_sigscript, fee_sigscript) = if exact_fee != est_fee_rel && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
         let nc = fee_utxo.utxo_entry.amount.saturating_sub(exact_fee);
         if nc >= MIN_UTXO_VALUE { tx.outputs[ci].value = nc; } else { tx.outputs.pop(); }
         let sh0 = compute_sighash(&tx, 0)?; let s0 = signing::schnorr_sign_secure(&privkey, &sh0)?;
         let rs = build_insurance_position_release_sigscript(&s0, &pubkey, &redeem_script);
         let sh1 = compute_sighash(&tx, 1)?; let s1 = signing::schnorr_sign_secure(&privkey, &sh1)?;
-        (rs, signing::build_p2pk_sigscript(&s1), exact_fee)
-    } else { (release_sigscript, fee_sigscript, est_fee_rel) };
+        (rs, signing::build_p2pk_sigscript(&s1))
+    } else { (release_sigscript, fee_sigscript) };
 
     println!("Release SigScript: {} bytes", release_sigscript.len());
 

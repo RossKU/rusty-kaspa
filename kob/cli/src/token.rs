@@ -318,7 +318,8 @@ pub async fn token_create(
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
     let exact_fee = exact_mass;
-    let (sigscript, actual_fee) = if exact_fee != est_fee && tx.outputs.len() > 1 {
+    let actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
+    let sigscript = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_in_create.saturating_sub(amount + exact_fee);
         if new_change >= MIN_UTXO_VALUE {
@@ -331,9 +332,9 @@ pub async fn token_create(
         }
         let sighash = compute_sighash(&tx, 0)?;
         let signature = signing::schnorr_sign(&privkey, &sighash)?;
-        (signing::build_p2pk_sigscript(&signature), exact_fee)
+        signing::build_p2pk_sigscript(&signature)
     } else {
-        (sigscript, est_fee)
+        sigscript
     };
 
     if total_in_create < 10_000_000_00 {
@@ -601,6 +602,7 @@ pub async fn token_mint(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_mint);
     let exact_fee = exact_mass;
 
+    let _actual_fee_mint = if exact_fee != est_fee_mint { exact_fee } else { est_fee_mint };
     let (sigscript_0, sigscript_1) = if exact_fee != est_fee_mint && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_in_mint.saturating_sub(fixed_sum_mint + exact_fee);
@@ -1029,6 +1031,7 @@ pub async fn token_transfer(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_send);
     let exact_fee = exact_mass;
 
+    let _actual_fee_send = if exact_fee != est_fee_send { exact_fee } else { est_fee_send };
     let (sigscript_0, sigscript_1) = if exact_fee != est_fee_send && tx.outputs.len() > 2 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_in_send.saturating_sub(fixed_sum_send + exact_fee);

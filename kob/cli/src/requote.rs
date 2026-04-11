@@ -413,7 +413,7 @@ pub async fn run(
     let exact_deploy_mass = calc_mass_with_sigscripts(&deploy_tx, &[deploy_sigscript.clone()]);
     let exact_deploy_fee = exact_deploy_mass;
 
-    let deploy_sigscript = if exact_deploy_fee > deploy_est_fee && deploy_tx.outputs.len() > 1 {
+    let deploy_sigscript = if exact_deploy_fee != deploy_est_fee && deploy_tx.outputs.len() > 1 {
         let change_idx = deploy_tx.outputs.len() - 1;
         let new_change = deploy_total_input.saturating_sub(new_params.amount + exact_deploy_fee);
         if new_change >= MIN_UTXO_VALUE {

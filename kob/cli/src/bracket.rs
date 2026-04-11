@@ -358,26 +358,32 @@ pub async fn deploy_bracket_v4(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
     let exact_fee = exact_mass;
 
-    let (sigscript, actual_fee) = if exact_fee != est_fee && tx.outputs.len() > 1 {
-        let change_idx = tx.outputs.len() - 1;
-        let new_change = total_input.saturating_sub(amount + exact_fee);
-        if new_change >= MIN_UTXO_VALUE {
-            tx.outputs[change_idx].value = new_change;
-        } else {
-            tx.outputs.pop();
-            if new_change > 0 {
-                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+    let (sigscript, actual_fee) = if exact_fee != est_fee {
+        if tx.outputs.len() > 1 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_input.saturating_sub(amount + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+                if new_change > 0 {
+                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+                }
             }
+            // Re-sign
+            let sighash = compute_sighash(&tx, 0)?;
+            let signature = signing::schnorr_sign(&privkey, &sighash)?;
+            (signing::build_p2pk_sigscript(&signature), exact_fee)
+        } else {
+            (sigscripts_vec.into_iter().next().unwrap(), exact_fee)
         }
-        // Re-sign
-        let sighash = compute_sighash(&tx, 0)?;
-        let signature = signing::schnorr_sign(&privkey, &sighash)?;
-        (signing::build_p2pk_sigscript(&signature), exact_fee)
     } else {
         (sigscripts_vec.into_iter().next().unwrap(), est_fee)
     };
 
-    println!("Miner fee:  {} sompi", actual_fee);
+    let deploy_exact_compute = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
+    println!("Compute mass:  {:>9} (exact, post-sign)", deploy_exact_compute);
+    println!("Miner fee:     {:>9} sompi", actual_fee);
     println!();
 
     // Submit
@@ -774,7 +780,9 @@ pub async fn fill_bracket_v4(
         (bracket_fill_ss, fee_sigscript, receipt_sigscript, est_fee)
     };
 
-    println!("Miner fee:      {} sompi", actual_fee);
+    let fill_exact_compute = calc_mass_with_sigscripts(&tx, &[bracket_fill_ss.clone(), fee_sigscript.clone(), receipt_sigscript.clone()]);
+    println!("Compute mass:   {:>9} (exact, post-sign)", fill_exact_compute);
+    println!("Miner fee:      {:>9} sompi", actual_fee);
     println!();
 
     // Submit
@@ -950,7 +958,9 @@ pub async fn cancel_bracket_v4(
 
     let output_value = tx.outputs[0].value;
     println!("Output Value:  {} sompi", output_value);
-    println!("Miner fee:     {} sompi", actual_fee);
+    let cancel_exact_compute = calc_mass_with_sigscripts(&tx, &[cancel_sigscript.clone(), fee_sigscript.clone()]);
+    println!("Compute mass:  {:>9} (exact, post-sign)", cancel_exact_compute);
+    println!("Miner fee:     {:>9} sompi", actual_fee);
     println!();
 
     // Submit
@@ -1219,20 +1229,24 @@ pub async fn run(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
     let exact_fee = exact_mass;
 
-    let (sigscript, _actual_fee) = if exact_fee != est_fee && tx.outputs.len() > 1 {
-        let change_idx = tx.outputs.len() - 1;
-        let new_change = total_input.saturating_sub(amount + exact_fee);
-        if new_change >= MIN_UTXO_VALUE {
-            tx.outputs[change_idx].value = new_change;
-        } else {
-            tx.outputs.pop();
-            if new_change > 0 {
-                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+    let (sigscript, _actual_fee) = if exact_fee != est_fee {
+        if tx.outputs.len() > 1 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_input.saturating_sub(amount + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+                if new_change > 0 {
+                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+                }
             }
+            let sighash = compute_sighash(&tx, 0)?;
+            let signature = signing::schnorr_sign(&privkey, &sighash)?;
+            (signing::build_p2pk_sigscript(&signature), exact_fee)
+        } else {
+            (sigscripts_vec.into_iter().next().unwrap(), exact_fee)
         }
-        let sighash = compute_sighash(&tx, 0)?;
-        let signature = signing::schnorr_sign(&privkey, &sighash)?;
-        (signing::build_p2pk_sigscript(&signature), exact_fee)
     } else {
         (sigscripts_vec.into_iter().next().unwrap(), est_fee)
     };

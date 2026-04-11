@@ -267,8 +267,10 @@ fn build_estimate(
 ) -> FeeEstimate {
     let transaction_mass = compute_transaction_mass(&inputs, &outputs);
     let storage_mass = compute_storage_mass(&inputs, &outputs);
-    let effective_storage = if storage_mass > 0 { storage_mass as u64 } else { 0 };
-    let effective_mass = std::cmp::max(transaction_mass, effective_storage);
+    // Mempool enforces compute mass only; storage mass affects block template
+    // priority but is not required for relay. Use compute mass for fee estimation
+    // to match actual deploy/cancel behavior.
+    let effective_mass = transaction_mass;
     let fee = std::cmp::max(effective_mass * FEE_PER_GRAM, MIN_RELAY_FEE);
 
     FeeEstimate {
@@ -916,11 +918,14 @@ mod tests {
 
 
     #[test]
-    fn effective_mass_storage_dominant() {
+    fn effective_mass_compute_only() {
         let est = estimate_deploy_buy(3_000_000, 8);
-        // At 3M sompi: storage mass = C/3M = 1_333_333 which dominates
-        assert!(est.effective_mass >= 1_333_333, "storage mass should dominate for small UTXO");
-        assert_eq!(est.effective_mass, std::cmp::max(est.transaction_mass, est.storage_mass.max(0) as u64));
+        // Effective mass uses compute mass only (mempool enforces compute mass;
+        // storage mass affects block template priority only).
+        assert_eq!(est.effective_mass, est.transaction_mass,
+            "effective mass should equal compute mass, not max(compute, storage)");
+        // Storage mass is still computed for informational display
+        assert!(est.storage_mass > 0, "storage mass should be positive for small output");
     }
 
     #[test]
@@ -931,8 +936,9 @@ mod tests {
         assert!(est.storage_mass <= 0,
             "storage mass should be negative for consolidation of large UTXOs: storage={}", est.storage_mass);
         assert!(est.transaction_mass > 0, "tx mass should be positive");
+        // Effective mass always equals compute mass (storage mass is informational only)
         assert_eq!(est.effective_mass, est.transaction_mass,
-            "effective mass should equal tx mass when storage is negative");
+            "effective mass should equal compute mass");
     }
 
 

@@ -425,12 +425,14 @@ pub async fn deploy_buy(
     let (est_fee, _) = if has_change {
         converge_fee(&mut tx, total_input, change_idx, min_fee_override)
     } else {
-        // No change output — fee is total_input - amount
+        // No change output — subtract fee from the order output
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-        (f, 0)
+        let adjusted = amount.saturating_sub(f);
+        tx.outputs[0].value = adjusted;
+        (f, adjusted)
     };
 
-    let change = if has_change { tx.outputs[change_idx].value } else { total_input.saturating_sub(amount + est_fee) };
+    let change = if has_change { tx.outputs[change_idx].value } else { total_input.saturating_sub(tx.outputs[0].value + est_fee) };
 
     // Remove change output if below MIN_UTXO_VALUE
     if has_change && change < MIN_UTXO_VALUE {
@@ -456,17 +458,22 @@ pub async fn deploy_buy(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > est_fee && tx.outputs.len() > 1 {
-        // Re-adjust change output
-        let change_idx = tx.outputs.len() - 1;
-        let new_change = total_input.saturating_sub(amount + exact_fee);
-        if new_change >= MIN_UTXO_VALUE {
-            tx.outputs[change_idx].value = new_change;
-        } else {
-            tx.outputs.pop();
-            if new_change > 0 {
-                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+    let actual_fee = if exact_fee > est_fee {
+        if tx.outputs.len() > 1 {
+            // Re-adjust change output
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_input.saturating_sub(amount + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+                if new_change > 0 {
+                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+                }
             }
+        } else {
+            // No change output — reduce order output by exact fee
+            tx.outputs[0].value = total_input.saturating_sub(exact_fee);
         }
         // Re-sign
         sigscripts.clear();
@@ -909,14 +916,17 @@ pub async fn deploy_sell(
         let change_idx = tx.outputs.len() - 1;
         converge_fee(&mut tx, total_input, change_idx, min_fee_override)
     } else {
+        // No change output — subtract fee from the order output
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-        (f, 0)
+        let adjusted = amount.saturating_sub(f);
+        tx.outputs[0].value = adjusted;
+        (f, adjusted)
     };
 
     let change = if has_change_sell {
         tx.outputs.last().unwrap().value
     } else {
-        total_input.saturating_sub(amount + est_fee_sell)
+        total_input.saturating_sub(tx.outputs[0].value + est_fee_sell)
     };
 
     if has_change_sell && change < MIN_UTXO_VALUE {
@@ -969,16 +979,21 @@ pub async fn deploy_sell(
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
     let exact_fee = exact_mass.max(min_fee_override);
 
-    let actual_fee = if exact_fee > est_fee_sell && tx.outputs.len() > 1 {
-        let change_idx = tx.outputs.len() - 1;
-        let new_change = total_input.saturating_sub(amount + exact_fee);
-        if new_change >= MIN_UTXO_VALUE {
-            tx.outputs[change_idx].value = new_change;
-        } else {
-            tx.outputs.pop();
-            if new_change > 0 {
-                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+    let actual_fee = if exact_fee > est_fee_sell {
+        if tx.outputs.len() > 1 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_input.saturating_sub(amount + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+                if new_change > 0 {
+                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+                }
             }
+        } else {
+            // No change output — reduce order output by exact fee
+            tx.outputs[0].value = total_input.saturating_sub(exact_fee);
         }
         sigscripts = sign_all_inputs(&tx, &privkey, &pubkey, token_input_value)?;
         exact_fee

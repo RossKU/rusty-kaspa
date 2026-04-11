@@ -2187,24 +2187,28 @@ mod adversarial_tests {
             "fill sigscript should be {} bytes, got {}", expected_len, ss.len());
 
         // Verify sigLen lands in fill range: T0 <= sigLen < T1
-        // T0 = 414, T1 = 417
-        assert!(ss.len() >= 414, "sigLen {} must be >= T0=414", ss.len());
-        assert!(ss.len() < 417, "sigLen {} must be < T1=417", ss.len());
+        // T0 = 410, T1 = 418
+        assert!(ss.len() >= 410, "sigLen {} must be >= T0=410", ss.len());
+        assert!(ss.len() < 418, "sigLen {} must be < T1=418", ss.len());
 
         // Verify body starts with correct dispatch
         let body = BUY_ORDER_BODY;
         assert_eq!(body[0], 0xb9, "OpTxInputIndex");
         assert_eq!(body[1], 0xc9, "OpTxInputScriptSigLen");
 
-        // Verify T2 = 425 encoded at offset 4-5
+        // Verify T2 = 423 encoded at offset 4-5
         let t2 = u16::from_le_bytes([body[4], body[5]]);
-        assert_eq!(t2, 425, "T2 should be 425");
+        assert_eq!(t2, 423, "T2 should be 423");
 
-        // Verify T0 = 414 encoded at offset 10-11
+        // Verify T0 = 410 encoded at offset 10-11
         let t0 = u16::from_le_bytes([body[10], body[11]]);
-        assert_eq!(t0, 414, "T0 should be 414");
+        assert_eq!(t0, 410, "T0 should be 410");
 
-        // Verify body does NOT contain OpInputCount (0xb3) — no InputCount==2 constraint
+        // Verify body does NOT contain OpInputCount (0xb3) — no InputCount==2 constraint.
+        // Rationale: removing InputCount==2 enables N-to-M batch matching (multiple
+        // sell + buy orders in one TX), cross-pair routing (3+ inputs), and a
+        // dedicated fee UTXO input.  The OCO contract (oco.rs) still enforces
+        // InputCount==2 for its own fill path, but standard spot orders do not.
         assert!(!body.contains(&0xb3), "body must NOT contain OpInputCount (InputCount constraint removed)");
 
         // Verify mmfee check is present: OpLTE (0xa1) followed by OpVerify (0x69)
@@ -2221,9 +2225,9 @@ mod adversarial_tests {
         .unwrap();
 
         let ss = build_buy_partial_fill_sigscript(&rs, 50000, 1, 0);
-        // T1 <= sigLen < T2: 417 <= sigLen < 425
-        assert!(ss.len() >= 417, "partial sigLen {} must be >= T1=417", ss.len());
-        assert!(ss.len() < 425, "partial sigLen {} must be < T2=425", ss.len());
+        // T1 <= sigLen < T2: 418 <= sigLen < 423
+        assert!(ss.len() >= 418, "partial sigLen {} must be >= T1=418", ss.len());
+        assert!(ss.len() < 423, "partial sigLen {} must be < T2=423", ss.len());
     }
 
     #[test]

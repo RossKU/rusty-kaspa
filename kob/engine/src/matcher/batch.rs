@@ -1,4 +1,33 @@
 //! N-to-M batch transaction builder for atomic multi-order matching.
+//!
+//! Builds a single Kaspa transaction that settles N sell orders against M buy
+//! orders atomically.  The spot covenant has no `OpTxInputCount==2` constraint
+//! (verified by `tests.rs:2207-2208`), so any number of order inputs is valid.
+//!
+//! # Input layout
+//!
+//!   `[sell_0 .. sell_{N-1}] [buy_0 .. buy_{M-1}] [token_units] [wallet_fee_utxo?]`
+//!
+//! No hard input count limit.  Indices >16 use data-push encoding (2 bytes)
+//! instead of OpN (1 byte).  Practical limit: bounded by MAX_TX_MASS (500,000).
+//!
+//! # Fee model
+//!
+//! Phase 1: Miner fee is pre-estimated via `kob_core::mass::estimate_compute_mass`
+//! (conservative: 152 B/input, 53 B/output, 1000 mass/sig_op).
+//!
+//! Phase 2: After signing, `BatchPlan::converge_fee_exact()` recomputes exact
+//! mass from real sigscripts via `calc_mass_with_sigscripts`, then re-adjusts
+//! the matcher fee / first-seller output so that miner_fee == compute_mass.
+//!
+//! # Compute mass reference (all well below MAX_TX_MASS = 500,000)
+//!
+//!   | Pattern           | Inputs | Outputs | Mass (gram) |
+//!   |-------------------|--------|---------|-------------|
+//!   | 1:1 batch         |      3 |       3 |       4,819 |
+//!   | 2:1 + fee UTXO    |      5 |       5 |       7,969 |
+//!   | 3:2 + fee UTXO    |      7 |       7 |      11,119 |
+//!   | 7:7 (max same-tk) |     15 |      15 |      23,719 |
 
 use std::collections::{HashMap, HashSet};
 
@@ -98,7 +127,7 @@ pub enum BatchError {
     AmountMismatch { total_in: u64, total_out: u64, fee: u64 },
     /// Missing token unit for a buy order's token.
     MissingTokenUnit { token_cov_id: String },
-    /// Index exceeds OpN range (>16) -- currently unsupported by Kaspa script.
+    /// Index exceeds u8 range -- used for legacy error compatibility.
     IndexOutOfRange { index: usize },
     /// Insufficient wallet UTXO for fees.
     InsufficientFee { needed: u64, available: u64 },
@@ -131,7 +160,7 @@ impl std::fmt::Display for BatchError {
                 write!(f, "No token unit for covenant {}", token_cov_id)
             }
             BatchError::IndexOutOfRange { index } => {
-                write!(f, "TX index {} exceeds OpN range (max 16)", index)
+                write!(f, "TX index {} exceeds maximum supported range", index)
             }
             BatchError::InsufficientFee { needed, available } => {
                 write!(f, "Insufficient fee UTXO: need {} have {}", needed, available)
@@ -148,6 +177,8 @@ impl std::fmt::Display for BatchError {
         }
     }
 }
+
+impl std::error::Error for BatchError {}
 
 /// A fully built batch transaction input.
 #[derive(Debug, Clone)]
@@ -210,10 +241,7 @@ impl BatchPlan {
         // === Build sell inputs ===
         for (sell, input_idx) in &self.sells {
             let koi = *input_idx; // seller's KAS output is at output[input_idx]
-            if koi > 16 {
-                return Err(BatchError::IndexOutOfRange { index: koi });
-            }
-            let ss = build_sell_fill_sigscript_batch(koi as u8, &sell.redeem_script)?;
+            let ss = build_sell_fill_sigscript_batch(koi as u16, &sell.redeem_script)?;
             inputs.push(BatchTxInput {
                 tx_id: sell.outpoint.0.clone(),
                 index: sell.outpoint.1,
@@ -224,8 +252,8 @@ impl BatchPlan {
 
         // === Build buy inputs ===
         // Track covenant output count per token_cov_id for coi computation
-        let mut cov_out_counter: HashMap<String, u8> = HashMap::new();
-        for (buy, input_idx) in &self.buys {
+        let mut cov_out_counter: HashMap<String, u16> = HashMap::new();
+        for (buy_idx, (buy, input_idx)) in self.buys.iter().enumerate() {
             let token_hex = hex::encode(buy.token_cov_id);
             let tii = self.token_input_map.get(&token_hex)
                 .ok_or_else(|| BatchError::MissingTokenUnit {
@@ -233,34 +261,23 @@ impl BatchPlan {
                 })?;
 
             // Buy's output index = N + j where j is position in buys vec
-            // SAFETY: buy is yielded from self.buys iterator, so it is always found
-            let buy_pos = self.buys.iter().position(|(b, _)| {
-                b.outpoint == buy.outpoint
-            }).expect("buy must exist in self.buys");
-            let toi = self.sells.len() + buy_pos;
+            let toi = self.sells.len() + buy_idx;
 
             // coi = index of this buy's output among all covenant outputs for this token
             let coi = *cov_out_counter.get(&token_hex).unwrap_or(&0);
             *cov_out_counter.entry(token_hex).or_insert(0) += 1;
 
-            if toi > 16 || *tii > 16 {
-                return Err(BatchError::IndexOutOfRange {
-                    index: toi.max(*tii),
-                });
-            }
-            if coi > 16 {
-                return Err(BatchError::IndexOutOfRange { index: coi as usize });
-            }
+            // Indices >16 are handled by data-push encoding (no OpN limit).
 
             let ss = match buy.version {
                 11 | 12 => {
                     let soi = self.buy_seller_map.get(input_idx)
                         .copied()
-                        .unwrap_or(0) as u8;
+                        .unwrap_or(0) as u16;
                     build_buy_fill_sigscript_batch_v11(
                         soi,
-                        toi as u8,
-                        *tii as u8,
+                        toi as u16,
+                        *tii as u16,
                         coi,
                         &buy.redeem_script,
                     )?
@@ -268,8 +285,8 @@ impl BatchPlan {
                 _ => {
                     // v8/v9/v10/v13: no soi parameter (v13 uses conservation instead)
                     build_buy_fill_sigscript_batch(
-                        toi as u8,
-                        *tii as u8,
+                        toi as u16,
+                        *tii as u16,
                         coi,
                         &buy.redeem_script,
                     )?
@@ -369,17 +386,8 @@ impl BatchPlan {
             }
         }
 
-        // Check: index range (all input/output indices <= 16)
-        let total_inputs = self.sells.len()
-            + self.buys.len()
-            + self.token_units.len()
-            + if self.wallet_input.is_some() { 1 } else { 0 };
-        let total_outputs = self.outputs.len();
-        if total_inputs > 17 || total_outputs > 17 {
-            return Err(BatchError::IndexOutOfRange {
-                index: total_inputs.max(total_outputs),
-            });
-        }
+        // No index range cap: push_index() handles indices >16 via data-push
+        // encoding.  The practical limit is MAX_TX_MASS (500,000).
 
         // Check: amounts balance
         //   Total KAS in = sum(buy.utxo_value) + wallet_input.value
@@ -403,6 +411,143 @@ impl BatchPlan {
         }
 
         Ok(())
+    }
+
+    /// Phase 2 fee convergence: recompute exact mass from real sigscripts and
+    /// return the exact fee.  The caller must re-adjust outputs (matcher-fee or
+    /// first-seller) by the delta `est_fee - exact_fee` and re-sign the wallet
+    /// input if the output set changed.
+    ///
+    /// # Arguments
+    /// * `tx`         - The `kob_core::tx::Transaction` built from this plan.
+    /// * `sigscripts` - Actual sigscript bytes for every input (post-signing).
+    ///
+    /// # Returns
+    /// `(exact_fee, delta)` where `delta = est_fee - exact_fee` (always >= 0
+    /// because `estimate_compute_mass` is conservative).
+    pub fn converge_fee_exact(
+        &self,
+        tx: &kob_core::tx::Transaction,
+        sigscripts: &[Vec<u8>],
+    ) -> (u64, u64) {
+        let exact_mass = kob_core::mass::calc_mass_with_sigscripts(tx, sigscripts);
+        let delta = self.total_fee.saturating_sub(exact_mass);
+        (exact_mass, delta)
+    }
+
+    /// Convert this plan into a `kob_core::tx::Transaction` suitable for
+    /// sighash computation and `calc_mass_with_sigscripts`.
+    ///
+    /// The returned transaction has correct input/output structure but
+    /// placeholder (empty) sigscripts -- callers fill those via signing.
+    ///
+    /// Each sell/buy input uses the order's P2SH SPK (derived from its
+    /// redeemScript) as `script_bytes` and `sig_op_count = 0`.
+    /// Token unit inputs use `sig_op_count = 0`.
+    /// The wallet input (if any) uses `sig_op_count = 1`.
+    pub fn to_transaction(&self) -> kob_core::tx::Transaction {
+        use kob_core::p2sh::build_p2sh;
+        use kob_core::tx::{Transaction, TxInput, TxOutput};
+
+        let mut tx = Transaction::new(0);
+
+        // Sell inputs
+        for (sell, _idx) in &self.sells {
+            let p2sh = build_p2sh(&sell.redeem_script);
+            tx.inputs.push(TxInput {
+                prev_tx_id: sell.outpoint.0.clone(),
+                prev_index: sell.outpoint.1,
+                sequence: 50,
+                sig_op_count: 0,
+                script_version: p2sh.version(),
+                script_bytes: p2sh.script().to_vec(),
+                value: sell.utxo_value,
+            });
+        }
+
+        // Buy inputs
+        for (buy, _idx) in &self.buys {
+            let p2sh = build_p2sh(&buy.redeem_script);
+            tx.inputs.push(TxInput {
+                prev_tx_id: buy.outpoint.0.clone(),
+                prev_index: buy.outpoint.1,
+                sequence: 50,
+                sig_op_count: 0,
+                script_version: p2sh.version(),
+                script_bytes: p2sh.script().to_vec(),
+                value: buy.utxo_value,
+            });
+        }
+
+        // Token unit inputs
+        for (tu, _idx) in &self.token_units {
+            let p2sh = build_p2sh(&tu.redeem_script);
+            tx.inputs.push(TxInput {
+                prev_tx_id: tu.outpoint.0.clone(),
+                prev_index: tu.outpoint.1,
+                sequence: 0,
+                sig_op_count: 0,
+                script_version: p2sh.version(),
+                script_bytes: p2sh.script().to_vec(),
+                value: tu.value,
+            });
+        }
+
+        // Wallet input (fee)
+        if let Some((ref tx_id, index, value)) = self.wallet_input {
+            tx.inputs.push(TxInput {
+                prev_tx_id: tx_id.clone(),
+                prev_index: index,
+                sequence: 0,
+                sig_op_count: 1,
+                // Wallet UTXO is P2PK; SPK will be set by CLI after lookup.
+                // Use dummy 34-byte P2PK SPK for mass estimation (correct size).
+                script_version: 0,
+                script_bytes: vec![0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xac],
+                value,
+            });
+        }
+
+        // Outputs
+        for planned in &self.outputs {
+            tx.outputs.push(TxOutput::new(
+                planned.value,
+                planned.spk_version,
+                planned.script_public_key.clone(),
+                None, // Covenant bindings set by CLI
+            ));
+        }
+
+        tx
+    }
+
+    /// Re-adjust plan outputs after Phase 2 fee convergence.
+    ///
+    /// Distributes the fee delta (= estimated_fee - exact_fee) back to the
+    /// matcher fee output (if present) or to the first seller KAS output.
+    /// Updates `self.total_fee` and `self.matcher_surplus` accordingly.
+    ///
+    /// # Arguments
+    /// * `exact_fee` - The exact miner fee computed from `converge_fee_exact`.
+    pub fn apply_exact_fee(&mut self, exact_fee: u64) {
+        let delta = self.total_fee.saturating_sub(exact_fee);
+        if delta == 0 {
+            return;
+        }
+
+        // Find matcher fee output, or fall back to first seller output
+        let adjust_idx = self.outputs.iter()
+            .position(|o| o.purpose == OutputPurpose::MatcherFee)
+            .unwrap_or(0);
+
+        self.outputs[adjust_idx].value += delta;
+        if self.outputs[adjust_idx].purpose == OutputPurpose::MatcherFee {
+            self.matcher_surplus += delta;
+        }
+        self.total_fee = exact_fee;
     }
 }
 
@@ -500,16 +645,9 @@ pub fn plan_batch_match(
 
     let t = used_token_units.len();
 
-    // Check total input count doesn't exceed OpN limit
-    let total_inputs = n + m + t + if wallet_utxo.is_some() { 1 } else { 0 };
-    if total_inputs > 17 {
-        return Err(BatchError::IndexOutOfRange { index: total_inputs });
-    }
-    // Check total outputs (N + M + optional matcher_fee + optional change)
-    // Worst case: N + M + 2
-    if n + m + 2 > 17 {
-        return Err(BatchError::IndexOutOfRange { index: n + m + 2 });
-    }
+    // Total input/output counts are no longer capped at 17 (OpN limit removed).
+    // Indices >16 use data-push encoding.  The practical limit is MAX_TX_MASS.
+    let _total_inputs = n + m + t + if wallet_utxo.is_some() { 1 } else { 0 };
 
     // Assign sell orders to input[0..N-1]
     let plan_sells: Vec<(BatchOrder, usize)> = sells.iter()
@@ -691,66 +829,86 @@ pub fn plan_batch_match(
 
 // Sigscript Builders (batch-specific)
 
-/// Convert an integer (0..=16) to the corresponding OpN opcode byte.
+/// Push a script integer onto a sigscript buffer.
 ///
-/// Op0 = 0x00, Op1 = 0x51, Op2 = 0x52, ..., Op16 = 0x60.
-///
-/// Returns Err if n > 16 (H-2: no panic on out-of-range index).
-fn opn(n: u8) -> Result<u8, BatchError> {
+/// Encoding:
+///   0        -> `[0x00]`             (Op0, 1 byte)
+///   1..=16   -> `[0x50+n]`           (OpN, 1 byte)
+///   17..=127 -> `[0x01, n]`          (data-push, 2 bytes)
+///   128..=255-> `[0x02, n, 0x00]`    (data-push, 3 bytes; zero-pad high byte for sign)
+///   256+     -> `[0x02, lo, hi]`     (data-push, 3 bytes, little-endian)
+fn push_index(ss: &mut Vec<u8>, n: u16) {
     match n {
-        0 => Ok(0x00),
-        1..=16 => Ok(0x50 + n),
-        _ => Err(BatchError::IndexOutOfRange { index: n as usize }),
+        0 => ss.push(0x00),
+        1..=16 => ss.push(0x50 + n as u8),
+        17..=127 => {
+            ss.push(0x01); // OpData1: push next 1 byte
+            ss.push(n as u8);
+        }
+        128..=255 => {
+            // Values 128-255: MSB of low byte is set, so a 1-byte push would
+            // be interpreted as negative by the script engine.  Push 2 bytes
+            // with a zero high byte to keep the value positive.
+            ss.push(0x02); // OpData2: push next 2 bytes
+            ss.push(n as u8);
+            ss.push(0x00);
+        }
+        _ => {
+            // 256+: 2-byte little-endian
+            ss.push(0x02);
+            ss.push(n as u8);         // low byte
+            ss.push((n >> 8) as u8);  // high byte
+        }
     }
 }
 
-/// Build sell_v8 fill sigscript for batch: `[Op(koi)] [Op1] [pushData(RS)]`
+/// Build sell_v8 fill sigscript for batch: `[koi] [Op1] [pushData(RS)]`
 ///
 /// * `kas_output_idx`: which output receives the seller's KAS
-fn build_sell_fill_sigscript_batch(kas_output_idx: u8, redeem_script: &[u8]) -> Result<Vec<u8>, BatchError> {
-    let mut ss = Vec::with_capacity(2 + redeem_script.len() + 3);
-    ss.push(opn(kas_output_idx)?);
+fn build_sell_fill_sigscript_batch(kas_output_idx: u16, redeem_script: &[u8]) -> Result<Vec<u8>, BatchError> {
+    let mut ss = Vec::with_capacity(3 + redeem_script.len() + 3);
+    push_index(&mut ss, kas_output_idx);
     ss.push(0x51); // Op1 (selector = fill)
     ss.extend_from_slice(&kob_core::push_data(redeem_script));
     Ok(ss)
 }
 
-/// Build buy_v8 fill sigscript for batch: `[Op(toi)] [Op(tii)] [Op(coi)] [Op1] [pushData(RS)]`
+/// Build buy_v8 fill sigscript for batch: `[toi] [tii] [coi] [Op1] [pushData(RS)]`
 ///
 /// * `token_output_idx`: which output receives the buyer's tokens (toi)
 /// * `token_input_idx`: which input carries the token covenant (tii)
 /// * `cov_output_idx`: which covenant output index for OpCovOutputIdx lookup (coi)
 fn build_buy_fill_sigscript_batch(
-    token_output_idx: u8,
-    token_input_idx: u8,
-    cov_output_idx: u8,
+    token_output_idx: u16,
+    token_input_idx: u16,
+    cov_output_idx: u16,
     redeem_script: &[u8],
 ) -> Result<Vec<u8>, BatchError> {
-    let mut ss = Vec::with_capacity(4 + redeem_script.len() + 3);
-    ss.push(opn(token_output_idx)?);
-    ss.push(opn(token_input_idx)?);
-    ss.push(opn(cov_output_idx)?);
+    let mut ss = Vec::with_capacity(7 + redeem_script.len() + 3);
+    push_index(&mut ss, token_output_idx);
+    push_index(&mut ss, token_input_idx);
+    push_index(&mut ss, cov_output_idx);
     ss.push(0x51); // Op1 (selector = fill)
     ss.extend_from_slice(&kob_core::push_data(redeem_script));
     Ok(ss)
 }
 
-/// Build buy_v11 fill sigscript for batch: `[Op(soi)] [Op(toi)] [Op(tii)] [Op(coi)] [Op1] [pushData(RS)]`
+/// Build buy_v11 fill sigscript for batch: `[soi] [toi] [tii] [coi] [Op1] [pushData(RS)]`
 ///
 /// v11 adds soi (seller output index) parameter for batch fill defense.
 /// In batch TX, soi = index of the seller KAS output this buy is paired with.
 fn build_buy_fill_sigscript_batch_v11(
-    seller_output_idx: u8,
-    token_output_idx: u8,
-    token_input_idx: u8,
-    cov_output_idx: u8,
+    seller_output_idx: u16,
+    token_output_idx: u16,
+    token_input_idx: u16,
+    cov_output_idx: u16,
     redeem_script: &[u8],
 ) -> Result<Vec<u8>, BatchError> {
-    let mut ss = Vec::with_capacity(5 + redeem_script.len() + 3);
-    ss.push(opn(seller_output_idx)?);
-    ss.push(opn(token_output_idx)?);
-    ss.push(opn(token_input_idx)?);
-    ss.push(opn(cov_output_idx)?);
+    let mut ss = Vec::with_capacity(9 + redeem_script.len() + 3);
+    push_index(&mut ss, seller_output_idx);
+    push_index(&mut ss, token_output_idx);
+    push_index(&mut ss, token_input_idx);
+    push_index(&mut ss, cov_output_idx);
     ss.push(0x51); // Op1 (selector = fill)
     ss.extend_from_slice(&kob_core::push_data(redeem_script));
     Ok(ss)
@@ -1035,11 +1193,11 @@ mod tests {
         assert_eq!(tu_ss[0], 0x07, "token unit RS pushdata length (7B)");
     }
 
-    // Test 6: Large batch (10 sells + 10 buys -> verify limits)
+    // Test 6: Large batch (10 sells + 10 buys -> no longer limited by OpN)
     #[test]
     fn test_large_batch() {
-        // With 10 sells + 10 buys = 20 orders, input index goes up to 20+
-        // This should fail because OpN only supports 0..=16
+        // With 10 sells + 10 buys = 20 orders, indices >16 use data-push encoding.
+        // This should now succeed (no OpN limit).
         let sells: Vec<BatchOrder> = (0..10)
             .map(|i| make_sell(0x10 + i, 10_000_000, 1, 2, TOKEN_A))
             .collect();
@@ -1048,25 +1206,29 @@ mod tests {
             .collect();
         let token_unit = make_token_unit(0x30, TOKEN_A, 500_000_000);
 
-        let result = plan_batch_match(
+        let plan = plan_batch_match(
             &sells,
             &buys,
             &[token_unit],
             None,
             &matcher_spk(),
             0,
-        );
+        ).expect("10+10 batch should succeed (no OpN limit)");
 
-        // 10+10+1 = 21 inputs > 17, should fail with IndexOutOfRange
-        assert!(result.is_err(), "batch with 20 orders should fail");
-        match result.unwrap_err() {
-            BatchError::IndexOutOfRange { index } => {
-                assert!(index > 16, "index should exceed 16");
-            }
-            e => panic!("expected IndexOutOfRange, got: {:?}", e),
-        }
+        assert_eq!(plan.sells.len(), 10);
+        assert_eq!(plan.buys.len(), 10);
 
-        // But 7+7 = 14 orders should work (14+1token+1wallet = 16, within limit)
+        let tx = plan.build_tx().expect("build should succeed");
+        // 10 sells + 10 buys + 1 token unit = 21 inputs
+        assert_eq!(tx.inputs.len(), 21);
+
+        // Verify indices >16 use data-push encoding (2 bytes: [0x01, n])
+        // Buy at input[20] (index 20) has toi = 10 + 10_pos = some index >= 10
+        // Sell at input[0] has koi=0 (Op0=0x00, 1 byte)
+        let sell0_ss = &tx.inputs[0].sigscript;
+        assert_eq!(sell0_ss[0], 0x00, "sell koi=0 -> Op0 (0x00)");
+
+        // 7+7 should still work
         let sells7: Vec<BatchOrder> = (0..7)
             .map(|i| make_sell(0x10 + i, 10_000_000, 1, 2, TOKEN_A))
             .collect();
@@ -1301,14 +1463,11 @@ mod tests {
         }
     }
 
-    // H-2: coi > 16 triggers IndexOutOfRange (not panic)
+    // H-2: coi > 16 now handled by data-push encoding (no error)
     #[test]
-    fn test_coi_out_of_range_returns_error() {
-        // opn() now returns Result instead of panicking (H-2 fix).
-        // plan_batch_match caps at 17 total inputs and at most n+m+2=17 outputs.
-        // With 7 sells + 7 buys + 1 token_unit = 15 inputs and 7+7+2=16 outputs,
-        // the batch is within limits and coi per-token stays 0..6 (all <= 16). OK.
-        // Use 10M value so seller gets 5M (>= MIN_UTXO_VALUE=3M) with price 1/2.
+    fn test_large_coi_succeeds() {
+        // With data-push encoding, coi > 16 is no longer an error.
+        // 7 sells + 7 buys + 1 token_unit = 15 inputs, coi stays 0..6.
         let sells: Vec<BatchOrder> = (0..7)
             .map(|i| make_sell(0x10 + i, 10_000_000, 1, 2, TOKEN_A))
             .collect();
@@ -1317,8 +1476,6 @@ mod tests {
             .collect();
         let token_unit = make_token_unit(0x30, TOKEN_A, 500_000_000);
 
-        // 7 sells + 7 buys + 1 token_unit = 15 inputs (within limit)
-        // Outputs: 7 + 7 + 2 = 16 (within limit)
         let plan = plan_batch_match(
             &sells,
             &buys,
@@ -1326,7 +1483,7 @@ mod tests {
             None,
             &matcher_spk(),
             0,
-        ).expect("7+7 batch should succeed, coi stays <= 6");
+        ).expect("7+7 batch should succeed");
 
         let tx = plan.build_tx().expect("build_tx should succeed");
         assert_eq!(tx.inputs.len(), 15);
@@ -1350,15 +1507,15 @@ mod tests {
 
         let tx = plan.build_tx().expect("build should succeed");
 
-        // Sell v13 fill SS: [Op(koi)] [Op1] [PUSHDATA2(2)] [378B RS]
-        // = 1 + 1 + 3 + 378 = 383 bytes
+        // Sell v13 fill SS: [Op(koi)] [Op1] [PUSHDATA2(2)] [374B RS]
+        // = 1 + 1 + 3 + 374 = 379 bytes
         let sell_ss_len = tx.inputs[0].sigscript.len();
-        assert_eq!(sell_ss_len, 383, "sell_v13 fill SS = 383B");
+        assert_eq!(sell_ss_len, 379, "sell_v13 fill SS = 379B");
 
-        // Buy v13 fill SS: [Op(toi)] [Op(tii)] [Op(coi)] [Op1] [PUSHDATA2(2)] [409B RS]
-        // = 1 + 1 + 1 + 1 + 3 + 409 = 416 bytes
+        // Buy v13 fill SS: [Op(toi)] [Op(tii)] [Op(coi)] [Op1] [PUSHDATA2(2)] [405B RS]
+        // = 1 + 1 + 1 + 1 + 3 + 405 = 412 bytes
         let buy_ss_len = tx.inputs[1].sigscript.len();
-        assert_eq!(buy_ss_len, 416, "buy_v13 fill SS = 416B");
+        assert_eq!(buy_ss_len, 412, "buy_v13 fill SS = 412B");
     }
 
     // v11 helpers and tests
@@ -1578,5 +1735,188 @@ mod tests {
             Err(BatchError::ZeroPriceDenominator { index: 1, side: "buy" }) => {} // expected (index = n + j = 1 + 0)
             other => panic!("expected ZeroPriceDenominator for buy, got: {:?}", other),
         }
+    }
+
+    #[test]
+    fn converge_fee_exact_reduces_overestimate() {
+        // 1:1 batch with wallet fee UTXO
+        let sell = make_sell(0x10, 50_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x20, 50_000_000, 1, 1, TOKEN_A);
+        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
+        let wallet = (hex::encode([0x40u8; 32]), 0u32, 100_000_000u64);
+
+        let mut plan = plan_batch_match(
+            &[sell],
+            &[buy],
+            &[token_unit],
+            Some(wallet),
+            &matcher_spk(),
+            0,
+        ).unwrap();
+        plan.validate().unwrap();
+
+        let est_fee = plan.total_fee;
+        assert!(est_fee > 0, "estimated fee must be positive");
+
+        // Build Transaction and sigscripts from the plan
+        let tx = plan.to_transaction();
+        let batch_tx = plan.build_tx().unwrap();
+        let mut sigscripts: Vec<Vec<u8>> = batch_tx.inputs.iter()
+            .map(|i| i.sigscript.clone())
+            .collect();
+
+        // The wallet input (last) gets a fake 64-byte P2PK sigscript
+        // (real Schnorr sig = 64 bytes + push opcode = 66 bytes total)
+        let fake_wallet_ss = vec![0x41, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0xac];
+        *sigscripts.last_mut().unwrap() = fake_wallet_ss;
+
+        // Phase 2: exact mass
+        let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
+        assert!(exact_fee <= est_fee, "exact fee must be <= estimated fee");
+        assert!(delta >= 0, "delta must be non-negative");
+        assert_eq!(exact_fee + delta, est_fee, "exact + delta = estimated");
+
+        // Apply and verify
+        let old_surplus = plan.matcher_surplus;
+        plan.apply_exact_fee(exact_fee);
+        assert_eq!(plan.total_fee, exact_fee);
+        // Surplus should increase by delta
+        assert_eq!(plan.matcher_surplus, old_surplus + delta);
+    }
+
+    #[test]
+    fn push_index_encoding() {
+        // Op0
+        let mut buf = Vec::new();
+        push_index(&mut buf, 0);
+        assert_eq!(buf, vec![0x00], "index 0 -> Op0");
+
+        // Op1..Op16
+        for n in 1..=16u16 {
+            let mut buf = Vec::new();
+            push_index(&mut buf, n);
+            assert_eq!(buf, vec![0x50 + n as u8], "index {} -> Op{}", n, n);
+        }
+
+        // 17..127 uses data-push [0x01, n]
+        for n in [17u16, 20, 50, 100, 127] {
+            let mut buf = Vec::new();
+            push_index(&mut buf, n);
+            assert_eq!(buf, vec![0x01, n as u8], "index {} -> data-push [0x01, {}]", n, n);
+        }
+
+        // 128..255 uses sign-extended data-push [0x02, n, 0x00]
+        for n in [128u16, 200, 255] {
+            let mut buf = Vec::new();
+            push_index(&mut buf, n);
+            assert_eq!(buf, vec![0x02, n as u8, 0x00],
+                "index {} -> data-push [0x02, {}, 0x00] (sign-extended)", n, n);
+        }
+
+        // 256+ uses 2-byte little-endian [0x02, lo, hi]
+        for n in [256u16, 300, 512] {
+            let mut buf = Vec::new();
+            push_index(&mut buf, n);
+            assert_eq!(buf, vec![0x02, n as u8, (n >> 8) as u8],
+                "index {} -> data-push [0x02, {}, {}]", n, n as u8, (n >> 8) as u8);
+        }
+    }
+
+    #[test]
+    fn to_transaction_correct_input_output_count() {
+        let sell = make_sell(0x10, 50_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x20, 50_000_000, 1, 1, TOKEN_A);
+        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
+        let wallet = (hex::encode([0x40u8; 32]), 0u32, 100_000_000u64);
+
+        let plan = plan_batch_match(
+            &[sell],
+            &[buy],
+            &[token_unit],
+            Some(wallet),
+            &matcher_spk(),
+            0,
+        ).unwrap();
+
+        let tx = plan.to_transaction();
+        // 1 sell + 1 buy + 1 token + 1 wallet = 4 inputs
+        assert_eq!(tx.inputs.len(), 4);
+        // outputs = plan.outputs.len()
+        assert_eq!(tx.outputs.len(), plan.outputs.len());
+    }
+
+    // Test: 20+20 batch (indices reach 39, well past old u8/OpN limits)
+    #[test]
+    fn test_20x20_large_batch() {
+        let sells: Vec<BatchOrder> = (0..20u8)
+            .map(|i| make_sell(i + 1, 10_000_000, 1, 2, TOKEN_A))
+            .collect();
+        let buys: Vec<BatchOrder> = (0..20u8)
+            .map(|i| make_buy(0x80 + i, 10_000_000, 1, 3, TOKEN_A))
+            .collect();
+        let token_unit = make_token_unit(0xFF, TOKEN_A, 1_000_000_000);
+
+        let plan = plan_batch_match(
+            &sells,
+            &buys,
+            &[token_unit],
+            None,
+            &matcher_spk(),
+            0,
+        ).expect("20+20 batch should succeed");
+
+        assert_eq!(plan.sells.len(), 20);
+        assert_eq!(plan.buys.len(), 20);
+
+        // Validate should pass (no index range cap)
+        plan.validate().expect("20+20 plan should validate");
+
+        let tx = plan.build_tx().expect("20+20 build_tx should succeed");
+        // 20 sells + 20 buys + 1 token unit = 41 inputs
+        assert_eq!(tx.inputs.len(), 41);
+        // 20 seller KAS + 20 buyer tokens + 1 matcher fee = 41 outputs
+        assert_eq!(tx.outputs.len(), 41);
+
+        // Verify sell koi=19 uses data-push [0x01, 19] (2 bytes, 17..127 range)
+        let sell19_ss = &tx.inputs[19].sigscript;
+        assert_eq!(sell19_ss[0], 0x01, "sell koi=19: OpData1");
+        assert_eq!(sell19_ss[1], 19, "sell koi=19: value byte");
+
+        // Verify buy toi = 20 + buy_pos (e.g., toi=20 for first buy)
+        // Buy[0] at input[20]: toi=20, tii=40, coi=0
+        let buy0_ss = &tx.inputs[20].sigscript;
+        // toi=20 -> [0x01, 20]
+        assert_eq!(buy0_ss[0], 0x01, "buy0 toi=20: OpData1");
+        assert_eq!(buy0_ss[1], 20, "buy0 toi=20: value byte");
+        // tii=40 -> [0x01, 40]
+        assert_eq!(buy0_ss[2], 0x01, "buy0 tii=40: OpData1");
+        assert_eq!(buy0_ss[3], 40, "buy0 tii=40: value byte");
+    }
+
+    // Test: push_index sign-extension for index 128 (regression for >127 batches)
+    #[test]
+    fn test_push_index_128_sign_extension() {
+        let mut buf = Vec::new();
+        push_index(&mut buf, 128);
+        // 128 must use [0x02, 0x80, 0x00] to avoid being read as -0 or negative
+        assert_eq!(buf, vec![0x02, 0x80, 0x00],
+            "index 128 needs sign-extension: [0x02, 0x80, 0x00]");
+
+        let mut buf2 = Vec::new();
+        push_index(&mut buf2, 255);
+        assert_eq!(buf2, vec![0x02, 0xFF, 0x00],
+            "index 255 needs sign-extension: [0x02, 0xFF, 0x00]");
+
+        let mut buf3 = Vec::new();
+        push_index(&mut buf3, 256);
+        assert_eq!(buf3, vec![0x02, 0x00, 0x01],
+            "index 256: [0x02, 0x00, 0x01] little-endian");
     }
 }

@@ -1,11 +1,10 @@
 use crate::primitives::{push_data, u64_le};
-use crate::contract::helpers::{gcd, opn};
+use crate::contract::helpers::{gcd, push_index};
 
-/// buy_order body bytecode (264 bytes, +4B output count limit).
+/// buy_order body bytecode (260 bytes, no output count limit).
 ///
 /// Features:
 /// - Max matcher fee (mmfee) cap: (kas_in - out[0].value) <= mmfee
-/// - Output count limit: max 4 outputs (prevents receipt multiplication attack)
 /// - On-chain expiry via CLTV
 /// - OP_CSV exposure delay (50 DAA) on fill/partial paths
 ///
@@ -14,18 +13,22 @@ use crate::contract::helpers::{gcd, opn};
 /// Stack after state push:
 ///   expiry(0), cpend(1), mmfee(2), bspkh(3), ohash(4), mfill(5), pden(6), pnum(7), tcid(8)
 ///
-/// Dispatch thresholds (RS=409B):
-///   T0 = 414 (expire < 414 < fill)
-///   T1 = 417 (fill < 417 < partial)
-///   T2 = 425 (partial < 425 < cancel)
+/// Dispatch thresholds (RS=405B):
+///   T0 = 410 (expire < 410 < fill)
+///   T1 = 418 (fill < 418 < partial)
+///   T2 = 423 (partial < 423 < cancel)
+///
+/// Fill sigscript margin: v13 base=412, max=415 (3 data-push indices).
+///                        v12 base=413, max=417 (4 data-push indices).
+/// Partial sigscript margin: v13 base=420, max=422 (2 data-push indices).
 pub const BUY_ORDER_BODY: &[u8] = &[
     // DISPATCH PREAMBLE (15B)
     0xb9, 0xc9, 0x76,             // OpTxInputIndex, OpTxInputScriptSigLen, OpDup  [3B]
-    0x02, 0xa9, 0x01,             // push T2=425                                   [3B]
+    0x02, 0xa7, 0x01,             // push T2=423                                   [3B]
     0x9f,                         // OpLessThan (sigLen < T2?)                      [1B]
     0x63,                         // OpIf (expire/fill/partial)                     [1B]
     0x76,                         // OpDup (keep sigLen for T0 check)               [1B]
-    0x02, 0x9e, 0x01,             // push T0=414                                   [3B]
+    0x02, 0x9a, 0x01,             // push T0=410                                   [3B]
     0x9f,                         // OpLessThan (sigLen < T0?)                      [1B]
     0x63,                         // OpIf (EXPIRE)                                  [1B]
     0x75,                         // OpDrop (sigLen, not needed in expire)           [1B]
@@ -76,7 +79,7 @@ pub const BUY_ORDER_BODY: &[u8] = &[
     0xb1,                         // OpCheckSequenceVerify (UTXO age >= 50)          [1B]
 
     // --- T1 DISPATCH (5B) ---
-    0x02, 0xa1, 0x01,             // push T1=417                                    [3B]
+    0x02, 0xa2, 0x01,             // push T1=418                                    [3B]
     0x9f,                         // OpLessThan (sigLen < T1?)                       [1B]
     0x63,                         // OpIf (fill)                                    [1B]
 
@@ -208,14 +211,8 @@ pub const BUY_ORDER_BODY: &[u8] = &[
     // --- FILL/PARTIAL END ---
     0x68,                         // OpEndIf (fill vs partial)                       [1B]
 
-    // --- OUTPUT COUNT LIMIT (4B) ---
-    // Prevents receipt output multiplication attack: a malicious matcher could
-    // duplicate receipt outputs to amplify a single off-market fill into
-    // multiple price-proof UTXOs for attacking lending/perp positions.
-    // Max 4 outputs: seller_kas + buyer_tokens + receipt + matcher_change.
-    0xb4,                         // OpTxOutputCount                                 [1B]
-    0x54,                         // Op4 (= 4)                                       [1B]
-    0xa1, 0x69,                   // OpLTE OpVerify (output_count <= 4)              [2B]
+    // NOTE: Output count limit removed to enable N:M batch matching.
+    // Receipt multiplication is mitigated by the mmfee cap and price checks.
 
     0x68,                         // OpEndIf (expire vs fill/partial)                [1B]
 
@@ -247,16 +244,15 @@ pub const BUY_ORDER_BODY: &[u8] = &[
 ];
 
 /// Expected length of BUY_ORDER_BODY bytecode.
-pub const BUY_ORDER_BODY_EXPECTED_LEN: usize = 264;
+pub const BUY_ORDER_BODY_EXPECTED_LEN: usize = 260;
 
-/// Expected length of buy_order redeemScript (145B state + 264B body).
-pub const BUY_ORDER_RS_EXPECTED_LEN: usize = 409;
+/// Expected length of buy_order redeemScript (145B state + 260B body).
+pub const BUY_ORDER_RS_EXPECTED_LEN: usize = 405;
 
-/// Sell order body bytecode (266B, +4B output count limit).
+/// Sell order body bytecode (262B, no output count limit).
 ///
 /// Features:
 /// - Max matcher fee (mmfee) cap: (token_in - out[0].value) <= mmfee
-/// - Output count limit: max 4 outputs (prevents receipt multiplication attack)
 /// - On-chain expiry via CLTV
 /// - OP_CSV exposure delay (50 DAA) on fill/partial paths
 ///
@@ -433,37 +429,30 @@ pub const SELL_ORDER_BODY: &[u8] = &[
     // mmfee(0)..pnum(5) = 6 items
     0x6d, 0x6d, 0x6d,             // Op2Drop x3                                      [3B]
 
-    // CLOSING (8B = 4B + output count limit 4B)
+    // CLOSING (4B, output count limit removed for N:M batch matching)
     0x68,                         // OpEndIf (partial vs cancel-mark)                [1B]
     0x68,                         // OpEndIf (sel<2 vs sel>=2)                       [1B]
 
-    // --- OUTPUT COUNT LIMIT (4B) ---
-    // Prevents receipt output multiplication attack (see BUY_ORDER_BODY).
-    // Max 4 outputs: seller_kas + buyer_tokens + receipt + matcher_change.
-    // Applied to all non-expire paths (fill, partial, cancel, cancel-mark).
-    // Cancel/cancel-mark always produce <= 4 outputs, so this is non-binding for them.
-    0xb4,                         // OpTxOutputCount                                 [1B]
-    0x54,                         // Op4 (= 4)                                       [1B]
-    0xa1, 0x69,                   // OpLTE OpVerify (output_count <= 4)              [2B]
+    // NOTE: Output count limit removed to enable N:M batch matching.
+    // Receipt multiplication is mitigated by the mmfee cap and price checks.
 
     0x68,                         // OpEndIf (expire vs rest)                        [1B]
     0x51,                         // Op1 (TRUE)                                      [1B]
 ];
 
 /// Expected body length for sell order.
-pub const SELL_ORDER_BODY_EXPECTED_LEN: usize = 266;
+pub const SELL_ORDER_BODY_EXPECTED_LEN: usize = 262;
 
-/// Expected redeemScript length for sell order (112B state + 266B body).
+/// Expected redeemScript length for sell order (112B state + 262B body).
 pub const SELL_ORDER_RS_EXPECTED_LEN: usize = 112 + SELL_ORDER_BODY_EXPECTED_LEN;
 
-/// Build buy_order redeemScript (145B state + 264B body = 409B).
+/// Build buy_order redeemScript (145B state + 260B body = 405B).
 ///
 /// State (145B):
 ///   `[0x20][tcid 32B][0x08][pnum 8B][0x08][pden 8B][0x08][mfill 8B]`
 ///   `[0x20][ohash 32B][0x20][bspkh 32B][0x08][mmfee 8B][cpend 1B][0x08][expiry_daa 8B]`
 ///
 /// Max matcher fee cap: (kas_in - out[0].value) <= mmfee.
-/// Includes output count limit (max 4) to prevent receipt multiplication.
 pub fn build_buy_redeem_script(
     token_covenant_id: &[u8; 32],
     price_num: u64,
@@ -520,17 +509,19 @@ pub fn build_buy_redeem_script(
 
 /// Build buy_order fill sigscript.
 ///
-/// Layout: `[toi_opN] [tii_opN] [coi_opN] [Op1] [pushData(RS)]`
+/// Layout: `[toi] [tii] [coi] [Op1] [pushData(RS)]`
+///
+/// Indices use OpN (1 byte) for 0..=16, or data-push `[0x01, val]` (2 bytes) for 17+.
 pub fn build_buy_fill_sigscript(
-    token_output_idx: u8,
-    token_input_idx: u8,
-    cov_output_idx: u8,
+    token_output_idx: u16,
+    token_input_idx: u16,
+    cov_output_idx: u16,
     redeem_script: &[u8],
 ) -> Vec<u8> {
-    let mut ss = Vec::with_capacity(4 + redeem_script.len() + 3);
-    ss.push(opn(token_output_idx));
-    ss.push(opn(token_input_idx));
-    ss.push(opn(cov_output_idx));
+    let mut ss = Vec::with_capacity(7 + redeem_script.len() + 3);
+    push_index(&mut ss, token_output_idx);
+    push_index(&mut ss, token_input_idx);
+    push_index(&mut ss, cov_output_idx);
     ss.push(0x51); // Op1 (selector = fill)
     ss.extend_from_slice(&push_data(redeem_script));
     ss
@@ -538,24 +529,26 @@ pub fn build_buy_fill_sigscript(
 
 /// Build buy_order partial fill sigscript.
 ///
-/// Layout: `[ri_opN] [ti_opN] [pushData(fk 8B)] [Op2] [pushData(RS)]`
+/// Layout: `[ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]`
+///
+/// Indices use OpN (1 byte) for 0..=16, or data-push `[0x01, val]` (2 bytes) for 17+.
 pub fn build_buy_partial_fill_sigscript(
     redeem_script: &[u8],
     fill_kas: u64,
-    residual_idx: u8,
-    token_idx: u8,
+    residual_idx: u16,
+    token_idx: u16,
 ) -> Vec<u8> {
     let fk = u64_le(fill_kas);
-    let mut ss = Vec::with_capacity(14 + redeem_script.len() + 3);
-    ss.push(opn(residual_idx));
-    ss.push(opn(token_idx));
+    let mut ss = Vec::with_capacity(16 + redeem_script.len() + 3);
+    push_index(&mut ss, residual_idx);
+    push_index(&mut ss, token_idx);
     ss.extend_from_slice(&push_data(&fk));
     ss.push(0x52); // Op2 (selector = partial fill)
     ss.extend_from_slice(&push_data(redeem_script));
     ss
 }
 
-/// Build sell_order redeemScript (112B state + 266B body = 378B).
+/// Build sell_order redeemScript (112B state + 262B body = 374B).
 ///
 /// State (112B):
 ///   `[0x08][pnum 8B][0x08][pden 8B][0x08][mfill 8B]`
@@ -563,7 +556,6 @@ pub fn build_buy_partial_fill_sigscript(
 ///   `[0x08][expiry_daa 8B]`
 ///
 /// Max matcher fee cap: (token_in - out[0].value) <= mmfee.
-/// Includes output count limit (max 4 outputs) on fill/partial paths.
 pub fn build_sell_redeem_script(
     price_num: u64,
     price_den: u64,
@@ -617,13 +609,15 @@ pub fn build_sell_redeem_script(
 
 /// Build sell_order fill sigscript.
 ///
-/// Layout: `[kas_output_idx_opN] [Op1] [pushData(RS)]`
+/// Layout: `[kas_output_idx] [Op1] [pushData(RS)]`
+///
+/// Index uses OpN (1 byte) for 0..=16, or data-push `[0x01, val]` (2 bytes) for 17+.
 pub fn build_sell_fill_sigscript(
-    kas_output_idx: u8,
+    kas_output_idx: u16,
     redeem_script: &[u8],
 ) -> Vec<u8> {
-    let mut ss = Vec::with_capacity(2 + redeem_script.len() + 3);
-    ss.push(opn(kas_output_idx));
+    let mut ss = Vec::with_capacity(3 + redeem_script.len() + 3);
+    push_index(&mut ss, kas_output_idx);
     ss.push(0x51); // Op1 (selector = fill)
     ss.extend_from_slice(&push_data(redeem_script));
     ss
@@ -631,17 +625,19 @@ pub fn build_sell_fill_sigscript(
 
 /// Build sell_order partial fill sigscript.
 ///
-/// Layout: `[kas_idx_opN] [residual_idx_opN] [pushData(fill_ta 8B)] [Op2] [pushData(RS)]`
+/// Layout: `[kas_idx] [residual_idx] [pushData(fill_ta 8B)] [Op2] [pushData(RS)]`
+///
+/// Indices use OpN (1 byte) for 0..=16, or data-push `[0x01, val]` (2 bytes) for 17+.
 pub fn build_sell_partial_fill_sigscript(
     redeem_script: &[u8],
     fill_token_amount: u64,
-    kas_idx: u8,
-    residual_idx: u8,
+    kas_idx: u16,
+    residual_idx: u16,
 ) -> Vec<u8> {
     let fta = u64_le(fill_token_amount);
-    let mut ss = Vec::with_capacity(14 + redeem_script.len() + 3);
-    ss.push(opn(kas_idx));
-    ss.push(opn(residual_idx));
+    let mut ss = Vec::with_capacity(16 + redeem_script.len() + 3);
+    push_index(&mut ss, kas_idx);
+    push_index(&mut ss, residual_idx);
     ss.extend_from_slice(&push_data(&fta));
     ss.push(0x52); // Op2 (selector = partial fill)
     ss.extend_from_slice(&push_data(redeem_script));

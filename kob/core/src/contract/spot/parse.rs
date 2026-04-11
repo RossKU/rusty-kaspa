@@ -45,13 +45,13 @@ const BUY_STATE_SIZE: usize = 145;
 const SELL_STATE_SIZE: usize = 112;
 
 /// Buy body size (from BUY_ORDER_BODY).
-const BUY_BODY_SIZE: usize = 264;
+const BUY_BODY_SIZE: usize = 260;
 /// Sell body size (from SELL_ORDER_BODY).
-const SELL_BODY_SIZE: usize = 266;
+const SELL_BODY_SIZE: usize = 262;
 
-/// Buy RS size: 145 + 264 = 409.
+/// Buy RS size: 145 + 260 = 405.
 pub const BUY_RS_SIZE: usize = BUY_STATE_SIZE + BUY_BODY_SIZE;
-/// Sell RS size: 112 + 266 = 378.
+/// Sell RS size: 112 + 262 = 374.
 pub const SELL_RS_SIZE: usize = SELL_STATE_SIZE + SELL_BODY_SIZE;
 
 /// Parse a redeemScript to extract order parameters.

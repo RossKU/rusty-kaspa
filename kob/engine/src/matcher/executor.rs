@@ -2701,12 +2701,12 @@ async fn run_scan_cycle(
                 let sell_rs = hex::decode(&pair.sell.redeem_script_hex).unwrap_or_default();
                 let buy_rs = hex::decode(&pair.buy.redeem_script_hex).unwrap_or_default();
 
-                // Detect sell version from RS length (284=v6, 287=v8, 344=v12, 378=v13)
+                // Detect sell version from RS length (284=v6, 287=v8, 344=v12, 374=v13)
                 let sell_version = match sell_rs.len() {
                     284 => 6,
                     287 => 8,
                     344 => 12,
-                    378 => 13,
+                    374 => 13,
                     other => {
                         warn!("[BATCH] Unknown sell RS size {}, skipping", other);
                         continue;
@@ -2726,7 +2726,7 @@ async fn run_scan_cycle(
                         }
                     }
                     415 => 12,  // v12: RS=415
-                    409 => 13,  // v13: RS=409 (145B state + 264B body)
+                    405 => 13,  // v13: RS=405 (145B state + 260B body)
                     other => {
                         warn!("[BATCH] Unknown buy RS size {}, skipping", other);
                         continue;
@@ -3148,7 +3148,7 @@ async fn run_scan_cycle(
                         284 => 6,
                         287 => 8,
                         344 => 12,
-                        378 => 13,
+                        374 => 13,
                         other => {
                             warn!("[CROSS-BATCH] Unknown sell RS size {}, skipping group", other);
                             skip_group = true;
@@ -3207,7 +3207,7 @@ async fn run_scan_cycle(
                             }
                         }
                         415 => 12,
-                        409 => 13,
+                        405 => 13,
                         other => {
                             warn!("[CROSS-BATCH] Unknown buy RS size {}, skipping group", other);
                             skip_group = true;
@@ -3449,7 +3449,7 @@ async fn run_scan_cycle(
                         284 => 6,
                         287 => 8,
                         344 => 12,
-                        378 => 13,
+                        374 => 13,
                         other => {
                             warn!("[TRI-BATCH] Unknown sell RS size {}, skipping group", other);
                             skip_group = true;
@@ -3508,7 +3508,7 @@ async fn run_scan_cycle(
                             }
                         }
                         415 => 12,
-                        409 => 13,
+                        405 => 13,
                         other => {
                             warn!("[TRI-BATCH] Unknown buy RS size {}, skipping group", other);
                             skip_group = true;

@@ -1,4 +1,32 @@
 //! Cross-pair route finding for batch matching engine.
+//!
+//! Implements 2-hop (Token A -> KAS -> Token B) and 3-hop triangular
+//! (A -> B -> C -> A) arbitrage routing across token pairs.
+//!
+//! # 2-hop (cross-pair) flow
+//!
+//!   input[0]: sell order   (Token A, freed when seller's KAS output verified)
+//!   input[1]: buy order    (KAS, freed when buyer's Token B output verified)
+//!   input[2]: token unit   (Token B, provides tokens for buyer)
+//!   input[3]: fee UTXO     (optional, matcher wallet)
+//!
+//!   output[0]: seller KAS
+//!   output[1]: buyer Token B
+//!   output[2]: receipt (1 KAS)
+//!   output[3]: matcher change
+//!
+//! Compute mass: ~5,242 gram (3 in, 4 out) -- well below 500K limit.
+//!
+//! # 3-hop (triangular) flow
+//!
+//! Three 2-hop legs chained: each leg's sell produces KAS consumed by a buy
+//! in a different pair.  All 6 orders settle in one batch TX (9+ inputs).
+//! Compute mass: ~14,269 gram.
+//!
+//! # Self-trade prevention (STP)
+//!
+//! Routes where `sell.owner_hash == buy.owner_hash` are skipped by default.
+//! Override with `allow_self_trade = true` for testing only.
 
 use std::collections::HashMap;
 

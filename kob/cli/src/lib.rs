@@ -15,6 +15,7 @@ pub mod ifd;
 pub mod lending;
 pub mod list;
 pub mod market;
+pub mod match_batch;
 pub mod matching;
 pub mod mm;
 pub mod my_orders;
@@ -348,6 +349,34 @@ pub enum Commands {
         /// Sell order expiry DAA score (for v13 RS reconstruction). 0 = GTC.
         #[arg(long, default_value = "0")]
         sell_expiry: u64,
+    },
+
+    /// N:M atomic batch match -- fills multiple sell and buy orders in a single TX.
+    ///
+    /// Uses 2-phase fee convergence for exact miner fee (compute mass == fee).
+    /// Orders are looked up from the local orders.json cache.
+    MatchBatch {
+        /// Sell order outpoints (comma-separated, e.g. TXID:0,TXID:1).
+        #[arg(long, value_delimiter = ',')]
+        sell_outpoints: Vec<String>,
+
+        /// Buy order outpoints (comma-separated, e.g. TXID:0,TXID:1).
+        #[arg(long, value_delimiter = ',')]
+        buy_outpoints: Vec<String>,
+
+        /// Token covenant ID (hex, 64 chars).
+        #[arg(long)]
+        token: String,
+
+        /// Token UTXO outpoint for providing tokens to buy orders (txid:index).
+        /// Required for cross-token matching. For same-token matching, sells
+        /// provide tokens directly.
+        #[arg(long)]
+        token_outpoint: Option<String>,
+
+        /// Maximum matcher fee in sompi (default: 10_000_000 = 0.1 KAS).
+        #[arg(long, default_value = "10000000")]
+        max_matcher_fee: u64,
     },
 
     /// Trade receipt operations: create, consume (v3), trigger, consume-v1 (legacy).
@@ -2021,6 +2050,26 @@ pub async fn dispatch(
                 )
                 .await?;
             }
+        }
+        Commands::MatchBatch {
+            sell_outpoints,
+            buy_outpoints,
+            token,
+            token_outpoint,
+            max_matcher_fee,
+        } => {
+            let token = token::resolve_token(&token, None)?;
+            match_batch::run(
+                wallet_path,
+                node,
+                network,
+                &sell_outpoints,
+                &buy_outpoints,
+                &token,
+                token_outpoint.as_deref(),
+                max_matcher_fee,
+            )
+            .await?;
         }
         Commands::Receipt { action } => match action {
             receipt::ReceiptCommand::Create {

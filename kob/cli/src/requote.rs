@@ -591,7 +591,7 @@ mod tests {
         let spk_hash = compute_p2pk_spk_hash(&pk);
         let rs = contract::build_buy_redeem_script(
             &tcid, 50, 1, 500_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 409);
+        assert_eq!(rs.len(), 405);
     }
 
     #[test]
@@ -601,7 +601,7 @@ mod tests {
         let spk_hash = compute_p2pk_spk_hash(&pk);
         let rs = contract::build_sell_redeem_script(
             50, 1, 500_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 378);
+        assert_eq!(rs.len(), 374);
     }
 
     #[test]

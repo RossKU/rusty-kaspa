@@ -854,6 +854,70 @@ pub struct BatchMatchResult {
     pub matcher_surplus: u64,
 }
 
+/// Trace all input sigscripts in a batch TX at debug level.
+///
+/// For each input, disassembles the sigscript into human-readable opcodes.
+/// Covenant inputs show the full sigscript structure (args + selector + RS).
+/// Wallet inputs show `P2PK(sig)`.
+fn trace_batch_inputs(
+    batch_tx: &crate::matcher::batch::BatchTx,
+    plan: &crate::matcher::batch::BatchPlan,
+) {
+    use kob_core::contract::opcodes::format_script;
+
+    if !tracing::enabled!(tracing::Level::DEBUG) {
+        return;
+    }
+
+    let wallet_idx = if plan.wallet_input.is_some() {
+        Some(batch_tx.inputs.len().saturating_sub(1))
+    } else {
+        None
+    };
+
+    debug!("[TRACE] ═══ Batch TX sigscript trace ({} inputs, {} outputs) ═══",
+        batch_tx.inputs.len(), batch_tx.outputs.len());
+
+    for (i, inp) in batch_tx.inputs.iter().enumerate() {
+        let role = if i < plan.sells.len() {
+            format!("sell[{}]", i)
+        } else if i < plan.sells.len() + plan.buys.len() {
+            format!("buy[{}]", i - plan.sells.len())
+        } else if wallet_idx == Some(i) {
+            "wallet".to_string()
+        } else {
+            format!("input[{}]", i)
+        };
+
+        let txid_short = &inp.tx_id[..inp.tx_id.len().min(12)];
+
+        if wallet_idx == Some(i) {
+            debug!("[TRACE]   {}  {}:{}  P2PK(sig={}B)",
+                role, txid_short, inp.index, inp.sigscript.len());
+            continue;
+        }
+
+        // Covenant input: disassemble sigscript
+        let disasm = format_script(&inp.sigscript);
+
+        // Split into args vs RS for readability
+        // RS is always the last pushdata element (largest)
+        let ss_len = inp.sigscript.len();
+        debug!("[TRACE]   {}  {}:{}  sigscript({}B): {}",
+            role, txid_short, inp.index, ss_len, disasm);
+    }
+
+    // Output summary
+    for (i, out) in batch_tx.outputs.iter().enumerate() {
+        let spk_hex = &hex::encode(&out.script_public_key);
+        let spk_short = &spk_hex[..spk_hex.len().min(16)];
+        debug!("[TRACE]   output[{}]  value={}  spk={}...({:?})",
+            i, out.value, spk_short, out.purpose);
+    }
+
+    debug!("[TRACE] ═══ end trace ═══");
+}
+
 /// Execute an N:M batch match from a pre-built BatchPlan.
 ///
 /// Builds the batch TX via `BatchPlan::build_tx()`, constructs a sighash TX
@@ -1140,6 +1204,9 @@ pub async fn execute_batch_match(
             return None;
         }
     }
+
+    // Bytecode trace: disassemble all input sigscripts at debug level
+    trace_batch_inputs(&batch_tx, plan);
 
     // Submit via RPC (version=1 for covenant output bindings, lockTime=50 for OP_CSV)
     let payload = match ifd_payload {

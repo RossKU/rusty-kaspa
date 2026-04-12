@@ -6,7 +6,7 @@ pub mod rest_client;
 pub use kob_core::rpc_types::{RpcUtxo, RpcOutpoint, RpcUtxoEntry, RpcSpk, parse_rest_spk};
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
@@ -87,6 +87,12 @@ pub struct RpcClient {
     notification_rx: Arc<Mutex<Option<mpsc::Receiver<serde_json::Value>>>>,
     /// Sender side kept for reconnection (cloned into reader task).
     notification_tx: mpsc::Sender<serde_json::Value>,
+    /// Real-time UTXO spent tracking via notifyUtxosChanged subscription.
+    /// Keys are "txid:index" strings. Populated by the reader task when
+    /// utxosChangedNotification arrives, and by submit_transaction auto-marking.
+    spent_outpoints: Arc<Mutex<HashSet<String>>>,
+    /// Addresses already subscribed to notifyUtxosChanged (avoid re-subscribing).
+    subscribed_addresses: Arc<Mutex<HashSet<String>>>,
 }
 
 impl RpcClient {
@@ -141,6 +147,8 @@ impl RpcClient {
 
         let (write_tx, mut write_rx) = mpsc::channel::<String>(256);
         let (notif_tx, notif_rx) = mpsc::channel::<serde_json::Value>(512);
+        let spent_outpoints: Arc<Mutex<HashSet<String>>> =
+            Arc::new(Mutex::new(HashSet::new()));
 
         // Split WebSocket into reader and writer
         use futures_util::stream::StreamExt;
@@ -167,6 +175,7 @@ impl RpcClient {
         let pending_r = pending.clone();
         let alive_r = alive.clone();
         let notif_tx_r = notif_tx.clone();
+        let spent_r = spent_outpoints.clone();
         tokio::spawn(async move {
             while let Some(msg_result) = ws_reader.next().await {
                 match msg_result {
@@ -180,27 +189,55 @@ impl RpcClient {
                                         tracing::warn!("[RPC] Response channel closed for request {}", id);
                                     }
                                 }
-                            } else if resp.method.is_some() {
-                                // Subscription notification (no id, has method)
-                                // Build a notification value with method + params
-                                let mut notif = serde_json::Map::new();
-                                if let Some(m) = &resp.method {
-                                    notif.insert("method".to_string(), serde_json::Value::String(m.clone()));
-                                }
-                                if let Some(p) = resp.params {
-                                    notif.insert("params".to_string(), p);
-                                }
-                                if let Err(e) = notif_tx_r.try_send(serde_json::Value::Object(notif)) {
-                                    tracing::warn!("[RPC] Failed to enqueue notification: {}", e);
+                            } else if let Some(ref method) = resp.method {
+                                if method == "utxosChangedNotification" {
+                                    // Route to spent_outpoints tracking
+                                    if let Some(ref params) = resp.params {
+                                        let mut spent_set = spent_r.lock().await;
+                                        // Removed UTXOs → mark as spent
+                                        if let Some(removed) = params.get("removed").and_then(|v| v.as_array()) {
+                                            for entry in removed {
+                                                if let Some(op) = entry.get("outpoint") {
+                                                    let txid = op.get("transactionId").and_then(|v| v.as_str()).unwrap_or("");
+                                                    let idx = op.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                    if !txid.is_empty() {
+                                                        let key = format!("{}:{}", txid, idx);
+                                                        tracing::debug!("[UTXO] Removed (spent): {}", key);
+                                                        spent_set.insert(key);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        // Added UTXOs → remove from spent (confirmed available)
+                                        if let Some(added) = params.get("added").and_then(|v| v.as_array()) {
+                                            for entry in added {
+                                                if let Some(op) = entry.get("outpoint") {
+                                                    let txid = op.get("transactionId").and_then(|v| v.as_str()).unwrap_or("");
+                                                    let idx = op.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                                    if !txid.is_empty() {
+                                                        let key = format!("{}:{}", txid, idx);
+                                                        tracing::debug!("[UTXO] Added (available): {}", key);
+                                                        spent_set.remove(&key);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Other notifications (blockAdded, etc.) → general channel
+                                    let mut notif = serde_json::Map::new();
+                                    notif.insert("method".to_string(), serde_json::Value::String(method.clone()));
+                                    if let Some(p) = resp.params {
+                                        notif.insert("params".to_string(), p);
+                                    }
+                                    if let Err(e) = notif_tx_r.try_send(serde_json::Value::Object(notif)) {
+                                        tracing::warn!("[RPC] Failed to enqueue notification: {}", e);
+                                    }
                                 }
                             }
                         }
                     }
-                    Ok(Message::Close(_)) => {
-                        alive_r.store(false, AtomicOrdering::Relaxed);
-                        break;
-                    }
-                    Err(_) => {
+                    Ok(Message::Close(_)) | Err(_) => {
                         alive_r.store(false, AtomicOrdering::Relaxed);
                         break;
                     }
@@ -220,6 +257,8 @@ impl RpcClient {
             retry_config,
             notification_rx: Arc::new(Mutex::new(Some(notif_rx))),
             notification_tx: notif_tx,
+            spent_outpoints,
+            subscribed_addresses: Arc::new(Mutex::new(HashSet::new())),
         })
     }
 
@@ -286,12 +325,12 @@ impl RpcClient {
         Ok(resp.params.unwrap_or(serde_json::Value::Null))
     }
 
-    /// Submit a transaction.
+    /// Submit a transaction. Auto-marks consumed inputs as spent.
     pub async fn submit_transaction(
         &self,
         tx_json: serde_json::Value,
     ) -> Result<SubmitResult, String> {
-        let result = self.call("submitTransaction", tx_json).await?;
+        let result = self.call("submitTransaction", tx_json.clone()).await?;
 
         // Check for error in params
         if let Some(err) = result.get("error") {
@@ -308,6 +347,28 @@ impl RpcClient {
             .get("transactionId")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+
+        // Auto-mark inputs as spent on success
+        if tx_id.is_some() {
+            if let Some(inputs) = tx_json
+                .get("transaction")
+                .and_then(|t| t.get("inputs"))
+                .and_then(|i| i.as_array())
+            {
+                let mut spent = self.spent_outpoints.lock().await;
+                for input in inputs {
+                    if let Some(prev) = input.get("previousOutpoint") {
+                        let txid = prev.get("transactionId").and_then(|v| v.as_str()).unwrap_or("");
+                        let idx = prev.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if !txid.is_empty() {
+                            let key = format!("{}:{}", txid, idx);
+                            tracing::debug!("[UTXO] Auto-marking spent: {}", key);
+                            spent.insert(key);
+                        }
+                    }
+                }
+            }
+        }
 
         Ok(SubmitResult {
             ok: tx_id.is_some(),
@@ -362,18 +423,42 @@ impl RpcClient {
         Ok(entries)
     }
 
-    /// Get spendable UTXOs (filtered by mempool-spent outpoints).
+    /// Get spendable UTXOs (filtered by real-time spent tracking + mempool query fallback).
     ///
-    /// Queries getMempoolEntriesByAddresses to exclude UTXOs that are already
-    /// spent in pending transactions.
+    /// Primary: uses notifyUtxosChanged subscription (spent_outpoints set).
+    /// Fallback: queries getMempoolEntriesByAddresses if available.
+    /// Auto-subscribes to UTXO changes on first query for each address.
     pub async fn get_spendable_utxos(
         &self,
         address: &str,
         min_amount: Option<u64>,
     ) -> Result<Vec<RpcUtxo>, String> {
+        // Auto-subscribe to UTXO changes on first query for this address
+        {
+            let mut subs = self.subscribed_addresses.lock().await;
+            if !subs.contains(address) {
+                subs.insert(address.to_string());
+                drop(subs);
+                if let Err(e) = self.subscribe_utxos_changed(&[address]).await {
+                    tracing::debug!("[UTXO] Auto-subscribe for {} failed: {}", address, e);
+                }
+            }
+        }
+
         let utxos = self.get_utxos(address, min_amount).await?;
 
-        // Try to filter by mempool
+        // Collect spent outpoints from both local tracking and mempool query
+        let mut spent = HashSet::new();
+
+        // 1. Local real-time tracking (notifyUtxosChanged)
+        {
+            let local_spent = self.spent_outpoints.lock().await;
+            for key in local_spent.iter() {
+                spent.insert(key.clone());
+            }
+        }
+
+        // 2. Mempool query fallback (may fail on some node versions)
         let mempool_result = self
             .call(
                 "getMempoolEntriesByAddresses",
@@ -386,8 +471,6 @@ impl RpcClient {
             .await;
 
         if let Ok(mempool_resp) = mempool_result {
-            let mut spent_outpoints = std::collections::HashSet::new();
-
             if let Some(entries) = mempool_resp.get("entries").and_then(|v| v.as_array()) {
                 for entry in entries {
                     if let Some(sending) = entry.get("sending").and_then(|v| v.as_array()) {
@@ -399,21 +482,11 @@ impl RpcClient {
                             {
                                 for inp in inputs {
                                     if let Some(op) = inp.get("previousOutpoint") {
-                                        let tx_id = op
-                                            .get("transactionId")
-                                            .and_then(|v| v.as_str());
-                                        let idx = op
-                                            .get("index")
-                                            .and_then(|v| v.as_u64());
-                                        if tx_id.is_none() || idx.is_none() {
-                                            tracing::warn!(
-                                                "[RPC] Malformed previousOutpoint in mempool entry: {:?}",
-                                                op
-                                            );
+                                        let tx_id = op.get("transactionId").and_then(|v| v.as_str()).unwrap_or("");
+                                        let idx = op.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
+                                        if !tx_id.is_empty() {
+                                            spent.insert(format!("{}:{}", tx_id, idx));
                                         }
-                                        let tx_id = tx_id.unwrap_or("");
-                                        let idx = idx.unwrap_or(0);
-                                        spent_outpoints.insert(format!("{}:{}", tx_id, idx));
                                     }
                                 }
                             }
@@ -421,25 +494,24 @@ impl RpcClient {
                     }
                 }
             }
+        }
+        // No warn on mempool failure — local tracking is primary
 
-            if !spent_outpoints.is_empty() {
-                let before = utxos.len();
-                let filtered: Vec<RpcUtxo> = utxos
-                    .into_iter()
-                    .filter(|u| !spent_outpoints.contains(&u.outpoint_key()))
-                    .collect();
-                let after = filtered.len();
-                if after < before {
-                    tracing::info!(
-                        "[MEMPOOL] Filtered {} spent UTXOs ({} in mempool)",
-                        before - after,
-                        spent_outpoints.len()
-                    );
-                }
-                return Ok(filtered);
+        if !spent.is_empty() {
+            let before = utxos.len();
+            let filtered: Vec<RpcUtxo> = utxos
+                .into_iter()
+                .filter(|u| !spent.contains(&u.outpoint_key()))
+                .collect();
+            let after = filtered.len();
+            if after < before {
+                tracing::info!(
+                    "[UTXO] Filtered {} spent UTXOs ({} tracked)",
+                    before - after,
+                    spent.len()
+                );
             }
-        } else {
-            tracing::warn!("[MEMPOOL] Mempool query failed, using unfiltered UTXOs");
+            return Ok(filtered);
         }
 
         Ok(utxos)
@@ -471,6 +543,32 @@ impl RpcClient {
     /// process incoming notifications.
     pub async fn take_notification_receiver(&self) -> Option<mpsc::Receiver<serde_json::Value>> {
         self.notification_rx.lock().await.take()
+    }
+
+    /// Subscribe to UTXO changes for the given addresses.
+    /// The reader task automatically processes notifications and updates
+    /// the spent_outpoints set — no background task needed.
+    pub async fn subscribe_utxos_changed(&self, addresses: &[&str]) -> Result<(), String> {
+        let addr_values: Vec<serde_json::Value> = addresses.iter()
+            .map(|a| serde_json::Value::String(a.to_string()))
+            .collect();
+        self.call(
+            "notifyUtxosChanged",
+            serde_json::json!({ "addresses": addr_values }),
+        )
+        .await?;
+        tracing::info!("[UTXO] Subscribed to utxosChanged for {} address(es)", addresses.len());
+        Ok(())
+    }
+
+    /// Mark an outpoint as spent (immediate, before notification arrives).
+    pub async fn mark_spent(&self, outpoint_key: &str) {
+        self.spent_outpoints.lock().await.insert(outpoint_key.to_string());
+    }
+
+    /// Check if an outpoint is known-spent.
+    pub async fn is_spent(&self, outpoint_key: &str) -> bool {
+        self.spent_outpoints.lock().await.contains(outpoint_key)
     }
 }
 

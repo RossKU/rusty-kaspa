@@ -24,11 +24,12 @@ use matcher::order_book::OrderBook;
 use rpc::RpcClient;
 
 /// Connect to primary RPC node, falling back to secondary if primary fails.
+/// Automatically subscribes to UTXO changes for the wallet address.
 pub async fn connect_rpc(config: &AppConfig) -> Result<RpcClient, String> {
-    match RpcClient::connect(&config.node_url).await {
+    let rpc = match RpcClient::connect(&config.node_url).await {
         Ok(rpc) => {
             info!("Connected to: {}", config.node_url);
-            Ok(rpc)
+            rpc
         }
         Err(e) => {
             warn!("Primary node failed: {}", e);
@@ -36,15 +37,22 @@ pub async fn connect_rpc(config: &AppConfig) -> Result<RpcClient, String> {
                 match RpcClient::connect(fallback).await {
                     Ok(rpc) => {
                         info!("Connected to fallback: {}", fallback);
-                        Ok(rpc)
+                        rpc
                     }
-                    Err(e2) => Err(format!("Primary: {}, Fallback: {}", e, e2)),
+                    Err(e2) => return Err(format!("Primary: {}, Fallback: {}", e, e2)),
                 }
             } else {
-                Err(e.to_string())
+                return Err(e.to_string());
             }
         }
+    };
+
+    // Auto-subscribe to UTXO changes for wallet address
+    if let Err(e) = rpc.subscribe_utxos_changed(&[&config.address]).await {
+        warn!("[UTXO] Failed to subscribe utxosChanged for wallet {}: {}", config.address, e);
     }
+
+    Ok(rpc)
 }
 
 /// Run the KOB matching engine with the given configuration.

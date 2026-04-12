@@ -1079,6 +1079,9 @@ pub async fn execute_batch_match(
         });
     }
 
+    // Wallet sigscript — needed for compute mass check after signing
+    let mut wallet_sigscript: Option<Vec<u8>> = None;
+
     // Add wallet input (P2PK, sigOpCount=1) if present
     if let Some((ref wallet_tx_id, wallet_index, wallet_value)) = plan.wallet_input {
         // Fetch wallet UTXOs to get the SPK for sighash computation
@@ -1201,9 +1204,10 @@ pub async fn execute_batch_match(
             &hex::encode(&wallet_ss),
             1, // sigOpCount = 1 for P2PK
         ));
+        wallet_sigscript = Some(wallet_ss);
     }
 
-    // Storage mass pre-check for batch TX
+    // Mass pre-check: storage mass + compute mass (with real sigscripts)
     {
         let in_vals: Vec<u64> = plan.sells.iter().map(|(s, _)| s.utxo_value).chain(
             plan.buys.iter().map(|(b, _)| b.utxo_value)
@@ -1211,15 +1215,43 @@ pub async fn execute_batch_match(
             plan.wallet_input.iter().map(|(_, _, val)| *val)
         ).collect();
         let out_vals: Vec<u64> = plan.outputs.iter().map(|o| o.value).collect();
+
+        // 1. Storage mass check
         if check_mass_presubmit(&in_vals, &out_vals, "BATCH").is_none() {
-            // Mark all inputs as failed for cooldown
             for (sell, _) in &plan.sells {
-                let key = format!("{}:{}", sell.outpoint.0, sell.outpoint.1);
-                spent_tracker.mark_failed(&key);
+                spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
             }
             for (buy, _) in &plan.buys {
-                let key = format!("{}:{}", buy.outpoint.0, buy.outpoint.1);
-                spent_tracker.mark_failed(&key);
+                spent_tracker.mark_failed(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
+            }
+            return None;
+        }
+
+        // 2. Compute mass check (with real sigscripts)
+        let sigscripts: Vec<Vec<u8>> = batch_tx.inputs.iter().enumerate().map(|(i, inp)| {
+            if has_wallet && i == wallet_input_idx {
+                wallet_sigscript.clone().unwrap_or_default()
+            } else {
+                inp.sigscript.clone()
+            }
+        }).collect();
+        let compute_mass = kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts);
+        let storage_mass = kob_core::mass::compute_storage_mass(&in_vals, &out_vals);
+        let effective_mass = compute_mass.max(storage_mass);
+        info!(
+            "[BATCH] Mass check: compute={}, storage={}, effective={}, limit={}",
+            compute_mass, storage_mass, effective_mass, kob_core::MAX_TX_MASS
+        );
+        if effective_mass > kob_core::MAX_TX_MASS {
+            error!(
+                "[BATCH] Effective mass {} exceeds limit {} — rejecting TX",
+                effective_mass, kob_core::MAX_TX_MASS
+            );
+            for (sell, _) in &plan.sells {
+                spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
+            }
+            for (buy, _) in &plan.buys {
+                spent_tracker.mark_failed(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
             }
             return None;
         }

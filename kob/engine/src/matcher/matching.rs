@@ -548,10 +548,11 @@ pub fn find_batch_groups(pairs: &[CrossingPair]) -> Vec<Vec<&CrossingPair>> {
         let mut sorted = token_pairs;
         sorted.sort_by(|a, b| b.surplus.cmp(&a.surplus));
 
-        // Deduplicate: each outpoint (sell or buy) can appear in at most one pair per group.
+        // Deduplicate: each outpoint (sell or buy) can appear in at most one pair.
         // Greedy selection: pick pairs in surplus order, skip if either outpoint is already used.
+        // Split into groups of MAX_BATCH_GROUP_SIZE.
         let mut used_outpoints = HashSet::new();
-        let mut group = Vec::new();
+        let mut deduped = Vec::new();
 
         for p in &sorted {
             let sell_key = p.sell.outpoint_key();
@@ -561,14 +562,13 @@ pub fn find_batch_groups(pairs: &[CrossingPair]) -> Vec<Vec<&CrossingPair>> {
             }
             used_outpoints.insert(sell_key);
             used_outpoints.insert(buy_key);
-            group.push(*p);
-            if group.len() >= MAX_BATCH_GROUP_SIZE {
-                break;
-            }
+            deduped.push(*p);
         }
 
-        if !group.is_empty() {
-            groups.push(group);
+        for chunk in deduped.chunks(MAX_BATCH_GROUP_SIZE) {
+            if !chunk.is_empty() {
+                groups.push(chunk.to_vec());
+            }
         }
     }
 

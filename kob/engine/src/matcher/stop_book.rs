@@ -56,6 +56,10 @@ pub struct StopOrder {
     /// Secret token required for cancellation (not exposed in list responses).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_secret: Option<String>,
+    /// Number of broadcast attempts that failed with orphan/missing-input errors.
+    /// The executor retries up to MAX_BROADCAST_RETRIES before giving up.
+    #[serde(default)]
+    pub broadcast_attempts: u32,
 }
 
 impl StopOrder {
@@ -100,6 +104,9 @@ impl StopOrder {
 }
 
 // Stop Order Book
+
+/// Maximum broadcast retry attempts for orphan/missing-input errors.
+pub const MAX_BROADCAST_RETRIES: u32 = 3;
 
 /// Maximum number of stop orders per trading pair.
 pub const MAX_STOP_ORDERS_PER_PAIR: usize = 1_000;
@@ -237,7 +244,11 @@ impl StopOrderBook {
 
         orders
             .iter()
-            .filter(|o| !o.triggered && o.is_triggered(trade_price_num, trade_price_den))
+            .filter(|o| {
+                !o.triggered
+                    && o.broadcast_attempts < MAX_BROADCAST_RETRIES
+                    && o.is_triggered(trade_price_num, trade_price_den)
+            })
             .map(|o| o.id)
             .collect()
     }
@@ -248,11 +259,21 @@ impl StopOrderBook {
             if let Some(order) = orders.iter_mut().find(|o| o.id == id) {
                 order.triggered = true;
                 order.trigger_tx_id = tx_id;
-                // Don't decrement total_count here; we purge triggered orders
-                // during cleanup instead.
                 return;
             }
         }
+    }
+
+    /// Increment broadcast attempt counter for a stop order.
+    /// Returns the new count, or None if the order was not found.
+    pub fn increment_broadcast_attempts(&mut self, id: StopOrderId) -> Option<u32> {
+        for orders in self.orders.values_mut() {
+            if let Some(order) = orders.iter_mut().find(|o| o.id == id) {
+                order.broadcast_attempts += 1;
+                return Some(order.broadcast_attempts);
+            }
+        }
+        None
     }
 
     /// Remove expired and triggered orders. Returns count of removed orders.
@@ -388,6 +409,7 @@ mod tests {
             triggered: false,
             trigger_tx_id: None,
             cancel_secret: None,
+            broadcast_attempts: 0,
         }
     }
 

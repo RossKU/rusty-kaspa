@@ -1541,6 +1541,7 @@ fn process_block_txs_all(
     prediction_book: &mut crate::matcher::prediction_book::PredictionBook,
     ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
     current_daa: u64,
+    mut ifd_book: Option<&mut crate::matcher::ifd::IfdBook>,
 ) -> ScanCounters {
     let mut counters = ScanCounters::default();
 
@@ -1644,6 +1645,10 @@ fn process_block_txs_all(
                     p2sh_value, parsed.price_num, parsed.price_den,
                 );
 
+                // IFD activation: check if this order's P2SH matches a pending IFD rule
+                let p2sh_hex_for_ifd = book_order.p2sh_script_hex.clone();
+                let outpoint_for_ifd = outpoint_key.clone();
+
                 match parsed.order_type {
                     OrderSide::Buy => {
                         if let Some(ws) = ws_tx {
@@ -1674,6 +1679,21 @@ fn process_block_txs_all(
                     }
                 }
                 counters.spot_added += 1;
+
+                // Activate IFD rule if this order matches a pending rule's P2SH
+                if let Some(ref mut ifd) = ifd_book {
+                    if let Some(rule) = ifd.find_by_a_p2sh(&p2sh_hex_for_ifd) {
+                        let rule_id = rule.id;
+                        if rule.status == crate::matcher::ifd::IfdStatus::Pending {
+                            if ifd.activate(rule_id, &outpoint_for_ifd) {
+                                info!(
+                                    "[IFD] Activated rule #{} — order A detected at {}",
+                                    rule_id, &outpoint_for_ifd[..outpoint_for_ifd.len().min(20)],
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
             ScanResult::Perp(parsed, p2sh_idx, p2sh_value) => {
@@ -1960,6 +1980,7 @@ async fn scan_new_blocks(
                 prediction_book,
                 ws_tx,
                 current_daa,
+                None, // No IFD book in scan_new_blocks (unused path)
             );
 
             total_counters.spot_added += counters.spot_added;
@@ -4011,11 +4032,12 @@ pub async fn run_continuous_with_ws(
                 let mut pb = shared_perp_book.lock().await;
                 let mut lb = shared_lending_book.lock().await;
                 let mut pred = shared_prediction_book.lock().await;
+                let mut ib = shared_ifd_book.lock().await;
 
                 for txs in &block_txs_batch {
                     let counters = process_block_txs_all(
                         txs, &mut ob, &scanner, &mut pb, &mut lb, &mut pred,
-                        ws_tx.as_ref(), current_daa,
+                        ws_tx.as_ref(), current_daa, Some(&mut ib),
                     );
                     total_counters.spot_added += counters.spot_added;
                     total_counters.spot_removed += counters.spot_removed;
@@ -4129,8 +4151,32 @@ pub async fn run_continuous_with_ws(
                                 shared_stop_book.lock().await.mark_triggered(*stop_id, Some(tx_id));
                             }
                             Ok(result) => {
-                                warn!("[STOP] Broadcast failed for stop order #{}: {:?}", stop_id, result.error);
-                                shared_stop_book.lock().await.mark_triggered(*stop_id, None);
+                                let err_str = result.error.as_deref().unwrap_or("");
+                                let is_orphan = err_str.contains("orphan")
+                                    || err_str.contains("missing")
+                                    || err_str.contains("not found")
+                                    || err_str.contains("MissingTxOut");
+                                if is_orphan {
+                                    // Fee UTXO was consumed — retry up to MAX_BROADCAST_RETRIES
+                                    let mut sb = shared_stop_book.lock().await;
+                                    let attempts = sb.increment_broadcast_attempts(*stop_id).unwrap_or(0);
+                                    if attempts >= crate::matcher::stop_book::MAX_BROADCAST_RETRIES {
+                                        warn!(
+                                            "[STOP] Stop order #{} exhausted {} retries (fee UTXO stale: {}). Giving up.",
+                                            stop_id, attempts, err_str,
+                                        );
+                                        sb.mark_triggered(*stop_id, None);
+                                    } else {
+                                        warn!(
+                                            "[STOP] Stop order #{} broadcast failed (attempt {}/{}): {} — will retry",
+                                            stop_id, attempts, crate::matcher::stop_book::MAX_BROADCAST_RETRIES, err_str,
+                                        );
+                                    }
+                                } else {
+                                    // Non-recoverable rejection (double-spend, bad signature, etc.)
+                                    warn!("[STOP] Broadcast failed for stop order #{}: {:?}", stop_id, result.error);
+                                    shared_stop_book.lock().await.mark_triggered(*stop_id, None);
+                                }
                             }
                             Err(e) => {
                                 warn!("[STOP] RPC error broadcasting stop order #{}: {}", stop_id, e);

@@ -1709,6 +1709,7 @@ async fn handle_submit_stop_order(
         triggered: false,
         trigger_tx_id: None,
         cancel_secret: Some(cancel_secret.clone()),
+        broadcast_attempts: 0,
     };
 
     let s = state.read().await;

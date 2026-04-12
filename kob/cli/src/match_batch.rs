@@ -4,7 +4,7 @@
 //! orders atomically, using 2-phase fee convergence for exact miner fee.
 //!
 //! Input layout:
-//!   `[sell_0 .. sell_{N-1}] [buy_0 .. buy_{M-1}] [token_unit] [wallet_fee_utxo]`
+//!   `[sell_0 .. sell_{N-1}] [buy_0 .. buy_{M-1}] [wallet_fee_utxo]`
 //!
 //! Output layout:
 //!   `[seller_kas_0 .. seller_kas_{N-1}] [buyer_tokens_0 .. buyer_tokens_{M-1}] [matcher_fee?]`
@@ -20,7 +20,7 @@ use kob_core::tx::{to_rpc_payload, CovenantBinding, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletFile;
 use kob_core::MIN_UTXO_VALUE;
-use kob_engine::matcher::batch::{BatchOrder, BatchPlan, OrderType, TokenUnit};
+use kob_engine::matcher::batch::{BatchOrder, BatchPlan, OrderType};
 use std::path::Path;
 use tracing::info;
 
@@ -32,8 +32,9 @@ pub async fn run(
     sell_outpoint_strs: &[String],
     buy_outpoint_strs: &[String],
     token_hex: &str,
-    token_outpoint_str: Option<&str>,
     max_matcher_fee: u64,
+    fee_bps: Option<u16>,
+    ioc: bool,
 ) -> anyhow::Result<()> {
     let wallet = WalletFile::load(wallet_path)?;
     let privkey = wallet.private_key_bytes()?;
@@ -231,53 +232,12 @@ pub async fn run(
         });
     }
 
-    // Find or specify token unit
-    let token_outpoint = if let Some(s) = token_outpoint_str {
-        Some(Outpoint::parse(s)?)
-    } else {
-        None
-    };
-
-    // Get wallet UTXOs for fee payment and token unit lookup
+    // Get wallet UTXOs for fee payment
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
-
-    // Build token units -- look for token covenant UTXOs in wallet
-    let mut token_units = Vec::new();
-    if let Some(ref top) = token_outpoint {
-        let tu_utxo = wallet_utxos.iter()
-            .find(|u| u.outpoint.transaction_id == top.transaction_id && u.outpoint.index == top.index)
-            .ok_or_else(|| anyhow::anyhow!("Token UTXO {} not found in wallet", token_outpoint_str.unwrap()))?;
-
-        // Token units use their P2SH redeemScript, but for wallet-owned tokens
-        // they're P2PK. Build a minimal token unit.
-        let tu_rs = tu_utxo.script_bytes();
-        token_units.push(TokenUnit {
-            outpoint: (top.transaction_id.clone(), top.index),
-            token_cov_id: tcid,
-            value: tu_utxo.utxo_entry.amount,
-            redeem_script: tu_rs,
-        });
-    } else {
-        // Auto-find: look for P2SH token UTXOs with matching covenant
-        // For now, skip auto-discovery and require --token-outpoint
-        // In batch matching, token units carry tokens for buy orders.
-        // The sell orders themselves provide tokens, so if all sells
-        // carry the same token as all buys need, no separate token unit needed.
-        // Actually in batch layout, sell inputs provide tokens directly.
-        // Token units are only needed for cross-token matching.
-        // For same-token batch, the sell inputs carry the tokens.
-        // We'll skip token units for same-token matching.
-    }
 
     // Select wallet UTXO for fee payment
     let fee_utxo = wallet_utxos.iter()
-        .find(|u| {
-            !u.is_p2sh()
-                && token_outpoint.as_ref().map_or(true, |top| {
-                    !(u.outpoint.transaction_id == top.transaction_id
-                        && u.outpoint.index == top.index)
-                })
-        })
+        .find(|u| !u.is_p2sh())
         .ok_or_else(|| anyhow::anyhow!(
             "No spendable UTXO for fee. Fund the wallet or run `kob wallet consolidate`."
         ))?;
@@ -292,14 +252,46 @@ pub async fn run(
     println!("Fee UTXO:       {}:{} ({} sompi)", wallet_utxo_info.0, wallet_utxo_info.1, wallet_utxo_info.2);
 
     // ---- Phase 1: Plan with estimated fee ----
-    let mut plan = kob_engine::matcher::batch::plan_batch_match(
-        &sells,
-        &buys,
-        &token_units,
-        Some(wallet_utxo_info.clone()),
-        &matcher_spk,
-        0,
-    )?;
+    let mut plan = if ioc {
+        // Auto-detect IOC direction:
+        //   1 buy  + N sells → buy sweeps sells (plan_ioc_match)
+        //   N buys + 1 sell  → sell sweeps buys (plan_sell_ioc_match)
+        if buys.len() == 1 && sells.len() >= 1 {
+            println!("IOC direction: buy sweeps {} sells", sells.len());
+            kob_engine::matcher::batch::plan_ioc_match(
+                &sells,
+                &buys[0],
+                Some(wallet_utxo_info.clone()),
+                &matcher_spk,
+                0,
+                fee_bps,
+            )?
+        } else if sells.len() == 1 && buys.len() >= 1 {
+            println!("IOC direction: sell sweeps {} buys", buys.len());
+            kob_engine::matcher::batch::plan_sell_ioc_match(
+                &sells[0],
+                &buys,
+                Some(wallet_utxo_info.clone()),
+                &matcher_spk,
+                0,
+                fee_bps,
+            )?
+        } else {
+            anyhow::bail!(
+                "--ioc requires asymmetric orders: 1 buy + N sells or N buys + 1 sell, got {} buys + {} sells",
+                buys.len(), sells.len()
+            );
+        }
+    } else {
+        kob_engine::matcher::batch::plan_batch_match(
+            &sells,
+            &buys,
+            Some(wallet_utxo_info.clone()),
+            &matcher_spk,
+            0,
+            fee_bps,
+        )?
+    };
     plan.validate()?;
 
     println!();
@@ -319,26 +311,38 @@ pub async fn run(
         }
     }
 
-    // Set covenant bindings on buyer token outputs
-    // Each buyer output at position [N+j] needs a covenant binding authorized
-    // by the sell input that provides the token.
-    for (j, _buy) in buys.iter().enumerate() {
-        let output_idx = sells.len() + j;
-        // Authorized by the first sell input (index 0) for same-token matching
-        let authorizing_input = plan.buy_seller_map
-            .get(&(sells.len() + j))
-            .copied()
-            .unwrap_or(0) as u16;
-        tx.outputs[output_idx].covenant = Some(CovenantBinding::new(
-            authorizing_input,
-            kob_core::compat::parse_hash(&token_hex.to_string()).unwrap(),
-        ));
+    // Set covenant bindings on token outputs.
+    // Buyer token outputs and sell remainder (IOC token change) need covenant
+    // binding authorized by the sell input that provides the tokens.
+    let token_hash = kob_core::compat::parse_hash(&token_hex.to_string()).unwrap();
+    for (idx, planned) in plan.outputs.iter().enumerate() {
+        use kob_engine::matcher::batch::OutputPurpose;
+        match planned.purpose {
+            OutputPurpose::BuyerTokens => {
+                let authorizing_input = plan.buy_seller_map
+                    .get(&idx)
+                    .copied()
+                    .unwrap_or(0) as u16;
+                tx.outputs[idx].covenant = Some(CovenantBinding::new(
+                    authorizing_input,
+                    token_hash,
+                ));
+            }
+            OutputPurpose::SellRemainder => {
+                // Sell IOC: token change back to seller, authorized by sell input (0)
+                tx.outputs[idx].covenant = Some(CovenantBinding::new(
+                    0,
+                    token_hash,
+                ));
+            }
+            _ => {}
+        }
     }
 
     // Build sigscripts from plan
     let batch_tx = plan.build_tx()?;
 
-    // Collect sigscripts in order (sell, buy, token, wallet)
+    // Collect sigscripts in order (sell, buy, wallet)
     let mut sigscripts: Vec<Vec<u8>> = batch_tx.inputs.iter()
         .map(|i| i.sigscript.clone())
         .collect();
@@ -375,16 +379,27 @@ pub async fn run(
         }
 
         // Re-set covenant bindings
-        for (j, _buy) in buys.iter().enumerate() {
-            let output_idx = sells.len() + j;
-            let authorizing_input = plan.buy_seller_map
-                .get(&(sells.len() + j))
-                .copied()
-                .unwrap_or(0) as u16;
-            tx.outputs[output_idx].covenant = Some(CovenantBinding::new(
-                authorizing_input,
-                kob_core::compat::parse_hash(&token_hex.to_string()).unwrap(),
-            ));
+        for (idx, planned) in plan.outputs.iter().enumerate() {
+            use kob_engine::matcher::batch::OutputPurpose;
+            match planned.purpose {
+                OutputPurpose::BuyerTokens => {
+                    let authorizing_input = plan.buy_seller_map
+                        .get(&idx)
+                        .copied()
+                        .unwrap_or(0) as u16;
+                    tx.outputs[idx].covenant = Some(CovenantBinding::new(
+                        authorizing_input,
+                        token_hash,
+                    ));
+                }
+                OutputPurpose::SellRemainder => {
+                    tx.outputs[idx].covenant = Some(CovenantBinding::new(
+                        0,
+                        token_hash,
+                    ));
+                }
+                _ => {}
+            }
         }
 
         // Re-sign wallet input (outputs changed -> sighash changed)
@@ -421,6 +436,25 @@ pub async fn run(
         println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
         println!("Miner fee:        {:>9} sompi", actual_fee);
         println!("Fee == mass:      {}", if actual_fee == exact_compute { "YES (exact)" } else { "NO (mismatch)" });
+    }
+
+    // Debug: print TX details
+    println!();
+    println!("TX Debug:");
+    println!("  Version: {}", tx.version);
+    println!("  Inputs: {}", tx.inputs.len());
+    for (i, inp) in tx.inputs.iter().enumerate() {
+        println!("    [{i}] {}:{} seq={} sigop={} spk_v={} spk_len={} val={}",
+            &inp.prev_tx_id[..16], inp.prev_index, inp.sequence,
+            inp.sig_op_count, inp.script_version,
+            inp.script_bytes.len(), inp.value);
+        println!("        ss_len={}", sigscripts[i].len());
+    }
+    println!("  Outputs: {}", tx.outputs.len());
+    for (i, out) in tx.outputs.iter().enumerate() {
+        println!("    [{i}] val={} spk_len={} cov={:?}",
+            out.value, out.script_bytes().len(),
+            out.covenant.as_ref().map(|c| format!("auth={} id={}", c.authorizing_input, &hex::encode(c.covenant_id.as_bytes())[..16])));
     }
 
     // Submit

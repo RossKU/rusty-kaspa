@@ -1,34 +1,34 @@
 use crate::primitives::{push_data, u64_le};
 use crate::contract::helpers::{gcd, push_index};
 
-/// buy_order body bytecode (260 bytes, no output count limit).
+/// buy_order body bytecode (251 bytes, v14: IOC fill path added, F6 removed).
 ///
 /// Features:
 /// - Max matcher fee (mmfee) cap: (kas_in - out[0].value) <= mmfee
 /// - On-chain expiry via CLTV
 /// - OP_CSV exposure delay (50 DAA) on fill/partial paths
+/// - IOC fill (selector=Op5): relaxes token output check to >= mfill
 ///
 /// State (145B): [tcid 32B][pnum 8B][pden 8B][mfill 8B][ohash 32B][bspkh 32B][mmfee 8B][cpend 1B][expiry_daa 8B]
 ///
 /// Stack after state push:
 ///   expiry(0), cpend(1), mmfee(2), bspkh(3), ohash(4), mfill(5), pden(6), pnum(7), tcid(8)
 ///
-/// Dispatch thresholds (RS=405B):
-///   T0 = 410 (expire < 410 < fill)
-///   T1 = 418 (fill < 418 < partial)
-///   T2 = 423 (partial < 423 < cancel)
+/// Dispatch thresholds (RS=396B):
+///   T0 = 401 (expire < 401 < fill)
+///   T1 = 409 (fill < 409 < partial)
+///   T2 = 415 (partial < 415 < cancel)
 ///
-/// Fill sigscript margin: v13 base=412, max=415 (3 data-push indices).
-///                        v12 base=413, max=417 (4 data-push indices).
-/// Partial sigscript margin: v13 base=420, max=422 (2 data-push indices).
+/// Fill sigscript margin: v14 base=403, max=406 (3 data-push indices).
+/// Partial sigscript margin: v14 base=412, max=414 (2 data-push indices).
 pub const BUY_ORDER_BODY: &[u8] = &[
     // DISPATCH PREAMBLE (15B)
     0xb9, 0xc9, 0x76,             // OpTxInputIndex, OpTxInputScriptSigLen, OpDup  [3B]
-    0x02, 0xa7, 0x01,             // push T2=423                                   [3B]
+    0x02, 0x9f, 0x01,             // push T2=415                                   [3B]
     0x9f,                         // OpLessThan (sigLen < T2?)                      [1B]
     0x63,                         // OpIf (expire/fill/partial)                     [1B]
     0x76,                         // OpDup (keep sigLen for T0 check)               [1B]
-    0x02, 0x9a, 0x01,             // push T0=410                                   [3B]
+    0x02, 0x91, 0x01,             // push T0=401                                   [3B]
     0x9f,                         // OpLessThan (sigLen < T0?)                      [1B]
     0x63,                         // OpIf (EXPIRE)                                  [1B]
     0x75,                         // OpDrop (sigLen, not needed in expire)           [1B]
@@ -79,7 +79,7 @@ pub const BUY_ORDER_BODY: &[u8] = &[
     0xb1,                         // OpCheckSequenceVerify (UTXO age >= 50)          [1B]
 
     // --- T1 DISPATCH (5B) ---
-    0x02, 0xa2, 0x01,             // push T1=418                                    [3B]
+    0x02, 0x99, 0x01,             // push T1=409                                    [3B]
     0x9f,                         // OpLessThan (sigLen < T1?)                       [1B]
     0x63,                         // OpIf (fill)                                    [1B]
 
@@ -100,7 +100,19 @@ pub const BUY_ORDER_BODY: &[u8] = &[
     0x76,                         // OpDup                                           [1B]
     // exp_tok_c(0), exp_tok(1), kas(2), mmfee(3), ..., mfill(6)
     0x56, 0x79, 0xa2, 0x69,       // Op6 OpPick(mfill) OpGTE OpVerify               [4B]
-    // exp_tok(0), kas(1), mmfee(2), ..., toi(12)
+    // exp_tok(0), kas(1), mmfee(2), ..., sel(9), ..., toi(12)
+    //
+    // IOC SUB-DISPATCH (9B): if selector==Op5, replace exp_tok with mfill
+    // so the output check becomes output[toi] >= mfill (not >= exp_tok).
+    0x59, 0x79,                   // Op9 OpPick(selector copy)                       [2B]
+    0x55, 0x87,                   // Op5 OpEqual (selector == 5?)                    [2B]
+    0x63,                         // OpIf (IOC)                                      [1B]
+    0x75,                         // OpDrop (drop exp_tok)                           [1B]
+    0x54, 0x79,                   // Op4 OpPick(mfill)                               [2B]
+    0x68,                         // OpEndIf                                          [1B]
+    // Normal fill: exp_tok(0) unchanged. IOC fill: mfill(0) replaces exp_tok.
+    // Either way depth=13, value_to_check at [0], toi at [12].
+    //
     // Token output amount (PARAMETERIZED: toi)
     0x5c, 0x79, 0xc2,             // Op12 OpPick(toi) OpTxOutputAmount               [3B]
     0x7c, 0xa2, 0x69,             // OpSwap OpGTE OpVerify                           [3B]
@@ -125,12 +137,10 @@ pub const BUY_ORDER_BODY: &[u8] = &[
     0x5c, 0x79,                   // Op12 OpPick(toi)                                [2B]
     0x87, 0x69,                   // OpEqual OpVerify                                [2B]
     // kas(0), mmfee(1), bspkh(2), ..., toi(11) = 12 items
-    // F6: matcher fee cap — (kas_in - out[0].value) <= mmfee
-    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> kas_in         [2B]
-    0x00, 0xc2,                   // Op0 OpTxOutputAmount -> out[0].value             [2B]
-    0x94,                         // OpSub -> fee = (kas_in - out[0].value)           [1B]
-    0x52, 0x79,                   // Op2 OpPick(mmfee at d2)                         [2B]
-    0xa1, 0x69,                   // OpLTE OpVerify (fee <= mmfee)                   [2B]
+    // F6 REMOVED: buy F6 was `kas_in - out[0].value <= mmfee` with hardcoded
+    // output[0]. In N:M batch, output[0] is only the first seller's KAS,
+    // so kas_in - out[0] >> mmfee for any multi-seller match.
+    // Buy is protected by price check and covenant binding instead.
     // Cleanup: 12 items = Op2Drop x6
     0x6d, 0x6d, 0x6d, 0x6d, 0x6d, 0x6d, // Op2Drop x6                              [6B]
 
@@ -199,12 +209,7 @@ pub const BUY_ORDER_BODY: &[u8] = &[
     0x51,                         // Op1                                             [1B]
     0x87, 0x69,                   // OpEqual OpVerify                                [2B]
     // mmfee(0), bspkh(1), ..., ri(10) = 11 items
-    // F6 PARTIAL: matcher fee cap — (kas_in - out[0].value) <= mmfee
-    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> kas_in         [2B]
-    0x00, 0xc2,                   // Op0 OpTxOutputAmount -> out[0].value             [2B]
-    0x94,                         // OpSub -> fee = (kas_in - out[0].value)           [1B]
-    0x51, 0x79,                   // Op1 OpPick(mmfee at d1)                         [2B]
-    0xa1, 0x69,                   // OpLTE OpVerify (fee <= mmfee)                   [2B]
+    // F6 PARTIAL REMOVED: same hardcoded output[0] issue as fill path F6.
     // Cleanup: 11 items = Op2Drop x5 + OpDrop
     0x6d, 0x6d, 0x6d, 0x6d, 0x6d, 0x75, // Op2Drop x5 + OpDrop                     [6B]
 
@@ -244,17 +249,18 @@ pub const BUY_ORDER_BODY: &[u8] = &[
 ];
 
 /// Expected length of BUY_ORDER_BODY bytecode.
-pub const BUY_ORDER_BODY_EXPECTED_LEN: usize = 260;
+pub const BUY_ORDER_BODY_EXPECTED_LEN: usize = 251;
 
-/// Expected length of buy_order redeemScript (145B state + 260B body).
-pub const BUY_ORDER_RS_EXPECTED_LEN: usize = 405;
+/// Expected length of buy_order redeemScript (145B state + 251B body).
+pub const BUY_ORDER_RS_EXPECTED_LEN: usize = 145 + BUY_ORDER_BODY_EXPECTED_LEN;
 
-/// Sell order body bytecode (262B, no output count limit).
+/// Sell order body bytecode (303B, v14: IOC fill path added, F6 removed).
 ///
 /// Features:
-/// - Max matcher fee (mmfee) cap: (token_in - out[0].value) <= mmfee
+/// - Token conservation via F4 (covenant-bound output >= input)
 /// - On-chain expiry via CLTV
 /// - OP_CSV exposure delay (50 DAA) on fill/partial paths
+/// - IOC fill (selector=Op5): uses `fta` (fill token amount) for partial sell
 ///
 /// State layout (112B):
 ///   `[pnum 8B][pden 8B][mfill 8B][ohash 32B][sspkh 32B][mmfee 8B][cpend 1B][expiry_daa 8B]`
@@ -330,12 +336,10 @@ pub const SELL_ORDER_BODY: &[u8] = &[
     0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount                  [2B]
     0xa2, 0x69,                   // OpGTE OpVerify                                  [2B]
 
-    // F6: matcher fee cap — (token_in - out[0].value) <= mmfee
-    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> token_in       [2B]
-    0x00, 0xc2,                   // Op0 OpTxOutputAmount -> out[0].value             [2B]
-    0x94,                         // OpSub -> fee = (token_in - out[0].value)         [1B]
-    0x51, 0x79,                   // Op1 OpPick(mmfee at d1)                         [2B]
-    0xa1, 0x69,                   // OpLTE OpVerify (fee <= mmfee)                   [2B]
+    // F6 REMOVED: sell F6 was denomination-blind (token_in - kas_out[0])
+    // which only passed at price 1/1.  Sell is protected by F4 (token
+    // conservation) and the price check instead.  See v8 sell body which
+    // also omits F6.
 
     // Cleanup: 7 items = Op2Drop x3 + OpDrop
     0x6d, 0x6d, 0x6d, 0x75,       // Op2Drop x3 + OpDrop                             [4B]
@@ -355,8 +359,63 @@ pub const SELL_ORDER_BODY: &[u8] = &[
     // --- INNER END ---
     0x68,                         // OpEndIf (fill vs cancel)                        [1B]
 
-    // ELSE: selector >= 2 (partial, cancel-mark)
+    // ELSE: selector >= 2 (IOC fill, partial, cancel-mark)
     0x67,                         // OpElse (selector >= 2)                          [1B]
+
+    // IOC FILL CHECK (4B dispatch)
+    0x76,                         // OpDup (keep selector for partial check)         [1B]
+    0x55, 0x87,                   // Op5 OpEqual (selector == 5?)                    [2B]
+    0x63,                         // OpIf (IOC FILL)                                 [1B]
+
+    // IOC FILL PATH (54B)
+    0x75,                         // OpDrop (remove stale selector from OpDup)       [1B]
+    // Stack: expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4), mfill(5),
+    //        pden(6), pnum(7), fta(8), koi(9)
+    //
+    // TIME GATE (10B) — same as fill/partial
+    0x76, 0x00, 0x9c,             // OpDup Op0 OpNumEqual                             [3B]
+    0x64,                         // OpNotIf (has expiry)                            [1B]
+    0x76, 0xb5,                   // OpDup OpTxLockTime                              [2B]
+    0xa0, 0x69,                   // OpGreaterThan OpVerify (expiry > lockTime)      [2B]
+    0x68,                         // OpEndIf                                         [1B]
+    0x75,                         // OpDrop (remove expiry)                          [1B]
+
+    // EXPOSURE DELAY (3B)
+    0x01, 0x32,                   // push(50) MIN_EXPOSURE = 50 DAA                  [2B]
+    0xb1,                         // OpCheckSequenceVerify                           [1B]
+
+    // F5: cpend==0 (3B)
+    0x00, 0x87, 0x69,             // Op0 OpEqual OpVerify                            [3B]
+    // Stack: mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5), fta(6), koi(7)
+
+    // Price calc from fta (13B)
+    0x56, 0x79,                   // Op6 OpPick(fta)                                 [2B]
+    0x56, 0x79, 0x95,             // Op6 OpPick(pnum) OpMul                          [3B]
+    0x55, 0x79, 0x96,             // Op5 OpPick(pden) OpDiv -> fill_kas              [3B]
+    0x76,                         // OpDup                                           [1B]
+    0x55, 0x79, 0xa2, 0x69,       // Op5 OpPick(mfill) OpGTE OpVerify               [4B]
+    // fill_kas(0), mmfee(1), sspkh(2), ..., fta(7), koi(8)
+
+    // KAS output check (6B)
+    0x58, 0x79, 0xc2,             // Op8 OpPick(koi) OpTxOutputAmount                [3B]
+    0x7c, 0xa2, 0x69,             // OpSwap OpGTE OpVerify (out >= fill_kas)         [3B]
+    // mmfee(0), sspkh(1), ..., fta(6), koi(7)
+
+    // F2: seller SPK hash (8B)
+    0x57, 0x79, 0xc3,             // Op7 OpPick(koi) OpTxOutputSpk                   [3B]
+    0xaa,                         // OpBlake2b                                       [1B]
+    0x52, 0x79, 0x87, 0x69,       // Op2 OpPick(sspkh) OpEqual OpVerify              [4B]
+    // mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5), fta(6), koi(7)
+
+    // F4: token conservation — at least 1 covenant output (6B)
+    0xb9, 0xcf,                   // OpTxInputIndex OpInputCovenantId -> T           [2B]
+    0xd2, 0x51, 0xa2, 0x69,       // OpCovOutCount(T) Op1 OpGTE OpVerify             [4B]
+
+    // Cleanup: 8 items = Op2Drop x4 (4B)
+    0x6d, 0x6d, 0x6d, 0x6d,       // Op2Drop x4                                      [4B]
+
+    0x67,                         // OpElse (not IOC — partial or cancel-mark)       [1B]
+
     0x52, 0x87,                   // Op2 OpEqual (selector == 2?)                    [2B]
     0x63,                         // OpIf (PARTIAL FILL)                             [1B]
 
@@ -406,12 +465,7 @@ pub const SELL_ORDER_BODY: &[u8] = &[
     0xb9, 0xcf,                   // OpTxInputIndex OpInputCovenantId -> T           [2B]
     0xd2, 0x52, 0xa2, 0x69,       // OpCovOutCount(T) Op2 OpGTE OpVerify             [4B]
 
-    // F6 PARTIAL: matcher fee cap — (token_in - out[0].value) <= mmfee
-    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> token_in       [2B]
-    0x00, 0xc2,                   // Op0 OpTxOutputAmount -> out[0].value             [2B]
-    0x94,                         // OpSub -> fee = (token_in - out[0].value)         [1B]
-    0x51, 0x79,                   // Op1 OpPick(mmfee at d1)                         [2B]
-    0xa1, 0x69,                   // OpLTE OpVerify (fee <= mmfee)                   [2B]
+    // F6 PARTIAL REMOVED: same denomination-blind issue as fill path F6.
 
     // Cleanup: 9 items = Op2Drop x4 + OpDrop
     0x6d, 0x6d, 0x6d, 0x6d, 0x75, // Op2Drop x4 + OpDrop                            [5B]
@@ -429,8 +483,9 @@ pub const SELL_ORDER_BODY: &[u8] = &[
     // mmfee(0)..pnum(5) = 6 items
     0x6d, 0x6d, 0x6d,             // Op2Drop x3                                      [3B]
 
-    // CLOSING (4B, output count limit removed for N:M batch matching)
+    // CLOSING (5B, output count limit removed for N:M batch matching)
     0x68,                         // OpEndIf (partial vs cancel-mark)                [1B]
+    0x68,                         // OpEndIf (IOC vs partial/cancel-mark)            [1B]
     0x68,                         // OpEndIf (sel<2 vs sel>=2)                       [1B]
 
     // NOTE: Output count limit removed to enable N:M batch matching.
@@ -441,12 +496,12 @@ pub const SELL_ORDER_BODY: &[u8] = &[
 ];
 
 /// Expected body length for sell order.
-pub const SELL_ORDER_BODY_EXPECTED_LEN: usize = 262;
+pub const SELL_ORDER_BODY_EXPECTED_LEN: usize = 304;
 
-/// Expected redeemScript length for sell order (112B state + 262B body).
+/// Expected redeemScript length for sell order (112B state + 304B body).
 pub const SELL_ORDER_RS_EXPECTED_LEN: usize = 112 + SELL_ORDER_BODY_EXPECTED_LEN;
 
-/// Build buy_order redeemScript (145B state + 260B body = 405B).
+/// Build buy_order redeemScript (145B state + 242B body = 387B).
 ///
 /// State (145B):
 ///   `[0x20][tcid 32B][0x08][pnum 8B][0x08][pden 8B][0x08][mfill 8B]`
@@ -548,7 +603,7 @@ pub fn build_buy_partial_fill_sigscript(
     ss
 }
 
-/// Build sell_order redeemScript (112B state + 262B body = 374B).
+/// Build sell_order redeemScript (112B state + 244B body = 356B).
 ///
 /// State (112B):
 ///   `[0x08][pnum 8B][0x08][pden 8B][0x08][mfill 8B]`
@@ -640,6 +695,50 @@ pub fn build_sell_partial_fill_sigscript(
     push_index(&mut ss, residual_idx);
     ss.extend_from_slice(&push_data(&fta));
     ss.push(0x52); // Op2 (selector = partial fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build sell_order IOC fill sigscript.
+///
+/// Layout: `[koi] [pushData(fta 8B)] [Op5] [pushData(RS)]`
+///
+/// * `kas_output_idx`: which output receives the seller's KAS
+/// * `fill_token_amount`: how many tokens are being filled (fta)
+///
+/// Selector=Op5 triggers the IOC path which uses `fta` for price calc
+/// instead of the full TxInputAmount.
+pub fn build_sell_ioc_fill_sigscript(
+    kas_output_idx: u16,
+    fill_token_amount: u64,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    let fta = u64_le(fill_token_amount);
+    let mut ss = Vec::with_capacity(14 + redeem_script.len() + 3);
+    push_index(&mut ss, kas_output_idx);
+    ss.extend_from_slice(&push_data(&fta));
+    ss.push(0x55); // Op5 (selector = IOC fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build buy_order IOC fill sigscript.
+///
+/// Layout: `[toi] [tii] [coi] [Op5] [pushData(RS)]`
+///
+/// Same as fill but selector=Op5 triggers the IOC sub-dispatch
+/// which relaxes the token output check to >= mfill instead of >= expected_tokens.
+pub fn build_buy_ioc_fill_sigscript(
+    token_output_idx: u16,
+    token_input_idx: u16,
+    cov_output_idx: u16,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    let mut ss = Vec::with_capacity(7 + redeem_script.len() + 3);
+    push_index(&mut ss, token_output_idx);
+    push_index(&mut ss, token_input_idx);
+    push_index(&mut ss, cov_output_idx);
+    ss.push(0x55); // Op5 (selector = IOC fill)
     ss.extend_from_slice(&push_data(redeem_script));
     ss
 }

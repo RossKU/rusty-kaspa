@@ -1355,7 +1355,7 @@ pub struct BatchMatchResult {
 /// to sign the wallet input (P2PK, last input), then submits via RPC.
 ///
 /// The wallet input is the LAST input in the batch TX and needs `sigOpCount: 1`
-/// with a Schnorr signature. All covenant inputs (sells, buys, token_units)
+/// with a Schnorr signature. All covenant inputs (sells, buys)
 /// use `sigOpCount: 0`.
 ///
 /// TX version = 1 (required for covenant output bindings on buyer token outputs).
@@ -1383,10 +1383,9 @@ pub async fn execute_batch_match(
 
     info!("======================================================================");
     info!(
-        "EXECUTING BATCH MATCH: {} sells + {} buys + {} token_units",
+        "EXECUTING BATCH MATCH: {} sells + {} buys",
         plan.sells.len(),
         plan.buys.len(),
-        plan.token_units.len(),
     );
     info!("======================================================================");
     debug!("  Total fee:       {}", plan.total_fee);
@@ -1430,20 +1429,6 @@ pub async fn execute_batch_match(
             script_version: p2sh.version,
             script_bytes: p2sh.script().to_vec(),
             value: buy.utxo_value,
-        });
-    }
-
-    // Add token unit inputs
-    for (tu, _input_idx) in &plan.token_units {
-        let p2sh = kob_core::build_p2sh(&tu.redeem_script);
-        sighash_tx.inputs.push(kob_core::tx::TxInput {
-            prev_tx_id: tu.outpoint.0.clone(),
-            prev_index: tu.outpoint.1,
-            sequence: 0,
-            sig_op_count: 0,
-            script_version: p2sh.version,
-            script_bytes: p2sh.script().to_vec(),
-            value: tu.value,
         });
     }
 
@@ -1556,8 +1541,6 @@ pub async fn execute_batch_match(
         let in_vals: Vec<u64> = plan.sells.iter().map(|(s, _)| s.utxo_value).chain(
             plan.buys.iter().map(|(b, _)| b.utxo_value)
         ).chain(
-            plan.token_units.iter().map(|(t, _)| t.value)
-        ).chain(
             plan.wallet_input.iter().map(|(_, _, val)| *val)
         ).collect();
         let out_vals: Vec<u64> = plan.outputs.iter().map(|o| o.value).collect();
@@ -1626,10 +1609,6 @@ pub async fn execute_batch_match(
     }
     for (buy, _) in &plan.buys {
         let key = format!("{}:{}", buy.outpoint.0, buy.outpoint.1);
-        spent_tracker.mark_spent(&key);
-    }
-    for (tu, _) in &plan.token_units {
-        let key = format!("{}:{}", tu.outpoint.0, tu.outpoint.1);
         spent_tracker.mark_spent(&key);
     }
     if let Some((ref wallet_tx_id, wallet_index, _)) = plan.wallet_input {
@@ -2701,37 +2680,17 @@ async fn run_scan_cycle(
                 let sell_rs = hex::decode(&pair.sell.redeem_script_hex).unwrap_or_default();
                 let buy_rs = hex::decode(&pair.buy.redeem_script_hex).unwrap_or_default();
 
-                // Detect sell version from RS length (284=v6, 287=v8, 344=v12, 374=v13)
-                let sell_version = match sell_rs.len() {
-                    284 => 6,
-                    287 => 8,
-                    344 => 12,
-                    374 => 13,
-                    other => {
-                        warn!("[BATCH] Unknown sell RS size {}, skipping", other);
-                        continue;
-                    }
-                };
-
-                // Detect buy version from RS length + T2 byte
-                let buy_version = match buy_rs.len() {
-                    356 => 8,   // v8: RS=356
-                    369 => 10,  // v10: RS=369
-                    371 => {
-                        // v9 and v11 share RS=371. Distinguish by T2 byte at rs[140]
-                        if buy_rs.len() > 140 && buy_rs[140] == 0x86 {
-                            11 // v11: T2=0x86
-                        } else {
-                            9  // v9: T2=0x87
-                        }
-                    }
-                    415 => 12,  // v12: RS=415
-                    405 => 13,  // v13: RS=405 (145B state + 260B body)
-                    other => {
-                        warn!("[BATCH] Unknown buy RS size {}, skipping", other);
-                        continue;
-                    }
-                };
+                // v14 only: sell RS=416 (112+304), buy RS=396 (145+251)
+                if sell_rs.len() != 416 {
+                    warn!("[BATCH] Unsupported sell RS size {}, skipping (v14=416)", sell_rs.len());
+                    continue;
+                }
+                if buy_rs.len() != 396 {
+                    warn!("[BATCH] Unsupported buy RS size {}, skipping (v14=396)", buy_rs.len());
+                    continue;
+                }
+                let sell_version = 14u8;
+                let buy_version = 14u8;
 
                 // Resolve counterparty SPKs for output routing
                 let (seller_spk_ver, seller_spk) = match pair.sell.resolve_counterparty_spk() {
@@ -2778,8 +2737,7 @@ async fn run_scan_cycle(
                 });
             }
 
-            if sells.len() < 2 || buys.len() < 2 {
-                // Not enough pairs survived filtering; fall through to 1:1
+            if sells.is_empty() || buys.is_empty() {
                 continue;
             }
 
@@ -2819,35 +2777,11 @@ async fn run_scan_cycle(
                 .max_by_key(|u| u.utxo_entry.amount)
                 .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-            // Find token unit UTXOs for each unique token in this batch group
-            let token_hex = hex::encode(sells[0].token_cov_id);
-            let total_tokens_needed: u64 = buys.iter().map(|b| {
-                // tokens = buy_amount * price_den / price_num (buy pays KAS, gets tokens)
-                b.amount.saturating_mul(b.price_den) / b.price_num.max(1)
-            }).sum();
-
-            let token_unit = find_token_utxo_from_wallet(&batch_utxos, total_tokens_needed, spent_tracker);
-            let token_units = match token_unit {
-                Some(tu) => vec![crate::matcher::batch::TokenUnit {
-                    outpoint: (tu.tx_id, tu.index),
-                    token_cov_id: sells[0].token_cov_id,
-                    value: tu.value,
-                    redeem_script: kob_core::TOKEN_RS.to_vec(),
-                }],
-                None => {
-                    warn!(
-                        "[BATCH] No token UTXO found (need >= {} for token {}...), falling through to 1:1",
-                        total_tokens_needed,
-                        &token_hex[..token_hex.len().min(16)],
-                    );
-                    continue;
-                }
-            };
-
-            // Plan the batch match
+            // Plan the batch match (sell inputs provide covenant lineage directly)
             let plan = match crate::matcher::batch::plan_batch_match(
-                &sells, &buys, &token_units, wallet_utxo,
+                &sells, &buys, wallet_utxo,
                 &wallet_spk_script, wallet_spk_version,
+                None,
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -2906,19 +2840,15 @@ async fn run_scan_cycle(
                         spent_tracker.mark_spent(&bk);
                         spent_tracker.mark_spent(&sk);
                     }
-                    // Mark wallet and token unit outpoints as spent to prevent
+                    // Mark wallet outpoint as spent to prevent
                     // reuse by subsequent matches in the same scan cycle.
                     if let Some(ref wu) = plan.wallet_input {
                         let wk = format!("{}:{}", wu.0, wu.1);
                         spent_tracker.mark_spent(&wk);
                     }
-                    for (tu, _) in &plan.token_units {
-                        let tk = format!("{}:{}", tu.outpoint.0, tu.outpoint.1);
-                        spent_tracker.mark_spent(&tk);
-                    }
                 }
                 None => {
-                    warn!("[BATCH] Batch execution failed for token {}...", &token_hex[..token_hex.len().min(16)]);
+                    warn!("[BATCH] Batch execution failed");
                     for pair in group {
                         spent_tracker.mark_failed(&pair.buy.outpoint_key());
                         spent_tracker.mark_failed(&pair.sell.outpoint_key());
@@ -3144,17 +3074,12 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    let sell_version = match sell_rs.len() {
-                        284 => 6,
-                        287 => 8,
-                        344 => 12,
-                        374 => 13,
-                        other => {
-                            warn!("[CROSS-BATCH] Unknown sell RS size {}, skipping group", other);
-                            skip_group = true;
-                            break;
-                        }
-                    };
+                    if sell_rs.len() != 416 {
+                        warn!("[CROSS-BATCH] Unsupported sell RS size {}, skipping group (v14=416)", sell_rs.len());
+                        skip_group = true;
+                        break;
+                    }
+                    let sell_version = 14u8;
                     let (seller_spk_ver, seller_spk) = match sell.resolve_counterparty_spk() {
                         Some(x) => x,
                         None => {
@@ -3196,24 +3121,12 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    let buy_version = match buy_rs.len() {
-                        356 => 8,
-                        369 => 10,
-                        371 => {
-                            if buy_rs.len() > 140 && buy_rs[140] == 0x86 {
-                                11
-                            } else {
-                                9
-                            }
-                        }
-                        415 => 12,
-                        405 => 13,
-                        other => {
-                            warn!("[CROSS-BATCH] Unknown buy RS size {}, skipping group", other);
-                            skip_group = true;
-                            break;
-                        }
-                    };
+                    if buy_rs.len() != 396 {
+                        warn!("[CROSS-BATCH] Unsupported buy RS size {}, skipping group (v14=396)", buy_rs.len());
+                        skip_group = true;
+                        break;
+                    }
+                    let buy_version = 14u8;
                     let (buyer_spk_ver, buyer_spk) = match buy.resolve_counterparty_spk() {
                         Some(x) => x,
                         None => {
@@ -3270,56 +3183,11 @@ async fn run_scan_cycle(
                     .max_by_key(|u| u.utxo_entry.amount)
                     .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-                // Find token unit UTXOs for each unique buy token
-                let mut unique_buy_tokens: HashSet<[u8; 32]> = HashSet::new();
-                for b in &buys {
-                    unique_buy_tokens.insert(b.token_cov_id);
-                }
-
-                let mut token_units = Vec::new();
-                let mut missing_token = false;
-                for token_id in &unique_buy_tokens {
-                    let tokens_needed: u64 = buys.iter()
-                        .filter(|b| &b.token_cov_id == token_id)
-                        .map(|b| {
-                            let wide = b.amount as u128 * b.price_num as u128 / b.price_den as u128;
-                            u64::try_from(wide).unwrap_or_else(|_| {
-                                warn!("u128->u64 overflow in token calc (amount={}, pnum={}, pden={}), capping",
-                                    b.amount, b.price_num, b.price_den);
-                                u64::MAX
-                            })
-                        })
-                        .sum();
-                    let token_hex = hex::encode(token_id);
-                    let token_unit = find_token_utxo_from_wallet(&cp_utxos, tokens_needed, spent_tracker);
-                    match token_unit {
-                        Some(tu) => {
-                            token_units.push(crate::matcher::batch::TokenUnit {
-                                outpoint: (tu.tx_id, tu.index),
-                                token_cov_id: *token_id,
-                                value: tu.value,
-                                redeem_script: kob_core::TOKEN_RS.to_vec(),
-                            });
-                        }
-                        None => {
-                            warn!(
-                                "[CROSS-BATCH] No token UTXO found (need >= {} for token {}...), skipping group",
-                                tokens_needed,
-                                &token_hex[..token_hex.len().min(16)],
-                            );
-                            missing_token = true;
-                            break;
-                        }
-                    }
-                }
-                if missing_token {
-                    continue;
-                }
-
-                // Plan and execute via batch engine
+                // Plan and execute via batch engine (sell inputs provide covenant lineage)
                 let plan = match crate::matcher::batch::plan_batch_match(
-                    &sells, &buys, &token_units, wallet_utxo,
+                    &sells, &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version,
+                    None,
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -3389,10 +3257,6 @@ async fn run_scan_cycle(
                             let wk = format!("{}:{}", wu.0, wu.1);
                             spent_tracker.mark_spent(&wk);
                         }
-                        for (tu, _) in &plan.token_units {
-                            let tk = format!("{}:{}", tu.outpoint.0, tu.outpoint.1);
-                            spent_tracker.mark_spent(&tk);
-                        }
                     }
                     None => {
                         warn!("[CROSS-BATCH] Batch execution failed");
@@ -3445,17 +3309,12 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    let sell_version = match sell_rs.len() {
-                        284 => 6,
-                        287 => 8,
-                        344 => 12,
-                        374 => 13,
-                        other => {
-                            warn!("[TRI-BATCH] Unknown sell RS size {}, skipping group", other);
-                            skip_group = true;
-                            break;
-                        }
-                    };
+                    if sell_rs.len() != 416 {
+                        warn!("[TRI-BATCH] Unsupported sell RS size {}, skipping group (v14=416)", sell_rs.len());
+                        skip_group = true;
+                        break;
+                    }
+                    let sell_version = 14u8;
                     let (seller_spk_ver, seller_spk) = match sell.resolve_counterparty_spk() {
                         Some(x) => x,
                         None => {
@@ -3497,24 +3356,12 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    let buy_version = match buy_rs.len() {
-                        356 => 8,
-                        369 => 10,
-                        371 => {
-                            if buy_rs.len() > 140 && buy_rs[140] == 0x86 {
-                                11
-                            } else {
-                                9
-                            }
-                        }
-                        415 => 12,
-                        405 => 13,
-                        other => {
-                            warn!("[TRI-BATCH] Unknown buy RS size {}, skipping group", other);
-                            skip_group = true;
-                            break;
-                        }
-                    };
+                    if buy_rs.len() != 396 {
+                        warn!("[TRI-BATCH] Unsupported buy RS size {}, skipping group (v14=396)", buy_rs.len());
+                        skip_group = true;
+                        break;
+                    }
+                    let buy_version = 14u8;
                     let (buyer_spk_ver, buyer_spk) = match buy.resolve_counterparty_spk() {
                         Some(x) => x,
                         None => {
@@ -3571,56 +3418,11 @@ async fn run_scan_cycle(
                     .max_by_key(|u| u.utxo_entry.amount)
                     .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-                // Find token unit UTXOs for each unique buy token
-                let mut unique_buy_tokens: HashSet<[u8; 32]> = HashSet::new();
-                for b in &buys {
-                    unique_buy_tokens.insert(b.token_cov_id);
-                }
-
-                let mut token_units = Vec::new();
-                let mut missing_token = false;
-                for token_id in &unique_buy_tokens {
-                    let tokens_needed: u64 = buys.iter()
-                        .filter(|b| &b.token_cov_id == token_id)
-                        .map(|b| {
-                            let wide = b.amount as u128 * b.price_num as u128 / b.price_den as u128;
-                            u64::try_from(wide).unwrap_or_else(|_| {
-                                warn!("u128->u64 overflow in token calc (amount={}, pnum={}, pden={}), capping",
-                                    b.amount, b.price_num, b.price_den);
-                                u64::MAX
-                            })
-                        })
-                        .sum();
-                    let token_hex = hex::encode(token_id);
-                    let token_unit = find_token_utxo_from_wallet(&tri_utxos, tokens_needed, spent_tracker);
-                    match token_unit {
-                        Some(tu) => {
-                            token_units.push(crate::matcher::batch::TokenUnit {
-                                outpoint: (tu.tx_id, tu.index),
-                                token_cov_id: *token_id,
-                                value: tu.value,
-                                redeem_script: kob_core::TOKEN_RS.to_vec(),
-                            });
-                        }
-                        None => {
-                            warn!(
-                                "[TRI-BATCH] No token UTXO found (need >= {} for token {}...), skipping group",
-                                tokens_needed,
-                                &token_hex[..token_hex.len().min(16)],
-                            );
-                            missing_token = true;
-                            break;
-                        }
-                    }
-                }
-                if missing_token {
-                    continue;
-                }
-
-                // Plan and execute via batch engine
+                // Plan and execute via batch engine (sell inputs provide covenant lineage)
                 let plan = match crate::matcher::batch::plan_batch_match(
-                    &sells, &buys, &token_units, wallet_utxo,
+                    &sells, &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version,
+                    None,
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -3689,10 +3491,6 @@ async fn run_scan_cycle(
                         if let Some(ref wu) = plan.wallet_input {
                             let wk = format!("{}:{}", wu.0, wu.1);
                             spent_tracker.mark_spent(&wk);
-                        }
-                        for (tu, _) in &plan.token_units {
-                            let tk = format!("{}:{}", tu.outpoint.0, tu.outpoint.1);
-                            spent_tracker.mark_spent(&tk);
                         }
                     }
                     None => {

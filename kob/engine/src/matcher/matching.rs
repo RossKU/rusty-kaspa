@@ -540,13 +540,12 @@ pub fn find_batch_groups(pairs: &[CrossingPair]) -> Vec<Vec<&CrossingPair>> {
 
     let mut groups = Vec::new();
     for (_token, token_pairs) in by_token {
-        if token_pairs.len() < 2 {
-            // Single pair: not worth batching
+        if token_pairs.is_empty() {
             continue;
         }
         // Split into chunks of MAX_BATCH_GROUP_SIZE
         for chunk in token_pairs.chunks(MAX_BATCH_GROUP_SIZE) {
-            if chunk.len() >= 2 {
+            if !chunk.is_empty() {
                 groups.push(chunk.to_vec());
             }
         }
@@ -1191,10 +1190,11 @@ mod tests {
     }
 
     #[test]
-    fn test_find_batch_groups_single_pair_no_batch() {
+    fn test_find_batch_groups_single_pair_batched() {
         let pairs = vec![make_crossing_pair(FAKE_TOKEN, 1)];
         let groups = find_batch_groups(&pairs);
-        assert!(groups.is_empty(), "single pair should not be batched");
+        assert_eq!(groups.len(), 1, "single pair should be batched");
+        assert_eq!(groups[0].len(), 1);
     }
 
     #[test]
@@ -1216,16 +1216,17 @@ mod tests {
             make_crossing_pair(token_b, 2),
         ];
         let groups = find_batch_groups(&pairs);
-        assert!(groups.is_empty(), "different tokens should not be batched together");
+        assert_eq!(groups.len(), 2, "different tokens should produce 2 groups of 1");
     }
 
     #[test]
     fn test_find_batch_groups_opn_limit() {
-        // 8 pairs of same token -> should be split: group of 7 + 1 leftover (not batched)
+        // 8 pairs of same token -> should be split: group of 7 + group of 1
         let pairs: Vec<_> = (0..8).map(|i| make_crossing_pair(FAKE_TOKEN, i)).collect();
         let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 1, "8 pairs should produce 1 group of 7 (leftover 1 not batched)");
+        assert_eq!(groups.len(), 2, "8 pairs should produce 2 groups (7 + 1)");
         assert_eq!(groups[0].len(), 7, "first group should have 7 pairs");
+        assert_eq!(groups[1].len(), 1, "second group should have 1 pair");
     }
 
     #[test]
@@ -1234,7 +1235,8 @@ mod tests {
         pair.match_type = MatchType::PartialBuy;
         let pairs = vec![pair, make_crossing_pair(FAKE_TOKEN, 2)];
         let groups = find_batch_groups(&pairs);
-        assert!(groups.is_empty(), "partial fills should be excluded from batch");
+        assert_eq!(groups.len(), 1, "partial excluded, 1 full pair should batch");
+        assert_eq!(groups[0].len(), 1);
     }
 
     #[test]

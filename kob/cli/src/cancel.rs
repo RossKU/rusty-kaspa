@@ -135,8 +135,8 @@ pub async fn run(
 
     // Reconstruct the redeemScript using the specified contract version.
     // cancel_pending: 0 for normal orders, 1 after cancel-mark transition.
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
+    if version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }
     // Resolve max_matcher_fee: CLI override > cache > default.
     let max_matcher_fee = max_matcher_fee_override.unwrap_or_else(|| {

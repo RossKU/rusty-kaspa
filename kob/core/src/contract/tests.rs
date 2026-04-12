@@ -2187,22 +2187,22 @@ mod adversarial_tests {
             "fill sigscript should be {} bytes, got {}", expected_len, ss.len());
 
         // Verify sigLen lands in fill range: T0 <= sigLen < T1
-        // T0 = 410, T1 = 418
-        assert!(ss.len() >= 410, "sigLen {} must be >= T0=410", ss.len());
-        assert!(ss.len() < 418, "sigLen {} must be < T1=418", ss.len());
+        // T0 = 401, T1 = 409 (v14)
+        assert!(ss.len() >= 401, "sigLen {} must be >= T0=401", ss.len());
+        assert!(ss.len() < 409, "sigLen {} must be < T1=409", ss.len());
 
         // Verify body starts with correct dispatch
         let body = BUY_ORDER_BODY;
         assert_eq!(body[0], 0xb9, "OpTxInputIndex");
         assert_eq!(body[1], 0xc9, "OpTxInputScriptSigLen");
 
-        // Verify T2 = 423 encoded at offset 4-5
+        // Verify T2 = 415 encoded at offset 4-5
         let t2 = u16::from_le_bytes([body[4], body[5]]);
-        assert_eq!(t2, 423, "T2 should be 423");
+        assert_eq!(t2, 415, "T2 should be 415");
 
-        // Verify T0 = 410 encoded at offset 10-11
+        // Verify T0 = 401 encoded at offset 10-11
         let t0 = u16::from_le_bytes([body[10], body[11]]);
-        assert_eq!(t0, 410, "T0 should be 410");
+        assert_eq!(t0, 401, "T0 should be 401");
 
         // Verify body does NOT contain OpInputCount (0xb3) — no InputCount==2 constraint.
         // Rationale: removing InputCount==2 enables N-to-M batch matching (multiple
@@ -2225,9 +2225,9 @@ mod adversarial_tests {
         .unwrap();
 
         let ss = build_buy_partial_fill_sigscript(&rs, 50000, 1, 0);
-        // T1 <= sigLen < T2: 418 <= sigLen < 423
-        assert!(ss.len() >= 418, "partial sigLen {} must be >= T1=418", ss.len());
-        assert!(ss.len() < 423, "partial sigLen {} must be < T2=423", ss.len());
+        // T1 <= sigLen < T2: 409 <= sigLen < 415 (v14)
+        assert!(ss.len() >= 409, "partial sigLen {} must be >= T1=409", ss.len());
+        assert!(ss.len() < 415, "partial sigLen {} must be < T2=415", ss.len());
     }
 
     #[test]

@@ -910,8 +910,8 @@ mod tests {
         assert!(result.is_ok());
 
         let (rs, p2sh_hex, _) = result.unwrap();
-        // Buy v13 RS = 405 bytes
-        assert_eq!(rs.len(), 405);
+        // Buy v14 RS = 396 bytes
+        assert_eq!(rs.len(), 396);
         assert_eq!(p2sh_hex.len(), 70);
     }
 

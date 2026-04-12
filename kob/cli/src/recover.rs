@@ -821,7 +821,7 @@ mod recover_orders_tests {
     #[test]
     fn extract_rs_kob_prefix_valid() {
         // Build a payload: KOB:1: + some RS bytes
-        let rs = vec![0x20; 405]; // buy v13 length
+        let rs = vec![0x20; 387]; // buy v13 length
         let mut payload = Vec::new();
         payload.extend_from_slice(b"KOB:1:");
         payload.extend_from_slice(&rs);
@@ -829,7 +829,7 @@ mod recover_orders_tests {
 
         let extracted = extract_rs_from_payload_hex(&payload_hex);
         assert!(extracted.is_some());
-        assert_eq!(extracted.unwrap().len(), 405);
+        assert_eq!(extracted.unwrap().len(), 387);
     }
 
     #[test]
@@ -862,8 +862,8 @@ mod recover_orders_tests {
 
     #[test]
     fn extract_rs_with_gtd_suffix_stripped() {
-        // Build payload: KOB:1: + 405B RS + :GTD: + 8B LE u64
-        let rs = vec![0x20; 405];
+        // Build payload: KOB:1: + 387B RS + :GTD: + 8B LE u64
+        let rs = vec![0x20; 387];
         let mut payload = Vec::new();
         payload.extend_from_slice(b"KOB:1:");
         payload.extend_from_slice(&rs);
@@ -873,7 +873,7 @@ mod recover_orders_tests {
 
         let extracted = extract_rs_from_payload_hex(&payload_hex);
         assert!(extracted.is_some());
-        assert_eq!(extracted.unwrap().len(), 405);
+        assert_eq!(extracted.unwrap().len(), 387);
     }
 
 
@@ -887,7 +887,7 @@ mod recover_orders_tests {
         let spk_hash = [0xCC; 32];
         let rs = kob_core::contract::build_buy_redeem_script(
             &token_cov_id, 1000, 1, 3_000_000, &owner_hash, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 405);
+        assert_eq!(rs.len(), 387);
 
         let parsed = parse_redeem_script(&rs).unwrap();
         assert_eq!(parsed.side, "buy");
@@ -906,7 +906,7 @@ mod recover_orders_tests {
         let spk_hash = [0xEE; 32];
         let rs = kob_core::contract::build_sell_redeem_script(
             500, 3, 1_000_000, &owner_hash, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 374);
+        assert_eq!(rs.len(), 356);
 
         let parsed = parse_redeem_script(&rs).unwrap();
         assert_eq!(parsed.side, "sell");
@@ -982,8 +982,8 @@ mod recover_orders_tests {
 
     #[test]
     fn parse_rs_correct_length_wrong_opcodes_ignored() {
-        // 405 bytes (buy v13 length) but wrong push opcodes
-        let mut data = vec![0xFF; 405];
+        // 387 bytes (buy v13 length) but wrong push opcodes
+        let mut data = vec![0xFF; 387];
         // First byte should be 0x20 for buy, set it wrong
         data[0] = 0xFF;
         assert!(parse_redeem_script(&data).is_none());
@@ -1039,7 +1039,7 @@ mod recover_orders_tests {
         // cancel_pending = 1
         let rs = kob_core::contract::build_buy_redeem_script(
             &token_cov_id, 100, 1, 1_000_000, &owner_hash, &spk_hash, 0, 1, 0,).unwrap();
-        assert_eq!(rs.len(), 405);
+        assert_eq!(rs.len(), 387);
 
         let parsed = parse_redeem_script(&rs).unwrap();
         assert_eq!(parsed.owner_hash, owner_hash);
@@ -1052,7 +1052,7 @@ mod recover_orders_tests {
         let spk_hash = [0xEE; 32];
         let rs = kob_core::contract::build_sell_redeem_script(
             200, 1, 500_000, &owner_hash, &spk_hash, 0, 1, 0,).unwrap();
-        assert_eq!(rs.len(), 374);
+        assert_eq!(rs.len(), 356);
 
         let parsed = parse_redeem_script(&rs).unwrap();
         assert_eq!(parsed.owner_hash, owner_hash);

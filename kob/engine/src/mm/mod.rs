@@ -74,8 +74,8 @@ impl MmConfig {
         if self.interval_secs == 0 {
             anyhow::bail!("interval must be > 0");
         }
-        if self.version != 13 {
-            anyhow::bail!("version must be 13");
+        if self.version != 14 {
+            anyhow::bail!("version must be 14");
         }
         if self.min_fill == 0 {
             anyhow::bail!("min_fill must be > 0");
@@ -853,8 +853,8 @@ async fn deploy_order(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_bytes);
 
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
+    if version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }
     let redeem_script = match side {
         "buy" => contract::build_buy_redeem_script(
@@ -998,8 +998,8 @@ async fn cancel_order(
     token_cov_id.copy_from_slice(&token_bytes);
 
     // Reconstruct the redeem script (v13 only)
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
+    if version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }
     let redeem_script = match side {
         "buy" => contract::build_buy_redeem_script(
@@ -1494,7 +1494,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1512,7 +1512,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1530,7 +1530,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1548,7 +1548,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1584,7 +1584,7 @@ mod tests {
             amount: 500_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1602,7 +1602,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1620,7 +1620,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 0,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1640,7 +1640,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1664,7 +1664,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -1685,7 +1685,7 @@ mod tests {
             amount: 50_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2001,7 +2001,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2019,7 +2019,7 @@ mod tests {
             amount: 0,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2037,7 +2037,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 0,
             requote_threshold_bps: 500,
         };
@@ -2055,7 +2055,7 @@ mod tests {
             amount: 1_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2074,7 +2074,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2083,7 +2083,7 @@ mod tests {
 
     #[test]
     fn config_validate_all_valid_versions() {
-        for v in [13] {
+        for v in [14] {
             let config = MmConfig {
                 token: "aa".repeat(32),
                 mid_price_num: 100,
@@ -2103,8 +2103,8 @@ mod tests {
 
     #[test]
     fn config_validate_version_boundaries() {
-        // Only version 13 is valid; all others should fail
-        for v in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 255] {
+        // Only version 14 is valid; all others should fail
+        for v in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 255] {
             let config = MmConfig {
                 token: "aa".repeat(32),
                 mid_price_num: 100,
@@ -2133,7 +2133,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2151,7 +2151,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: true,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2460,7 +2460,7 @@ mod tests {
             amount: 5_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2483,7 +2483,7 @@ mod tests {
             amount: 50_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 5_000_000,
             requote_threshold_bps: 500,
         };
@@ -2503,7 +2503,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2530,7 +2530,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
         };
@@ -2756,7 +2756,7 @@ mod tests {
             amount: 1_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 100_000,
             requote_threshold_bps: 500,
         };
@@ -2822,7 +2822,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 13,
+            version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 0,
         };

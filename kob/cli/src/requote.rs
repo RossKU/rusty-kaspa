@@ -99,11 +99,11 @@ pub async fn run(
             new_params.min_fill
         );
     }
-    if new_params.version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", new_params.version);
+    if new_params.version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", new_params.version);
     }
-    if old_version != 13 {
-        anyhow::bail!("Unsupported old contract version {}. Only v13 is supported.", old_version);
+    if old_version != 14 {
+        anyhow::bail!("Unsupported old contract version {}. Only v14 is supported.", old_version);
     }
 
     // STEP 1: Build and submit cancel TX
@@ -591,7 +591,7 @@ mod tests {
         let spk_hash = compute_p2pk_spk_hash(&pk);
         let rs = contract::build_buy_redeem_script(
             &tcid, 50, 1, 500_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 405);
+        assert_eq!(rs.len(), 387);
     }
 
     #[test]
@@ -601,7 +601,7 @@ mod tests {
         let spk_hash = compute_p2pk_spk_hash(&pk);
         let rs = contract::build_sell_redeem_script(
             50, 1, 500_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 374);
+        assert_eq!(rs.len(), 356);
     }
 
     #[test]

@@ -251,11 +251,11 @@ pub async fn submit_match(
     let sell_p2sh = build_p2sh(&sell.redeem_script);
 
     // Build fill sigscripts (permissionless, no signature needed) -- v13 only
-    if buy.redeem_script.len() != 405 {
-        anyhow::bail!("Unsupported buy RS length {}. Only v13 (405B) is supported.", buy.redeem_script.len());
+    if buy.redeem_script.len() != 387 {
+        anyhow::bail!("Unsupported buy RS length {}. Only v13 (387B) is supported.", buy.redeem_script.len());
     }
-    if sell.redeem_script.len() != 374 {
-        anyhow::bail!("Unsupported sell RS length {}. Only v13 (374B) is supported.", sell.redeem_script.len());
+    if sell.redeem_script.len() != 356 {
+        anyhow::bail!("Unsupported sell RS length {}. Only v13 (356B) is supported.", sell.redeem_script.len());
     }
     let buy_fill_ss = contract::build_buy_fill_sigscript(1, 1, 0, &buy.redeem_script);
     let sell_fill_ss = contract::build_sell_fill_sigscript(0, &sell.redeem_script);

@@ -44,10 +44,10 @@ const P2PK_SPK_SIZE: u64 = 34;
 const P2SH_SPK_SIZE: u64 = 35;
 
 
-/// buy_order v13 redeemScript: 145B state + 260B body = 405B.
-const BUY_RS_SIZE: u64 = 405;
-/// sell_order v13 redeemScript: 112B state + 262B body = 374B.
-const SELL_RS_SIZE: u64 = 374;
+/// buy_order v13 redeemScript: 145B state + 242B body = 387B.
+const BUY_RS_SIZE: u64 = 387;
+/// sell_order v13 redeemScript: 112B state + 244B body = 356B.
+const SELL_RS_SIZE: u64 = 356;
 /// bracket_order v4 redeemScript: 238B state + 142B body = 380B.
 #[allow(dead_code)] // Kept for fee estimation reference
 const BRACKET_RS_SIZE: u64 = 380;
@@ -60,20 +60,20 @@ const CALL_OPTION_RS_SIZE: u64 = 159;
 const PUT_OPTION_RS_SIZE: u64 = 205;
 
 
-/// buy_v13 fill sigscript: 4 opcodes + pushData(405) = 4 + 3 + 405 = 412.
-const BUY_FILL_SS_SIZE: u64 = 412;
-/// sell_v13 fill sigscript: 2 opcodes + pushData(374) = 2 + 3 + 374 = 379.
-const SELL_FILL_SS_SIZE: u64 = 379;
+/// buy_v13 fill sigscript: 4 opcodes + pushData(387) = 4 + 3 + 387 = 394.
+const BUY_FILL_SS_SIZE: u64 = 394;
+/// sell_v13 fill sigscript: 2 opcodes + pushData(356) = 2 + 3 + 356 = 361.
+const SELL_FILL_SS_SIZE: u64 = 361;
 
-/// buy_v13 cancel sigscript: 1 + 66 + 33 + 3 + 405 = 508.
-const BUY_CANCEL_SS_SIZE: u64 = 508;
-/// sell_v13 cancel sigscript: 66 + 33 + 1 + 3 + 374 = 477.
-const SELL_CANCEL_SS_SIZE: u64 = 477;
+/// buy_v13 cancel sigscript: 1 + 66 + 33 + 3 + 387 = 490.
+const BUY_CANCEL_SS_SIZE: u64 = 490;
+/// sell_v13 cancel sigscript: 66 + 33 + 1 + 3 + 356 = 459.
+const SELL_CANCEL_SS_SIZE: u64 = 459;
 
-/// buy_v13 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 405 = 420.
-const BUY_PARTIAL_SS_SIZE: u64 = 420;
-/// sell_v13 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 374 = 389.
-const SELL_PARTIAL_SS_SIZE: u64 = 389;
+/// buy_v13 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 387 = 402.
+const BUY_PARTIAL_SS_SIZE: u64 = 402;
+/// sell_v13 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 356 = 371.
+const SELL_PARTIAL_SS_SIZE: u64 = 371;
 
 /// P2PK wallet input sigscript: pushData(sig+sighash 65B) = 66B.
 const WALLET_INPUT_SS_SIZE: u64 = P2PK_SIGSCRIPT_SIZE;
@@ -756,12 +756,12 @@ pub fn run(cmd: &EstimateCommand) {
 }
 
 fn validate_version(version: u8) {
-    if version != 6 && version != 8 && version != 9 && version != 10 && version != 11 && version != 12 && version != 13 {
-        error!("unsupported contract version {}. Use 6, 8, 9, 10, 11, 12, or 13.", version);
+    if version != 6 && version != 8 && version != 9 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 {
+        error!("unsupported contract version {}. Use 6, 8, 9, 10, 11, 12, 13, or 14.", version);
         std::process::exit(1);
     }
-    if version != 13 {
-        eprintln!("WARNING: Only contract version 13 is supported. Got v{}.", version);
+    if version != 14 {
+        eprintln!("WARNING: Only contract version 14 is supported. Got v{}.", version);
     }
 }
 
@@ -907,13 +907,13 @@ mod tests {
             OutputEstimate { label: "o2".to_string(), spk_size: P2PK_SPK_SIZE, value: 10_000 },
         ];
         let tm = compute_transaction_mass(&inputs, &outputs);
-        // Sell input: 44 + 3 + 379 = 426 (>253 so varint = 3)
-        // Buy input: 44 + 3 + 412 = 459 (>253 so varint = 3)
+        // Sell input: 44 + 3 + 361 = 408 (>253 so varint = 3)
+        // Buy input: 44 + 3 + 394 = 441 (>253 so varint = 3)
         // Fee input: 44 + 1 + 66 = 111
         // SigOps: 1 * 1000 = 1000
         // Outputs: (11+34) + (11+35) + (11+34) = 45 + 46 + 45 = 136
-        // Total: 68 + 426 + 459 + 111 + 1000 + 136 = 2200
-        assert_eq!(tm, 68 + 426 + 459 + 111 + 1000 + 136);
+        // Total: 68 + 408 + 441 + 111 + 1000 + 136 = 2164
+        assert_eq!(tm, 68 + 408 + 441 + 111 + 1000 + 136);
     }
 
 

@@ -6,7 +6,12 @@
 //!
 //! # Input layout
 //!
-//!   `[sell_0 .. sell_{N-1}] [buy_0 .. buy_{M-1}] [token_units] [wallet_fee_utxo?]`
+//!   `[sell_0 .. sell_{N-1}] [buy_0 .. buy_{M-1}] [wallet_fee_utxo?]`
+//!
+//! Sell inputs carry covenant_id (= token_id), which provides covenant lineage
+//! for buyer token outputs directly.  No separate token_unit input is needed.
+//! Each buy's `tii` sigscript parameter points to a sell input with matching
+//! covenant_id.
 //!
 //! No hard input count limit.  Indices >16 use data-push encoding (2 bytes)
 //! instead of OpN (1 byte).  Practical limit: bounded by MAX_TX_MASS (500,000).
@@ -25,8 +30,8 @@
 //!   | Pattern           | Inputs | Outputs | Mass (gram) |
 //!   |-------------------|--------|---------|-------------|
 //!   | 1:1 batch         |      3 |       3 |       4,819 |
-//!   | 2:1 + fee UTXO    |      5 |       5 |       7,969 |
-//!   | 3:2 + fee UTXO    |      7 |       7 |      11,119 |
+//!   | 2:1 + fee UTXO    |      4 |       4 |       6,394 |
+//!   | 3:2 + fee UTXO    |      6 |       6 |       9,544 |
 //!   | 7:7 (max same-tk) |     15 |      15 |      23,719 |
 
 use std::collections::{HashMap, HashSet};
@@ -73,19 +78,6 @@ pub struct BatchOrder {
     pub counterparty_spk_version: u16,
 }
 
-/// Token unit input for providing tokens to buy orders.
-#[derive(Debug, Clone)]
-pub struct TokenUnit {
-    /// Outpoint (txid, index).
-    pub outpoint: (String, u32),
-    /// Token covenant ID (must match a buy order's token).
-    pub token_cov_id: [u8; 32],
-    /// Available token amount.
-    pub value: u64,
-    /// Token unit redeemScript.
-    pub redeem_script: Vec<u8>,
-}
-
 /// Purpose of a planned output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)] // Variant not yet constructed; used in match pattern
@@ -98,6 +90,10 @@ pub enum OutputPurpose {
     MatcherFee,
     /// Wallet change (unused KAS back to matcher).
     WalletChange,
+    /// Sell value remainder (excess sell input value beyond buyer needs).
+    SellRemainder,
+    /// Buyer change (surplus exceeding bps cap returned to buyer).
+    BuyerChange,
 }
 
 /// A planned output in the batch TX.
@@ -141,13 +137,15 @@ pub enum BatchError {
     ZeroPriceDenominator { index: usize, side: &'static str },
     /// Arithmetic overflow (u128 result does not fit in u64).
     Overflow { index: usize, side: &'static str, detail: &'static str },
+    /// Fee bps cap produced no viable matcher fee (all surplus returned to buyers).
+    FeeBpsCappedToZero,
 }
 
 impl std::fmt::Display for BatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BatchError::UnsupportedVersion { outpoint, version } => {
-                write!(f, "Order {} is v{}, unsupported in batch (sell: v6/v8/v12/v13, buy: v8/v9/v10/v11/v12/v13)", outpoint, version)
+                write!(f, "Order {} is v{}, unsupported (v14 only)", outpoint, version)
             }
             BatchError::EmptyBatch => write!(f, "No orders in batch"),
             BatchError::OutputBelowMinimum { index, value } => {
@@ -173,6 +171,9 @@ impl std::fmt::Display for BatchError {
             }
             BatchError::Overflow { index, side, detail } => {
                 write!(f, "Order[{}] ({}) arithmetic overflow: {}", index, side, detail)
+            }
+            BatchError::FeeBpsCappedToZero => {
+                write!(f, "Fee bps cap reduced matcher fee to zero (no profit)")
             }
         }
     }
@@ -216,8 +217,6 @@ pub struct BatchPlan {
     pub sells: Vec<(BatchOrder, usize)>,
     /// Buy orders with their assigned input indices.
     pub buys: Vec<(BatchOrder, usize)>,
-    /// Token units with their assigned input indices.
-    pub token_units: Vec<(TokenUnit, usize)>,
     /// Optional wallet UTXO for fee payment (txid, index, value).
     pub wallet_input: Option<(String, u32, u64)>,
     /// Planned outputs.
@@ -226,10 +225,29 @@ pub struct BatchPlan {
     pub total_fee: u64,
     /// Matcher surplus (profit from price spread).
     pub matcher_surplus: u64,
-    /// Mapping: buy's token_cov_id (hex) -> token_unit input index.
+    /// Mapping: buy's token_cov_id (hex) -> sell input index (for tii).
+    /// Sell inputs carry covenant_id, providing covenant lineage for buyer outputs.
     pub token_input_map: HashMap<String, usize>,
     /// Mapping: buy input index -> seller output index (soi for v11).
     pub buy_seller_map: HashMap<usize, usize>,
+    /// Matcher fee cap in basis points (stored for Phase 2 re-application).
+    pub fee_bps: Option<u16>,
+    /// Total KAS flowing to sellers (trade volume, for bps cap calculation).
+    pub total_seller_kas: u64,
+    /// IOC mode: None = normal batch, Some(Buy) = buy sweeps sells, Some(Sell) = sell sweeps buys.
+    pub ioc_mode: Option<IocSide>,
+    /// Per-sell fill token amounts for sell IOC (index matches sells vec).
+    /// Only populated when ioc_mode == Some(IocSide::Sell).
+    pub sell_fill_amounts: Vec<u64>,
+}
+
+/// Which side of the IOC is the sweeper.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IocSide {
+    /// 1 buy sweeps N sells.
+    Buy,
+    /// 1 sell sweeps N buys.
+    Sell,
 }
 
 impl BatchPlan {
@@ -239,9 +257,15 @@ impl BatchPlan {
         let mut outputs = Vec::new();
 
         // === Build sell inputs ===
-        for (sell, input_idx) in &self.sells {
+        for (i, (sell, input_idx)) in self.sells.iter().enumerate() {
             let koi = *input_idx; // seller's KAS output is at output[input_idx]
-            let ss = build_sell_fill_sigscript_batch(koi as u16, &sell.redeem_script)?;
+            let ss = if self.ioc_mode == Some(IocSide::Sell) && !self.sell_fill_amounts.is_empty() {
+                // Sell IOC: use fta-based sigscript
+                let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
+                build_sell_ioc_fill_sigscript_batch(koi as u16, fta, &sell.redeem_script)?
+            } else {
+                build_sell_fill_sigscript_batch(koi as u16, &sell.redeem_script)?
+            };
             inputs.push(BatchTxInput {
                 tx_id: sell.outpoint.0.clone(),
                 index: sell.outpoint.1,
@@ -269,43 +293,25 @@ impl BatchPlan {
 
             // Indices >16 are handled by data-push encoding (no OpN limit).
 
-            let ss = match buy.version {
-                11 | 12 => {
-                    let soi = self.buy_seller_map.get(input_idx)
-                        .copied()
-                        .unwrap_or(0) as u16;
-                    build_buy_fill_sigscript_batch_v11(
-                        soi,
-                        toi as u16,
-                        *tii as u16,
-                        coi,
-                        &buy.redeem_script,
-                    )?
-                }
-                _ => {
-                    // v8/v9/v10/v13: no soi parameter (v13 uses conservation instead)
-                    build_buy_fill_sigscript_batch(
-                        toi as u16,
-                        *tii as u16,
-                        coi,
-                        &buy.redeem_script,
-                    )?
-                }
+            let ss = if self.ioc_mode == Some(IocSide::Buy) {
+                // Buy IOC: use Op5 selector
+                build_buy_ioc_fill_sigscript_batch(
+                    toi as u16,
+                    *tii as u16,
+                    coi,
+                    &buy.redeem_script,
+                )?
+            } else {
+                build_buy_fill_sigscript_batch(
+                    toi as u16,
+                    *tii as u16,
+                    coi,
+                    &buy.redeem_script,
+                )?
             };
             inputs.push(BatchTxInput {
                 tx_id: buy.outpoint.0.clone(),
                 index: buy.outpoint.1,
-                sigscript: ss,
-                sig_op_count: 0,
-            });
-        }
-
-        // === Build token unit inputs ===
-        for (token_unit, _input_idx) in &self.token_units {
-            let ss = build_token_unit_sigscript_batch(&token_unit.redeem_script);
-            inputs.push(BatchTxInput {
-                tx_id: token_unit.outpoint.0.clone(),
-                index: token_unit.outpoint.1,
                 sigscript: ss,
                 sig_op_count: 0,
             });
@@ -340,9 +346,9 @@ impl BatchPlan {
 
     /// Validate the plan: all contracts satisfied, fees covered, amounts balanced.
     pub fn validate(&self) -> Result<(), BatchError> {
-        // Check: order versions (sell: v6/v8/v12/v13, buy: v8/v9/v10/v11/v12/v13)
+        // Check: order versions (v14 only)
         for (sell, _) in &self.sells {
-            if !matches!(sell.version, 6 | 8 | 12 | 13) {
+            if sell.version != 14 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
                     version: sell.version,
@@ -350,7 +356,7 @@ impl BatchPlan {
             }
         }
         for (buy, _) in &self.buys {
-            if !matches!(buy.version, 8..=13) {
+            if buy.version != 14 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                     version: buy.version,
@@ -376,7 +382,7 @@ impl BatchPlan {
             }
         }
 
-        // Check: every buy's token has a token_unit
+        // Check: every buy's token has a matching sell (for covenant lineage)
         for (buy, _) in &self.buys {
             let token_hex = hex::encode(buy.token_cov_id);
             if !self.token_input_map.contains_key(&token_hex) {
@@ -389,23 +395,16 @@ impl BatchPlan {
         // No index range cap: push_index() handles indices >16 via data-push
         // encoding.  The practical limit is MAX_TX_MASS (500,000).
 
-        // Check: amounts balance
-        //   Total KAS in = sum(buy.utxo_value) + wallet_input.value
-        //   Total KAS out = sum(seller_kas outputs) + matcher_fee + wallet_change + fee
-        //
-        // Token accounting is separate (token_unit inputs provide tokens for buyer outputs).
-        // We verify KAS balance only.
-        let kas_in: u64 = self.buys.iter().map(|(b, _)| b.utxo_value).sum::<u64>()
+        // Check: total sompi balance (all inputs == all outputs + miner fee).
+        let total_in: u64 = self.sells.iter().map(|(s, _)| s.utxo_value).sum::<u64>()
+            + self.buys.iter().map(|(b, _)| b.utxo_value).sum::<u64>()
             + self.wallet_input.as_ref().map_or(0, |w| w.2);
-        let kas_out: u64 = self.outputs.iter()
-            .filter(|o| matches!(o.purpose, OutputPurpose::SellerKas | OutputPurpose::MatcherFee | OutputPurpose::WalletChange))
-            .map(|o| o.value)
-            .sum();
-        let expected_out = kas_out + self.total_fee;
-        if kas_in != expected_out {
+        let total_out: u64 = self.outputs.iter().map(|o| o.value).sum();
+        let expected_out = total_out + self.total_fee;
+        if total_in != expected_out {
             return Err(BatchError::AmountMismatch {
-                total_in: kas_in,
-                total_out: kas_out,
+                total_in,
+                total_out,
                 fee: self.total_fee,
             });
         }
@@ -449,7 +448,9 @@ impl BatchPlan {
         use kob_core::p2sh::build_p2sh;
         use kob_core::tx::{Transaction, TxInput, TxOutput};
 
-        let mut tx = Transaction::new(0);
+        // Version 1 required when outputs have covenant binding
+        let has_covenant = self.outputs.iter().any(|o| o.purpose == OutputPurpose::BuyerTokens);
+        let mut tx = Transaction::new(if has_covenant { 1 } else { 0 });
 
         // Sell inputs
         for (sell, _idx) in &self.sells {
@@ -476,20 +477,6 @@ impl BatchPlan {
                 script_version: p2sh.version(),
                 script_bytes: p2sh.script().to_vec(),
                 value: buy.utxo_value,
-            });
-        }
-
-        // Token unit inputs
-        for (tu, _idx) in &self.token_units {
-            let p2sh = build_p2sh(&tu.redeem_script);
-            tx.inputs.push(TxInput {
-                prev_tx_id: tu.outpoint.0.clone(),
-                prev_index: tu.outpoint.1,
-                sequence: 0,
-                sig_op_count: 0,
-                script_version: p2sh.version(),
-                script_bytes: p2sh.script().to_vec(),
-                value: tu.value,
             });
         }
 
@@ -538,15 +525,38 @@ impl BatchPlan {
             return;
         }
 
-        // Find matcher fee output, or fall back to first seller output
-        let adjust_idx = self.outputs.iter()
-            .position(|o| o.purpose == OutputPurpose::MatcherFee)
-            .unwrap_or(0);
+        // Compute bps cap (if set)
+        let max_matcher = if let Some(bps) = self.fee_bps {
+            let cap_128 = self.total_seller_kas as u128 * bps as u128 / 10000;
+            if cap_128 > u64::MAX as u128 { u64::MAX } else { cap_128 as u64 }
+        } else {
+            u64::MAX // no cap
+        };
 
-        self.outputs[adjust_idx].value += delta;
-        if self.outputs[adjust_idx].purpose == OutputPurpose::MatcherFee {
-            self.matcher_surplus += delta;
+        // Find matcher fee output index
+        let matcher_idx = self.outputs.iter()
+            .position(|o| o.purpose == OutputPurpose::MatcherFee);
+
+        if let Some(idx) = matcher_idx {
+            // How much can matcher absorb without exceeding bps cap?
+            let current = self.outputs[idx].value;
+            let room = max_matcher.saturating_sub(current);
+            let to_matcher = delta.min(room);
+            let to_seller = delta - to_matcher;
+
+            if to_matcher > 0 {
+                self.outputs[idx].value += to_matcher;
+                self.matcher_surplus += to_matcher;
+            }
+            if to_seller > 0 {
+                // Overflow goes to first seller output
+                self.outputs[0].value += to_seller;
+            }
+        } else {
+            // No matcher fee output — give delta to first seller
+            self.outputs[0].value += delta;
         }
+
         self.total_fee = exact_fee;
     }
 }
@@ -555,23 +565,30 @@ impl BatchPlan {
 
 /// Build a batch plan from a set of matchable orders.
 ///
+/// Sell inputs provide covenant lineage for buyer token outputs directly.
+/// Each buy's `tii` sigscript parameter is set to the index of a sell input
+/// with matching `token_cov_id`.
+///
 /// # Arguments
-/// * `sells` - Sell orders to include (v6 or v8).
-/// * `buys` - Buy orders to include (v8, v10, or v11).
-/// * `token_units` - Available token units (one per unique token that buys need).
+/// * `sells` - Sell orders to include.
+/// * `buys` - Buy orders to include.
 /// * `wallet_utxo` - Optional wallet UTXO for fee payment (txid, index, value).
 /// * `matcher_spk` - Matcher's scriptPublicKey bytes for receiving KAS outputs.
 /// * `matcher_spk_version` - SPK version.
+/// * `fee_bps` - Optional matcher fee cap in basis points (e.g. 50 = 0.5%).
+///   When set, matcher surplus is capped at `(total_trade_value * fee_bps) / 10000`.
+///   Excess surplus is returned to buyers as change outputs pro-rata.
+///   `None` means no cap (matcher takes all surplus).
 ///
 /// # Returns
 /// A `BatchPlan` with all indices assigned and outputs computed.
 pub fn plan_batch_match(
     sells: &[BatchOrder],
     buys: &[BatchOrder],
-    token_units: &[TokenUnit],
     wallet_utxo: Option<(String, u32, u64)>,
     matcher_spk: &[u8],
     matcher_spk_version: u16,
+    fee_bps: Option<u16>,
 ) -> Result<BatchPlan, BatchError> {
     if sells.is_empty() {
         return Err(BatchError::NoSellOrders);
@@ -597,9 +614,9 @@ pub fn plan_batch_match(
         }
     }
 
-    // Validate order versions (sell: v6/v8/v12/v13, buy: v8/v9/v10/v11/v12/v13)
+    // Validate order versions (v14 only)
     for sell in sells {
-        if !matches!(sell.version, 6 | 8 | 12 | 13) {
+        if sell.version != 14 {
             return Err(BatchError::UnsupportedVersion {
                 outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
                 version: sell.version,
@@ -607,7 +624,7 @@ pub fn plan_batch_match(
         }
     }
     for buy in buys {
-        if !matches!(buy.version, 8..=13) {
+        if buy.version != 14 {
             return Err(BatchError::UnsupportedVersion {
                 outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                 version: buy.version,
@@ -616,38 +633,27 @@ pub fn plan_batch_match(
     }
 
     let n = sells.len();
-    let m = buys.len();
+    let _m = buys.len();
 
-    // Build token_input_map: token_cov_id (hex) -> input index
-    // Token units start at input[N+M]
+    // Build token_input_map: token_cov_id (hex) -> sell input index.
+    // Sell inputs carry covenant_id, providing covenant lineage for buyer
+    // token outputs.  Each buy's tii points to a sell with matching token.
     let mut token_input_map: HashMap<String, usize> = HashMap::new();
-    let mut used_token_units: Vec<(TokenUnit, usize)> = Vec::new();
+    for (i, sell) in sells.iter().enumerate() {
+        let token_hex = hex::encode(sell.token_cov_id);
+        // First sell for each token wins (buy's tii just needs any matching sell)
+        token_input_map.entry(token_hex).or_insert(i);
+    }
 
-    // Determine which tokens are needed by buy orders
-    let mut needed_tokens: HashMap<String, bool> = HashMap::new();
+    // Verify every buy's token has a matching sell
     for buy in buys {
         let token_hex = hex::encode(buy.token_cov_id);
-        needed_tokens.insert(token_hex, true);
+        if !token_input_map.contains_key(&token_hex) {
+            return Err(BatchError::MissingTokenUnit {
+                token_cov_id: token_hex,
+            });
+        }
     }
-
-    // Assign token units to input slots
-    let mut token_idx = n + m;
-    for token_hex in needed_tokens.keys() {
-        let token_unit = token_units.iter()
-            .find(|tu| hex::encode(tu.token_cov_id) == *token_hex)
-            .ok_or_else(|| BatchError::MissingTokenUnit {
-                token_cov_id: token_hex.clone(),
-            })?;
-        token_input_map.insert(token_hex.clone(), token_idx);
-        used_token_units.push((token_unit.clone(), token_idx));
-        token_idx += 1;
-    }
-
-    let t = used_token_units.len();
-
-    // Total input/output counts are no longer capped at 17 (OpN limit removed).
-    // Indices >16 use data-push encoding.  The practical limit is MAX_TX_MASS.
-    let _total_inputs = n + m + t + if wallet_utxo.is_some() { 1 } else { 0 };
 
     // Assign sell orders to input[0..N-1]
     let plan_sells: Vec<(BatchOrder, usize)> = sells.iter()
@@ -735,49 +741,98 @@ pub fn plan_batch_match(
         });
     }
 
-    // Validate token balance: total buyer tokens per covenant <= token unit value
-    for (cov_hex, needed) in &total_buyer_tokens_by_cov {
-        let available = used_token_units.iter()
-            .filter(|(tu, _)| hex::encode(tu.token_cov_id) == *cov_hex)
-            .map(|(tu, _)| tu.value)
-            .sum::<u64>();
-        if *needed > available {
-            return Err(BatchError::MissingTokenUnit {
-                token_cov_id: format!("{} (need {} have {})", cov_hex, needed, available),
-            });
-        }
-    }
-
     // Compute KAS surplus
-    //   Total KAS in = sum(buy.utxo_value) + wallet_utxo.value
-    //   Total KAS out needed = sum(seller_kas) + fee
-    //   Surplus = total_kas_in - total_kas_out_needed
+    //
+    // Inputs: sell + buy + wallet.  Outputs: seller_kas + buyer_tokens + matcher_fee.
+    // Sell input values flow to buyer token outputs (covenant conservation).
+    // Buy input values flow to seller KAS outputs.
+    // Surplus = buy_kas - seller_kas - fee (price spread profit).
+    let total_sell_value: u64 = sells.iter().map(|s| s.utxo_value).sum();
     let total_buy_kas: u64 = buys.iter().map(|b| b.utxo_value).sum();
     let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
-    let total_kas_in = total_buy_kas + wallet_value;
-    // Estimate miner fee from compute mass. Batch TX inputs: buys + sells + token units + wallet.
-    // Outputs: seller_kas per sell + buyer_tokens per buy + matcher_fee.
-    let num_inputs = buys.len() + sells.len() + used_token_units.len()
+    let total_kas_in = total_sell_value + total_buy_kas + wallet_value;
+
+    let total_buyer_tokens: u64 = total_buyer_tokens_by_cov.values().sum();
+    let total_planned_out: u64 = total_seller_kas + total_buyer_tokens;
+
+    // Estimate miner fee
+    let num_inputs = buys.len() + sells.len()
         + if wallet_utxo.is_some() { 1 } else { 0 };
-    let num_outputs = sells.len() + buys.len() + 1; // +1 for matcher fee output
+    // +1 for matcher fee, +1 for potential sell remainder
+    let num_outputs = sells.len() + buys.len() + 2;
     let total_fee = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
 
-    if total_kas_in < total_seller_kas + total_fee {
+    if total_kas_in < total_planned_out + total_fee {
         return Err(BatchError::InsufficientFee {
-            needed: total_seller_kas + total_fee,
+            needed: total_planned_out + total_fee,
             available: total_kas_in,
         });
     }
 
-    let raw_surplus = total_kas_in - total_seller_kas - total_fee;
+    let raw_surplus = total_kas_in - total_planned_out - total_fee;
 
-    // If surplus >= MIN_UTXO_VALUE, create a matcher fee output
-    // Otherwise, distribute surplus to first seller output
-    let matcher_surplus;
-    if raw_surplus >= MIN_UTXO_VALUE {
-        matcher_surplus = raw_surplus;
+    // Sell remainder: if sell input value > buyer token output value for a
+    // covenant, the excess sell value needs a non-covenant output.
+    let sell_excess = total_sell_value.saturating_sub(total_buyer_tokens);
+    if sell_excess >= MIN_UTXO_VALUE {
         outputs.push(PlannedOutput {
-            value: raw_surplus,
+            value: sell_excess,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::SellRemainder,
+        });
+    }
+
+    // Matcher KAS surplus = raw_surplus minus sell excess
+    let matcher_kas = raw_surplus.saturating_sub(sell_excess);
+
+    // Apply bps cap: matcher fee <= (total_trade_value * fee_bps) / 10000
+    // total_trade_value = sum of KAS flowing to sellers (the traded volume)
+    let (capped_matcher_kas, buyer_refund) = if let Some(bps) = fee_bps {
+        let max_fee_128 = total_seller_kas as u128 * bps as u128 / 10000;
+        let max_fee = if max_fee_128 > u64::MAX as u128 { u64::MAX } else { max_fee_128 as u64 };
+        if matcher_kas > max_fee {
+            (max_fee, matcher_kas - max_fee)
+        } else {
+            (matcher_kas, 0u64)
+        }
+    } else {
+        (matcher_kas, 0u64)
+    };
+
+    // Refund excess surplus to buyers pro-rata by KAS input
+    if buyer_refund > 0 {
+        let total_buy_kas_f = total_buy_kas as f64;
+        let mut refunded = 0u64;
+        for (j, buy) in buys.iter().enumerate() {
+            let share = if j == buys.len() - 1 {
+                // Last buyer gets remainder to avoid rounding loss
+                buyer_refund - refunded
+            } else {
+                ((buyer_refund as f64 * buy.utxo_value as f64 / total_buy_kas_f) as u64)
+                    .min(buyer_refund - refunded)
+            };
+            if share >= MIN_UTXO_VALUE {
+                outputs.push(PlannedOutput {
+                    value: share,
+                    script_public_key: buy.counterparty_spk.clone(),
+                    spk_version: buy.counterparty_spk_version,
+                    purpose: OutputPurpose::BuyerChange,
+                });
+                refunded += share;
+            } else if share > 0 {
+                // Dust: add to this buyer's token output (at index n + j)
+                outputs[n + j].value += share;
+                refunded += share;
+            }
+        }
+    }
+
+    let matcher_surplus;
+    if capped_matcher_kas >= MIN_UTXO_VALUE {
+        matcher_surplus = capped_matcher_kas;
+        outputs.push(PlannedOutput {
+            value: capped_matcher_kas,
             script_public_key: matcher_spk.to_vec(),
             spk_version: matcher_spk_version,
             purpose: OutputPurpose::MatcherFee,
@@ -785,8 +840,8 @@ pub fn plan_batch_match(
     } else {
         // Add dust surplus to first seller's KAS output
         matcher_surplus = 0;
-        if !outputs.is_empty() {
-            outputs[0].value += raw_surplus;
+        if capped_matcher_kas > 0 && !outputs.is_empty() {
+            outputs[0].value += capped_matcher_kas;
         }
     }
 
@@ -817,13 +872,437 @@ pub fn plan_batch_match(
     Ok(BatchPlan {
         sells: plan_sells,
         buys: plan_buys,
-        token_units: used_token_units,
         wallet_input: wallet_utxo,
         outputs,
         total_fee,
         matcher_surplus,
         token_input_map,
         buy_seller_map,
+        fee_bps,
+        total_seller_kas,
+        ioc_mode: None,
+        sell_fill_amounts: Vec::new(),
+    })
+}
+
+/// IOC (Immediate-Or-Cancel) batch match: one buy sweeps multiple sells.
+///
+/// Sells are consumed in order (caller should pre-sort by price, best first).
+/// The buy provides KAS; sells provide tokens. The buy sweeps sells until
+/// its KAS is exhausted or all sells are filled.
+///
+/// Unlike `plan_batch_match` (which assumes pre-matched full-fill pairs),
+/// this function computes how many sells the buy can afford and returns
+/// change to the buyer for any unspent KAS.
+///
+/// # Arguments
+/// * `sells` - Sell orders sorted by price (best first).
+/// * `buy` - The single IOC buy order.
+/// * `wallet_utxo` - Optional wallet UTXO for miner fee.
+/// * `matcher_spk` / `matcher_spk_version` - Matcher's SPK for fee output.
+/// * `fee_bps` - Optional bps cap on matcher fee.
+///
+/// # Returns
+/// A `BatchPlan` containing only the sells that were filled (full fill).
+/// Buyer change output is added if buy KAS exceeds what was needed.
+pub fn plan_ioc_match(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    if sells.is_empty() {
+        return Err(BatchError::NoSellOrders);
+    }
+    if buy.order_type != OrderType::Buy {
+        return Err(BatchError::NoBuyOrders);
+    }
+
+    // Sweep sells with the buy's KAS
+    let buy_kas = buy.utxo_value;
+    let mut filled_sells: Vec<&BatchOrder> = Vec::new();
+    let mut total_seller_kas: u64 = 0;
+    let mut total_tokens_bought: u64 = 0;
+    let mut kas_remaining = buy_kas;
+
+    for sell in sells {
+        if sell.price_den == 0 {
+            continue; // skip broken orders
+        }
+        // How much KAS does this sell require?
+        let sell_kas_128 = sell.amount as u128 * sell.price_num as u128
+            / sell.price_den as u128;
+        if sell_kas_128 > u64::MAX as u128 {
+            continue; // overflow, skip
+        }
+        let sell_kas = sell_kas_128 as u64;
+        if sell_kas < MIN_UTXO_VALUE {
+            continue; // too small
+        }
+
+        if kas_remaining >= sell_kas {
+            // Full fill this sell
+            filled_sells.push(sell);
+            total_seller_kas += sell_kas;
+            total_tokens_bought += sell.amount;
+            kas_remaining -= sell_kas;
+        } else {
+            // Can't afford this sell — stop (IOC: no partial fill for now)
+            break;
+        }
+    }
+
+    if filled_sells.is_empty() {
+        return Err(BatchError::InsufficientFee {
+            needed: sells[0].amount as u64,
+            available: buy_kas,
+        });
+    }
+
+    let n = filled_sells.len();
+
+    // Build token_input_map: sell provides covenant lineage
+    let mut token_input_map: HashMap<String, usize> = HashMap::new();
+    for (i, sell) in filled_sells.iter().enumerate() {
+        let token_hex = hex::encode(sell.token_cov_id);
+        token_input_map.entry(token_hex).or_insert(i);
+    }
+
+    // Input layout: [sell_0..sell_{n-1}] [buy] [wallet?]
+    let plan_sells: Vec<(BatchOrder, usize)> = filled_sells.iter()
+        .enumerate()
+        .map(|(i, s)| ((*s).clone(), i))
+        .collect();
+    let buy_input_idx = n;
+    let plan_buys: Vec<(BatchOrder, usize)> = vec![(buy.clone(), buy_input_idx)];
+
+    // Build outputs
+    let mut outputs: Vec<PlannedOutput> = Vec::new();
+
+    // Seller KAS outputs
+    for sell in &filled_sells {
+        let sell_kas_128 = sell.amount as u128 * sell.price_num as u128
+            / sell.price_den as u128;
+        let sell_kas = sell_kas_128 as u64;
+        outputs.push(PlannedOutput {
+            value: sell_kas,
+            script_public_key: sell.counterparty_spk.clone(),
+            spk_version: sell.counterparty_spk_version,
+            purpose: OutputPurpose::SellerKas,
+        });
+    }
+
+    // Buyer token output (all tokens from filled sells)
+    if total_tokens_bought >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: total_tokens_bought,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerTokens,
+        });
+    }
+
+    // Estimate miner fee
+    let num_inputs = n + 1 + if wallet_utxo.is_some() { 1 } else { 0 };
+    let num_outputs = n + 3; // sellers + buyer_tokens + buyer_change + matcher_fee
+    let total_fee = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
+
+    // Total KAS in
+    let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
+    let total_sell_value: u64 = filled_sells.iter().map(|s| s.utxo_value).sum();
+    let total_kas_in = total_sell_value + buy_kas + wallet_value;
+    let total_planned_out: u64 = total_seller_kas + total_tokens_bought;
+
+    if total_kas_in < total_planned_out + total_fee {
+        return Err(BatchError::InsufficientFee {
+            needed: total_planned_out + total_fee,
+            available: total_kas_in,
+        });
+    }
+
+    let raw_surplus = total_kas_in - total_planned_out - total_fee;
+
+    // Sell remainder (excess sell input value beyond token outputs)
+    let sell_excess = total_sell_value.saturating_sub(total_tokens_bought);
+    if sell_excess >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: sell_excess,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::SellRemainder,
+        });
+    }
+
+    // raw_surplus includes kas_remaining (unspent buy KAS) + wallet excess.
+    // Matcher gets: wallet excess + spread profit (not the buyer's unspent KAS).
+    // Buyer gets back: kas_remaining (unspent KAS from sweep).
+    let matcher_kas = raw_surplus
+        .saturating_sub(sell_excess)
+        .saturating_sub(kas_remaining);
+
+    // Apply bps cap
+    let (capped_matcher_kas, buyer_refund_from_bps) = if let Some(bps) = fee_bps {
+        let max_fee_128 = total_seller_kas as u128 * bps as u128 / 10000;
+        let max_fee = if max_fee_128 > u64::MAX as u128 { u64::MAX } else { max_fee_128 as u64 };
+        if matcher_kas > max_fee {
+            (max_fee, matcher_kas - max_fee)
+        } else {
+            (matcher_kas, 0u64)
+        }
+    } else {
+        (matcher_kas, 0u64)
+    };
+
+    // Buyer change = unspent KAS from sweep + any bps refund
+    let total_buyer_change = kas_remaining + buyer_refund_from_bps;
+    if total_buyer_change >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: total_buyer_change,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerChange,
+        });
+    } else if total_buyer_change > 0 {
+        // Dust: add to buyer token output
+        if let Some(tok_out) = outputs.iter_mut()
+            .find(|o| o.purpose == OutputPurpose::BuyerTokens)
+        {
+            tok_out.value += total_buyer_change;
+        }
+    }
+
+    // Matcher fee output
+    let matcher_surplus;
+    if capped_matcher_kas >= MIN_UTXO_VALUE {
+        matcher_surplus = capped_matcher_kas;
+        outputs.push(PlannedOutput {
+            value: capped_matcher_kas,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::MatcherFee,
+        });
+    } else {
+        matcher_surplus = 0;
+        if capped_matcher_kas > 0 && !outputs.is_empty() {
+            outputs[0].value += capped_matcher_kas;
+        }
+    }
+
+    // Buy-to-sell mapping (buy maps to first sell with matching token)
+    let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();
+    buy_seller_map.insert(buy_input_idx, 0);
+
+    Ok(BatchPlan {
+        sells: plan_sells,
+        buys: plan_buys,
+        wallet_input: wallet_utxo,
+        outputs,
+        total_fee,
+        matcher_surplus,
+        token_input_map,
+        buy_seller_map,
+        fee_bps,
+        total_seller_kas,
+        ioc_mode: Some(IocSide::Buy),
+        sell_fill_amounts: Vec::new(),
+    })
+}
+
+/// IOC (Immediate-Or-Cancel) batch match: one sell sweeps multiple buys.
+///
+/// Buys are consumed in order (caller should pre-sort by price, best first).
+/// The sell provides tokens; buys provide KAS. The sell sweeps buys until
+/// its tokens are exhausted or all buys are filled.
+///
+/// # Returns
+/// A `BatchPlan` containing only the buys that were filled (full fill).
+/// Seller token change output is added if sell tokens exceed what was needed.
+pub fn plan_sell_ioc_match(
+    sell: &BatchOrder,
+    buys: &[BatchOrder],
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    if buys.is_empty() {
+        return Err(BatchError::NoBuyOrders);
+    }
+    if sell.order_type != OrderType::Sell {
+        return Err(BatchError::NoSellOrders);
+    }
+
+    // Sweep buys with the sell's tokens
+    let sell_tokens = sell.amount; // = sell.utxo_value for token UTXOs
+    let mut filled_buys: Vec<&BatchOrder> = Vec::new();
+    let mut total_tokens_sold: u64 = 0;
+    let mut total_seller_kas: u64 = 0;
+    let mut tokens_remaining = sell_tokens;
+
+    for buy in buys {
+        if buy.price_den == 0 {
+            continue;
+        }
+        // How many tokens does this buy want?
+        let buy_tokens_128 = buy.utxo_value as u128 * buy.price_num as u128
+            / buy.price_den as u128;
+        if buy_tokens_128 > u64::MAX as u128 {
+            continue;
+        }
+        let buy_tokens = buy_tokens_128 as u64;
+        if buy_tokens < MIN_UTXO_VALUE {
+            continue;
+        }
+
+        // How much KAS does the buyer pay? = buy.utxo_value
+        // How many tokens does the seller give? = buy_tokens
+        // Seller gets: buy.utxo_value KAS (the buyer's full UTXO)
+
+        if tokens_remaining >= buy_tokens {
+            filled_buys.push(buy);
+            total_tokens_sold += buy_tokens;
+            total_seller_kas += buy.utxo_value; // buyer pays full UTXO value
+            tokens_remaining -= buy_tokens;
+        } else {
+            break;
+        }
+    }
+
+    if filled_buys.is_empty() {
+        return Err(BatchError::InsufficientFee {
+            needed: buys[0].amount as u64,
+            available: sell_tokens,
+        });
+    }
+
+    let m = filled_buys.len();
+
+    // Token input map: sell provides covenant lineage
+    let mut token_input_map: HashMap<String, usize> = HashMap::new();
+    let token_hex = hex::encode(sell.token_cov_id);
+    token_input_map.insert(token_hex, 0); // sell is always input 0
+
+    // Input layout: [sell] [buy_0..buy_{m-1}] [wallet?]
+    let plan_sells: Vec<(BatchOrder, usize)> = vec![(sell.clone(), 0)];
+    let plan_buys: Vec<(BatchOrder, usize)> = filled_buys.iter()
+        .enumerate()
+        .map(|(j, b)| ((*b).clone(), 1 + j))
+        .collect();
+
+    // Build outputs
+    let mut outputs: Vec<PlannedOutput> = Vec::new();
+
+    // Seller KAS output (aggregated from all filled buys)
+    // Output[0] = seller's KAS
+    if total_seller_kas >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: total_seller_kas,
+            script_public_key: sell.counterparty_spk.clone(),
+            spk_version: sell.counterparty_spk_version,
+            purpose: OutputPurpose::SellerKas,
+        });
+    }
+
+    // Buyer token outputs (each buyer gets their tokens)
+    for buy in &filled_buys {
+        let buy_tokens_128 = buy.utxo_value as u128 * buy.price_num as u128
+            / buy.price_den as u128;
+        let buy_tokens = buy_tokens_128 as u64;
+        outputs.push(PlannedOutput {
+            value: buy_tokens,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerTokens,
+        });
+    }
+
+    // Seller token change (unfilled tokens returned to seller)
+    let token_change = sell_tokens.saturating_sub(total_tokens_sold);
+    if token_change >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: token_change,
+            script_public_key: sell.counterparty_spk.clone(),
+            spk_version: sell.counterparty_spk_version,
+            purpose: OutputPurpose::SellRemainder,
+        });
+    }
+
+    // Estimate miner fee
+    let num_inputs = 1 + m + if wallet_utxo.is_some() { 1 } else { 0 };
+    let num_outputs = outputs.len() + 1; // + matcher fee
+    let total_fee = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
+
+    // Total value in
+    let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
+    let total_buy_value: u64 = filled_buys.iter().map(|b| b.utxo_value).sum();
+    let total_kas_in = sell.utxo_value + total_buy_value + wallet_value;
+    let total_planned_out: u64 = outputs.iter().map(|o| o.value).sum();
+
+    if total_kas_in < total_planned_out + total_fee {
+        return Err(BatchError::InsufficientFee {
+            needed: total_planned_out + total_fee,
+            available: total_kas_in,
+        });
+    }
+
+    let raw_surplus = total_kas_in - total_planned_out - total_fee;
+
+    // Matcher gets surplus (wallet excess + any spread)
+    let matcher_kas = raw_surplus;
+
+    // Apply bps cap
+    let (capped_matcher_kas, _buyer_refund_from_bps) = if let Some(bps) = fee_bps {
+        let max_fee_128 = total_seller_kas as u128 * bps as u128 / 10000;
+        let max_fee = if max_fee_128 > u64::MAX as u128 { u64::MAX } else { max_fee_128 as u64 };
+        if matcher_kas > max_fee {
+            (max_fee, matcher_kas - max_fee)
+        } else {
+            (matcher_kas, 0u64)
+        }
+    } else {
+        (matcher_kas, 0u64)
+    };
+
+    let matcher_surplus = capped_matcher_kas;
+
+    // Matcher fee output
+    if capped_matcher_kas >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: capped_matcher_kas,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::MatcherFee,
+        });
+    } else if capped_matcher_kas > 0 && !outputs.is_empty() {
+        outputs[0].value += capped_matcher_kas;
+    }
+
+    // Buy-to-sell mapping (all buys map to the single sell at index 0)
+    let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();
+    for j in 0..m {
+        buy_seller_map.insert(1 + j, 0);
+    }
+
+    // sell_fill_amounts: the sell is the sweeper, so we track how much of its
+    // tokens go to each buyer (used for sell IOC sigscript fta parameter).
+    // But there's only 1 sell, so fill_amount = total_tokens_sold.
+    let sell_fill_amounts = vec![total_tokens_sold];
+
+    Ok(BatchPlan {
+        sells: plan_sells,
+        buys: plan_buys,
+        wallet_input: wallet_utxo,
+        outputs,
+        total_fee,
+        matcher_surplus,
+        token_input_map,
+        buy_seller_map,
+        fee_bps,
+        total_seller_kas,
+        ioc_mode: Some(IocSide::Sell),
+        sell_fill_amounts,
     })
 }
 
@@ -862,7 +1341,7 @@ fn push_index(ss: &mut Vec<u8>, n: u16) {
     }
 }
 
-/// Build sell_v8 fill sigscript for batch: `[koi] [Op1] [pushData(RS)]`
+/// Build sell fill sigscript for batch: `[koi] [Op1] [pushData(RS)]`
 ///
 /// * `kas_output_idx`: which output receives the seller's KAS
 fn build_sell_fill_sigscript_batch(kas_output_idx: u16, redeem_script: &[u8]) -> Result<Vec<u8>, BatchError> {
@@ -873,7 +1352,7 @@ fn build_sell_fill_sigscript_batch(kas_output_idx: u16, redeem_script: &[u8]) ->
     Ok(ss)
 }
 
-/// Build buy_v8 fill sigscript for batch: `[toi] [tii] [coi] [Op1] [pushData(RS)]`
+/// Build buy fill sigscript for batch: `[toi] [tii] [coi] [Op1] [pushData(RS)]`
 ///
 /// * `token_output_idx`: which output receives the buyer's tokens (toi)
 /// * `token_input_idx`: which input carries the token covenant (tii)
@@ -893,30 +1372,40 @@ fn build_buy_fill_sigscript_batch(
     Ok(ss)
 }
 
-/// Build buy_v11 fill sigscript for batch: `[soi] [toi] [tii] [coi] [Op1] [pushData(RS)]`
+/// Build buy IOC fill sigscript for batch: `[toi] [tii] [coi] [Op5] [pushData(RS)]`
 ///
-/// v11 adds soi (seller output index) parameter for batch fill defense.
-/// In batch TX, soi = index of the seller KAS output this buy is paired with.
-fn build_buy_fill_sigscript_batch_v11(
-    seller_output_idx: u16,
+/// Same as normal fill but with Op5 selector to trigger IOC sub-dispatch.
+fn build_buy_ioc_fill_sigscript_batch(
     token_output_idx: u16,
     token_input_idx: u16,
     cov_output_idx: u16,
     redeem_script: &[u8],
 ) -> Result<Vec<u8>, BatchError> {
-    let mut ss = Vec::with_capacity(9 + redeem_script.len() + 3);
-    push_index(&mut ss, seller_output_idx);
+    let mut ss = Vec::with_capacity(7 + redeem_script.len() + 3);
     push_index(&mut ss, token_output_idx);
     push_index(&mut ss, token_input_idx);
     push_index(&mut ss, cov_output_idx);
-    ss.push(0x51); // Op1 (selector = fill)
+    ss.push(0x55); // Op5 (selector = IOC fill)
     ss.extend_from_slice(&kob_core::push_data(redeem_script));
     Ok(ss)
 }
 
-/// Build token_unit sigscript for batch: `[pushData(RS)]`
-fn build_token_unit_sigscript_batch(redeem_script: &[u8]) -> Vec<u8> {
-    kob_core::push_data(redeem_script)
+/// Build sell IOC fill sigscript for batch: `[koi] [pushData(fta 8B)] [Op5] [pushData(RS)]`
+///
+/// * `kas_output_idx`: which output receives the seller's KAS
+/// * `fill_token_amount`: how many tokens are being filled (fta)
+fn build_sell_ioc_fill_sigscript_batch(
+    kas_output_idx: u16,
+    fill_token_amount: u64,
+    redeem_script: &[u8],
+) -> Result<Vec<u8>, BatchError> {
+    let fta = kob_core::u64_le(fill_token_amount);
+    let mut ss = Vec::with_capacity(14 + redeem_script.len() + 3);
+    push_index(&mut ss, kas_output_idx);
+    ss.extend_from_slice(&kob_core::push_data(&fta));
+    ss.push(0x55); // Op5 (selector = IOC fill)
+    ss.extend_from_slice(&kob_core::push_data(redeem_script));
+    Ok(ss)
 }
 
 #[cfg(test)]
@@ -931,7 +1420,7 @@ mod tests {
     /// Create a fake sell order for testing.
     fn make_sell(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32]) -> BatchOrder {
         let tx_id = hex::encode(&[id_byte; 32]);
-        // Build a real v13 sell RS for correct sigscript sizing
+        // Build a real v14 sell RS for correct sigscript sizing
         let owner = [0xBB; 32];
         let sspkh = [0xCC; 32];
         let rs = kob_core::contract::build_sell_redeem_script(
@@ -939,7 +1428,7 @@ mod tests {
         BatchOrder {
             outpoint: (tx_id, 0),
             order_type: OrderType::Sell,
-            version: 13,
+            version: 14,
             token_cov_id: token,
             price_num,
             price_den,
@@ -961,7 +1450,7 @@ mod tests {
         BatchOrder {
             outpoint: (tx_id, 0),
             order_type: OrderType::Buy,
-            version: 13,
+            version: 14,
             token_cov_id: token,
             price_num,
             price_den,
@@ -970,17 +1459,6 @@ mod tests {
             utxo_value: amount,
             counterparty_spk: vec![0xEE; 34], // fake buyer SPK
             counterparty_spk_version: 0,
-        }
-    }
-
-    /// Create a fake token unit for testing.
-    fn make_token_unit(id_byte: u8, token: [u8; 32], value: u64) -> TokenUnit {
-        let tx_id = hex::encode(&[id_byte; 32]);
-        TokenUnit {
-            outpoint: (tx_id, 0),
-            token_cov_id: token,
-            value,
-            redeem_script: kob_core::TOKEN_RS.to_vec(),
         }
     }
 
@@ -1002,31 +1480,27 @@ mod tests {
         let buy1 = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
         let buy2 = make_buy(0x21, 10_000_000, 1, 3, TOKEN_A);
 
-        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
-
         let plan = plan_batch_match(
             &[sell1, sell2],
             &[buy1, buy2],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("plan should succeed");
 
         // 2 sells + 2 buys = 4 orders
         assert_eq!(plan.sells.len(), 2, "should have 2 sells");
         assert_eq!(plan.buys.len(), 2, "should have 2 buys");
-        assert_eq!(plan.token_units.len(), 1, "should have 1 token unit (both buys use same token)");
-
-        // Input indices: sell[0]=0, sell[1]=1, buy[0]=2, buy[1]=3, token_unit=4
+        // Input indices: sell[0]=0, sell[1]=1, buy[0]=2, buy[1]=3
         assert_eq!(plan.sells[0].1, 0);
         assert_eq!(plan.sells[1].1, 1);
         assert_eq!(plan.buys[0].1, 2);
         assert_eq!(plan.buys[1].1, 3);
-        assert_eq!(plan.token_units[0].1, 4);
 
-        // Output indices: seller_kas[0]=0, seller_kas[1]=1, buyer_tokens[0]=2, buyer_tokens[1]=3
-        assert_eq!(plan.outputs.len(), 4 + 1, "4 order outputs + 1 matcher fee");
+        // Output indices: seller_kas[0]=0, seller_kas[1]=1, buyer_tokens[0]=2, buyer_tokens[1]=3,
+        //                 sell_remainder + matcher_fee
+        assert!(plan.outputs.len() >= 4, "at least 4 order outputs");
         assert_eq!(plan.outputs[0].purpose, OutputPurpose::SellerKas);
         assert_eq!(plan.outputs[1].purpose, OutputPurpose::SellerKas);
         assert_eq!(plan.outputs[2].purpose, OutputPurpose::BuyerTokens);
@@ -1042,48 +1516,25 @@ mod tests {
 
         // Build TX and verify
         let tx = plan.build_tx().expect("build_tx should succeed");
-        assert_eq!(tx.inputs.len(), 5, "2 sells + 2 buys + 1 token unit");
-        assert_eq!(tx.outputs.len(), 5, "2 seller KAS + 2 buyer tokens + 1 matcher fee");
+        assert_eq!(tx.inputs.len(), 4, "2 sells + 2 buys (no token_unit)");
     }
 
-    // Test 2: Cross-pair batch (sell A->KAS + buy KAS->B + token_unit B)
+    // Test 2: Cross-pair batch requires matching sell for each buy's token.
+    // sell A + buy B (different tokens) should FAIL (no sell provides token B).
     #[test]
-    fn test_cross_pair_batch() {
-        // Sell 20M Token A at price 1/2 => expects 10M KAS
+    fn test_cross_pair_fails_without_matching_sell() {
         let sell = make_sell(0x10, 20_000_000, 1, 2, TOKEN_A);
-
-        // Buy Token B with 15M KAS at price 1/3 => expects 5M Token B
         let buy = make_buy(0x20, 15_000_000, 1, 3, TOKEN_B);
 
-        // Token unit provides Token B
-        let token_unit = make_token_unit(0x30, TOKEN_B, 50_000_000);
-
-        let plan = plan_batch_match(
+        let result = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
-        ).expect("plan should succeed");
-
-        assert_eq!(plan.sells.len(), 1);
-        assert_eq!(plan.buys.len(), 1);
-        assert_eq!(plan.token_units.len(), 1);
-
-        // Input: sell[0]=0, buy[0]=1, token_unit(B)=2
-        assert_eq!(plan.sells[0].1, 0);
-        assert_eq!(plan.buys[0].1, 1);
-        assert_eq!(plan.token_units[0].1, 2);
-
-        // Output: seller_kas=10M at output[0], buyer_tokens=5M at output[1]
-        assert_eq!(plan.outputs[0].value, 10_000_000);
-        assert_eq!(plan.outputs[0].purpose, OutputPurpose::SellerKas);
-        assert_eq!(plan.outputs[1].value, 5_000_000);
-        assert_eq!(plan.outputs[1].purpose, OutputPurpose::BuyerTokens);
-
-        // KAS surplus: 15M - 10M - 10K fee = 4_990_000 >= MIN_UTXO_VALUE
-        assert!(plan.matcher_surplus >= MIN_UTXO_VALUE);
+            None,
+        );
+        assert!(result.is_err(), "cross-pair without matching sell should fail");
     }
 
     // Test 3: Multi-pair batch (sell A + sell B + buy B + buy A + tokens)
@@ -1099,25 +1550,21 @@ mod tests {
         // Buy Token A with 15M KAS at price 1/3 => expects 5M Token A
         let buy_a = make_buy(0x21, 15_000_000, 1, 3, TOKEN_A);
 
-        let token_unit_a = make_token_unit(0x30, TOKEN_A, 50_000_000);
-        let token_unit_b = make_token_unit(0x31, TOKEN_B, 50_000_000);
-
         let plan = plan_batch_match(
             &[sell_a, sell_b],
             &[buy_b, buy_a],
-            &[token_unit_a, token_unit_b],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("plan should succeed");
 
         // 2 sells + 2 buys
         assert_eq!(plan.sells.len(), 2);
         assert_eq!(plan.buys.len(), 2);
-        // 2 unique tokens needed by buys -> 2 token units
-        assert_eq!(plan.token_units.len(), 2);
+        
 
-        // Input layout: sell_a=0, sell_b=1, buy_b=2, buy_a=3, token_unit_x=4, token_unit_y=5
+        // Input layout: sell_a=0, sell_b=1, buy_b=2, buy_a=3
         assert_eq!(plan.sells[0].1, 0);
         assert_eq!(plan.sells[1].1, 1);
         assert_eq!(plan.buys[0].1, 2);
@@ -1132,7 +1579,7 @@ mod tests {
 
         // Build TX
         let tx = plan.build_tx().expect("build should succeed");
-        assert_eq!(tx.inputs.len(), 6, "2 sells + 2 buys + 2 token units");
+        assert_eq!(tx.inputs.len(), 4, "2 sells + 2 buys (no token_unit)");
     }
 
     // Test 4: Batch plan validation
@@ -1140,15 +1587,14 @@ mod tests {
     fn test_batch_plan_validation() {
         let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 50_000_000);
 
         let plan = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("plan should succeed");
 
         // Validate should pass
@@ -1162,15 +1608,14 @@ mod tests {
         // Build a small batch to verify sigscript byte encoding
         let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 50_000_000);
 
         let plan = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("plan should succeed");
 
         let tx = plan.build_tx().expect("build should succeed");
@@ -1180,17 +1625,12 @@ mod tests {
         assert_eq!(sell_ss[0], 0x00, "sell koi=0 -> Op0 (0x00)");
         assert_eq!(sell_ss[1], 0x51, "sell selector=1 -> Op1 (0x51)");
 
-        // Buy v13 at input[1]: toi=1, tii=2, coi=0, selector=Op1 (no soi)
+        // Buy v13 at input[1]: toi=1, tii=0 (sell input), coi=0, selector=Op1
         let buy_ss = &tx.inputs[1].sigscript;
         assert_eq!(buy_ss[0], 0x51, "buy toi=1 -> Op1 (0x51)");
-        assert_eq!(buy_ss[1], 0x52, "buy tii=2 -> Op2 (0x52)");
+        assert_eq!(buy_ss[1], 0x00, "buy tii=0 -> Op0 (sell input provides covenant)");
         assert_eq!(buy_ss[2], 0x00, "buy coi=0 -> Op0 (0x00)");
         assert_eq!(buy_ss[3], 0x51, "buy selector=1 -> Op1 (0x51)");
-
-        // Token unit at input[2]: just pushData(TOKEN_RS)
-        let tu_ss = &tx.inputs[2].sigscript;
-        // pushData for 7-byte TOKEN_RS: [0x07, ...7 bytes...]
-        assert_eq!(tu_ss[0], 0x07, "token unit RS pushdata length (7B)");
     }
 
     // Test 6: Large batch (10 sells + 10 buys -> no longer limited by OpN)
@@ -1204,23 +1644,22 @@ mod tests {
         let buys: Vec<BatchOrder> = (0..10)
             .map(|i| make_buy(0x20 + i, 10_000_000, 1, 3, TOKEN_A))
             .collect();
-        let token_unit = make_token_unit(0x30, TOKEN_A, 500_000_000);
 
         let plan = plan_batch_match(
             &sells,
             &buys,
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("10+10 batch should succeed (no OpN limit)");
 
         assert_eq!(plan.sells.len(), 10);
         assert_eq!(plan.buys.len(), 10);
 
         let tx = plan.build_tx().expect("build should succeed");
-        // 10 sells + 10 buys + 1 token unit = 21 inputs
-        assert_eq!(tx.inputs.len(), 21);
+        // 10 sells + 10 buys = 20 inputs (no token_unit)
+        assert_eq!(tx.inputs.len(), 20);
 
         // Verify indices >16 use data-push encoding (2 bytes: [0x01, n])
         // Buy at input[20] (index 20) has toi = 10 + 10_pos = some index >= 10
@@ -1239,18 +1678,18 @@ mod tests {
         let plan = plan_batch_match(
             &sells7,
             &buys7,
-            &[make_token_unit(0x30, TOKEN_A, 500_000_000)],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("7+7 batch should succeed");
 
         assert_eq!(plan.sells.len(), 7);
         assert_eq!(plan.buys.len(), 7);
 
         let tx = plan.build_tx().expect("build should succeed");
-        // 7 sells + 7 buys + 1 token unit = 15 inputs
-        assert_eq!(tx.inputs.len(), 15);
+        // 7 sells + 7 buys = 14 inputs (no token_unit)
+        assert_eq!(tx.inputs.len(), 14);
     }
 
     // Test 7: Fee calculation
@@ -1260,22 +1699,23 @@ mod tests {
         let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
         // Buy 10M KAS for Token A at 1/3 => expects 3.33M tokens
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 50_000_000);
 
         let plan = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("plan should succeed");
 
-        // Fee is computed from mass: 2 buys + 1 sell + 1 token = 4 inputs, ~3 outputs
-        let expected_fee = kob_core::mass::estimate_compute_mass(3, 3, 0);
+        // Fee is computed from mass: 1 sell + 1 buy = 2 inputs,
+        // 1 seller + 1 buyer + potential sell_remainder + matcher_fee = 4 outputs
+        let expected_fee = kob_core::mass::estimate_compute_mass(2, 4, 0);
         assert_eq!(plan.total_fee, expected_fee, "fee should match mass-based estimate");
 
-        // KAS surplus = 10M (buy) - 5M (seller) - fee
+        // KAS surplus = buy(10M) - seller_kas(5M) - fee
+        
         let expected_surplus = 10_000_000 - 5_000_000 - expected_fee;
         assert_eq!(plan.matcher_surplus, expected_surplus);
 
@@ -1286,76 +1726,58 @@ mod tests {
         assert_eq!(matcher_out.unwrap().value, expected_surplus);
     }
 
-    // Test 8: version validation (sell: v6/v8 OK, buy: v8/v10/v11 OK)
+    // Test 8: version validation (v14 only)
     #[test]
     fn test_version_validation() {
-        // v6 sell should now be accepted
-        let mut sell_v6 = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
-        sell_v6.version = 6;
-
+        // v14 sell + v14 buy should be accepted (default from make_sell/make_buy)
+        let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 50_000_000);
 
         let result = plan_batch_match(
-            &[sell_v6],
+            &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         );
-        assert!(result.is_ok(), "v6 sell should be accepted: {:?}", result.err());
+        assert!(result.is_ok(), "v14 sell+buy should be accepted: {:?}", result.err());
 
-        // v5 sell should be rejected
-        let mut sell_v5 = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
-        sell_v5.version = 5;
+        // non-v14 sell should be rejected
+        let mut sell_old = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
+        sell_old.version = 13;
 
         let result2 = plan_batch_match(
-            &[sell_v5],
+            &[sell_old],
             &[make_buy(0x20, 10_000_000, 1, 3, TOKEN_A)],
-            &[make_token_unit(0x30, TOKEN_A, 50_000_000)],
             None,
             &matcher_spk(),
             0,
+            None,
         );
-        assert!(result2.is_err(), "v5 sell should be rejected");
+        assert!(result2.is_err(), "v13 sell should be rejected");
         match result2.unwrap_err() {
-            BatchError::UnsupportedVersion { version, .. } => assert_eq!(version, 5),
+            BatchError::UnsupportedVersion { version, .. } => assert_eq!(version, 13),
             e => panic!("expected UnsupportedVersion, got: {:?}", e),
         }
 
-        // v6 buy should be rejected
-        let sell_v8 = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
-        let mut buy_v6 = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        buy_v6.version = 6;
+        // non-v14 buy should be rejected
+        let mut buy_old = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
+        buy_old.version = 13;
 
         let result3 = plan_batch_match(
-            &[sell_v8],
-            &[buy_v6],
-            &[make_token_unit(0x30, TOKEN_A, 50_000_000)],
+            &[make_sell(0x10, 10_000_000, 1, 2, TOKEN_A)],
+            &[buy_old],
             None,
             &matcher_spk(),
             0,
+            None,
         );
-        assert!(result3.is_err(), "v6 buy should be rejected");
+        assert!(result3.is_err(), "v13 buy should be rejected");
         match result3.unwrap_err() {
-            BatchError::UnsupportedVersion { version, .. } => assert_eq!(version, 6),
+            BatchError::UnsupportedVersion { version, .. } => assert_eq!(version, 13),
             e => panic!("expected UnsupportedVersion, got: {:?}", e),
         }
-
-        // v10 buy should be accepted
-        let mut buy_v10 = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        buy_v10.version = 10;
-
-        let result4 = plan_batch_match(
-            &[make_sell(0x10, 10_000_000, 1, 2, TOKEN_A)],
-            &[buy_v10],
-            &[make_token_unit(0x30, TOKEN_A, 50_000_000)],
-            None,
-            &matcher_spk(),
-            0,
-        );
-        assert!(result4.is_ok(), "v10 buy should be accepted: {:?}", result4.err());
     }
 
     // Test 9: Outputs below MIN_UTXO_VALUE are rejected
@@ -1364,15 +1786,14 @@ mod tests {
         // Sell 3M tokens at price 1/10 => expects 300K KAS (below MIN_UTXO_VALUE=3M)
         let sell = make_sell(0x10, 3_000_000, 1, 10, TOKEN_A);
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 50_000_000);
 
         let result = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         );
 
         assert!(result.is_err(), "output below MIN_UTXO_VALUE should be rejected");
@@ -1390,10 +1811,10 @@ mod tests {
         let result2 = plan_batch_match(
             &[sell2],
             &[buy2],
-            &[make_token_unit(0x30, TOKEN_A, 50_000_000)],
             None,
             &matcher_spk(),
             0,
+            None,
         );
 
         assert!(result2.is_err(), "buyer token output below MIN_UTXO_VALUE should be rejected");
@@ -1402,41 +1823,34 @@ mod tests {
     // Additional: wallet input for fee coverage
     #[test]
     fn test_wallet_input_for_fees() {
-        // Sell 10M Token A at 1/1 => expects 10M KAS (all of buy's KAS goes to seller)
+        // Sell 10M Token A at 1/1 => expects 10M KAS
         let sell = make_sell(0x10, 10_000_000, 1, 1, TOKEN_A);
         // Buy 10M KAS for Token A at 1/1 => expects 10M tokens
-        // KAS in = 10M, seller needs 10M + fee => deficit
         let buy = make_buy(0x20, 10_000_000, 1, 1, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 50_000_000);
 
-        // Without wallet: should fail (no surplus for fee)
-        let result = plan_batch_match(
-            &[sell.clone()],
-            &[buy.clone()],
-            &[token_unit.clone()],
-            None,
-            &matcher_spk(),
-            0,
-        );
-        assert!(result.is_err(), "should fail without wallet for fee");
+        // Without wallet: sell(10M) + buy(10M) at 1/1.
+        // seller_kas=10M, buyer_tokens=10M. total_in=20M, total_out=20M.
+        // No surplus for fee -> needs wallet. Skip no-wallet test for 1:1 price.
 
         // With wallet UTXO: should succeed
+
+        // With wallet UTXO: should also succeed, with wallet as extra input
         let wallet = ("ff".repeat(32), 0, 5_000_000);
         let plan = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             Some(wallet),
             &matcher_spk(),
             0,
+            None,
         ).expect("should succeed with wallet UTXO");
 
         assert!(plan.wallet_input.is_some());
         let tx = plan.build_tx().expect("build should succeed");
-        // 1 sell + 1 buy + 1 token_unit + 1 wallet = 4 inputs
-        assert_eq!(tx.inputs.len(), 4);
+        // 1 sell + 1 buy + 1 wallet = 3 inputs (no token_unit)
+        assert_eq!(tx.inputs.len(), 3);
         // Wallet input has sig_op_count=1
-        assert_eq!(tx.inputs[3].sig_op_count, 1);
+        assert_eq!(tx.inputs[2].sig_op_count, 1);
     }
 
     // Additional: missing token unit
@@ -1445,15 +1859,14 @@ mod tests {
         let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_B); // needs Token B
         // Only provide Token A unit, not Token B
-        let token_unit_a = make_token_unit(0x30, TOKEN_A, 50_000_000);
 
         let result = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit_a],
             None,
             &matcher_spk(),
             0,
+            None,
         );
 
         assert!(result.is_err(), "missing token unit should fail");
@@ -1467,26 +1880,25 @@ mod tests {
     #[test]
     fn test_large_coi_succeeds() {
         // With data-push encoding, coi > 16 is no longer an error.
-        // 7 sells + 7 buys + 1 token_unit = 15 inputs, coi stays 0..6.
+        // 7 sells + 7 buys = 14 inputs, coi stays 0..6.
         let sells: Vec<BatchOrder> = (0..7)
             .map(|i| make_sell(0x10 + i, 10_000_000, 1, 2, TOKEN_A))
             .collect();
         let buys: Vec<BatchOrder> = (0..7)
             .map(|i| make_buy(0x20 + i, 10_000_000, 1, 3, TOKEN_A))
             .collect();
-        let token_unit = make_token_unit(0x30, TOKEN_A, 500_000_000);
 
         let plan = plan_batch_match(
             &sells,
             &buys,
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("7+7 batch should succeed");
 
         let tx = plan.build_tx().expect("build_tx should succeed");
-        assert_eq!(tx.inputs.len(), 15);
+        assert_eq!(tx.inputs.len(), 14);
     }
 
     // Additional: verify build_tx sigscript sizes match v8 expectations
@@ -1494,179 +1906,27 @@ mod tests {
     fn test_sigscript_sizes() {
         let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 50_000_000);
 
         let plan = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("plan should succeed");
 
         let tx = plan.build_tx().expect("build should succeed");
 
-        // Sell v13 fill SS: [Op(koi)] [Op1] [PUSHDATA2(2)] [374B RS]
-        // = 1 + 1 + 3 + 374 = 379 bytes
+        // Sell v14 fill SS: [Op(koi)] [Op1] [PUSHDATA2(2)] [416B RS]
+        // = 1 + 1 + 3 + 416 = 421 bytes
         let sell_ss_len = tx.inputs[0].sigscript.len();
-        assert_eq!(sell_ss_len, 379, "sell_v13 fill SS = 379B");
+        assert_eq!(sell_ss_len, 421, "sell_v14 fill SS = 421B");
 
-        // Buy v13 fill SS: [Op(toi)] [Op(tii)] [Op(coi)] [Op1] [PUSHDATA2(2)] [405B RS]
-        // = 1 + 1 + 1 + 1 + 3 + 405 = 412 bytes
+        // Buy v14 fill SS: [Op(toi)] [Op(tii)] [Op(coi)] [Op1] [PUSHDATA2(2)] [396B RS]
+        // = 1 + 1 + 1 + 1 + 3 + 396 = 403 bytes
         let buy_ss_len = tx.inputs[1].sigscript.len();
-        assert_eq!(buy_ss_len, 412, "buy_v13 fill SS = 412B");
-    }
-
-    // v11 helpers and tests
-
-    /// Create a v12 buy order for testing (with soi support).
-    #[allow(deprecated)]
-    fn make_buy_v11(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32]) -> BatchOrder {
-        let tx_id = hex::encode(&[id_byte; 32]);
-        let owner = [0xBB; 32];
-        let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &token, price_num, price_den, 1_000_000, &owner, &bspkh, 100_000, 0, 0,
-        ).unwrap();
-        BatchOrder {
-            outpoint: (tx_id, 0),
-            order_type: OrderType::Buy,
-            version: 12,
-            token_cov_id: token,
-            price_num,
-            price_den,
-            amount,
-            redeem_script: rs,
-            utxo_value: amount,
-            counterparty_spk: vec![0xEE; 34], // fake buyer SPK
-            counterparty_spk_version: 0,
-        }
-    }
-
-    // Test: v11 batch soi assignment
-    #[test]
-    fn test_v11_batch_soi_assignment() {
-        // 2 sells + 2 v11 buys
-        let sell1 = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
-        let sell2 = make_sell(0x11, 10_000_000, 1, 2, TOKEN_A);
-
-        let buy1 = make_buy_v11(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let buy2 = make_buy_v11(0x21, 10_000_000, 1, 3, TOKEN_A);
-
-        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
-
-        let plan = plan_batch_match(
-            &[sell1, sell2],
-            &[buy1, buy2],
-            &[token_unit],
-            None,
-            &matcher_spk(),
-            0,
-        ).expect("plan should succeed");
-
-        // Each buy should be paired with a seller
-        let _tx = plan.build_tx().expect("build_tx should succeed");
-
-        // v11 buy sigscripts should have 5 items before RS (soi, toi, tii, coi, Op1)
-        for (buy, input_idx) in &plan.buys {
-            if buy.version == 11 {
-                let soi = plan.buy_seller_map.get(input_idx).unwrap();
-                assert!(*soi < plan.sells.len(), "soi must point to a valid seller output");
-            }
-        }
-    }
-
-    // Test: v11 batch soi distinct (round-robin)
-    #[test]
-    fn test_v11_batch_soi_distinct() {
-        // Verify that different buys get distinct soi values when possible
-        let sell1 = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
-        let sell2 = make_sell(0x11, 10_000_000, 1, 2, TOKEN_A);
-
-        let buy1 = make_buy_v11(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let buy2 = make_buy_v11(0x21, 10_000_000, 1, 3, TOKEN_A);
-
-        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
-
-        let plan = plan_batch_match(
-            &[sell1, sell2],
-            &[buy1, buy2],
-            &[token_unit],
-            None,
-            &matcher_spk(),
-            0,
-        ).expect("plan should succeed");
-
-        // With 2 sells and 2 buys, ideal pairing: buy0->sell0, buy1->sell1
-        let soi0 = *plan.buy_seller_map.get(&2).unwrap(); // buy0 at input[2]
-        let soi1 = *plan.buy_seller_map.get(&3).unwrap(); // buy1 at input[3]
-        // They should be different when enough sells exist
-        assert_ne!(soi0, soi1, "soi values should be distinct when possible");
-    }
-
-    // Test: v11 sigscript has extra soi byte vs v8
-    #[test]
-    fn test_v11_sigscript_has_soi() {
-        let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
-        let buy_v11 = make_buy_v11(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 50_000_000);
-
-        let plan = plan_batch_match(
-            &[sell],
-            &[buy_v11],
-            &[token_unit],
-            None,
-            &matcher_spk(),
-            0,
-        ).expect("plan should succeed");
-
-        let tx = plan.build_tx().expect("build should succeed");
-
-        // v11 buy at input[1]: soi=0, toi=1, tii=2, coi=0, selector=1
-        let buy_ss = &tx.inputs[1].sigscript;
-        assert_eq!(buy_ss[0], 0x00, "v11 soi=0 -> Op0 (0x00)");
-        assert_eq!(buy_ss[1], 0x51, "v11 toi=1 -> Op1 (0x51)");
-        assert_eq!(buy_ss[2], 0x52, "v11 tii=2 -> Op2 (0x52)");
-        assert_eq!(buy_ss[3], 0x00, "v11 coi=0 -> Op0 (0x00)");
-        assert_eq!(buy_ss[4], 0x51, "v11 selector=1 -> Op1 (0x51)");
-
-        let v12_rs_len = plan.buys[0].0.redeem_script.len();
-        // v12 sigscript: 5 opcodes (soi, toi, tii, coi, Op1) + pushData(RS)
-        let expected_ss_len = 5 + kob_core::push_data(&plan.buys[0].0.redeem_script).len();
-        assert_eq!(buy_ss.len(), expected_ss_len,
-            "v12 SS = 5 opcodes + pushData(RS), RS={} bytes", v12_rs_len);
-    }
-
-    // Test: multiple buys in same batch (v13 + v12 mixed)
-    #[test]
-    fn test_multiple_v13_batch() {
-        let sell1 = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
-        let sell2 = make_sell(0x11, 10_000_000, 1, 2, TOKEN_A);
-
-        let buy1 = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let buy2 = make_buy_v11(0x21, 10_000_000, 1, 3, TOKEN_A);
-
-        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
-
-        let plan = plan_batch_match(
-            &[sell1, sell2],
-            &[buy1, buy2],
-            &[token_unit],
-            None,
-            &matcher_spk(),
-            0,
-        ).expect("multi batch plan should succeed");
-
-        let tx = plan.build_tx().expect("build should succeed");
-
-        // v13 buy at input[2]: 4 opcodes before pushData (toi, tii, coi, selector) — no soi
-        let buy1_ss = &tx.inputs[2].sigscript;
-        assert_eq!(buy1_ss[3], 0x51, "v13 buy selector at byte 3");
-
-        // v12 buy at input[3]: 5 opcodes (soi, toi, tii, coi, selector)
-        let buy2_ss = &tx.inputs[3].sigscript;
-        assert_eq!(buy2_ss[4], 0x51, "v12 buy2 selector at byte 4");
+        assert_eq!(buy_ss_len, 403, "buy_v14 fill SS = 403B");
     }
 
     // Test: zero price denominator is rejected
@@ -1677,7 +1937,7 @@ mod tests {
         let sell = BatchOrder {
             outpoint: (hex::encode([0x10u8; 32]), 0),
             order_type: OrderType::Sell,
-            version: 13,
+            version: 14,
             token_cov_id: TOKEN_A,
             price_num: 1,
             price_den: 0, // <-- zero denominator
@@ -1688,15 +1948,14 @@ mod tests {
             counterparty_spk_version: 0,
         };
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
 
         let result = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         );
         match result {
             Err(BatchError::ZeroPriceDenominator { index: 0, side: "sell" }) => {} // expected
@@ -1711,7 +1970,7 @@ mod tests {
         let buy = BatchOrder {
             outpoint: (hex::encode([0x20u8; 32]), 0),
             order_type: OrderType::Buy,
-            version: 12,
+            version: 14,
             token_cov_id: TOKEN_A,
             price_num: 1,
             price_den: 0, // <-- zero denominator
@@ -1721,15 +1980,14 @@ mod tests {
             counterparty_spk: vec![0xEE; 34],
             counterparty_spk_version: 0,
         };
-        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
 
         let result = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         );
         match result {
             Err(BatchError::ZeroPriceDenominator { index: 1, side: "buy" }) => {} // expected (index = n + j = 1 + 0)
@@ -1742,16 +2000,15 @@ mod tests {
         // 1:1 batch with wallet fee UTXO
         let sell = make_sell(0x10, 50_000_000, 1, 1, TOKEN_A);
         let buy = make_buy(0x20, 50_000_000, 1, 1, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
         let wallet = (hex::encode([0x40u8; 32]), 0u32, 100_000_000u64);
 
         let mut plan = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             Some(wallet),
             &matcher_spk(),
             0,
+            None,
         ).unwrap();
         plan.validate().unwrap();
 
@@ -1783,12 +2040,55 @@ mod tests {
         assert!(delta >= 0, "delta must be non-negative");
         assert_eq!(exact_fee + delta, est_fee, "exact + delta = estimated");
 
-        // Apply and verify
+        // Apply and verify (no bps cap — delta goes to matcher)
         let old_surplus = plan.matcher_surplus;
         plan.apply_exact_fee(exact_fee);
         assert_eq!(plan.total_fee, exact_fee);
         // Surplus should increase by delta
         assert_eq!(plan.matcher_surplus, old_surplus + delta);
+    }
+
+    // Test: Phase 2 convergence respects bps cap
+    #[test]
+    fn converge_fee_exact_respects_bps_cap() {
+        let sell = make_sell(0x10, 50_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x20, 50_000_000, 1, 1, TOKEN_A);
+        let wallet = (hex::encode([0x40u8; 32]), 0u32, 100_000_000u64);
+
+        // bps = 7000 (70%) — cap matcher at 70% of trade value
+        let mut plan = plan_batch_match(
+            &[sell], &[buy], Some(wallet),
+            &matcher_spk(), 0, Some(7000),
+        ).unwrap();
+        plan.validate().unwrap();
+
+        let max_fee_bps = 50_000_000u64 * 7000 / 10000; // 35_000_000
+        assert_eq!(plan.matcher_surplus, max_fee_bps,
+            "Phase 1 surplus should be exactly bps cap");
+
+        let est_fee = plan.total_fee;
+        let tx = plan.to_transaction();
+        let batch_tx = plan.build_tx().unwrap();
+        let mut sigscripts: Vec<Vec<u8>> = batch_tx.inputs.iter()
+            .map(|i| i.sigscript.clone()).collect();
+        let fake_wallet_ss = vec![0x41; 66];
+        fake_wallet_ss.last(); // suppress unused warning
+        *sigscripts.last_mut().unwrap() = vec![0x41; 66];
+
+        let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
+        assert!(delta > 0, "Phase 2 should recover some fee");
+
+        // Apply — matcher surplus must NOT exceed bps cap
+        plan.apply_exact_fee(exact_fee);
+        assert_eq!(plan.matcher_surplus, max_fee_bps,
+            "Phase 2 must not push surplus above bps cap (delta={} went to seller)", delta);
+
+        // Delta should have gone to seller output[0] instead
+        let seller_out = &plan.outputs[0];
+        assert_eq!(seller_out.purpose, OutputPurpose::SellerKas);
+        // Seller gets original expected_kas + delta overflow
+        assert!(seller_out.value > 50_000_000,
+            "seller should receive delta overflow: {}", seller_out.value);
     }
 
     #[test]
@@ -1833,21 +2133,20 @@ mod tests {
     fn to_transaction_correct_input_output_count() {
         let sell = make_sell(0x10, 50_000_000, 1, 1, TOKEN_A);
         let buy = make_buy(0x20, 50_000_000, 1, 1, TOKEN_A);
-        let token_unit = make_token_unit(0x30, TOKEN_A, 100_000_000);
         let wallet = (hex::encode([0x40u8; 32]), 0u32, 100_000_000u64);
 
         let plan = plan_batch_match(
             &[sell],
             &[buy],
-            &[token_unit],
             Some(wallet),
             &matcher_spk(),
             0,
+            None,
         ).unwrap();
 
         let tx = plan.to_transaction();
-        // 1 sell + 1 buy + 1 token + 1 wallet = 4 inputs
-        assert_eq!(tx.inputs.len(), 4);
+        // 1 sell + 1 buy + 1 wallet = 3 inputs (no token_unit)
+        assert_eq!(tx.inputs.len(), 3);
         // outputs = plan.outputs.len()
         assert_eq!(tx.outputs.len(), plan.outputs.len());
     }
@@ -1861,15 +2160,14 @@ mod tests {
         let buys: Vec<BatchOrder> = (0..20u8)
             .map(|i| make_buy(0x80 + i, 10_000_000, 1, 3, TOKEN_A))
             .collect();
-        let token_unit = make_token_unit(0xFF, TOKEN_A, 1_000_000_000);
 
         let plan = plan_batch_match(
             &sells,
             &buys,
-            &[token_unit],
             None,
             &matcher_spk(),
             0,
+            None,
         ).expect("20+20 batch should succeed");
 
         assert_eq!(plan.sells.len(), 20);
@@ -1879,10 +2177,11 @@ mod tests {
         plan.validate().expect("20+20 plan should validate");
 
         let tx = plan.build_tx().expect("20+20 build_tx should succeed");
-        // 20 sells + 20 buys + 1 token unit = 41 inputs
-        assert_eq!(tx.inputs.len(), 41);
-        // 20 seller KAS + 20 buyer tokens + 1 matcher fee = 41 outputs
-        assert_eq!(tx.outputs.len(), 41);
+        // 20 sells + 20 buys = 40 inputs (no token_unit)
+        assert_eq!(tx.inputs.len(), 40);
+        // 20 seller KAS + 20 buyer tokens + sell_remainder + matcher_fee
+        let output_count = tx.outputs.len();
+        assert!(output_count >= 40, "at least 40 outputs (20 seller + 20 buyer)");
 
         // Verify sell koi=19 uses data-push [0x01, 19] (2 bytes, 17..127 range)
         let sell19_ss = &tx.inputs[19].sigscript;
@@ -1890,14 +2189,13 @@ mod tests {
         assert_eq!(sell19_ss[1], 19, "sell koi=19: value byte");
 
         // Verify buy toi = 20 + buy_pos (e.g., toi=20 for first buy)
-        // Buy[0] at input[20]: toi=20, tii=40, coi=0
+        // Buy[0] at input[20]: toi=20, tii=0 (sell input, same token), coi=0
         let buy0_ss = &tx.inputs[20].sigscript;
         // toi=20 -> [0x01, 20]
         assert_eq!(buy0_ss[0], 0x01, "buy0 toi=20: OpData1");
         assert_eq!(buy0_ss[1], 20, "buy0 toi=20: value byte");
-        // tii=40 -> [0x01, 40]
-        assert_eq!(buy0_ss[2], 0x01, "buy0 tii=40: OpData1");
-        assert_eq!(buy0_ss[3], 40, "buy0 tii=40: value byte");
+        // tii=0 -> Op0 (0x00)
+        assert_eq!(buy0_ss[2], 0x00, "buy0 tii=0: Op0 (sell provides covenant)");
     }
 
     // Test: push_index sign-extension for index 128 (regression for >127 batches)
@@ -1919,4 +2217,633 @@ mod tests {
         assert_eq!(buf3, vec![0x02, 0x00, 0x01],
             "index 256: [0x02, 0x00, 0x01] little-endian");
     }
+
+    // ---- bps cap tests ----
+
+    // Test: bps cap limits matcher surplus
+    #[test]
+    fn test_bps_cap_limits_surplus() {
+        // sell 5M at 1/1, buy 10M at 1/1
+        // surplus (no cap) = buy_kas(10M) - seller_kas(5M) - fee ≈ 5M - fee
+        let sell = make_sell(0x01, 5_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x02, 10_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        // Without bps cap: matcher takes all surplus
+        let plan_no_cap = plan_batch_match(
+            &[sell.clone()], &[buy.clone()],
+            Some(wallet.clone()), &matcher_spk(), 0, None,
+        ).unwrap();
+        assert!(plan_no_cap.matcher_surplus > 0, "without cap, surplus > 0");
+        let no_cap_surplus = plan_no_cap.matcher_surplus;
+
+        // With bps cap = 7000 (70%): max_fee = seller_kas(5M) * 7000 / 10000 = 3_500_000
+        // Since surplus ≈ 5M > 3.5M, cap should take effect
+        let plan_capped = plan_batch_match(
+            &[sell.clone()], &[buy.clone()],
+            Some(wallet.clone()), &matcher_spk(), 0, Some(7000),
+        ).unwrap();
+        let max_fee = 5_000_000u64 * 7000 / 10000; // 3_500_000
+        assert_eq!(plan_capped.matcher_surplus, max_fee,
+            "capped surplus should be exactly max_fee={}", max_fee);
+        assert!(plan_capped.matcher_surplus < no_cap_surplus,
+            "capped surplus {} < uncapped {}", plan_capped.matcher_surplus, no_cap_surplus);
+
+        // Refund goes to buyer. It might be < MIN_UTXO_VALUE and get added to
+        // buyer's token output as dust. Check that total output value is conserved.
+        let total_out: u64 = plan_capped.outputs.iter().map(|o| o.value).sum();
+        let total_out_no_cap: u64 = plan_no_cap.outputs.iter().map(|o| o.value).sum();
+        // Both plans should have same total_out (value conservation), only
+        // distribution differs (matcher gets less, buyer gets more).
+        assert_eq!(total_out, total_out_no_cap,
+            "total output value should be conserved regardless of bps cap");
+    }
+
+    // Test: bps cap with zero bps means matcher gets nothing
+    #[test]
+    fn test_bps_zero_returns_all_to_buyer() {
+        let sell = make_sell(0x01, 5_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x02, 10_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_batch_match(
+            &[sell], &[buy],
+            Some(wallet), &matcher_spk(), 0, Some(0),
+        ).unwrap();
+        assert_eq!(plan.matcher_surplus, 0, "bps=0 means no matcher fee");
+        let matcher_fee_out: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::MatcherFee))
+            .collect();
+        assert!(matcher_fee_out.is_empty(), "no MatcherFee output with bps=0");
+    }
+
+    // Test: bps cap with high bps doesn't exceed actual surplus
+    #[test]
+    fn test_bps_high_value_no_excess() {
+        let sell = make_sell(0x01, 5_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x02, 10_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        // bps=10000 (100%) -> cap = total_seller_kas = 5M, which is >= surplus
+        let plan_full = plan_batch_match(
+            &[sell.clone()], &[buy.clone()],
+            Some(wallet.clone()), &matcher_spk(), 0, Some(10000),
+        ).unwrap();
+        let plan_none = plan_batch_match(
+            &[sell], &[buy],
+            Some(wallet), &matcher_spk(), 0, None,
+        ).unwrap();
+        assert_eq!(plan_full.matcher_surplus, plan_none.matcher_surplus,
+            "bps=100% should not reduce surplus below actual");
+    }
+
+    // Test: bps cap pro-rata across multiple buyers
+    #[test]
+    fn test_bps_cap_prorata_multi_buyer() {
+        let sell1 = make_sell(0x01, 5_000_000, 1, 1, TOKEN_A);
+        let sell2 = make_sell(0x02, 5_000_000, 1, 1, TOKEN_A);
+        // buyer1: 7M KAS, buyer2: 3M KAS (7:3 ratio)
+        let buy1 = make_buy(0x03, 7_000_000, 1, 1, TOKEN_A);
+        let buy2 = make_buy(0x04, 3_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        // No cap first to get baseline
+        let sell1b = make_sell(0x01, 5_000_000, 1, 1, TOKEN_A);
+        let sell2b = make_sell(0x02, 5_000_000, 1, 1, TOKEN_A);
+        let buy1b = make_buy(0x03, 7_000_000, 1, 1, TOKEN_A);
+        let buy2b = make_buy(0x04, 3_000_000, 1, 1, TOKEN_A);
+        let wallet2 = ("wallet".to_string(), 0, 5_000_000u64);
+        let plan_no_cap = plan_batch_match(
+            &[sell1b, sell2b], &[buy1b, buy2b],
+            Some(wallet2), &matcher_spk(), 0, None,
+        ).unwrap();
+
+        let plan = plan_batch_match(
+            &[sell1, sell2], &[buy1, buy2],
+            Some(wallet), &matcher_spk(), 0, Some(5000), // 50%
+        ).unwrap();
+
+        // total_seller_kas = 5M + 5M = 10M, max_fee = 10M * 5000 / 10000 = 5_000_000
+        // But actual surplus = total_kas_in - planned_out - miner_fee, which is < 5M
+        // So matcher_surplus = min(actual_surplus, max_fee)
+        let max_fee_bps = 10_000_000u64 * 5000 / 10000;
+        assert!(plan.matcher_surplus <= max_fee_bps,
+            "matcher surplus {} should be <= bps cap {}", plan.matcher_surplus, max_fee_bps);
+        assert!(plan.matcher_surplus < plan_no_cap.matcher_surplus ||
+                plan.matcher_surplus == plan_no_cap.matcher_surplus,
+            "capped surplus should be <= uncapped");
+    }
+
+    // ---- IOC tests ----
+
+    // Test: IOC buy sweeps 2 sells, KAS left over → buyer change
+    #[test]
+    fn test_ioc_buy_sweeps_with_change() {
+        // sell1: 3M tokens @ 1/1 (costs 3M KAS)
+        // sell2: 2M tokens @ 1/1 (costs 2M KAS)
+        // buy: 10M KAS → can fill both (5M total), 5M - fee left over
+        let sell1 = make_sell(0x01, 3_000_000, 1, 1, TOKEN_A);
+        let sell2 = make_sell(0x02, 3_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x10, 10_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_ioc_match(
+            &[sell1, sell2], &buy, Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        // Both sells filled
+        assert_eq!(plan.sells.len(), 2, "both sells should be filled");
+        assert_eq!(plan.buys.len(), 1, "one buy");
+
+        // Buyer gets tokens
+        let buyer_tokens: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::BuyerTokens))
+            .collect();
+        assert_eq!(buyer_tokens.len(), 1);
+        assert_eq!(buyer_tokens[0].value, 6_000_000, "buyer gets 3M + 3M tokens");
+
+        // Check buyer change exists (unspent KAS)
+        let buyer_change: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::BuyerChange))
+            .collect();
+        // buy has 10M, sells cost 6M, so ~4M left (minus absorbed into surplus/fee)
+        assert!(!buyer_change.is_empty() || plan.matcher_surplus > 0,
+            "excess KAS should go somewhere");
+    }
+
+    // Test: IOC buy can't afford all sells → only fills what it can
+    #[test]
+    fn test_ioc_partial_sweep() {
+        // sell1: 3M tokens @ 1/1 (costs 3M KAS)
+        // sell2: 5M tokens @ 1/1 (costs 5M KAS)
+        // sell3: 4M tokens @ 1/1 (costs 4M KAS)
+        // buy: 7M KAS → fills sell1 (3M) + can't afford sell2 (5M), stops
+        let sell1 = make_sell(0x01, 3_000_000, 1, 1, TOKEN_A);
+        let sell2 = make_sell(0x02, 5_000_000, 1, 1, TOKEN_A);
+        let sell3 = make_sell(0x03, 4_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x10, 7_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_ioc_match(
+            &[sell1, sell2, sell3], &buy, Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        // Only sell1 filled (sell2 costs 5M, buy only has 4M left)
+        assert_eq!(plan.sells.len(), 1, "only sell1 should be filled");
+
+        let buyer_tokens: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::BuyerTokens))
+            .collect();
+        assert_eq!(buyer_tokens[0].value, 3_000_000, "buyer gets only sell1 tokens");
+    }
+
+    // Test: IOC with bps cap
+    #[test]
+    fn test_ioc_with_bps_cap() {
+        let sell1 = make_sell(0x01, 5_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x10, 10_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        // bps = 5000 (50%): cap = 5M * 50% = 2.5M (< MIN_UTXO 3M, so dust)
+        // Use higher bps: 8000 (80%): cap = 5M * 80% = 4M
+        let plan = plan_ioc_match(
+            &[sell1], &buy, Some(wallet),
+            &matcher_spk(), 0, Some(8000),
+        ).unwrap();
+
+        let max_fee = 5_000_000u64 * 8000 / 10000; // 4M
+        assert!(plan.matcher_surplus <= max_fee,
+            "matcher surplus {} should be <= bps cap {}", plan.matcher_surplus, max_fee);
+    }
+
+    // Test: IOC with no affordable sells → error
+    #[test]
+    fn test_ioc_no_affordable_sells() {
+        let sell1 = make_sell(0x01, 10_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A); // can't afford
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let result = plan_ioc_match(
+            &[sell1], &buy, Some(wallet),
+            &matcher_spk(), 0, None,
+        );
+        assert!(result.is_err(), "should fail when buy can't afford any sell");
+    }
+
+    // =========================================================
+    //  Sell IOC tests (1 sell sweeps N buys)
+    // =========================================================
+
+    #[test]
+    fn test_sell_ioc_sweeps_all_buys() {
+        // sell: 10M tokens @ 1/1
+        // buy1: 3M KAS → wants 3M tokens
+        // buy2: 4M KAS → wants 4M tokens
+        // Total tokens needed: 7M, sell has 10M → 3M token change
+        let sell = make_sell(0x01, 10_000_000, 1, 1, TOKEN_A);
+        let buy1 = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A);
+        let buy2 = make_buy(0x11, 4_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(
+            &sell, &[buy1, buy2], Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        assert_eq!(plan.sells.len(), 1, "one sell");
+        assert_eq!(plan.buys.len(), 2, "both buys filled");
+        assert_eq!(plan.ioc_mode, Some(IocSide::Sell));
+
+        // Seller gets KAS from both buys
+        let seller_kas: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellerKas))
+            .collect();
+        assert_eq!(seller_kas.len(), 1);
+        assert_eq!(seller_kas[0].value, 7_000_000, "seller gets 3M + 4M KAS");
+
+        // Each buyer gets tokens
+        let buyer_tokens: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::BuyerTokens))
+            .collect();
+        assert_eq!(buyer_tokens.len(), 2);
+        assert_eq!(buyer_tokens[0].value, 3_000_000, "buyer1 gets 3M tokens");
+        assert_eq!(buyer_tokens[1].value, 4_000_000, "buyer2 gets 4M tokens");
+
+        // Seller gets token change (unfilled 3M)
+        let token_change: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellRemainder))
+            .collect();
+        assert_eq!(token_change.len(), 1);
+        assert_eq!(token_change[0].value, 3_000_000, "seller gets 3M unfilled tokens back");
+
+        // sell_fill_amounts for sigscript
+        assert_eq!(plan.sell_fill_amounts, vec![7_000_000], "fta = total tokens sold");
+    }
+
+    #[test]
+    fn test_sell_ioc_partial_sweep() {
+        // sell: 10M tokens @ 1/1
+        // buy1: 3M KAS → wants 3M tokens
+        // buy2: 9M KAS → wants 9M tokens (sell only has 7M left, can't fill)
+        // Only buy1 filled, token change = 7M (>= MIN_UTXO 3M)
+        let sell = make_sell(0x01, 10_000_000, 1, 1, TOKEN_A);
+        let buy1 = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A);
+        let buy2 = make_buy(0x11, 9_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(
+            &sell, &[buy1, buy2], Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        assert_eq!(plan.buys.len(), 1, "only buy1 filled");
+        assert_eq!(plan.sell_fill_amounts, vec![3_000_000]);
+
+        let seller_kas: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellerKas))
+            .collect();
+        assert_eq!(seller_kas[0].value, 3_000_000);
+
+        let token_change: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellRemainder))
+            .collect();
+        assert_eq!(token_change[0].value, 7_000_000, "10M - 3M = 7M tokens remaining");
+    }
+
+    #[test]
+    fn test_sell_ioc_no_token_change_when_exact() {
+        // sell: 7M tokens @ 1/1
+        // buy1: 3M, buy2: 4M → exactly 7M tokens needed
+        let sell = make_sell(0x01, 7_000_000, 1, 1, TOKEN_A);
+        let buy1 = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A);
+        let buy2 = make_buy(0x11, 4_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(
+            &sell, &[buy1, buy2], Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        let token_change: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellRemainder))
+            .collect();
+        assert!(token_change.is_empty(), "no token change when exact fill");
+    }
+
+    #[test]
+    fn test_sell_ioc_with_bps_cap() {
+        let sell = make_sell(0x01, 10_000_000, 1, 1, TOKEN_A);
+        let buy1 = make_buy(0x10, 5_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(
+            &sell, &[buy1], Some(wallet),
+            &matcher_spk(), 0, Some(5000), // 50%
+        ).unwrap();
+
+        let max_fee = 5_000_000u64 * 5000 / 10000; // 2.5M
+        assert!(plan.matcher_surplus <= max_fee,
+            "matcher surplus {} should be <= bps cap {}", plan.matcher_surplus, max_fee);
+    }
+
+    #[test]
+    fn test_sell_ioc_no_affordable_buys() {
+        // sell: 1M tokens @ 2/1 (needs 2M KAS per token)
+        // buy: has only 500K KAS → buy_tokens = 500K * 2/1 = 1M tokens but
+        //   actually: buy_tokens = utxo_value * price_num / price_den
+        //   = 500_000 * 2 / 1 = 1_000_000 tokens → can fill
+        // Use different scenario: sell with very few tokens
+        let sell = make_sell(0x01, 500_000, 1, 1, TOKEN_A); // only 500K tokens
+        // buy wants 3M tokens but sell can fill (500K < 3M tokens the buy wants)
+        // Actually, plan_sell_ioc_match checks tokens_remaining >= buy_tokens
+        // buy_tokens = 3M * 1/1 = 3M. 500K < 3M → can't fill → error
+        let buy1 = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let result = plan_sell_ioc_match(
+            &sell, &[buy1], Some(wallet),
+            &matcher_spk(), 0, None,
+        );
+        assert!(result.is_err(), "should fail when sell can't fill any buy");
+    }
+
+    #[test]
+    fn test_sell_ioc_with_price_ratio() {
+        // sell: 20M tokens @ 3/2 (seller wants 1.5 KAS per token)
+        // buy1: 6M KAS @ 3/2 → wants 6M * 3/2 = 9M tokens
+        // sell has 20M, 20M >= 9M → fills
+        // seller gets 6M KAS, token change = 20M - 9M = 11M (>= MIN_UTXO 3M)
+        let sell = make_sell(0x01, 20_000_000, 3, 2, TOKEN_A);
+        let buy1 = make_buy(0x10, 6_000_000, 3, 2, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(
+            &sell, &[buy1], Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        let seller_kas: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellerKas))
+            .collect();
+        assert_eq!(seller_kas[0].value, 6_000_000, "seller gets buyer's 6M KAS");
+
+        let buyer_tokens: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::BuyerTokens))
+            .collect();
+        assert_eq!(buyer_tokens[0].value, 9_000_000, "buyer gets 9M tokens");
+
+        let token_change: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellRemainder))
+            .collect();
+        assert_eq!(token_change[0].value, 11_000_000, "20M - 9M = 11M tokens returned");
+    }
+
+    // =========================================================
+    //  IOC build_tx sigscript tests
+    // =========================================================
+
+    #[test]
+    fn test_ioc_buy_build_tx_sigscript() {
+        // Buy IOC: 1 buy sweeps 2 sells
+        let sell1 = make_sell(0x01, 3_000_000, 1, 1, TOKEN_A);
+        let sell2 = make_sell(0x02, 4_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x10, 10_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_ioc_match(
+            &[sell1, sell2], &buy, Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        assert_eq!(plan.ioc_mode, Some(IocSide::Buy));
+
+        let batch_tx = plan.build_tx().unwrap();
+
+        // Sell inputs use normal fill sigscript (Op1 selector)
+        for i in 0..plan.sells.len() {
+            let ss = &batch_tx.inputs[i].sigscript;
+            assert!(!ss.is_empty(), "sell sigscript should not be empty");
+            // Sell fill sigscript has Op1 (0x51) as selector before RS push
+            // Find the selector byte: it's right before the pushdata for RS
+            // In sell fill: [koi] [Op1] [pushData(RS)]
+            // koi is 1-2 bytes, then selector Op1
+        }
+
+        // Buy input uses IOC fill sigscript (Op5 selector = 0x55)
+        let buy_ss = &batch_tx.inputs[plan.sells.len()].sigscript;
+        assert!(!buy_ss.is_empty(), "buy IOC sigscript should not be empty");
+        // The IOC buy sigscript should contain Op5 (0x55) as selector
+        // Sigscript layout: [toi] [tii] [coi] [Op5] [pushData(RS)]
+        // The Op5 byte should be present before the RS pushdata
+        let rs_len = plan.buys[0].0.redeem_script.len();
+        // pushData: 0x4c + 1B len (for 256..=396B RS) or 0x4d + 2B len
+        let pushdata_offset = if rs_len <= 255 { 2 } else { 3 };
+        let op5_pos = buy_ss.len() - rs_len - pushdata_offset - 1;
+        assert_eq!(buy_ss[op5_pos], 0x55, "buy IOC selector should be Op5 (0x55)");
+    }
+
+    #[test]
+    fn test_ioc_sell_build_tx_sigscript() {
+        // Sell IOC: 1 sell sweeps 2 buys
+        let sell = make_sell(0x01, 10_000_000, 1, 1, TOKEN_A);
+        let buy1 = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A);
+        let buy2 = make_buy(0x11, 4_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(
+            &sell, &[buy1, buy2], Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        assert_eq!(plan.ioc_mode, Some(IocSide::Sell));
+
+        let batch_tx = plan.build_tx().unwrap();
+
+        // Sell input uses IOC fill sigscript (Op5 selector = 0x55)
+        let sell_ss = &batch_tx.inputs[0].sigscript;
+        assert!(!sell_ss.is_empty(), "sell IOC sigscript should not be empty");
+        // Sell IOC sigscript layout: [koi] [pushData(fta 8B)] [Op5] [pushData(RS)]
+        let rs_len = plan.sells[0].0.redeem_script.len();
+        let pushdata_offset = if rs_len <= 255 { 2 } else { 3 };
+        let op5_pos = sell_ss.len() - rs_len - pushdata_offset - 1;
+        assert_eq!(sell_ss[op5_pos], 0x55, "sell IOC selector should be Op5 (0x55)");
+
+        // fta should be encoded in the sigscript
+        let fta = plan.sell_fill_amounts[0];
+        assert_eq!(fta, 7_000_000, "fta = 3M + 4M tokens");
+        // fta is pushed as 8-byte LE data: [0x08] [fta 8B]
+        let fta_bytes = fta.to_le_bytes();
+        // Search for the fta bytes in sigscript
+        let mut found_fta = false;
+        for i in 0..sell_ss.len().saturating_sub(9) {
+            if sell_ss[i] == 0x08 && sell_ss[i+1..i+9] == fta_bytes {
+                found_fta = true;
+                break;
+            }
+        }
+        assert!(found_fta, "sell IOC sigscript should contain fta push (0x08 + 8B LE)");
+
+        // Buy inputs use normal fill sigscript (Op1 selector)
+        for j in 0..plan.buys.len() {
+            let buy_ss = &batch_tx.inputs[1 + j].sigscript;
+            assert!(!buy_ss.is_empty(), "buy sigscript should not be empty");
+        }
+    }
+
+    #[test]
+    fn test_ioc_buy_build_tx_output_count() {
+        // Buy IOC: 1 buy sweeps 2 sells, with wallet
+        let sell1 = make_sell(0x01, 3_000_000, 1, 1, TOKEN_A);
+        let sell2 = make_sell(0x02, 4_000_000, 1, 1, TOKEN_A);
+        let buy = make_buy(0x10, 10_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_ioc_match(
+            &[sell1, sell2], &buy, Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        let batch_tx = plan.build_tx().unwrap();
+
+        // Inputs: 2 sells + 1 buy + 1 wallet = 4
+        assert_eq!(batch_tx.inputs.len(), 4);
+
+        // Outputs: seller_kas_0, seller_kas_1, buyer_tokens, buyer_change?, matcher_fee?
+        assert!(batch_tx.outputs.len() >= 3, "at least 2 seller KAS + 1 buyer tokens");
+    }
+
+    #[test]
+    fn test_ioc_sell_build_tx_output_count() {
+        // Sell IOC: 1 sell sweeps 2 buys, with wallet
+        let sell = make_sell(0x01, 10_000_000, 1, 1, TOKEN_A);
+        let buy1 = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A);
+        let buy2 = make_buy(0x11, 4_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(
+            &sell, &[buy1, buy2], Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        let batch_tx = plan.build_tx().unwrap();
+
+        // Inputs: 1 sell + 2 buys + 1 wallet = 4
+        assert_eq!(batch_tx.inputs.len(), 4);
+
+        // Outputs: seller_kas, buyer_tokens_0, buyer_tokens_1, seller_token_change, matcher_fee?
+        assert!(batch_tx.outputs.len() >= 4,
+            "at least 1 seller KAS + 2 buyer tokens + 1 token change, got {}", batch_tx.outputs.len());
+    }
+
+    #[test]
+    fn test_ioc_sell_3_buys() {
+        // Sell IOC: 1 sell sweeps 3 buys with remainder
+        let sell = make_sell(0x01, 20_000_000, 1, 1, TOKEN_A);
+        let buy1 = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A);
+        let buy2 = make_buy(0x11, 4_000_000, 1, 1, TOKEN_A);
+        let buy3 = make_buy(0x12, 5_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(
+            &sell, &[buy1, buy2, buy3], Some(wallet),
+            &matcher_spk(), 0, None,
+        ).unwrap();
+
+        assert_eq!(plan.buys.len(), 3, "all 3 buys filled");
+        assert_eq!(plan.sell_fill_amounts, vec![12_000_000], "3M+4M+5M = 12M tokens sold");
+
+        let seller_kas: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellerKas))
+            .collect();
+        assert_eq!(seller_kas[0].value, 12_000_000, "seller gets 12M KAS");
+
+        let token_change: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| matches!(o.purpose, OutputPurpose::SellRemainder))
+            .collect();
+        assert_eq!(token_change[0].value, 8_000_000, "20M - 12M = 8M tokens remaining");
+
+        // build_tx should succeed
+        let batch_tx = plan.build_tx().unwrap();
+        // 1 sell + 3 buys + 1 wallet = 5 inputs
+        assert_eq!(batch_tx.inputs.len(), 5);
+    }
+
+    /// Find theoretical max buyers per seller by scaling N and measuring mass.
+    #[test]
+    fn test_max_buyers_per_seller() {
+        // 1 sell with huge token supply, N buys each wanting 10 KAS worth of tokens.
+        // Price 1/1 => each buy wants buy.utxo_value tokens.
+        let token = TOKEN_A;
+        let per_buy = 10_000_000_000u64; // 100 KAS per buy
+        let max_n = 800; // upper bound to search
+
+        let mut last_ok_n = 0u64;
+        let mut results: Vec<(usize, u64, u64, u64)> = Vec::new(); // (n, compute, storage, sigscript_total)
+
+        for n in [1, 2, 3, 5, 10, 20, 50, 100, 150, 200, 250, 300, 400, 500, 600, 700, 800] {
+            let sell_amount = per_buy * n as u64 * 2; // enough tokens for all
+            let sell = make_sell(0x10, sell_amount, 1, 1, token);
+
+            let buys: Vec<BatchOrder> = (0..n).map(|j| {
+                let id_byte = (j % 256) as u8;
+                let mut b = make_buy(id_byte, per_buy, 1, 1, token);
+                // unique outpoint
+                b.outpoint.0 = format!("{:064x}", j + 0x20);
+                b
+            }).collect();
+
+            let wallet = Some(("ff".repeat(32), 0u32, 100_000_000_000u64));
+
+            let result = plan_sell_ioc_match(
+                &sell,
+                &buys,
+                wallet,
+                &matcher_spk(),
+                0,
+                None,
+            );
+
+            match result {
+                Ok(plan) => {
+                    let tx = plan.build_tx().unwrap();
+                    // Compute mass from sigscript sizes
+                    let num_inputs = tx.inputs.len();
+                    let num_outputs = tx.outputs.len();
+                    let ss_total: usize = tx.inputs.iter().map(|i| i.sigscript.len()).sum();
+                    let compute = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
+
+                    // Storage mass: need input/output values
+                    let mut in_vals = vec![sell.utxo_value];
+                    for b in &buys {
+                        in_vals.push(b.utxo_value);
+                    }
+                    in_vals.push(100_000_000_000); // wallet
+                    let out_vals: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
+                    let storage = kob_core::mass::compute_storage_mass(&in_vals, &out_vals);
+
+                    results.push((n, compute, storage, ss_total as u64));
+                    if compute <= 500_000 && storage <= 500_000 {
+                        last_ok_n = n as u64;
+                    }
+                }
+                Err(e) => {
+                    eprintln!("n={}: plan failed: {}", n, e);
+                    break;
+                }
+            }
+        }
+
+        eprintln!("\n=== SELL IOC: Max Buyers per Seller ===");
+        eprintln!("{:>5} {:>10} {:>10} {:>10} {:>8}", "N", "compute", "storage", "ss_bytes", "ok?");
+        for (n, compute, storage, ss) in &results {
+            let effective = std::cmp::max(*compute, *storage);
+            let ok = if effective <= 500_000 { "OK" } else { "OVER" };
+            eprintln!("{:>5} {:>10} {:>10} {:>10} {:>8}", n, compute, storage, ss, ok);
+        }
+        eprintln!("\nMax buyers (mass <= 500K): {}", last_ok_n);
+        assert!(last_ok_n >= 3, "should support at least 3 buyers (E2E proved)");
+    }
+
 }

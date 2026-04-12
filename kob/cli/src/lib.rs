@@ -153,7 +153,7 @@ pub enum Commands {
         order_value: Option<u64>,
 
         /// Contract version (only 13 is supported). Must match the version used to deploy the order.
-        #[arg(long, default_value_t = 13)]
+        #[arg(long, default_value_t = 14)]
         version: u8,
 
         /// Expiry DAA score (required for v13 orders to reconstruct RS). 0 = GTC.
@@ -224,7 +224,7 @@ pub enum Commands {
         fee_input: Option<String>,
 
         /// Contract version (only 13 is supported).
-        #[arg(long, default_value = "13")]
+        #[arg(long, default_value = "14")]
         version: u8,
 
         /// Expiry DAA score (required for v13 RS reconstruction). 0 = GTC.
@@ -339,7 +339,7 @@ pub enum Commands {
         buy_token: Option<String>,
 
         /// Contract version (only 13 is supported).
-        #[arg(long, default_value = "13")]
+        #[arg(long, default_value = "14")]
         version: u8,
 
         /// Buy order expiry DAA score (for v13 RS reconstruction). 0 = GTC.
@@ -368,15 +368,22 @@ pub enum Commands {
         #[arg(long)]
         token: String,
 
-        /// Token UTXO outpoint for providing tokens to buy orders (txid:index).
-        /// Required for cross-token matching. For same-token matching, sells
-        /// provide tokens directly.
-        #[arg(long)]
-        token_outpoint: Option<String>,
-
         /// Maximum matcher fee in sompi (default: 10_000_000 = 0.1 KAS).
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
+
+        /// Matcher fee cap in basis points (e.g. 50 = 0.5% of trade value).
+        /// When set, matcher surplus is capped at (trade_value * fee_bps / 10000).
+        /// Excess is returned to buyers as change.
+        #[arg(long)]
+        fee_bps: Option<u16>,
+
+        /// IOC (Immediate-Or-Cancel) mode: single buy sweeps multiple sells.
+        /// Sells are consumed in order until the buy's KAS is exhausted.
+        /// Unspent KAS is returned to the buyer as change.
+        /// Requires exactly one --buy-outpoints entry.
+        #[arg(long)]
+        ioc: bool,
     },
 
     /// Trade receipt operations: create, consume (v3), trigger, consume-v1 (legacy).
@@ -601,11 +608,11 @@ pub enum Commands {
         new_amount: u64,
 
         /// Contract version of the old order being cancelled (only 13 is supported). Must match the version used to deploy.
-        #[arg(long, default_value = "13")]
+        #[arg(long, default_value = "14")]
         old_version: u8,
 
         /// Contract version for new order (only 13 is supported).
-        #[arg(long, default_value = "13")]
+        #[arg(long, default_value = "14")]
         new_version: u8,
 
         /// Old order expiry DAA score (for v13 RS reconstruction). 0 = GTC.
@@ -735,7 +742,7 @@ pub enum Commands {
         interval: u64,
 
         /// Contract version (only 13 is supported).
-        #[arg(long, default_value = "13")]
+        #[arg(long, default_value = "14")]
         version: u8,
 
         /// Print orders without deploying.
@@ -852,7 +859,7 @@ pub enum DeployCommands {
         amount_kas: Option<String>,
 
         /// Contract version (only 13 is supported).
-        #[arg(long, default_value = "13")]
+        #[arg(long, default_value = "14")]
         version: u8,
 
         /// Time-in-force: GTC (default), IOC, or FOK.
@@ -926,7 +933,7 @@ pub enum DeployCommands {
         amount_kas: Option<String>,
 
         /// Contract version (only 13 is supported).
-        #[arg(long, default_value = "13")]
+        #[arg(long, default_value = "14")]
         version: u8,
 
         /// Time-in-force: GTC (default), IOC, or FOK.
@@ -2055,8 +2062,9 @@ pub async fn dispatch(
             sell_outpoints,
             buy_outpoints,
             token,
-            token_outpoint,
             max_matcher_fee,
+            fee_bps,
+            ioc,
         } => {
             let token = token::resolve_token(&token, None)?;
             match_batch::run(
@@ -2066,8 +2074,9 @@ pub async fn dispatch(
                 &sell_outpoints,
                 &buy_outpoints,
                 &token,
-                token_outpoint.as_deref(),
                 max_matcher_fee,
+                fee_bps,
+                ioc,
             )
             .await?;
         }

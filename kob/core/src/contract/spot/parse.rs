@@ -44,14 +44,14 @@ const BUY_STATE_SIZE: usize = 145;
 /// Sell state size: 112B.
 const SELL_STATE_SIZE: usize = 112;
 
-/// Buy body size (from BUY_ORDER_BODY).
-const BUY_BODY_SIZE: usize = 260;
-/// Sell body size (from SELL_ORDER_BODY).
-const SELL_BODY_SIZE: usize = 262;
+/// Buy body size (v14: IOC path added, +9B).
+const BUY_BODY_SIZE: usize = 251;
+/// Sell body size (v14: IOC path added, +60B).
+const SELL_BODY_SIZE: usize = 304;
 
-/// Buy RS size: 145 + 260 = 405.
+/// Buy RS size: 145 + 251 = 396.
 pub const BUY_RS_SIZE: usize = BUY_STATE_SIZE + BUY_BODY_SIZE;
-/// Sell RS size: 112 + 262 = 374.
+/// Sell RS size: 112 + 304 = 416.
 pub const SELL_RS_SIZE: usize = SELL_STATE_SIZE + SELL_BODY_SIZE;
 
 /// Parse a redeemScript to extract order parameters.

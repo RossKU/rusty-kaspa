@@ -653,7 +653,7 @@ mod tests {
     #[test]
     fn test_parse_buy_v12_rs_default() {
         let (rs, tcid, pnum, pden, mfill, ohash, bspkh, mmfee) = make_buy_v12_rs_default();
-        assert_eq!(rs.len(), BUY_RS_SIZE, "Buy RS must be 405 bytes");
+        assert_eq!(rs.len(), BUY_RS_SIZE, "Buy RS must be 396 bytes");
 
         let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse buy v12 RS");
         assert_eq!(parsed.order_type, OrderSide::Buy);
@@ -686,7 +686,7 @@ mod tests {
     #[test]
     fn test_parse_sell_v12_rs_default() {
         let (rs, pnum, pden, mfill, ohash, sspkh) = make_sell_v12_rs_default();
-        assert_eq!(rs.len(), SELL_RS_SIZE, "Sell RS must be 374 bytes");
+        assert_eq!(rs.len(), SELL_RS_SIZE, "Sell RS must be 415 bytes");
 
         let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse sell v12 RS");
         assert_eq!(parsed.order_type, OrderSide::Sell);
@@ -1756,7 +1756,7 @@ mod tests {
         let t = [0u8; 32];
         let rs = kob_core::contract::build_buy_redeem_script(&t, 1, 2, 1, &t, &t, 100_000, 0, 0).unwrap();
         assert_eq!(rs.len(), BUY_RS_SIZE, "BUY_RS_SIZE constant must match actual RS length");
-        assert_eq!(BUY_RS_SIZE, 405);
+        assert_eq!(BUY_RS_SIZE, 396);
     }
 
     #[test]
@@ -1764,7 +1764,7 @@ mod tests {
         let t = [0u8; 32];
         let rs = kob_core::contract::build_sell_redeem_script(1, 2, 1, &t, &t, 0, 0, 0).unwrap();
         assert_eq!(rs.len(), SELL_RS_SIZE, "SELL_RS_SIZE constant must match actual RS length");
-        assert_eq!(SELL_RS_SIZE, 374);
+        assert_eq!(SELL_RS_SIZE, 415);
     }
 
     #[test]

@@ -1081,10 +1081,10 @@ mod tests {
         let buy_ss = contract::build_buy_fill_sigscript(1, 1, 0, &buy_rs);
         let sell_ss = contract::build_sell_fill_sigscript(0, &sell_rs);
 
-        // Buy v13 RS must be 405 bytes (145B state + 260B body)
-        assert_eq!(buy_rs.len(), 405, "Buy v13 RS must be 405 bytes");
-        // Sell v13 RS must be 374 bytes (112B state + 262B body)
-        assert_eq!(sell_rs.len(), 374, "Sell v13 RS must be 374 bytes");
+        // Buy v13 RS must be 387 bytes (145B state + 242B body)
+        assert_eq!(buy_rs.len(), 387, "Buy v13 RS must be 387 bytes");
+        // Sell v13 RS must be 356 bytes (112B state + 244B body)
+        assert_eq!(sell_rs.len(), 356, "Sell v13 RS must be 356 bytes");
         // Fill sigscripts should be non-empty
         assert!(!buy_ss.is_empty(), "Buy fill SS must not be empty");
         assert!(!sell_ss.is_empty(), "Sell fill SS must not be empty");

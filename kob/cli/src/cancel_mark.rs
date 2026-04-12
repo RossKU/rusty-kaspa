@@ -69,8 +69,8 @@ pub async fn run(
         Ok(tcid)
     };
 
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
+    if version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }
 
     // Reconstruct the current redeemScript (cpend=0, the active order)

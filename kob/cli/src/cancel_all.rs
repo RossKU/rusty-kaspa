@@ -432,8 +432,8 @@ pub fn build_redeem_script_for_order(
     let spk_hash = compute_p2pk_spk_hash(pubkey);
 
 
-    if order.version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", order.version);
+    if order.version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", order.version);
     }
 
     match order.side.as_str() {
@@ -470,7 +470,7 @@ mod tests {
             price_den: 1,
             min_fill: 1_000_000,
             value: 50_000_000,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
         };
         let json = serde_json::to_string(&order).unwrap();
@@ -515,7 +515,7 @@ mod tests {
                 price_den: 1,
                 min_fill: 100_000,
                 value: 10_000_000,
-                version: 13,
+                version: 14,
                 expiry_daa: 0,
             },
             CachedOrder {
@@ -526,7 +526,7 @@ mod tests {
                 price_den: 1,
                 min_fill: 50_000,
                 value: 5_000_000,
-                version: 13,
+                version: 14,
                 expiry_daa: 0,
             },
         ];
@@ -553,7 +553,7 @@ mod tests {
             price_den: 1,
             min_fill: 1_000_000,
             value: 50_000_000,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
         });
 
@@ -575,7 +575,7 @@ mod tests {
             price_den: 1,
             min_fill: 500_000,
             value: 20_000_000,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
         });
 
@@ -597,7 +597,7 @@ mod tests {
             price_den: 1,
             min_fill: 100,
             value: 1000,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
         });
         let result = build_redeem_script_for_order(&order, &pubkey);
@@ -615,7 +615,7 @@ mod tests {
             price_den: 1,
             min_fill: 100,
             value: 1000,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
         });
         let result = build_redeem_script_for_order(&order, &pubkey);
@@ -700,7 +700,7 @@ mod tests {
             outpoint: "a:0".into(), side: "buy".into(),
             token: Some("ff".repeat(32)),
             price_num: 100, price_den: 1, min_fill: 1_000_000, value: 50_000_000,
-            version: 13, expiry_daa: 0,
+            version: 14, expiry_daa: 0,
         });
         let order2 = OrderCacheEntry { price_num: 200, ..order1.clone() };
 
@@ -716,7 +716,7 @@ mod tests {
             outpoint: "a:0".into(), side: "sell".into(),
             token: None,
             price_num: 5, price_den: 1, min_fill: 500_000, value: 20_000_000,
-            version: 13, expiry_daa: 0,
+            version: 14, expiry_daa: 0,
         });
         let order2 = OrderCacheEntry { price_num: 10, ..order1.clone() };
 

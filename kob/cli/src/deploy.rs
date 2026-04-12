@@ -217,8 +217,8 @@ pub async fn deploy_buy(
     expiry_daa: Option<u64>,
     max_matcher_fee: u64,
 ) -> anyhow::Result<String> {
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported for deployment.", version);
+    if version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported for deployment.", version);
     }
 
     let wallet = WalletFile::load(wallet_path)?;
@@ -581,8 +581,8 @@ pub async fn deploy_sell(
     token_utxo_str: Option<&str>,
     fee_utxo_str: Option<&str>,
 ) -> anyhow::Result<String> {
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported for deployment.", version);
+    if version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported for deployment.", version);
     }
 
     let wallet = WalletFile::load(wallet_path)?;
@@ -887,10 +887,30 @@ pub async fn deploy_sell(
 
     tx.outputs.push(TxOutput::new(amount, 0, p2sh.script().to_vec(), covenant_binding));
 
+    // Output 1 (if needed): token remainder back to token_unit P2SH
+    // When token_input_value > amount, the surplus tokens must be returned
+    // to the token_unit P2SH address to preserve covenant lineage.
+    let token_remainder = token_input_value.saturating_sub(amount);
+    let mut num_outputs = 2usize; // order + KAS change
+    if token_remainder >= MIN_UTXO_VALUE && token_covenant_id.is_some() {
+        let unit_rs = kob_core::contract::build_token_unit_redeem_script(&pubkey);
+        let unit_p2sh = build_p2sh(&unit_rs);
+        let token_cov_hex = token_covenant_id.unwrap();
+        let remainder_binding = kob_core::tx::CovenantBinding::new(
+            token_input_idx as u16,
+            kob_core::compat::parse_hash(&token_cov_hex.to_string()).unwrap(),
+        );
+        tx.outputs.push(TxOutput::new(token_remainder, 0, unit_p2sh.script().to_vec(), Some(remainder_binding)));
+        num_outputs += 1;
+        println!("Token remainder: {} sompi -> token_unit P2SH", token_remainder);
+    } else if token_remainder > 0 && token_remainder < MIN_UTXO_VALUE {
+        println!("WARNING: Token remainder {} sompi below MIN_UTXO_VALUE, lost as dust.", token_remainder);
+    }
+
     // TX payload: RS for matcher L1 discovery (replaces OP_RETURN)
     tx.payload = build_payload_auto_full(&redeem_script, post_only, expiry_daa);
 
-    // Output 1: change (plain KAS, no covenant)
+    // Next output: KAS change (plain KAS, no covenant)
     let wallet_spk = if let Some(u) = fee_utxo.first() {
         hex::decode(&u.utxo_entry.script_public_key.script)?
     } else {
@@ -903,8 +923,8 @@ pub async fn deploy_sell(
     };
 
     // Add tentative change output for mass calculation, then adjust
-    let est_fee_sell = kob_core::mass::estimate_compute_mass(tx.inputs.len(), 2, tx.payload.len());
-    let tent_change = total_input.saturating_sub(amount + est_fee_sell);
+    let est_fee_sell = kob_core::mass::estimate_compute_mass(tx.inputs.len(), num_outputs + 1, tx.payload.len());
+    let tent_change = total_input.saturating_sub(amount + token_remainder + est_fee_sell);
     if tent_change >= MIN_UTXO_VALUE {
         tx.outputs.push(TxOutput::new(tent_change, 0, wallet_spk.clone(), None));
     }
@@ -926,7 +946,7 @@ pub async fn deploy_sell(
     let change = if has_change_sell {
         tx.outputs.last().unwrap().value
     } else {
-        total_input.saturating_sub(tx.outputs[0].value + est_fee_sell)
+        total_input.saturating_sub(tx.outputs[0].value + token_remainder + est_fee_sell)
     };
 
     if has_change_sell && change < MIN_UTXO_VALUE {
@@ -971,7 +991,7 @@ pub async fn deploy_sell(
     let actual_fee = if exact_fee != est_fee_sell {
         if tx.outputs.len() > 1 {
             let change_idx = tx.outputs.len() - 1;
-            let new_change = total_input.saturating_sub(amount + exact_fee);
+            let new_change = total_input.saturating_sub(amount + token_remainder + exact_fee);
             if new_change >= MIN_UTXO_VALUE {
                 tx.outputs[change_idx].value = new_change;
             } else {

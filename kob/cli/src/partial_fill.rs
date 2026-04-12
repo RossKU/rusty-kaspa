@@ -58,8 +58,8 @@ pub async fn run(
     expiry_daa: u64,
     max_matcher_fee: u64,
 ) -> anyhow::Result<()> {
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
+    if version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }
     let wallet = WalletFile::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;

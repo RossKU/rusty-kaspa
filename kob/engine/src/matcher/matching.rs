@@ -527,7 +527,7 @@ pub const MAX_BATCH_GROUP_SIZE: usize = 7;
 /// Returns a vec of groups, where each group is a vec of crossing pairs
 /// that share the same token and are all full fills.
 pub fn find_batch_groups(pairs: &[CrossingPair]) -> Vec<Vec<&CrossingPair>> {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     // Partition full-fill pairs by token
     let mut by_token: HashMap<&str, Vec<&CrossingPair>> = HashMap::new();
@@ -543,11 +543,32 @@ pub fn find_batch_groups(pairs: &[CrossingPair]) -> Vec<Vec<&CrossingPair>> {
         if token_pairs.is_empty() {
             continue;
         }
-        // Split into chunks of MAX_BATCH_GROUP_SIZE
-        for chunk in token_pairs.chunks(MAX_BATCH_GROUP_SIZE) {
-            if !chunk.is_empty() {
-                groups.push(chunk.to_vec());
+
+        // Sort by surplus descending so we greedily pick the most profitable pairs first
+        let mut sorted = token_pairs;
+        sorted.sort_by(|a, b| b.surplus.cmp(&a.surplus));
+
+        // Deduplicate: each outpoint (sell or buy) can appear in at most one pair per group.
+        // Greedy selection: pick pairs in surplus order, skip if either outpoint is already used.
+        let mut used_outpoints = HashSet::new();
+        let mut group = Vec::new();
+
+        for p in &sorted {
+            let sell_key = p.sell.outpoint_key();
+            let buy_key = p.buy.outpoint_key();
+            if used_outpoints.contains(&sell_key) || used_outpoints.contains(&buy_key) {
+                continue;
             }
+            used_outpoints.insert(sell_key);
+            used_outpoints.insert(buy_key);
+            group.push(*p);
+            if group.len() >= MAX_BATCH_GROUP_SIZE {
+                break;
+            }
+        }
+
+        if !group.is_empty() {
+            groups.push(group);
         }
     }
 

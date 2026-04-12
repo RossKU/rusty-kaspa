@@ -194,6 +194,8 @@ impl RpcClient {
                                     // Route to spent_outpoints tracking
                                     if let Some(ref params) = resp.params {
                                         let mut spent_set = spent_r.lock().await;
+                                        let mut n_removed = 0u32;
+                                        let mut n_added = 0u32;
                                         // Removed UTXOs → mark as spent
                                         if let Some(removed) = params.get("removed").and_then(|v| v.as_array()) {
                                             for entry in removed {
@@ -204,6 +206,7 @@ impl RpcClient {
                                                         let key = format!("{}:{}", txid, idx);
                                                         tracing::debug!("[UTXO] Removed (spent): {}", key);
                                                         spent_set.insert(key);
+                                                        n_removed += 1;
                                                     }
                                                 }
                                             }
@@ -218,9 +221,16 @@ impl RpcClient {
                                                         let key = format!("{}:{}", txid, idx);
                                                         tracing::debug!("[UTXO] Added (available): {}", key);
                                                         spent_set.remove(&key);
+                                                        n_added += 1;
                                                     }
                                                 }
                                             }
+                                        }
+                                        if n_removed > 0 || n_added > 0 {
+                                            tracing::info!(
+                                                "[UTXO] Notification: -{} spent, +{} available (tracking {} total)",
+                                                n_removed, n_added, spent_set.len()
+                                            );
                                         }
                                     }
                                 } else {
@@ -356,16 +366,19 @@ impl RpcClient {
                 .and_then(|i| i.as_array())
             {
                 let mut spent = self.spent_outpoints.lock().await;
+                let mut n = 0u32;
                 for input in inputs {
                     if let Some(prev) = input.get("previousOutpoint") {
                         let txid = prev.get("transactionId").and_then(|v| v.as_str()).unwrap_or("");
                         let idx = prev.get("index").and_then(|v| v.as_u64()).unwrap_or(0);
                         if !txid.is_empty() {
-                            let key = format!("{}:{}", txid, idx);
-                            tracing::debug!("[UTXO] Auto-marking spent: {}", key);
-                            spent.insert(key);
+                            spent.insert(format!("{}:{}", txid, idx));
+                            n += 1;
                         }
                     }
+                }
+                if n > 0 {
+                    tracing::info!("[UTXO] Auto-marked {} input(s) spent (tracking {} total)", n, spent.len());
                 }
             }
         }

@@ -1114,7 +1114,8 @@ pub async fn execute_batch_match(
     for (i, out) in batch_tx.outputs.iter().enumerate() {
         let spk_hex = hex::encode(&out.script_public_key);
 
-        // Buyer token outputs need covenant bindings
+        // BuyerTokens and SellRemainder outputs need covenant bindings
+        // (sell covenant F4 checks: covenant_output_value >= sell_input_value)
         if out.purpose == OutputPurpose::BuyerTokens {
             // output[N+j] corresponds to buy[j]
             let buy_j = i.saturating_sub(n);
@@ -1129,13 +1130,30 @@ pub async fn execute_batch_match(
                         tii as u16,
                         &token_hex,
                     ));
-                    // Also add to sighash TX with covenant binding
                     sighash_tx.outputs.push(kob_core::tx::TxOutput::new(out.value, out.spk_version, out.script_public_key.clone(), Some(kob_core::tx::CovenantBinding::new(tii as u16, kob_core::compat::parse_hash(&token_hex).unwrap()))));
                     continue;
                 }
             }
-            // Fallback: no covenant binding (should not happen for valid plans)
             warn!("[BATCH] BuyerTokens output[{}] missing covenant binding", i);
+            rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
+        } else if out.purpose == OutputPurpose::SellRemainder {
+            // SellRemainder carries excess token value — needs covenant binding
+            // to satisfy sell contract F4 (covenant output conservation).
+            // Use the first sell's token_cov_id for the binding.
+            if let Some((sell, _)) = plan.sells.first() {
+                let token_hex = hex::encode(sell.token_cov_id);
+                if let Some(&tii) = plan.token_input_map.get(&token_hex) {
+                    rpc_outputs.push(deploy::build_rpc_output_with_covenant(
+                        out.value,
+                        out.spk_version,
+                        &spk_hex,
+                        tii as u16,
+                        &token_hex,
+                    ));
+                    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(out.value, out.spk_version, out.script_public_key.clone(), Some(kob_core::tx::CovenantBinding::new(tii as u16, kob_core::compat::parse_hash(&token_hex).unwrap()))));
+                    continue;
+                }
+            }
             rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
         } else {
             rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
@@ -1145,17 +1163,19 @@ pub async fn execute_batch_match(
     }
 
     // Build RPC inputs
+    // Covenant inputs (sell/buy) require sequence=50 for OP_CSV compliance.
     let mut rpc_inputs = Vec::new();
     for (i, inp) in batch_tx.inputs.iter().enumerate() {
         if has_wallet && i == wallet_input_idx {
             // Wallet input: needs signing — we'll replace the sigscript below
             continue;
         }
-        rpc_inputs.push(deploy::build_rpc_input(
+        rpc_inputs.push(deploy::build_rpc_input_with_sequence(
             &inp.tx_id,
             inp.index,
             &hex::encode(&inp.sigscript),
             inp.sig_op_count,
+            50, // OP_CSV(50) compliance
         ));
     }
 
@@ -2481,7 +2501,7 @@ async fn run_scan_cycle(
             );
 
             // STP defense-in-depth
-            if best.buy.owner_hash == best.sell.owner_hash {
+            if !allow_self_trade && best.buy.owner_hash == best.sell.owner_hash {
                 warn!("[STP] Blocked self-trade in remaining-pair path");
                 continue;
             }

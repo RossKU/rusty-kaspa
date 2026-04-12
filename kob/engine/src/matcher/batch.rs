@@ -869,6 +869,25 @@ pub fn plan_batch_match(
         buy_seller_map.insert(n + j, seller_idx);
     }
 
+    // If sell excess exists, switch to IOC sell mode so each sell uses
+    // the IOC fill path (Op5 + fta) instead of full fill (Op1).
+    // Full fill path F4 requires covenant_output[0].value >= sell_input_value,
+    // which fails when buyers don't absorb all tokens.
+    // IOC fill F4 only checks covenant_output_count >= 1 (existence).
+    let (ioc_mode, sell_fill_amounts) = if sell_excess > 0 {
+        // Each sell's fta = total_buyer_tokens allocated to that sell's token.
+        // For single-token batches, all buyer tokens go to the single sell.
+        let mut sfa = Vec::with_capacity(sells.len());
+        for sell in sells.iter() {
+            let token_hex = hex::encode(sell.token_cov_id);
+            let allocated = total_buyer_tokens_by_cov.get(&token_hex).copied().unwrap_or(0);
+            sfa.push(allocated);
+        }
+        (Some(IocSide::Sell), sfa)
+    } else {
+        (None, Vec::new())
+    };
+
     Ok(BatchPlan {
         sells: plan_sells,
         buys: plan_buys,
@@ -880,8 +899,8 @@ pub fn plan_batch_match(
         buy_seller_map,
         fee_bps,
         total_seller_kas,
-        ioc_mode: None,
-        sell_fill_amounts: Vec::new(),
+        ioc_mode,
+        sell_fill_amounts,
     })
 }
 

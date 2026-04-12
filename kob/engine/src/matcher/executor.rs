@@ -2394,11 +2394,11 @@ async fn run_scan_cycle(
             {
                 Ok(u) if !u.is_empty() => u,
                 Ok(_) => {
-                    warn!("[BATCH] No wallet UTXOs available, falling through to 1:1");
+                    warn!("[BATCH] No wallet UTXOs available, skipping batch group");
                     continue;
                 }
                 Err(e) => {
-                    warn!("[BATCH] Failed to get wallet UTXOs: {}, falling through to 1:1", e);
+                    warn!("[BATCH] Failed to get wallet UTXOs: {}, skipping batch group", e);
                     continue;
                 }
             };
@@ -2424,7 +2424,7 @@ async fn run_scan_cycle(
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    warn!("[BATCH] Plan failed: {}, falling through to 1:1", e);
+                    warn!("[BATCH] Plan failed: {}, skipping batch group", e);
                     continue;
                 }
             };

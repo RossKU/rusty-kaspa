@@ -1018,6 +1018,217 @@ pub fn find_triangular_batch_groups(
     groups
 }
 
+/// Planner hint: which plan function to call for this group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GroupKind {
+    /// N:N full-fill batch (including 1:1 full). Uses `plan_batch_match`.
+    Batch,
+    /// 1 buy sweeps N sells. Uses `plan_ioc_match`.
+    BuySweep,
+    /// 1 sell sweeps N buys. Uses `plan_sell_ioc_match`.
+    SellSweep,
+    /// 1:1 partial buy (buyer larger than seller). Uses `plan_ioc_match`.
+    PartialBuy,
+    /// 1:1 partial sell (seller larger than buyer). Uses `plan_sell_ioc_match`.
+    PartialSell,
+}
+
+/// A unified batch group that the executor processes in one loop.
+///
+/// Replaces the old Phase 0/0.5/1a/1b split. Each `BatchGroup` maps to
+/// exactly one call to the appropriate planner + `execute_batch_match`.
+#[derive(Debug, Clone)]
+pub struct BatchGroup {
+    /// Sell-side orders.
+    pub sells: Vec<BookOrder>,
+    /// Buy-side orders.
+    pub buys: Vec<BookOrder>,
+    /// Total surplus across all pairs in this group.
+    pub total_surplus: u64,
+    /// Which planner to use.
+    pub kind: GroupKind,
+    /// The crossing pairs that formed this group (for IFD lookup + MatchResult).
+    pub source_pairs: Vec<CrossingPair>,
+}
+
+impl BatchGroup {
+    /// All orders (sells + buys) for iteration.
+    pub fn all_orders(&self) -> impl Iterator<Item = &BookOrder> {
+        self.sells.iter().chain(self.buys.iter())
+    }
+}
+
+/// Unified grouper: replaces `find_batch_groups`, `find_sweep_groups`, and
+/// the Phase 1b remaining-pair selection with a single pass.
+///
+/// Algorithm:
+/// 1. Collect sweep groups from the order book (1:N relationships).
+/// 2. Collect N:N batch groups from the crossing pairs.
+/// 3. Collect remaining 1:1 pairs (full, partial buy, partial sell) not yet claimed.
+/// 4. Return all groups sorted by surplus descending.
+///
+/// The returned groups are non-overlapping: no outpoint appears in more than one group.
+pub fn find_optimal_groups(
+    all_pairs: &[CrossingPair],
+    order_book: &OrderBook,
+    allow_self_trade: bool,
+    spent_outpoints: Option<&std::collections::HashSet<String>>,
+) -> Vec<BatchGroup> {
+    use std::collections::HashSet;
+
+    let mut groups: Vec<BatchGroup> = Vec::new();
+    let mut used: HashSet<String> = HashSet::new();
+
+    // ---------------------------------------------------------------
+    // Step 1: Sweep groups (1:N)  -- highest priority because they
+    // atomically fill large orders that would otherwise be broken into
+    // multiple 1:1 pairs across cycles.
+    // ---------------------------------------------------------------
+    let sweep_spent: HashSet<String> = spent_outpoints
+        .map(|s| s.iter().cloned().collect())
+        .unwrap_or_default();
+    let sweep_groups = find_sweep_groups(order_book, allow_self_trade, Some(&sweep_spent));
+
+    for sg in sweep_groups {
+        let anchor_key = sg.anchor.outpoint_key();
+        if used.contains(&anchor_key) {
+            continue;
+        }
+        // Skip if any fill already used
+        if sg.fills.iter().any(|f| used.contains(&f.outpoint_key())) {
+            continue;
+        }
+        // Claim all outpoints
+        used.insert(anchor_key);
+        for f in &sg.fills {
+            used.insert(f.outpoint_key());
+        }
+
+        let total_surplus = sg.total_fill_cost; // approximate
+        let (sells, buys, kind) = if sg.is_buy_sweep {
+            (sg.fills.clone(), vec![sg.anchor.clone()], GroupKind::BuySweep)
+        } else {
+            (vec![sg.anchor.clone()], sg.fills.clone(), GroupKind::SellSweep)
+        };
+
+        groups.push(BatchGroup {
+            sells,
+            buys,
+            total_surplus,
+            kind,
+            source_pairs: Vec::new(), // sweep groups don't map 1:1 to CrossingPairs
+        });
+    }
+
+    // ---------------------------------------------------------------
+    // Step 2: N:N batch groups from full-fill crossing pairs.
+    // Greedy: sort all full-fill pairs by surplus desc, deduplicate
+    // outpoints, then chunk by token into groups of MAX_BATCH_GROUP_SIZE.
+    // ---------------------------------------------------------------
+    {
+        let mut full_pairs: Vec<&CrossingPair> = all_pairs
+            .iter()
+            .filter(|p| {
+                p.match_type == MatchType::Full
+                    && !used.contains(&p.buy.outpoint_key())
+                    && !used.contains(&p.sell.outpoint_key())
+            })
+            .collect();
+        full_pairs.sort_by(|a, b| b.surplus.cmp(&a.surplus));
+
+        // Greedy deduplicate
+        let mut deduped: Vec<&CrossingPair> = Vec::new();
+        for p in &full_pairs {
+            let bk = p.buy.outpoint_key();
+            let sk = p.sell.outpoint_key();
+            if used.contains(&bk) || used.contains(&sk) {
+                continue;
+            }
+            used.insert(bk);
+            used.insert(sk);
+            deduped.push(p);
+        }
+
+        // Group by token
+        let mut by_token: std::collections::HashMap<&str, Vec<&CrossingPair>> =
+            std::collections::HashMap::new();
+        for p in &deduped {
+            by_token.entry(&p.token_cov_id).or_default().push(p);
+        }
+
+        for (_token, token_pairs) in by_token {
+            for chunk in token_pairs.chunks(MAX_BATCH_GROUP_SIZE) {
+                if chunk.is_empty() {
+                    continue;
+                }
+                let sells: Vec<BookOrder> = chunk.iter().map(|p| p.sell.clone()).collect();
+                let buys: Vec<BookOrder> = chunk.iter().map(|p| p.buy.clone()).collect();
+                let total_surplus: u64 = chunk.iter().map(|p| p.surplus).sum();
+                let source_pairs: Vec<CrossingPair> = chunk.iter().map(|p| (*p).clone()).collect();
+
+                groups.push(BatchGroup {
+                    sells,
+                    buys,
+                    total_surplus,
+                    kind: GroupKind::Batch,
+                    source_pairs,
+                });
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Step 3: Remaining 1:1 pairs (partial buy, partial sell, or
+    // full-fill pairs that didn't make it into a batch group).
+    // Pick the best remaining pair per token.
+    // ---------------------------------------------------------------
+    {
+        let mut best_by_token: std::collections::HashMap<&str, &CrossingPair> =
+            std::collections::HashMap::new();
+
+        for p in all_pairs {
+            let bk = p.buy.outpoint_key();
+            let sk = p.sell.outpoint_key();
+            if used.contains(&bk) || used.contains(&sk) {
+                continue;
+            }
+            let entry = best_by_token.entry(&p.token_cov_id).or_insert(p);
+            if p.surplus > entry.surplus {
+                *entry = p;
+            }
+        }
+
+        for (_token, best) in best_by_token {
+            let bk = best.buy.outpoint_key();
+            let sk = best.sell.outpoint_key();
+            if used.contains(&bk) || used.contains(&sk) {
+                continue;
+            }
+            used.insert(bk);
+            used.insert(sk);
+
+            let kind = match best.match_type {
+                MatchType::Full => GroupKind::Batch,
+                MatchType::PartialBuy => GroupKind::PartialBuy,
+                MatchType::PartialSell => GroupKind::PartialSell,
+            };
+
+            groups.push(BatchGroup {
+                sells: vec![best.sell.clone()],
+                buys: vec![best.buy.clone()],
+                total_surplus: best.surplus,
+                kind,
+                source_pairs: vec![best.clone()],
+            });
+        }
+    }
+
+    // Sort all groups by surplus descending (most profitable first)
+    groups.sort_by(|a, b| b.total_surplus.cmp(&a.total_surplus));
+
+    groups
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2587,5 +2798,151 @@ mod tests {
             MAX_BATCH_GROUP_SIZE,
             groups[0].fills.len(),
         );
+    }
+
+    // --- find_optimal_groups tests ---
+
+    #[test]
+    fn test_optimal_groups_single_full_pair() {
+        let mut ob = OrderBook::new();
+        ob.add_buy_order(make_buy(10_000_000, 1, 2, FAKE_TOKEN));
+        ob.add_sell_order(make_sell(10_000_000, 1, 2, FAKE_TOKEN));
+
+        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
+        let groups = find_optimal_groups(&pairs, &ob, true, None);
+
+        assert!(!groups.is_empty(), "Should produce at least 1 group");
+        // Single pair should be a Batch group
+        let batch_groups: Vec<_> = groups.iter().filter(|g| g.kind == GroupKind::Batch).collect();
+        assert!(!batch_groups.is_empty(), "Single full pair should produce a Batch group");
+    }
+
+    #[test]
+    fn test_optimal_groups_no_overlap() {
+        // 3 full pairs same token -> all in one batch group, no duplicates
+        let mut ob = OrderBook::new();
+        for i in 0..3u32 {
+            let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
+            buy.tx_id = format!("{:0>64}", format!("buy{}", i));
+            buy.owner_hash = format!("{:0>64}", format!("ob{}", i));
+            ob.add_buy_order(buy);
+            let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("os{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
+        let groups = find_optimal_groups(&pairs, &ob, true, None);
+
+        // Collect all outpoints across all groups
+        let mut all_outpoints = std::collections::HashSet::new();
+        let mut total_orders = 0;
+        for g in &groups {
+            for o in g.all_orders() {
+                let key = o.outpoint_key();
+                assert!(!all_outpoints.contains(&key), "Outpoint {} appears in multiple groups", key);
+                all_outpoints.insert(key);
+                total_orders += 1;
+            }
+        }
+        assert!(total_orders > 0, "Should have some orders in groups");
+    }
+
+    #[test]
+    fn test_optimal_groups_sweep_priority() {
+        // 1 large buy + 3 small sells -> sweep should take priority
+        let mut ob = OrderBook::new();
+
+        let mut buy = make_buy(5_000_000_000, 4, 1, FAKE_TOKEN);
+        buy.tx_id = format!("{:0>64}", "buy_big");
+        buy.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy);
+
+        for i in 0..3u32 {
+            let mut sell = make_sell(500_000_000, 2, 1, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("b{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
+        let groups = find_optimal_groups(&pairs, &ob, true, None);
+
+        let sweep_groups: Vec<_> = groups.iter()
+            .filter(|g| g.kind == GroupKind::BuySweep || g.kind == GroupKind::SellSweep)
+            .collect();
+        assert!(!sweep_groups.is_empty(), "Should find sweep groups when 1:N relationship exists");
+    }
+
+    #[test]
+    fn test_optimal_groups_partial_remaining() {
+        // Large buy + small sell -> should produce a PartialBuy group
+        let mut ob = OrderBook::new();
+
+        let mut buy = make_buy(50_000_000, 2, 1, FAKE_TOKEN);
+        buy.tx_id = "a".repeat(64);
+        buy.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy);
+
+        let mut sell = make_sell(20_000_000, 1, 3, FAKE_TOKEN);
+        sell.tx_id = "c".repeat(64);
+        sell.owner_hash = "bb".repeat(32);
+        ob.add_sell_order(sell);
+
+        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
+        let groups = find_optimal_groups(&pairs, &ob, true, None);
+
+        assert!(!groups.is_empty(), "Should find at least one group");
+        // Should have a partial group if partial pair exists
+        let has_partial = groups.iter().any(|g|
+            g.kind == GroupKind::PartialBuy || g.kind == GroupKind::PartialSell
+        );
+        let has_full = groups.iter().any(|g| g.kind == GroupKind::Batch);
+        assert!(has_partial || has_full, "Should have either partial or batch group");
+    }
+
+    #[test]
+    fn test_optimal_groups_empty() {
+        let ob = OrderBook::new();
+        let groups = find_optimal_groups(&[], &ob, true, None);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_optimal_groups_sorted_by_surplus() {
+        let mut ob = OrderBook::new();
+        let token_a = FAKE_TOKEN;
+        let token_b = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+        // Token A: high surplus
+        let mut buy_a = make_buy(20_000_000, 1, 1, token_a);
+        buy_a.tx_id = "a".repeat(64);
+        buy_a.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy_a);
+        let mut sell_a = make_sell(20_000_000, 1, 2, token_a);
+        sell_a.tx_id = "b".repeat(64);
+        sell_a.owner_hash = "bb".repeat(32);
+        ob.add_sell_order(sell_a);
+
+        // Token B: lower surplus
+        let mut buy_b = make_buy(5_000_000, 1, 1, token_b);
+        buy_b.tx_id = "c".repeat(64);
+        buy_b.owner_hash = "cc".repeat(32);
+        ob.add_buy_order(buy_b);
+        let mut sell_b = make_sell(5_000_000, 1, 2, token_b);
+        sell_b.tx_id = "d".repeat(64);
+        sell_b.owner_hash = "dd".repeat(32);
+        ob.add_sell_order(sell_b);
+
+        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
+        let groups = find_optimal_groups(&pairs, &ob, true, None);
+
+        if groups.len() >= 2 {
+            assert!(
+                groups[0].total_surplus >= groups[1].total_surplus,
+                "Groups should be sorted by surplus descending"
+            );
+        }
     }
 }

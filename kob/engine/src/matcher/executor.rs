@@ -2116,9 +2116,10 @@ async fn run_scan_cycle(
                                     Side::Sell,
                                     None,
                                 ).await;
-                                // Look up OCO partner key while order is still in book
-                                let sell_oco_partner = order_book.get_order(&sk)
-                                    .and_then(|o| o.oco_partner_key.clone());
+                                // Use BookOrder clone partner key directly —
+                                // order_book.get_order() may return None if
+                                // scanner concurrently removed order (C5 fix).
+                                let sell_oco_partner = sell.oco_partner_key.clone();
                                 // Mark as spent; scanner removes on confirmation
                                 spent_tracker.mark_spent(&sk);
                                 batched_outpoints.insert(sk);
@@ -2388,10 +2389,8 @@ async fn run_scan_cycle(
                             Side::Buy,
                             None,
                         ).await;
-
-                        // Look up OCO partner key while order is still in book
-                        let sell_oco_partner = order_book.get_order(&sk)
-                            .and_then(|o| o.oco_partner_key.clone());
+                        // Use BookOrder clone partner key directly (C5 fix).
+                        let sell_oco_partner = pair.sell.oco_partner_key.clone();
 
                         // Mark as spent to prevent re-matching; scanner will
                         // do the actual order_book removal upon block confirmation.
@@ -2628,10 +2627,8 @@ async fn run_scan_cycle(
                         Side::Buy,
                         None,
                     ).await;
-
-                    // Look up OCO partner key while order is still in book
-                    let sell_oco_partner = order_book.get_order(&sell_key)
-                        .and_then(|o| o.oco_partner_key.clone());
+                    // Use BookOrder clone partner key directly (C5 fix).
+                    let sell_oco_partner = best.sell.oco_partner_key.clone();
 
                     // Mark as spent to prevent re-matching; scanner will
                     // do the actual order_book removal upon block confirmation.
@@ -2872,9 +2869,8 @@ async fn run_scan_cycle(
                                 Side::Sell,
                                 None,
                             ).await;
-                            // Look up OCO partner key while order is still in book
-                            let sell_oco_partner = order_book.get_order(&sk)
-                                .and_then(|o| o.oco_partner_key.clone());
+                            // Use BookOrder clone partner key directly (C5 fix).
+                            let sell_oco_partner = sell.oco_partner_key.clone();
                             // Mark as spent; scanner removes on confirmation
                             spent_tracker.mark_spent(&sk);
                             // Mark OCO partner as spent so it cannot match while pending

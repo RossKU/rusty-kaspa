@@ -411,7 +411,7 @@ async fn deploy(
 
     // TX payload: both RS for matcher L1 discovery (replaces OP_RETURN)
     // Format: KOB:1:<buy_rs_len_u16_LE><buy_rs><sell_rs>
-    tx.payload = build_oco_order_payload(&buy_rs, &sell_rs, false);
+    tx.payload = build_oco_order_payload(&buy_rs, &sell_rs, false)?;
 
     // Output 2: tentative change for mass calculation
     let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;

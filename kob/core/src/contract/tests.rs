@@ -2023,7 +2023,7 @@ mod adversarial_tests {
     fn payload_oco_build_and_parse() {
         let buy_rs = vec![0x11; 10];
         let sell_rs = vec![0x22; 8];
-        let payload = build_oco_order_payload(&buy_rs, &sell_rs, true);
+        let payload = build_oco_order_payload(&buy_rs, &sell_rs, true).unwrap();
         assert_eq!(&payload[..6], b"KOB:2:");
         assert_eq!(payload[6], PAYLOAD_FLAG_POST_ONLY);
 
@@ -2125,7 +2125,7 @@ mod adversarial_tests {
         let buy_rs = vec![0x11; 10];
         let sell_rs = vec![0x22; 8];
         let daa: u64 = 5_000_000;
-        let payload = build_oco_order_payload_full(&buy_rs, &sell_rs, false, Some(daa));
+        let payload = build_oco_order_payload_full(&buy_rs, &sell_rs, false, Some(daa)).unwrap();
         assert_eq!(payload[6], PAYLOAD_FLAG_GTD);
 
         let parsed = parse_order_payload(&payload).expect("should parse OCO GTD");

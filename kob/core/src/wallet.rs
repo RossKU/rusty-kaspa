@@ -35,13 +35,17 @@ pub struct SecureKey([u8; 32]);
 impl SecureKey {
     /// Create a `SecureKey` from a `LegacyWalletJson`'s hex-encoded private key.
     pub fn from_legacy(wallet: &LegacyWalletJson) -> crate::Result<Self> {
-        let bytes = hex::decode(&wallet.private_key)?;
+        let mut bytes = hex::decode(&wallet.private_key)?;
         let mut key = [0u8; 32];
         if bytes.len() != 32 {
+            bytes.zeroize();
             return Err(crate::KobError::Wallet("private key must be 32 bytes".into()));
         }
         key.copy_from_slice(&bytes);
-        Ok(Self(key))
+        bytes.zeroize();
+        let secure = Self(key);
+        key.zeroize();
+        Ok(secure)
     }
 
     /// Create a `SecureKey` from raw bytes.

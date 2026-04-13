@@ -75,12 +75,14 @@ pub fn build_order_payload_full(
 ///
 /// Order A's `bspkh` must be set to the SPK hash of order B's P2SH so the
 /// covenant enforces that the fill TX output goes to order B's P2SH address.
+///
+/// Returns an error if `order_a_rs` exceeds 65 535 bytes.
 pub fn build_ifd_order_payload(
     order_a_rs: &[u8],
     order_b_rs: &[u8],
     post_only: bool,
     expiry_daa: Option<u64>,
-) -> Vec<u8> {
+) -> crate::Result<Vec<u8>> {
     let mut flags: u8 = PAYLOAD_FLAG_IFD;
     if post_only {
         flags |= PAYLOAD_FLAG_POST_ONLY;
@@ -88,7 +90,11 @@ pub fn build_ifd_order_payload(
     if expiry_daa.is_some() {
         flags |= PAYLOAD_FLAG_GTD;
     }
-    assert!(order_a_rs.len() <= u16::MAX as usize, "order A RS exceeds u16::MAX");
+    if order_a_rs.len() > u16::MAX as usize {
+        return Err(crate::KobError::InvalidData(
+            format!("order A RS length {} exceeds u16::MAX", order_a_rs.len()),
+        ));
+    }
     let a_len = order_a_rs.len() as u16;
     let gtd_len = if expiry_daa.is_some() { 8 } else { 0 };
     let mut payload = Vec::with_capacity(
@@ -102,23 +108,27 @@ pub fn build_ifd_order_payload(
     if let Some(daa) = expiry_daa {
         payload.extend_from_slice(&daa.to_le_bytes());
     }
-    payload
+    Ok(payload)
 }
 
 /// Build a TX payload for an OCO deploy with flags.
 ///
 /// Format: `KOB:2:<flags_byte><buy_rs_len as u16 LE><buy_rs><sell_rs>[<expiry_daa_u64_LE>]`
-pub fn build_oco_order_payload(buy_rs: &[u8], sell_rs: &[u8], post_only: bool) -> Vec<u8> {
+///
+/// Returns an error if `buy_rs` exceeds 65 535 bytes.
+pub fn build_oco_order_payload(buy_rs: &[u8], sell_rs: &[u8], post_only: bool) -> crate::Result<Vec<u8>> {
     build_oco_order_payload_full(buy_rs, sell_rs, post_only, None)
 }
 
 /// Build a TX payload for an OCO deploy with full options.
+///
+/// Returns an error if `buy_rs` exceeds 65 535 bytes.
 pub fn build_oco_order_payload_full(
     buy_rs: &[u8],
     sell_rs: &[u8],
     post_only: bool,
     expiry_daa: Option<u64>,
-) -> Vec<u8> {
+) -> crate::Result<Vec<u8>> {
     let mut flags: u8 = 0;
     if post_only {
         flags |= PAYLOAD_FLAG_POST_ONLY;
@@ -126,7 +136,11 @@ pub fn build_oco_order_payload_full(
     if expiry_daa.is_some() {
         flags |= PAYLOAD_FLAG_GTD;
     }
-    assert!(buy_rs.len() <= u16::MAX as usize, "buy RS exceeds u16::MAX");
+    if buy_rs.len() > u16::MAX as usize {
+        return Err(crate::KobError::InvalidData(
+            format!("buy RS length {} exceeds u16::MAX", buy_rs.len()),
+        ));
+    }
     let buy_len = buy_rs.len() as u16;
     let gtd_len = if expiry_daa.is_some() { 8 } else { 0 };
     let mut payload = Vec::with_capacity(
@@ -140,7 +154,7 @@ pub fn build_oco_order_payload_full(
     if let Some(daa) = expiry_daa {
         payload.extend_from_slice(&daa.to_le_bytes());
     }
-    payload
+    Ok(payload)
 }
 
 /// Parse a KOB order payload, stripping the `KOB:2:` prefix.

@@ -246,7 +246,7 @@ pub async fn deploy_ifd(
     // Step 3: Build IFD payload
     let ifd_payload = contract::build_ifd_order_payload(
         &order_a_rs, &order_b_rs, false, None,
-    );
+    )?;
 
     // Connect and fetch UTXOs
     let rpc = NodeClient::connect(node_url).await?;

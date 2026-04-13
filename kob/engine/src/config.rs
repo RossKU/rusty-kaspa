@@ -61,6 +61,9 @@ pub struct AppConfig {
     /// (e.g. USDC). When false (default), orders involving freezable tokens
     /// are accepted into the book but skipped during matching.
     pub zk_prover_enabled: bool,
+    /// Matcher fee in basis points. Default 30 (0.30%), max 100 (1.00%).
+    /// Clamped to [0, MAX_FEE_BPS] on load to prevent misconfiguration.
+    pub fee_bps: u16,
 }
 
 // Custom Debug that doesn't leak key material or auth tokens
@@ -75,6 +78,7 @@ impl std::fmt::Debug for AppConfig {
             .field("rpc_auth", &self.rpc_auth.as_ref().map(|_| "[REDACTED]"))
             .field("history", &self.history)
             .field("zk_prover_enabled", &self.zk_prover_enabled)
+            .field("fee_bps", &self.fee_bps)
             .finish()
     }
 }
@@ -136,6 +140,7 @@ impl AppConfig {
             rpc_auth: node_config.rpc_auth,
             history: HistoryConfig::default(),
             zk_prover_enabled: false,
+            fee_bps: crate::matcher::executor::DEFAULT_FEE_BPS,
         })
     }
 

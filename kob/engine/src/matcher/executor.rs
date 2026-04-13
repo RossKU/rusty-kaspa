@@ -25,6 +25,15 @@ use crate::matcher::scanner::{
 /// Default cooldown for failed outpoints (seconds).
 pub const FAILED_OUTPOINT_COOLDOWN_SECS: u64 = 30;
 
+/// Default matcher fee in basis points (0.30%).
+pub const DEFAULT_FEE_BPS: u16 = 30;
+/// Maximum allowed fee in basis points (1.00%). Prevents misconfiguration.
+pub const MAX_FEE_BPS: u16 = 100;
+
+/// Spent-tracker prune threshold in seconds. Entries older than this
+/// are removed each cycle to bound memory growth (H-1).
+const SPENT_PRUNE_AGE_SECS: u64 = 600;
+
 /// Tracks outpoints that have been used locally (spent in submitted TXs)
 /// to avoid selecting stale UTXOs before mempool catches up.
 #[derive(Debug)]
@@ -2152,28 +2161,28 @@ async fn run_scan_cycle(
                 // 1 buy (in buys[0]) sweeps N sells
                 crate::matcher::batch::plan_ioc_match(
                     &sells, &buys[0], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(30u16),
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
             }
             matching::GroupKind::SellSweep => {
                 // 1 sell (in sells[0]) sweeps N buys
                 crate::matcher::batch::plan_sell_ioc_match(
                     &sells[0], &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(30u16),
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
             }
             matching::GroupKind::PartialBuy => {
                 // 1:1 partial buy: buy IOC sweeps 1 sell
                 crate::matcher::batch::plan_ioc_match(
                     &sells, &buys[0], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(30u16),
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
             }
             matching::GroupKind::PartialSell => {
                 // 1:1 partial sell: sell IOC sweeps 1 buy
                 crate::matcher::batch::plan_sell_ioc_match(
                     &sells[0], &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(30u16),
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
             }
             matching::GroupKind::Batch
@@ -2186,7 +2195,7 @@ async fn run_scan_cycle(
                 // fill tokens >= expected_tokens.
                 crate::matcher::batch::plan_batch_match(
                     &sells, &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(30u16),
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
             }
         };
@@ -2366,6 +2375,16 @@ async fn run_scan_cycle(
                         &group.buys
                     };
                     for fill in fills {
+                        // H-2: Guard against division by zero on price_den.
+                        // A zero denominator indicates a malformed order that
+                        // slipped past validation; skip it rather than panic.
+                        if fill.price_den == 0 {
+                            warn!(
+                                "[UNIFIED] Skipping fill with price_den=0: {}...:{} (H-2)",
+                                &fill.tx_id[..fill.tx_id.len().min(16)], fill.index,
+                            );
+                            continue;
+                        }
                         let (seller_kas_val, buyer_tokens_val) = if group.kind == matching::GroupKind::BuySweep
                             || group.kind == matching::GroupKind::GtcBuyMultiFill
                         {
@@ -2566,7 +2585,7 @@ async fn run_scan_cycle(
                 let mut plan = match crate::matcher::batch::plan_batch_match(
                     &sells, &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version,
-                    Some(30u16),
+                    Some(config.fee_bps),
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -3526,8 +3545,10 @@ pub async fn run_continuous_with_ws(
         cycle += 1;
         debug!("--- Scan cycle {} ---", cycle);
 
-        // M-6: Age-based pruning of spent tracker entries every cycle.
-        spent_tracker.prune_spent(60);
+        // M-6 / H-1: Age-based pruning of spent tracker entries every cycle.
+        // Uses SPENT_PRUNE_AGE_SECS (600s) to prevent OOM from unbounded growth
+        // while keeping entries long enough for mempool propagation.
+        spent_tracker.prune_spent(SPENT_PRUNE_AGE_SECS);
         spent_tracker.expire_failed();
 
         // Phase 0: Process block notifications (event-driven).

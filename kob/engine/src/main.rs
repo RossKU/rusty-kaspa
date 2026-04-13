@@ -94,6 +94,10 @@ struct Cli {
     #[arg(long)]
     zk_prover: bool,
 
+    /// Matcher fee in basis points (default 30 = 0.30%, max 100 = 1.00%)
+    #[arg(long, default_value_t = 30)]
+    fee_bps: u16,
+
     /// SQLite history database path (empty string to disable)
     #[arg(long, default_value = "history.db")]
     history_db: String,
@@ -136,6 +140,16 @@ async fn main() {
             if let Some(ref node_url) = cli.node {
                 c.node_url = node_url.clone();
             }
+            // H-5: Apply and validate fee_bps from CLI
+            if cli.fee_bps > kob_engine::matcher::executor::MAX_FEE_BPS {
+                error!(
+                    "fee_bps={} exceeds maximum allowed value of {} (1.00%)",
+                    cli.fee_bps,
+                    kob_engine::matcher::executor::MAX_FEE_BPS,
+                );
+                std::process::exit(1);
+            }
+            c.fee_bps = cli.fee_bps;
             c
         }
         Err(e) => {

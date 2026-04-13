@@ -410,9 +410,9 @@ pub(crate) fn pair_to_batch_orders(
     let sell_rs = hex::decode(&pair.sell.redeem_script_hex).unwrap_or_default();
     let buy_rs = hex::decode(&pair.buy.redeem_script_hex).unwrap_or_default();
 
-    // v14 only: sell RS=416 (112+304), buy RS=396 (145+251)
-    if sell_rs.len() != 416 {
-        warn!("[{}] Unsupported sell RS size {}, skipping (v14=416)", label, sell_rs.len());
+    // v14 only: sell RS=416 (112+304), OCO sell RS=333 (139+194), buy RS=396 (145+251)
+    if sell_rs.len() != 416 && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
+        warn!("[{}] Unsupported sell RS size {}, skipping (v14=416, oco={})", label, sell_rs.len(), kob_core::OCO_SELL_RS_SIZE);
         return None;
     }
     if buy_rs.len() != 396 {
@@ -447,7 +447,7 @@ pub(crate) fn pair_to_batch_orders(
         utxo_value: pair.sell.value,
         counterparty_spk: seller_spk,
         counterparty_spk_version: seller_spk_ver,
-        oco_path: None,
+        oco_path: pair.sell.oco_path,
     };
 
     let buy_order = crate::matcher::batch::BatchOrder {
@@ -2498,8 +2498,8 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    if sell_rs.len() != 416 {
-                        warn!("[CROSS-BATCH] Unsupported sell RS size {}, skipping group (v14=416)", sell_rs.len());
+                    if sell_rs.len() != 416 && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
+                        warn!("[CROSS-BATCH] Unsupported sell RS size {}, skipping group (v14=416, oco={})", sell_rs.len(), kob_core::OCO_SELL_RS_SIZE);
                         skip_group = true;
                         break;
                     }
@@ -2524,7 +2524,7 @@ async fn run_scan_cycle(
                         utxo_value: sell.value,
                         counterparty_spk: seller_spk,
                         counterparty_spk_version: seller_spk_ver,
-                        oco_path: None,
+                        oco_path: sell.oco_path,
                     });
                 }
 
@@ -2735,8 +2735,8 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    if sell_rs.len() != 416 {
-                        warn!("[TRI-BATCH] Unsupported sell RS size {}, skipping group (v14=416)", sell_rs.len());
+                    if sell_rs.len() != 416 && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
+                        warn!("[TRI-BATCH] Unsupported sell RS size {}, skipping group (v14=416, oco={})", sell_rs.len(), kob_core::OCO_SELL_RS_SIZE);
                         skip_group = true;
                         break;
                     }
@@ -2761,7 +2761,7 @@ async fn run_scan_cycle(
                         utxo_value: sell.value,
                         counterparty_spk: seller_spk,
                         counterparty_spk_version: seller_spk_ver,
-                        oco_path: None,
+                        oco_path: sell.oco_path,
                     });
                 }
 

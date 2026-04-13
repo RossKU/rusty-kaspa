@@ -1,6 +1,6 @@
 //! DCA (Dollar-Cost Averaging) order tracker.
 //!
-//! Tracks on-chain DCA V2 UTXOs (315B RS) and exposes executable orders
+//! Tracks on-chain DCA V2 UTXOs (369B RS) and exposes executable orders
 //! to the scan cycle for permissionless auto-fill.
 //!
 //! Unlike spot orders, DCA orders don't participate in regular bid/ask

@@ -20,6 +20,7 @@ use crate::rpc::{RpcClient, RpcUtxo};
 use crate::matcher::scanner::{
     BlockScanner, TransactionData, ScanResult,
     PerpDeploySide, LendingOrderType, PredictionItemType,
+    BUY_RS_SIZE, SELL_RS_SIZE,
 };
 
 /// Default cooldown for failed outpoints (seconds).
@@ -338,13 +339,13 @@ pub(crate) fn pair_to_batch_orders(
     let sell_rs = hex::decode(&pair.sell.redeem_script_hex).unwrap_or_default();
     let buy_rs = hex::decode(&pair.buy.redeem_script_hex).unwrap_or_default();
 
-    // v14 only: sell RS=416 (112+304), OCO sell RS=333 (139+194), buy RS=396 (145+251)
-    if sell_rs.len() != 416 && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
-        warn!("[{}] Unsupported sell RS size {}, skipping (v14=416, oco={})", label, sell_rs.len(), kob_core::OCO_SELL_RS_SIZE);
+    // sell RS: v14=416, OCO=333; buy RS: v14=396, v15=479
+    if sell_rs.len() != SELL_RS_SIZE && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
+        warn!("[{}] Unsupported sell RS size {}, skipping (v14={}, oco={})", label, sell_rs.len(), SELL_RS_SIZE, kob_core::OCO_SELL_RS_SIZE);
         return None;
     }
-    if buy_rs.len() != 396 && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
-        warn!("[{}] Unsupported buy RS size {}, skipping (v14=396, v15={})", label, buy_rs.len(), kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN);
+    if buy_rs.len() != BUY_RS_SIZE && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v15={})", label, buy_rs.len(), BUY_RS_SIZE, kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN);
         return None;
     }
 
@@ -419,16 +420,16 @@ pub(crate) fn book_order_to_batch_order(
 
     let rs = hex::decode(&order.redeem_script_hex).unwrap_or_default();
 
-    // v14 RS sizes: sell=416, OCO sell=333, buy=396
+    // RS sizes: sell v14=416, OCO=333, buy v14=396, buy v15=479
     match order.side {
         crate::matcher::order_book::OrderSide::Sell => {
-            if rs.len() != 416 && rs.len() != kob_core::OCO_SELL_RS_SIZE {
+            if rs.len() != SELL_RS_SIZE && rs.len() != kob_core::OCO_SELL_RS_SIZE {
                 warn!("[{}] Unsupported sell RS size {} for {}", label, rs.len(), order.outpoint_key());
                 return None;
             }
         }
         crate::matcher::order_book::OrderSide::Buy => {
-            if rs.len() != 396 && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+            if rs.len() != BUY_RS_SIZE && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
                 warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
                 return None;
             }
@@ -2461,8 +2462,8 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    if sell_rs.len() != 416 && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
-                        warn!("[TRI-BATCH] Unsupported sell RS size {}, skipping group (v14=416, oco={})", sell_rs.len(), kob_core::OCO_SELL_RS_SIZE);
+                    if sell_rs.len() != SELL_RS_SIZE && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
+                        warn!("[TRI-BATCH] Unsupported sell RS size {}, skipping group (v14={}, oco={})", sell_rs.len(), SELL_RS_SIZE, kob_core::OCO_SELL_RS_SIZE);
                         skip_group = true;
                         break;
                     }
@@ -2512,8 +2513,8 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    if buy_rs.len() != 396 && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
-                        warn!("[TRI-BATCH] Unsupported buy RS size {}, skipping group (v14=396, v15={})", buy_rs.len(), kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN);
+                    if buy_rs.len() != BUY_RS_SIZE && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+                        warn!("[TRI-BATCH] Unsupported buy RS size {}, skipping group (v14={}, v15={})", buy_rs.len(), BUY_RS_SIZE, kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN);
                         skip_group = true;
                         break;
                     }

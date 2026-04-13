@@ -267,7 +267,7 @@ impl BatchPlan {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
 
-        // V15 detection: if any buy in the batch uses the v15 contract (438B RS),
+        // V15 detection: if any buy in the batch uses the v15 contract (479B RS),
         // all sells must use v15 sigscript format (fixed 2-byte koi push) so the
         // v15 buy can read sell's pnum/pden at fixed offsets via OpTxInputScriptSigSubstr.
         let has_v15_buy = self.buys.iter().any(|(b, _)| b.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN);

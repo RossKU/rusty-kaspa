@@ -56,7 +56,7 @@ pub enum ScanResult {
     Lending(ParsedLendingOrder, u32, u64),
     /// Prediction market covenant detected.
     Prediction(ParsedPredictionItem, u32, u64),
-    /// DCA order detected (dca_order_v2, 315B RS).
+    /// DCA order detected (dca_order_v2, 369B RS).
     Dca(ParsedDcaOrder, u32, u64),
 }
 
@@ -491,7 +491,7 @@ impl BlockScanner {
             }
         }
 
-        // 5. Try DCA (KOB:2: payload with 315B RS)
+        // 5. Try DCA (KOB:2: payload with 369B RS)
         if let Some(v2) = kob_core::contract::parse_order_payload(&tx.payload) {
             if v2.rs_data.len() == DCA_V2_RS_SIZE {
                 let rs_hash = kob_core::blake2b_256(&v2.rs_data);

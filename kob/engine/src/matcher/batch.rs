@@ -615,6 +615,103 @@ impl BatchPlan {
     }
 }
 
+// ── Shared helpers for plan_batch_match / plan_ioc_match / plan_sell_ioc_match ──
+
+/// Build a token_cov_id (hex) -> sell input index map from a list of token covenant IDs.
+///
+/// First occurrence of each token wins (the buy's tii just needs any matching sell).
+fn build_token_input_map(token_cov_ids: &[[u8; 32]]) -> HashMap<String, usize> {
+    let mut map: HashMap<String, usize> = HashMap::new();
+    for (i, id) in token_cov_ids.iter().enumerate() {
+        let token_hex = hex::encode(id);
+        map.entry(token_hex).or_insert(i);
+    }
+    map
+}
+
+/// Apply a basis-point cap to the matcher's KAS surplus.
+///
+/// Returns `(capped_matcher_kas, refund_amount)`.
+/// If `fee_bps` is `None`, returns the original `matcher_kas` with zero refund.
+fn apply_bps_cap(matcher_kas: u64, total_seller_kas: u64, fee_bps: Option<u16>) -> (u64, u64) {
+    if let Some(bps) = fee_bps {
+        let max_fee_128 = total_seller_kas as u128 * bps as u128 / 10000;
+        let max_fee = if max_fee_128 > u64::MAX as u128 { u64::MAX } else { max_fee_128 as u64 };
+        if matcher_kas > max_fee {
+            (max_fee, matcher_kas - max_fee)
+        } else {
+            (matcher_kas, 0u64)
+        }
+    } else {
+        (matcher_kas, 0u64)
+    }
+}
+
+/// Emit a MatcherFee output if `capped_kas` >= MIN_UTXO_VALUE, otherwise
+/// add dust to the first existing output.
+///
+/// Returns the value actually emitted as a separate MatcherFee output
+/// (0 when dust was folded into an existing output).
+fn emit_matcher_fee(
+    outputs: &mut Vec<PlannedOutput>,
+    capped_kas: u64,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+) -> u64 {
+    if capped_kas >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: capped_kas,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::MatcherFee,
+        });
+        capped_kas
+    } else {
+        if capped_kas > 0 && !outputs.is_empty() {
+            outputs[0].value += capped_kas;
+        }
+        0
+    }
+}
+
+/// Distribute a BPS-cap refund to buyers pro-rata by KAS input value.
+///
+/// * `buyer_token_output_offset` — index into `outputs` where buyer j's token
+///   output lives (= `buyer_token_output_offset + j`).  Dust shares are added
+///   to that token output instead of creating a new BuyerChange output.
+fn distribute_buyer_refund(
+    outputs: &mut Vec<PlannedOutput>,
+    refund: u64,
+    buys: &[&BatchOrder],
+    total_buy_kas: u64,
+    buyer_token_output_offset: usize,
+) {
+    let mut refunded = 0u64;
+    for (j, buy) in buys.iter().enumerate() {
+        let share = if j == buys.len() - 1 {
+            // Last buyer gets remainder to avoid rounding loss
+            refund - refunded
+        } else {
+            // u128 intermediate to avoid precision loss above 2^53 sompi (~9,007 KAS)
+            ((refund as u128 * buy.utxo_value as u128 / total_buy_kas as u128) as u64)
+                .min(refund - refunded)
+        };
+        if share >= MIN_UTXO_VALUE {
+            outputs.push(PlannedOutput {
+                value: share,
+                script_public_key: buy.counterparty_spk.clone(),
+                spk_version: buy.counterparty_spk_version,
+                purpose: OutputPurpose::BuyerChange,
+            });
+            refunded += share;
+        } else if share > 0 {
+            // Dust: add to this buyer's token output
+            outputs[buyer_token_output_offset + j].value += share;
+            refunded += share;
+        }
+    }
+}
+
 // Plan Builder
 
 /// Build a batch plan from a set of matchable orders.
@@ -692,12 +789,9 @@ pub fn plan_batch_match(
     // Build token_input_map: token_cov_id (hex) -> sell input index.
     // Sell inputs carry covenant_id, providing covenant lineage for buyer
     // token outputs.  Each buy's tii points to a sell with matching token.
-    let mut token_input_map: HashMap<String, usize> = HashMap::new();
-    for (i, sell) in sells.iter().enumerate() {
-        let token_hex = hex::encode(sell.token_cov_id);
-        // First sell for each token wins (buy's tii just needs any matching sell)
-        token_input_map.entry(token_hex).or_insert(i);
-    }
+    let token_input_map = build_token_input_map(
+        &sells.iter().map(|s| s.token_cov_id).collect::<Vec<_>>(),
+    );
 
     // Verify every buy's token has a matching sell
     for buy in buys {
@@ -860,62 +954,15 @@ pub fn plan_batch_match(
 
     // Apply bps cap: matcher fee <= (total_trade_value * fee_bps) / 10000
     // total_trade_value = sum of KAS flowing to sellers (the traded volume)
-    let (capped_matcher_kas, buyer_refund) = if let Some(bps) = fee_bps {
-        let max_fee_128 = total_seller_kas as u128 * bps as u128 / 10000;
-        let max_fee = if max_fee_128 > u64::MAX as u128 { u64::MAX } else { max_fee_128 as u64 };
-        if matcher_kas > max_fee {
-            (max_fee, matcher_kas - max_fee)
-        } else {
-            (matcher_kas, 0u64)
-        }
-    } else {
-        (matcher_kas, 0u64)
-    };
+    let (capped_matcher_kas, buyer_refund) = apply_bps_cap(matcher_kas, total_seller_kas, fee_bps);
 
     // Refund excess surplus to buyers pro-rata by KAS input
     if buyer_refund > 0 {
-        let mut refunded = 0u64;
-        for (j, buy) in buys.iter().enumerate() {
-            let share = if j == buys.len() - 1 {
-                // Last buyer gets remainder to avoid rounding loss
-                buyer_refund - refunded
-            } else {
-                // u128 intermediate to avoid precision loss above 2^53 sompi (~9,007 KAS)
-                ((buyer_refund as u128 * buy.utxo_value as u128 / total_buy_kas as u128) as u64)
-                    .min(buyer_refund - refunded)
-            };
-            if share >= MIN_UTXO_VALUE {
-                outputs.push(PlannedOutput {
-                    value: share,
-                    script_public_key: buy.counterparty_spk.clone(),
-                    spk_version: buy.counterparty_spk_version,
-                    purpose: OutputPurpose::BuyerChange,
-                });
-                refunded += share;
-            } else if share > 0 {
-                // Dust: add to this buyer's token output (at index n + j)
-                outputs[n + j].value += share;
-                refunded += share;
-            }
-        }
+        let buy_refs: Vec<&BatchOrder> = buys.iter().collect();
+        distribute_buyer_refund(&mut outputs, buyer_refund, &buy_refs, total_buy_kas, n);
     }
 
-    let matcher_surplus;
-    if capped_matcher_kas >= MIN_UTXO_VALUE {
-        matcher_surplus = capped_matcher_kas;
-        outputs.push(PlannedOutput {
-            value: capped_matcher_kas,
-            script_public_key: matcher_spk.to_vec(),
-            spk_version: matcher_spk_version,
-            purpose: OutputPurpose::MatcherFee,
-        });
-    } else {
-        // Add dust surplus to first seller's KAS output
-        matcher_surplus = 0;
-        if capped_matcher_kas > 0 && !outputs.is_empty() {
-            outputs[0].value += capped_matcher_kas;
-        }
-    }
+    let matcher_surplus = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
 
     // Build buy-to-sell mapping for soi (round-robin across matching sells)
     let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();
@@ -1048,11 +1095,9 @@ pub fn plan_ioc_match(
     let n = filled_sells.len();
 
     // Build token_input_map: sell provides covenant lineage
-    let mut token_input_map: HashMap<String, usize> = HashMap::new();
-    for (i, sell) in filled_sells.iter().enumerate() {
-        let token_hex = hex::encode(sell.token_cov_id);
-        token_input_map.entry(token_hex).or_insert(i);
-    }
+    let token_input_map = build_token_input_map(
+        &filled_sells.iter().map(|s| s.token_cov_id).collect::<Vec<_>>(),
+    );
 
     // Input layout: [sell_0..sell_{n-1}] [buy] [wallet?]
     let plan_sells: Vec<(BatchOrder, usize)> = filled_sells.iter()
@@ -1134,17 +1179,7 @@ pub fn plan_ioc_match(
         .saturating_sub(kas_remaining);
 
     // Apply bps cap
-    let (capped_matcher_kas, buyer_refund_from_bps) = if let Some(bps) = fee_bps {
-        let max_fee_128 = total_seller_kas as u128 * bps as u128 / 10000;
-        let max_fee = if max_fee_128 > u64::MAX as u128 { u64::MAX } else { max_fee_128 as u64 };
-        if matcher_kas > max_fee {
-            (max_fee, matcher_kas - max_fee)
-        } else {
-            (matcher_kas, 0u64)
-        }
-    } else {
-        (matcher_kas, 0u64)
-    };
+    let (capped_matcher_kas, buyer_refund_from_bps) = apply_bps_cap(matcher_kas, total_seller_kas, fee_bps);
 
     // Buyer change = unspent KAS from sweep + any bps refund
     let total_buyer_change = kas_remaining + buyer_refund_from_bps;
@@ -1165,21 +1200,7 @@ pub fn plan_ioc_match(
     }
 
     // Matcher fee output
-    let matcher_surplus;
-    if capped_matcher_kas >= MIN_UTXO_VALUE {
-        matcher_surplus = capped_matcher_kas;
-        outputs.push(PlannedOutput {
-            value: capped_matcher_kas,
-            script_public_key: matcher_spk.to_vec(),
-            spk_version: matcher_spk_version,
-            purpose: OutputPurpose::MatcherFee,
-        });
-    } else {
-        matcher_surplus = 0;
-        if capped_matcher_kas > 0 && !outputs.is_empty() {
-            outputs[0].value += capped_matcher_kas;
-        }
-    }
+    let matcher_surplus = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
 
     // Buy-to-sell mapping (buy maps to first sell with matching token)
     let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();
@@ -1271,9 +1292,7 @@ pub fn plan_sell_ioc_match(
     let m = filled_buys.len();
 
     // Token input map: sell provides covenant lineage
-    let mut token_input_map: HashMap<String, usize> = HashMap::new();
-    let token_hex = hex::encode(sell.token_cov_id);
-    token_input_map.insert(token_hex, 0); // sell is always input 0
+    let token_input_map = build_token_input_map(&[sell.token_cov_id]);
 
     // Input layout: [sell] [buy_0..buy_{m-1}] [wallet?]
     let plan_sells: Vec<(BatchOrder, usize)> = vec![(sell.clone(), 0)];
@@ -1344,58 +1363,18 @@ pub fn plan_sell_ioc_match(
     let matcher_kas = raw_surplus;
 
     // Apply bps cap
-    let (capped_matcher_kas, buyer_refund_from_bps) = if let Some(bps) = fee_bps {
-        let max_fee_128 = total_seller_kas as u128 * bps as u128 / 10000;
-        let max_fee = if max_fee_128 > u64::MAX as u128 { u64::MAX } else { max_fee_128 as u64 };
-        if matcher_kas > max_fee {
-            (max_fee, matcher_kas - max_fee)
-        } else {
-            (matcher_kas, 0u64)
-        }
-    } else {
-        (matcher_kas, 0u64)
-    };
+    let (capped_matcher_kas, buyer_refund_from_bps) = apply_bps_cap(matcher_kas, total_seller_kas, fee_bps);
 
     // Refund BPS cap excess to buyers pro-rata by KAS input
     if buyer_refund_from_bps > 0 {
-        let mut refunded = 0u64;
-        for (j, buy) in filled_buys.iter().enumerate() {
-            let share = if j == filled_buys.len() - 1 {
-                buyer_refund_from_bps - refunded
-            } else {
-                ((buyer_refund_from_bps as u128 * buy.utxo_value as u128
-                    / total_buy_value as u128) as u64)
-                    .min(buyer_refund_from_bps - refunded)
-            };
-            if share >= MIN_UTXO_VALUE {
-                outputs.push(PlannedOutput {
-                    value: share,
-                    script_public_key: buy.counterparty_spk.clone(),
-                    spk_version: buy.counterparty_spk_version,
-                    purpose: OutputPurpose::BuyerChange,
-                });
-                refunded += share;
-            } else if share > 0 {
-                // Dust: add to this buyer's token output (at index 1 + j)
-                outputs[1 + j].value += share;
-                refunded += share;
-            }
-        }
+        distribute_buyer_refund(&mut outputs, buyer_refund_from_bps, &filled_buys, total_buy_value, 1);
     }
 
+    // sell_ioc: matcher_surplus = full capped amount (even dust)
     let matcher_surplus = capped_matcher_kas;
 
-    // Matcher fee output
-    if capped_matcher_kas >= MIN_UTXO_VALUE {
-        outputs.push(PlannedOutput {
-            value: capped_matcher_kas,
-            script_public_key: matcher_spk.to_vec(),
-            spk_version: matcher_spk_version,
-            purpose: OutputPurpose::MatcherFee,
-        });
-    } else if capped_matcher_kas > 0 && !outputs.is_empty() {
-        outputs[0].value += capped_matcher_kas;
-    }
+    // Matcher fee output (emit_matcher_fee handles dust folding into outputs[0])
+    emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
 
     // Buy-to-sell mapping (all buys map to the single sell at index 0)
     let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();

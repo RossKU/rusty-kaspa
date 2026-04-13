@@ -11,8 +11,6 @@ pub mod matcher;
 pub mod mm;
 pub mod rpc;
 pub mod utils;
-#[allow(dead_code)] // ZK skeleton — wired into executor when ZK tokens (USDC) go live
-pub mod zk;
 
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};

@@ -1131,7 +1131,7 @@ pub fn find_optimal_groups(
     // OCO partner.  OCO orders (TP + SL) share a single UTXO; if one
     // path is selected for a group the other must be excluded from all
     // subsequent groups to prevent a double-spend within the same cycle.
-    let mut use_order = |used: &mut HashSet<String>, order: &BookOrder| {
+    let use_order = |used: &mut HashSet<String>, order: &BookOrder| {
         let key = order.outpoint_key();
         used.insert(key);
         if let Some(ref partner) = order.oco_partner_key {

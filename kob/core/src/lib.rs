@@ -3,7 +3,6 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod contract;
-pub mod lab;
 pub mod error;
 pub mod mass;
 pub mod p2sh;
@@ -20,7 +19,6 @@ pub use contract::insurance;
 pub use contract::auction;
 pub mod bech32;
 pub mod compat;
-pub mod listing;
 pub mod rpc_types;
 
 pub use error::KobError;

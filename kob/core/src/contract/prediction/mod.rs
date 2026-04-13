@@ -7,7 +7,6 @@ pub mod ballot_box;
 pub mod parse;
 pub mod redemption;
 pub mod split_merge;
-pub mod market_mint;
 pub mod market;
 pub mod vote_receipt;
 
@@ -15,7 +14,6 @@ pub use ballot_box::*;
 pub use parse::*;
 pub use redemption::*;
 pub use split_merge::*;
-pub use market_mint::*;
 pub use market::*;
 pub use vote_receipt::*;
 

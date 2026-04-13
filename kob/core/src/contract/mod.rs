@@ -12,8 +12,6 @@ pub mod auction;
 pub mod options;
 
 pub mod token;
-pub mod payment_channel;
-pub mod vesting;
 pub mod payload;
 
 #[cfg(test)]
@@ -31,6 +29,4 @@ pub use insurance::*;
 pub use auction::*;
 pub use options::*;
 pub use token::*;
-pub use payment_channel::*;
-pub use vesting::*;
 pub use payload::*;

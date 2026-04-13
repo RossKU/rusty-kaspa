@@ -1,5 +1,5 @@
 //! Spot order covenants: buy/sell orders, receipts, OCO, brackets, DCA,
-//! token pairs, and order routing.
+//! and token pairs.
 
 pub mod order;
 pub mod parse;
@@ -8,7 +8,6 @@ pub mod oco;
 pub mod bracket;
 pub mod dca;
 pub mod token_pair;
-pub mod order_router;
 
 pub use order::*;
 pub use parse::*;
@@ -17,4 +16,3 @@ pub use oco::*;
 pub use bracket::*;
 pub use dca::*;
 pub use token_pair::*;
-pub use order_router::*;

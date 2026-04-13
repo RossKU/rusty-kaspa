@@ -51,9 +51,9 @@ const SELL_RS_SIZE: u64 = 356;
 /// bracket_order v5 redeemScript: 271B state + 159B body = 430B.
 #[allow(dead_code)] // Kept for fee estimation reference
 const BRACKET_RS_SIZE: u64 = 430;
-/// oco_pair v4 redeemScript: 181B state + 147B body = 328B.
+/// oco_sell redeemScript: 139B state + 194B body = 333B.
 #[allow(dead_code)] // Kept for fee estimation reference
-const OCO_RS_SIZE: u64 = 328;
+const OCO_RS_SIZE: u64 = 333;
 /// call_option v3 redeemScript: 126B state + 33B body = 159B.
 const CALL_OPTION_RS_SIZE: u64 = 159;
 /// put_option v4 redeemScript: 159B state + 46B body = 205B.
@@ -153,7 +153,7 @@ pub enum EstimateCommand {
         #[arg(long)]
         amount: u64,
     },
-    /// Estimate fee for deploying an OCO pair (oco_pair_v4, 328B RS).
+    /// Estimate fee for deploying an OCO sell (oco_sell, 333B RS).
     Oco {
         /// Amount to lock in the OCO order (in sompi).
         #[arg(long)]
@@ -638,7 +638,7 @@ fn estimate_bracket(amount: u64) -> FeeEstimate {
 }
 
 fn estimate_oco(amount: u64) -> FeeEstimate {
-    let label = "deploy-oco (v4)".to_string();
+    let label = "deploy-oco (oco_sell)".to_string();
     let wallet_value = amount + 10_000;
     let inputs = vec![InputEstimate {
         label: "wallet P2PK".to_string(),
@@ -648,7 +648,7 @@ fn estimate_oco(amount: u64) -> FeeEstimate {
     }];
     let outputs = vec![
         OutputEstimate {
-            label: "oco_pair P2SH".to_string(),
+            label: "oco_sell P2SH".to_string(),
             spk_size: P2SH_SPK_SIZE,
             value: amount,
         },
@@ -1248,12 +1248,10 @@ mod tests {
 
     #[test]
     fn oco_rs_size_constant() {
-        use kob_core::contract::build_oco_pair_redeem_script;
-        let nonce = [0u8; 32];
-        let tcid = [0u8; 32];
+        use kob_core::contract::build_oco_sell_redeem_script;
         let ohash = [0u8; 32];
-        let ospk = [0u8; 36];
-        let rs = build_oco_pair_redeem_script(&nonce, 0, &tcid, 1, 2, 1, 1000, &ohash, &ospk).unwrap();
+        let spkh = [0u8; 32];
+        let rs = build_oco_sell_redeem_script(2, 1, 1000, 1, 1, 1000, &ohash, &spkh, 10_000, 0, 0).unwrap();
         assert_eq!(OCO_RS_SIZE, rs.len() as u64,
             "OCO_RS_SIZE ({}) != actual ({})", OCO_RS_SIZE, rs.len());
     }

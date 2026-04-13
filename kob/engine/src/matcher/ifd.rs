@@ -410,65 +410,41 @@ pub fn compute_order_b_scripts(
     Ok((rs, p2sh_hex, spk_hash_hex))
 }
 
-/// Build order B's OCO redeem scripts for IFO.
+/// Build order B's OCO sell redeem script for IFO.
 ///
-/// Returns (tp_rs, sl_rs, tp_p2sh_hex, sl_p2sh_hex).
+/// Creates a single oco_sell UTXO with TP and SL paths.
+/// Spending one path naturally cancels the other (UTXO model).
+///
+/// Returns (rs, p2sh_hex) -- single RS and its P2SH script hex.
 pub fn compute_oco_b_scripts(
-    token: &str,
+    _token: &str,
     oco: &IfoOcoParams,
     owner_hash: &[u8; 32],
     owner_spk: &[u8; 36],
-    amount: u64,
-) -> Result<(Vec<u8>, Vec<u8>, String, String), String> {
-    let token_bytes = parse_hex_32(token)?;
+    _amount: u64,
+) -> Result<(Vec<u8>, String), String> {
+    // Derive seller SPK hash from owner_spk (P2PK SPK: version 2B + script 34B)
+    let seller_spk_hash = kob_core::p2sh::blake2b_256(owner_spk);
 
-    // Generate shared nonce for the OCO pair
-    let nonce = generate_nonce();
-
-    let tp_role: u64 = match oco.tp_side {
-        IfdSide::Buy => 0,
-        IfdSide::Sell => 1,
-    };
-    let sl_role: u64 = match oco.sl_side {
-        IfdSide::Buy => 0,
-        IfdSide::Sell => 1,
-    };
-
-    let tp_token_amount = if tp_role == 1 { amount } else { 0 };
-    let sl_token_amount = if sl_role == 1 { amount } else { 0 };
-
-    let tp_rs = kob_core::contract::build_oco_pair_redeem_script(
-        &nonce,
-        tp_role,
-        &token_bytes,
-        tp_token_amount,
+    let rs = kob_core::contract::build_oco_sell_redeem_script(
         oco.tp_price_num,
         oco.tp_price_den,
         oco.tp_min_fill,
-        owner_hash,
-        owner_spk,
-    ).map_err(|e| e.to_string())?;
-
-    let sl_rs = kob_core::contract::build_oco_pair_redeem_script(
-        &nonce,
-        sl_role,
-        &token_bytes,
-        sl_token_amount,
         oco.sl_price_num,
         oco.sl_price_den,
         oco.sl_min_fill,
         owner_hash,
-        owner_spk,
+        &seller_spk_hash,
+        crate::DEFAULT_MAX_MATCHER_FEE,
+        0, // cancel_pending
+        0, // expiry_daa (GTC)
     ).map_err(|e| e.to_string())?;
 
-    let tp_p2sh = kob_core::p2sh::build_p2sh(&tp_rs);
-    let sl_p2sh = kob_core::p2sh::build_p2sh(&sl_rs);
+    let p2sh = kob_core::p2sh::build_p2sh(&rs);
 
     Ok((
-        tp_rs,
-        sl_rs,
-        hex::encode(&tp_p2sh.script()),
-        hex::encode(&sl_p2sh.script()),
+        rs,
+        hex::encode(&p2sh.script()),
     ))
 }
 
@@ -480,24 +456,6 @@ fn parse_hex_32(hex_str: &str) -> Result<[u8; 32], String> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(arr)
-}
-
-fn generate_nonce() -> [u8; 32] {
-    let mut nonce = [0u8; 32];
-    // Use timestamp + counter as entropy source (no external rand dep)
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
-    let seed = now.as_nanos();
-    // Fill with blake2b of timestamp for unpredictability
-    let seed_bytes = seed.to_le_bytes();
-    nonce[..16].copy_from_slice(&seed_bytes);
-    // Add process-level entropy
-    let pid = std::process::id();
-    nonce[16..20].copy_from_slice(&pid.to_le_bytes());
-    // Hash to distribute entropy
-    nonce = kob_core::p2sh::blake2b_256(&nonce);
-    nonce
 }
 
 // Persistence
@@ -935,7 +893,7 @@ mod tests {
 
 
     #[test]
-    fn compute_oco_b_scripts_produces_valid_pair() {
+    fn compute_oco_b_scripts_produces_valid_oco_sell() {
         let owner_hash = [0xbb; 32];
         let mut owner_spk = [0u8; 36];
         // version=0 (2B LE) + script (34B: 0x20 + pk(32) + 0xac)
@@ -963,14 +921,10 @@ mod tests {
         );
         assert!(result.is_ok());
 
-        let (tp_rs, sl_rs, tp_p2sh, sl_p2sh) = result.unwrap();
-        // OCO v4 RS = 328 bytes each
-        assert_eq!(tp_rs.len(), 328);
-        assert_eq!(sl_rs.len(), 328);
-        assert_eq!(tp_p2sh.len(), 70);
-        assert_eq!(sl_p2sh.len(), 70);
-        // TP and SL should have different P2SH (different prices)
-        assert_ne!(tp_p2sh, sl_p2sh);
+        let (rs, p2sh) = result.unwrap();
+        // oco_sell RS = 139B state + 194B body = 333 bytes
+        assert_eq!(rs.len(), kob_core::OCO_SELL_RS_SIZE);
+        assert_eq!(p2sh.len(), 70); // P2SH script hex = 35 bytes * 2
     }
 
 

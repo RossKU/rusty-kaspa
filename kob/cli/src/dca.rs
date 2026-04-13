@@ -24,7 +24,7 @@ use crate::signing;
 use clap::Subcommand;
 use kob_core::contract;
 use kob_core::contract::build_order_payload;
-use kob_core::p2sh::{blake2b_256, build_p2sh};
+use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
@@ -174,15 +174,16 @@ pub async fn run(
 
 // State parsing helpers
 
-/// DCA V2 RS state layout (120B, with push-prefix bytes):
+/// DCA V2 RS state layout (153B, with push-prefix bytes):
 ///
 ///   [0x20](1) [owner_hash](32) [0x20](1) [target_cov_id](32)
+///   [0x20](1) [buyer_spk_hash](32)
 ///   [0x08](1) [price_num](8)   [0x08](1) [price_den](8)
 ///   [0x08](1) [amount_per_period](8)
 ///   [0x08](1) [interval_daa](8)
 ///   [0x08](1) [next_execution_daa](8)
 ///   [0x08](1) [periods_remaining](8)
-const DCA_V2_STATE_LEN: usize = 120;
+const DCA_V2_STATE_LEN: usize = 153;
 
 fn parse_u64_le(rs: &[u8], offset: usize) -> u64 {
     let mut buf = [0u8; 8];
@@ -202,28 +203,34 @@ fn parse_target_cov_id(rs: &[u8]) -> [u8; 32] {
     h
 }
 
+fn parse_buyer_spk_hash(rs: &[u8]) -> [u8; 32] {
+    let mut h = [0u8; 32];
+    h.copy_from_slice(&rs[67..99]);
+    h
+}
+
 fn parse_price_num(rs: &[u8]) -> u64 {
-    parse_u64_le(rs, 67)
+    parse_u64_le(rs, 100)
 }
 
 fn parse_price_den(rs: &[u8]) -> u64 {
-    parse_u64_le(rs, 76)
+    parse_u64_le(rs, 109)
 }
 
 fn parse_amount_per_period(rs: &[u8]) -> u64 {
-    parse_u64_le(rs, 85)
+    parse_u64_le(rs, 118)
 }
 
 fn parse_interval_daa(rs: &[u8]) -> u64 {
-    parse_u64_le(rs, 94)
+    parse_u64_le(rs, 127)
 }
 
 fn parse_next_execution_daa(rs: &[u8]) -> u64 {
-    parse_u64_le(rs, 103)
+    parse_u64_le(rs, 136)
 }
 
 fn parse_periods_remaining(rs: &[u8]) -> u64 {
-    parse_u64_le(rs, 112)
+    parse_u64_le(rs, 145)
 }
 
 // UTXO query helper
@@ -330,10 +337,14 @@ async fn deploy(
         }
     };
 
+    // buyer_spk_hash: where purchased tokens are sent (adversarial matcher protection)
+    let buyer_spk_hash = compute_p2pk_spk_hash(&pubkey);
+
     // Build RS
     let redeem_script = contract::build_dca_order_redeem_script(
         &owner_hash,
         &target_cov_id,
+        &buyer_spk_hash,
         price_num,
         price_den,
         amount_per_period,
@@ -537,6 +548,7 @@ async fn fill(
     // Parse state from current RS
     let owner_hash = parse_owner_hash(&old_rs);
     let target_cov_id = parse_target_cov_id(&old_rs);
+    let buyer_spk_hash = parse_buyer_spk_hash(&old_rs);
     let price_num = parse_price_num(&old_rs);
     let price_den = parse_price_den(&old_rs);
     let amount_per_period = parse_amount_per_period(&old_rs);
@@ -595,6 +607,7 @@ async fn fill(
         contract::build_dca_order_redeem_script(
             &owner_hash,
             &target_cov_id,
+            &buyer_spk_hash,
             price_num,
             price_den,
             amount_per_period,

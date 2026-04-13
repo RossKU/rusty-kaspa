@@ -1440,8 +1440,8 @@ async fn handle_submit_ifo(
         sl_min_fill: req.sl_min_fill,
     };
 
-    // Compute OCO B scripts (take-profit + stop-loss)
-    let (tp_rs, _sl_rs, tp_p2sh_hex, sl_p2sh_hex) = match crate::matcher::ifd::compute_oco_b_scripts(
+    // Compute OCO B script (single oco_sell with TP + SL paths)
+    let (oco_rs, oco_p2sh_hex) = match crate::matcher::ifd::compute_oco_b_scripts(
         &req.token,
         &oco_params,
         &owner_hash,
@@ -1452,11 +1452,10 @@ async fn handle_submit_ifo(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
     };
 
-    // For IFO, the "order B" that gets deployed is the take-profit leg.
-    // The stop-loss leg is the OCO partner, deployed alongside.
-    let tp_p2sh_spk = kob_core::p2sh::build_p2sh(&tp_rs);
-    let tp_spk_hash = kob_core::p2sh::compute_spk_hash(tp_p2sh_spk.version, &tp_p2sh_spk.script());
-    let tp_spk_hash_hex = hex::encode(tp_spk_hash);
+    // Single oco_sell UTXO: both TP and SL share the same P2SH.
+    let oco_p2sh_spk = kob_core::p2sh::build_p2sh(&oco_rs);
+    let oco_spk_hash = kob_core::p2sh::compute_spk_hash(oco_p2sh_spk.version, &oco_p2sh_spk.script());
+    let oco_spk_hash_hex = hex::encode(oco_spk_hash);
 
     // Compute order A's P2SH
     let a_token_bytes = match parse_hex_32_api(&req.order_a.token) {
@@ -1464,9 +1463,9 @@ async fn handle_submit_ifo(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
     };
 
-    // For buy A -> OCO B: A's bspkh = TP leg's SPK hash (tokens flow to TP)
+    // For buy A -> OCO B: A's bspkh = oco_sell's SPK hash (tokens flow to oco_sell)
     let a_bspkh = if req.order_a.side == crate::matcher::ifd::IfdSide::Buy {
-        tp_spk_hash
+        oco_spk_hash
     } else {
         owner_spk_hash
     };
@@ -1531,9 +1530,9 @@ async fn handle_submit_ifo(
             expiry_daa: req.expiry_daa,
             oco: oco_params,
         },
-        order_b_rs_hex: hex::encode(&tp_rs),
-        order_b_p2sh: tp_p2sh_hex.clone(),
-        order_b_spk_hash: tp_spk_hash_hex.clone(),
+        order_b_rs_hex: hex::encode(&oco_rs),
+        order_b_p2sh: oco_p2sh_hex.clone(),
+        order_b_spk_hash: oco_spk_hash_hex.clone(),
         status: crate::matcher::ifd::IfdStatus::Pending,
         trigger_tx_id: None,
         created_at: now_unix,
@@ -1550,9 +1549,8 @@ async fn handle_submit_ifo(
                 "ifo_id": id,
                 "order_a_p2sh": a_p2sh_hex,
                 "order_a_bspkh": hex::encode(a_bspkh),
-                "tp_p2sh": tp_p2sh_hex,
-                "sl_p2sh": sl_p2sh_hex,
-                "tp_spk_hash": tp_spk_hash_hex,
+                "oco_sell_p2sh": oco_p2sh_hex,
+                "oco_sell_spk_hash": oco_spk_hash_hex,
                 "status": "pending",
                 "cancel_secret": cancel_secret,
             })),

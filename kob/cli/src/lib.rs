@@ -20,7 +20,6 @@ pub mod matching;
 pub mod mm;
 pub mod my_orders;
 pub mod node;
-pub mod oco;
 pub mod order_cache;
 pub mod options;
 pub mod orderbook;
@@ -441,12 +440,6 @@ pub enum Commands {
         /// Requires v8 contracts. Scans all pairs for arbitrage routes.
         #[arg(long)]
         cross_pair: bool,
-    },
-
-    /// One-Cancels-Other order pair (oco_pair_v3): deploy, fill, cancel.
-    Oco {
-        #[command(subcommand)]
-        action: oco::OcoCommand,
     },
 
     /// Bracket order (bracket_order_v5): deploy, fill, cancel.
@@ -2546,9 +2539,6 @@ pub async fn dispatch(
                 cross_pair,
             )
             .await?;
-        }
-        Commands::Oco { action } => {
-            oco::run(wallet_path, node, network, &action).await?;
         }
         Commands::Bracket { action } => match action {
             bracket::BracketCommand::Deploy {

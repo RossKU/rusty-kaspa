@@ -10,15 +10,20 @@
 //!
 //! bracket_order_v5 RS = 271B state + 159B body = 430B
 //!
-//! Fill TX layout (3 inputs, 4+ outputs):
+//! Fill TX layout (3 inputs, 3+ outputs):
 //!   input[0]: bracket_order_v5 (sigscript: [Op1][pushData(RS 430B)] = 434B < 480)
 //!   input[1]: P2PK funding/payment UTXO
 //!   input[2]: trade_receipt UTXO (must have correct covenant_id AND value >= min)
 //!   output[0]: seller KAS (for sell entry) or buyer KAS (for buy entry)
 //!   output[1]: buyer tokens (for buy entry) or seller tokens (for sell entry)
-//!   output[2]: TP oco_pair P2SH (SPK must match tp_spk, value >= tp_min_value)
-//!   output[3]: SL oco_pair P2SH (SPK must match sl_spk, value >= sl_min_value)
-//!   output[4+]: change (optional)
+//!   output[2]: oco_sell P2SH (single UTXO with TP + SL paths)
+//!   output[3+]: change (optional)
+//!
+//! TODO: bracket_order bytecode currently hardcodes output[2]=TP and output[3]=SL
+//! as two separate oco_pair P2SH outputs. The bytecode needs updating to verify
+//! a single oco_sell output at output[2] instead. Until the bytecode is updated,
+//! the legacy deploy path below prepares the oco_sell RS but the on-chain bracket
+//! contract will not accept it.
 //!
 //! Cancel TX layout (2 inputs, 1 output):
 //!   input[0]: bracket_order_v5 (sigscript: [Op0][sig+type 65B][pk 32B][pushData(RS)] = 533B >= 480)
@@ -64,7 +69,7 @@ pub enum BracketCommand {
         entry_den: u64,
 
         /// Take-profit P2SH SPK (hex, 74 chars = 37 bytes: version u16LE + P2SH script). The full
-        /// scriptPublicKey bytes of the TP oco_pair contract.
+        /// scriptPublicKey bytes of the TP exit oco_sell contract.
         #[arg(long)]
         tp_spk: String,
 
@@ -73,7 +78,7 @@ pub enum BracketCommand {
         tp_min_value: u64,
 
         /// Stop-loss P2SH SPK (hex, 74 chars = 37 bytes: version u16LE + P2SH script). The full
-        /// scriptPublicKey bytes of the SL oco_pair contract.
+        /// scriptPublicKey bytes of the SL exit oco_sell contract.
         #[arg(long)]
         sl_spk: String,
 
@@ -681,10 +686,12 @@ pub async fn fill_bracket_v4(
     // Output 1: buyer tokens
     tx.outputs.push(TxOutput::new(buyer_tokens, wallet_spk_version, wallet_spk.clone(), None));
 
-    // Output 2: TP oco_pair P2SH (SPK extracted from RS)
+    // Output 2: TP oco_sell P2SH (SPK extracted from RS)
     tx.outputs.push(TxOutput::new(tp_value, tp_spk_version, tp_spk_script.to_vec(), None));
 
-    // Output 3: SL oco_pair P2SH (SPK extracted from RS)
+    // Output 3: SL oco_sell P2SH (SPK extracted from RS)
+    // TODO: Once bracket bytecode is updated for single oco_sell UTXO,
+    // output[2] becomes the single oco_sell P2SH and output[3] is removed.
     tx.outputs.push(TxOutput::new(sl_value, sl_spk_version, sl_spk_script.to_vec(), None));
 
     // Output 4: tentative change for mass calculation
@@ -997,11 +1004,16 @@ pub async fn cancel_bracket_v4(
 // Legacy bracket deploy (top-level `kob-cli bracket` command) -- retained
 // for backward compat but now calls deploy_bracket_v4_simple.
 
-/// Legacy bracket deploy (simple: builds TP/SL oco_pair RS internally).
+/// Legacy bracket deploy (simple: builds TP/SL oco_sell RS internally).
 ///
 /// This is the backward-compatible entry point for the top-level `bracket`
-/// command. It constructs the TP/SL oco_pair redeemScripts from the provided
-/// prices, then deploys a bracket_order_v5.
+/// command. It constructs the oco_sell redeemScript from the provided
+/// TP/SL prices, then deploys a bracket_order_v5.
+///
+/// TODO: bracket_order bytecode currently hardcodes 2 separate OCO outputs
+/// (output[2]=TP, output[3]=SL). It needs updating to verify a single
+/// oco_sell output at output[2]. Until then, the bracket contract will
+/// not accept a single oco_sell output.
 ///
 /// Because the receipt_cov_id depends on the receipt's genesis TX (which
 /// doesn't exist yet at bracket deploy time), this command requires the
@@ -1051,62 +1063,34 @@ pub async fn run(
     let privkey = *wallet.privkey_bytes();
 
     let owner_hash = blake2b_256(&pubkey);
-    // Build TP / SL oco_pair redeemScripts to get their P2SH SPKs.
-    // Using oco_pair_v4 which adds CBP value floor + input count = 2 checks.
-    // v4 has the same state layout as v3 (181B), no circular dependency.
-    let nonce: [u8; 32] = {
-        // Deterministic nonce from pair_id + entry_price to avoid randomness
-        // In production, use a true random nonce
-        let mut h = kob_core::p2sh::Blake2bSimple::new_keyed(b"BracketNonce");
-        h.update(&pair_id);
-        h.update(&entry_price_num.to_le_bytes());
-        h.update(&entry_price_den.to_le_bytes());
-        h.update(&pubkey);
-        h.finalize()
-    };
 
-    // Owner SPK (36 bytes: version u16LE + script 34B for P2PK)
-    let mut owner_spk = [0u8; 36];
-    owner_spk[0..2].copy_from_slice(&0u16.to_le_bytes()); // version 0
-    owner_spk[2] = 0x20; // push 32 bytes
-    owner_spk[3..35].copy_from_slice(&pubkey);
-    owner_spk[35] = 0xac; // OpCheckSig
+    // Build oco_sell redeemScript with TP/SL prices.
+    // Single UTXO: spending one path naturally cancels the other.
+    let seller_spk_hash = kob_core::p2sh::compute_p2pk_spk_hash(&pubkey);
 
-    let tp_rs = contract::build_oco_pair_redeem_script(
-        &nonce,
-        1, // role = sell (TP exit is a sell)
-        &pair_id,
-        0, // token_amount (not used for sell role in bracket context)
+    let oco_sell_rs = contract::build_oco_sell_redeem_script(
         tp_price_num,
         tp_price_den,
-        MIN_UTXO_VALUE,
-        &owner_hash,
-        &owner_spk,
-    )?;
-
-    let sl_rs = contract::build_oco_pair_redeem_script(
-        &nonce,
-        1, // role = sell (SL exit is also a sell)
-        &pair_id,
-        0,
+        MIN_UTXO_VALUE,     // min_fill_tp
         sl_price_num,
         sl_price_den,
-        MIN_UTXO_VALUE,
+        MIN_UTXO_VALUE,     // min_fill_sl
         &owner_hash,
-        &owner_spk,
+        &seller_spk_hash,
+        kob_core::DEFAULT_MATCHER_FEE,
+        0, // cancel_pending
+        0, // expiry_daa (GTC)
     )?;
 
-    let tp_p2sh = build_p2sh(&tp_rs);
-    let sl_p2sh = build_p2sh(&sl_rs);
+    let oco_sell_p2sh = build_p2sh(&oco_sell_rs);
 
-    // Build 37-byte SPK bytes (version u16LE + P2SH script 35B)
-    let mut tp_spk = [0u8; 37];
-    tp_spk[0..2].copy_from_slice(&tp_p2sh.version.to_le_bytes());
-    tp_spk[2..37].copy_from_slice(&tp_p2sh.script());
-
-    let mut sl_spk = [0u8; 37];
-    sl_spk[0..2].copy_from_slice(&sl_p2sh.version.to_le_bytes());
-    sl_spk[2..37].copy_from_slice(&sl_p2sh.script());
+    // TODO: bracket_order bytecode currently expects 2 separate SPKs (tp_spk at
+    // output[2] and sl_spk at output[3]). When the bytecode is updated for
+    // single oco_sell, only one SPK will be needed here. For now, we use the
+    // same oco_sell P2SH SPK for both tp_spk and sl_spk placeholders.
+    let mut oco_spk = [0u8; 37];
+    oco_spk[0..2].copy_from_slice(&oco_sell_p2sh.version.to_le_bytes());
+    oco_spk[2..37].copy_from_slice(&oco_sell_p2sh.script());
 
     // Parse receipt covenant ID (required for N4 security check)
     let rcid_bytes = hex::decode(receipt_cov_id_hex)?;
@@ -1120,6 +1104,11 @@ pub async fn run(
     receipt_cov_id.copy_from_slice(&rcid_bytes);
 
     // Compute trade_spk_hash from the owner's P2PK SPK (N5 fix)
+    let mut owner_spk = [0u8; 36];
+    owner_spk[0..2].copy_from_slice(&0u16.to_le_bytes()); // version 0
+    owner_spk[2] = 0x20; // push 32 bytes
+    owner_spk[3..35].copy_from_slice(&pubkey);
+    owner_spk[35] = 0xac; // OpCheckSig
     let trade_spk_hash = blake2b_256(&owner_spk);
 
     // Build bracket_order_v5 redeemScript
@@ -1128,9 +1117,9 @@ pub async fn run(
         &pair_id,
         entry_price_num,
         entry_price_den,
-        &tp_spk,
+        &oco_spk,      // tp_spk (oco_sell P2SH)
         MIN_UTXO_VALUE,
-        &sl_spk,
+        &oco_spk,      // sl_spk (same oco_sell P2SH -- single UTXO)
         MIN_UTXO_VALUE,
         MIN_UTXO_VALUE,
         min_receipt_value,
@@ -1159,8 +1148,7 @@ pub async fn run(
     println!("Owner Hash:     {}", hex::encode(owner_hash));
     println!();
     println!("bracket_order_v5 RS: {} bytes", redeem_script.len());
-    println!("TP oco_pair RS:      {} bytes", tp_rs.len());
-    println!("SL oco_pair RS:      {} bytes", sl_rs.len());
+    println!("oco_sell RS:         {} bytes", oco_sell_rs.len());
     println!("Receipt Cov ID:      {}", receipt_cov_id_hex);
     println!("P2SH SPK:            {}", hex::encode(&p2sh.script()));
     println!();

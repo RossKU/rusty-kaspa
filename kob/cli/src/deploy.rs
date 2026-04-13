@@ -1084,6 +1084,330 @@ pub async fn deploy_sell(
     Ok(tx_id)
 }
 
+/// Deploy a single-UTXO OCO sell order (TP + SL in one P2SH).
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_oco_sell(
+    wallet_path: &Path,
+    node_url: &str,
+    network: Network,
+    token_covenant_id: &str,
+    tp_price_num: u64,
+    tp_price_den: u64,
+    tp_min_fill: u64,
+    sl_price_num: u64,
+    sl_price_den: u64,
+    sl_min_fill: u64,
+    amount: u64,
+    fee: u64,
+    expiry_daa: Option<u64>,
+    max_matcher_fee: u64,
+    token_utxo_str: Option<&str>,
+    fee_utxo_str: Option<&str>,
+) -> anyhow::Result<String> {
+    let wallet = WalletContext::load(wallet_path)?;
+
+    // Overflow guards
+    if (amount as u128) * (tp_price_num as u128) > (i64::MAX as u128) {
+        anyhow::bail!("amount * tp_price_num overflows i64");
+    }
+    if (amount as u128) * (sl_price_num as u128) > (i64::MAX as u128) {
+        anyhow::bail!("amount * sl_price_num overflows i64");
+    }
+
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
+    let owner_hash = blake2b_256(&pubkey);
+    let seller_spk_hash = compute_p2pk_spk_hash(&pubkey);
+
+    let redeem_script = kob_core::build_oco_sell_redeem_script(
+        tp_price_num, tp_price_den, tp_min_fill,
+        sl_price_num, sl_price_den, sl_min_fill,
+        &owner_hash, &seller_spk_hash,
+        max_matcher_fee,
+        0, // cancel_pending
+        expiry_daa.unwrap_or(0),
+    )?;
+    assert_eq!(redeem_script.len(), kob_core::OCO_SELL_RS_SIZE);
+
+    let p2sh = build_p2sh(&redeem_script);
+
+    println!("Deploy OCO Sell Order (single-UTXO)");
+    println!("====================================");
+    println!("Token:        {}", token_covenant_id);
+    println!(
+        "TP Price:     {}/{} ({:.6})",
+        tp_price_num, tp_price_den, tp_price_num as f64 / tp_price_den as f64
+    );
+    println!("TP Min Fill:  {} sompi", tp_min_fill);
+    println!(
+        "SL Price:     {}/{} ({:.6})",
+        sl_price_num, sl_price_den, sl_price_num as f64 / sl_price_den as f64
+    );
+    println!("SL Min Fill:  {} sompi", sl_min_fill);
+    println!(
+        "Amount:       {} sompi ({:.8} KAS)",
+        amount, amount as f64 / 1e8
+    );
+    println!("Max Matcher Fee: {} sompi", max_matcher_fee);
+    println!("Owner:        {}", wallet.pubkey_hex());
+    if let Some(daa) = expiry_daa {
+        println!("Expiry DAA:   {}", daa);
+    }
+    println!();
+    println!("RedeemScript: {} bytes (OCO sell)", redeem_script.len());
+    println!("P2SH SPK:     {}", hex::encode(&p2sh.script()));
+    println!();
+
+    info!(address = %wallet.address, amount = amount, "deploying OCO sell order");
+    println!("Connecting to {}...", node_url);
+    let rpc = NodeClient::connect(node_url).await?;
+
+    let rpc_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
+    let p2pk_rpc: Vec<_> = rpc_utxos.iter().filter(|u| !u.is_p2sh()).collect();
+
+    // Sell with covenant binding → TX version 1
+    let mut tx = Transaction::new(1);
+
+    // Token UTXO as input[0] for covenant lineage
+    let mut token_input_value: u64 = 0;
+    if let Some(token_op_str) = token_utxo_str {
+        let token_op = Outpoint::parse(token_op_str)?;
+        let found_utxo = rpc_utxos
+            .iter()
+            .find(|u| u.outpoint.transaction_id == token_op.transaction_id && u.outpoint.index == token_op.index)
+            .cloned();
+        let extra_utxos;
+        let found_utxo = if found_utxo.is_some() {
+            found_utxo
+        } else {
+            let mint_rs = kob_core::contract::build_token_mint_redeem_script(&pubkey);
+            let mint_p2sh = build_p2sh(&mint_rs);
+            let mint_addr = crate::cancel::kaspa_address_encode(network.address_prefix(), 8, &mint_p2sh.script()[2..34]);
+            let unit_rs = kob_core::contract::build_token_unit_redeem_script(&pubkey);
+            let unit_p2sh = build_p2sh(&unit_rs);
+            let unit_addr = crate::cancel::kaspa_address_encode(network.address_prefix(), 8, &unit_p2sh.script()[2..34]);
+            extra_utxos = rpc.get_utxos_by_addresses(&[&mint_addr, &unit_addr]).await?;
+            extra_utxos
+                .iter()
+                .find(|u| u.outpoint.transaction_id == token_op.transaction_id && u.outpoint.index == token_op.index)
+                .cloned()
+        };
+        let token_utxo = found_utxo.ok_or_else(|| anyhow::anyhow!("Token UTXO {} not found", token_op_str))?;
+        token_input_value = token_utxo.utxo_entry.amount;
+        println!("Token UTXO: {}:{} ({} sompi)", &token_utxo.outpoint.transaction_id[..16], token_utxo.outpoint.index, token_input_value);
+        tx.inputs.push(TxInput {
+            prev_tx_id: token_utxo.outpoint.transaction_id.clone(),
+            prev_index: token_utxo.outpoint.index,
+            sequence: 0,
+            sig_op_count: 1,
+            script_version: token_utxo.utxo_entry.script_public_key.version,
+            script_bytes: token_utxo.script_bytes(),
+            value: token_input_value,
+        });
+    } else {
+        // Auto-discover token UTXO
+        let mint_rs = kob_core::contract::build_token_mint_redeem_script(&pubkey);
+        let mint_p2sh = build_p2sh(&mint_rs);
+        let mint_addr = crate::cancel::kaspa_address_encode(network.address_prefix(), 8, &mint_p2sh.script()[2..34]);
+        let mint_utxos = rpc.get_utxos_by_addresses(&[&mint_addr]).await?;
+        let unit_rs = kob_core::contract::build_token_unit_redeem_script(&pubkey);
+        let unit_p2sh = build_p2sh(&unit_rs);
+        let unit_addr = crate::cancel::kaspa_address_encode(network.address_prefix(), 8, &unit_p2sh.script()[2..34]);
+        let unit_utxos = rpc.get_utxos_by_addresses(&[&unit_addr]).await?;
+        let all_token_utxos: Vec<_> = mint_utxos.iter().chain(unit_utxos.iter()).collect();
+        if let Some(token_utxo) = all_token_utxos.first() {
+            token_input_value = token_utxo.utxo_entry.amount;
+            println!("Token UTXO: {}:{} ({} sompi)", &token_utxo.outpoint.transaction_id[..16], token_utxo.outpoint.index, token_input_value);
+            tx.inputs.push(TxInput {
+                prev_tx_id: token_utxo.outpoint.transaction_id.clone(),
+                prev_index: token_utxo.outpoint.index,
+                sequence: 0,
+                sig_op_count: 1,
+                script_version: token_utxo.utxo_entry.script_public_key.version,
+                script_bytes: token_utxo.script_bytes(),
+                value: token_input_value,
+            });
+        } else {
+            anyhow::bail!("No token UTXO found. Use --token-utxo to specify one.");
+        }
+    }
+
+    // Fee/funding UTXO(s) from P2PK
+    let fee_utxo = if let Some(fee_op_str) = fee_utxo_str {
+        let fee_op = Outpoint::parse(fee_op_str)?;
+        let found = p2pk_rpc.iter()
+            .find(|u| u.outpoint.transaction_id == fee_op.transaction_id && u.outpoint.index == fee_op.index)
+            .ok_or_else(|| anyhow::anyhow!("Fee UTXO {} not found", fee_op_str))?;
+        vec![*found]
+    } else {
+        let est_fee = kob_core::mass::estimate_compute_mass(2, 3, 100);
+        let sel_fee = if fee > 0 { fee.max(est_fee) } else { est_fee };
+        let needed = if token_input_value >= amount + sel_fee {
+            sel_fee
+        } else {
+            amount + sel_fee - token_input_value
+        };
+        let core_utxos: Vec<UtxoEntry> = p2pk_rpc.iter().map(|u| UtxoEntry {
+            outpoint: Outpoint {
+                transaction_id: u.outpoint.transaction_id.clone(),
+                index: u.outpoint.index,
+            },
+            value: u.utxo_entry.amount,
+            script_public_key: format!("{:04x}{}", u.utxo_entry.script_public_key.version, u.utxo_entry.script_public_key.script),
+        }).collect();
+
+        if token_input_value >= amount {
+            let mut candidates = core_utxos.clone();
+            candidates.sort_by(|a, b| a.value.cmp(&b.value));
+            let fee_entry = candidates.into_iter()
+                .find(|u| u.value >= sel_fee)
+                .ok_or_else(|| anyhow::anyhow!("No P2PK UTXO with >= {} sompi for fee", sel_fee))?;
+            vec![p2pk_rpc.iter().find(|u| u.outpoint.transaction_id == fee_entry.outpoint.transaction_id
+                && u.outpoint.index == fee_entry.outpoint.index)
+                .copied()
+                .ok_or_else(|| anyhow::anyhow!("UTXO spent during TX construction"))?]
+        } else {
+            let coin_sel: CoinSelection = select_utxos_mass_aware(&core_utxos, needed, 0, 3)
+                .map_err(|e| anyhow::anyhow!("UTXO selection failed: {}", e))?;
+            coin_sel.utxos.iter().map(|sel| {
+                p2pk_rpc.iter().find(|u| u.outpoint.transaction_id == sel.outpoint.transaction_id
+                    && u.outpoint.index == sel.outpoint.index)
+                    .copied()
+                    .ok_or_else(|| anyhow::anyhow!("UTXO spent during TX construction"))
+            }).collect::<Result<Vec<_>, _>>()?
+        }
+    };
+
+    // Add P2PK funding inputs
+    let mut total_p2pk_input: u64 = 0;
+    for u in &fee_utxo {
+        total_p2pk_input += u.utxo_entry.amount;
+        tx.inputs.push(TxInput {
+            prev_tx_id: u.outpoint.transaction_id.clone(),
+            prev_index: u.outpoint.index,
+            sequence: 0,
+            sig_op_count: 1,
+            script_version: u.utxo_entry.script_public_key.version,
+            script_bytes: u.script_bytes(),
+            value: u.utxo_entry.amount,
+        });
+    }
+
+    let total_input = token_input_value + total_p2pk_input;
+
+    // Output 0: P2SH OCO sell order with covenant binding
+    let covenant_binding = Some(kob_core::tx::CovenantBinding::new(
+        0, kob_core::compat::parse_hash(&token_covenant_id.to_string()).unwrap(),
+    ));
+    tx.outputs.push(TxOutput::new(amount, 0, p2sh.script().to_vec(), covenant_binding));
+
+    // Token remainder back to token_unit P2SH
+    let token_remainder = token_input_value.saturating_sub(amount);
+    let mut num_outputs = 2usize;
+    if token_remainder >= MIN_UTXO_VALUE {
+        let unit_rs = kob_core::contract::build_token_unit_redeem_script(&pubkey);
+        let unit_p2sh = build_p2sh(&unit_rs);
+        let remainder_binding = kob_core::tx::CovenantBinding::new(
+            0, kob_core::compat::parse_hash(&token_covenant_id.to_string()).unwrap(),
+        );
+        tx.outputs.push(TxOutput::new(token_remainder, 0, unit_p2sh.script().to_vec(), Some(remainder_binding)));
+        num_outputs += 1;
+    }
+
+    // Payload: RS for matcher L1 discovery
+    tx.payload = build_payload_auto_full(&redeem_script, false, expiry_daa);
+
+    // Change output
+    let wallet_spk = if let Some(u) = fee_utxo.first() {
+        hex::decode(&u.utxo_entry.script_public_key.script)?
+    } else {
+        let mut spk = Vec::with_capacity(34);
+        spk.push(0x20);
+        spk.extend_from_slice(&pubkey);
+        spk.push(0xac);
+        spk
+    };
+
+    let est_fee_oco = kob_core::mass::estimate_compute_mass(tx.inputs.len(), num_outputs + 1, tx.payload.len());
+    let tent_change = total_input.saturating_sub(amount + token_remainder + est_fee_oco);
+    if tent_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tent_change, 0, wallet_spk.clone(), None));
+    }
+
+    // Phase 1: converge fee on change output
+    let min_fee_override = if fee > 0 { fee } else { 0 };
+    let has_change = tent_change >= MIN_UTXO_VALUE;
+    let (est_fee_oco, _) = if has_change {
+        let change_idx = tx.outputs.len() - 1;
+        converge_fee(&mut tx, total_input, change_idx, min_fee_override)
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+        tx.outputs[0].value = amount.saturating_sub(f);
+        (f, tx.outputs[0].value)
+    };
+
+    // Sign all inputs
+    let sign_all = |tx: &Transaction, privkey: &kob_core::wallet::SecureKey, pubkey: &[u8; 32], token_val: u64| -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut sigs = Vec::new();
+        for i in 0..tx.inputs.len() {
+            let sighash = compute_sighash(tx, i)?;
+            let sig = signing::schnorr_sign_secure(privkey, &sighash)?;
+            if token_val > 0 && i == 0 {
+                let mint_rs = contract::build_token_mint_redeem_script(pubkey);
+                let unit_rs = contract::build_token_unit_redeem_script(pubkey);
+                let is_mint = tx.inputs[0].script_bytes == build_p2sh(&mint_rs).script();
+                if is_mint {
+                    sigs.push(contract::build_token_mint_sigscript(&sig, &mint_rs));
+                } else {
+                    sigs.push(contract::build_token_unit_sigscript(&sig, &unit_rs));
+                }
+            } else {
+                sigs.push(signing::build_p2pk_sigscript(&sig));
+            }
+        }
+        Ok(sigs)
+    };
+
+    let mut sigscripts = sign_all(&tx, &privkey, &pubkey, token_input_value)?;
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let exact_fee = exact_mass.max(min_fee_override);
+
+    if exact_fee != est_fee_oco {
+        if has_change && tx.outputs.len() > 1 {
+            let change_idx = tx.outputs.len() - 1;
+            let new_change = total_input.saturating_sub(amount + token_remainder + exact_fee);
+            if new_change >= MIN_UTXO_VALUE {
+                tx.outputs[change_idx].value = new_change;
+            } else {
+                tx.outputs.pop();
+            }
+        } else {
+            tx.outputs[0].value = total_input.saturating_sub(exact_fee);
+        }
+        sigscripts = sign_all(&tx, &privkey, &pubkey, token_input_value)?;
+    }
+
+    println!("Signed {} input(s)", sigscripts.len());
+
+    // Storage mass pre-check
+    if let Err(e) = kob_core::check_tx_storage_mass(&tx) {
+        anyhow::bail!("Deploy TX rejected: {}. Increase amount or use larger UTXO.", e);
+    }
+
+    let payload = to_rpc_payload(&tx, &sigscripts);
+    println!("Submitting transaction...");
+    let tx_id = rpc.submit_transaction(payload).await?;
+
+    println!();
+    println!("SUCCESS! OCO sell order deployed.");
+    println!("TXID: {}", tx_id);
+    println!("Order at output {}:0 (TP + SL in single UTXO)", tx_id);
+
+    Ok(tx_id)
+}
+
 /// Deploy a bracket order (OTOCO: entry + take-profit + stop-loss).
 #[allow(clippy::too_many_arguments)]
 pub async fn deploy_bracket(

@@ -1122,6 +1122,61 @@ pub enum DeployCommands {
         #[arg(long)]
         matcher_url: String,
     },
+
+    /// Deploy a single-UTXO OCO sell order (take-profit + stop-loss in one UTXO).
+    ///
+    /// One P2SH UTXO encodes both TP and SL sell orders. The UTXO model
+    /// provides natural OCO behavior: filling either path spends the UTXO,
+    /// canceling the other. 333B redeem script, FOK-only v1.
+    OcoSell {
+        /// Token covenant ID (hex, 64 chars) or alias.
+        #[arg(long)]
+        token: String,
+
+        /// Take-profit price numerator.
+        #[arg(long)]
+        tp_price_num: u64,
+
+        /// Take-profit price denominator.
+        #[arg(long)]
+        tp_price_den: u64,
+
+        /// Take-profit minimum fill (sompi).
+        #[arg(long)]
+        tp_min_fill: u64,
+
+        /// Stop-loss price numerator.
+        #[arg(long)]
+        sl_price_num: u64,
+
+        /// Stop-loss price denominator.
+        #[arg(long)]
+        sl_price_den: u64,
+
+        /// Stop-loss minimum fill (sompi).
+        #[arg(long)]
+        sl_min_fill: u64,
+
+        /// Amount of tokens to lock (in sompi value).
+        #[arg(long)]
+        amount: u64,
+
+        /// GTD expiry: DAA score after which the order expires (0 = GTC).
+        #[arg(long, default_value = "0")]
+        expiry: u64,
+
+        /// Maximum fee (in sompi) the matcher may extract per fill.
+        #[arg(long, default_value = "10000000")]
+        max_matcher_fee: u64,
+
+        /// Token UTXO outpoint (txid:index) for covenant binding.
+        #[arg(long)]
+        token_utxo: Option<String>,
+
+        /// Fee UTXO outpoint (txid:index) override.
+        #[arg(long)]
+        fee_utxo: Option<String>,
+    },
 }
 
 /// Subcommands for `lending`.
@@ -1834,6 +1889,54 @@ pub async fn dispatch(
                     sl_price_den,
                     sl_min_fill,
                     fee,
+                )
+                .await?;
+            }
+            DeployCommands::OcoSell {
+                token,
+                tp_price_num,
+                tp_price_den,
+                tp_min_fill,
+                sl_price_num,
+                sl_price_den,
+                sl_min_fill,
+                amount,
+                expiry,
+                max_matcher_fee,
+                token_utxo,
+                fee_utxo,
+            } => {
+                let token = token::resolve_token(&token, None)?;
+                if tp_price_num == 0 || tp_price_den == 0 {
+                    anyhow::bail!("TP price must be > 0");
+                }
+                if sl_price_num == 0 || sl_price_den == 0 {
+                    anyhow::bail!("SL price must be > 0");
+                }
+                if tp_min_fill == 0 || sl_min_fill == 0 {
+                    anyhow::bail!("min_fill must be > 0");
+                }
+                if amount == 0 {
+                    anyhow::bail!("amount must be > 0");
+                }
+                let expiry_opt = if expiry == 0 { None } else { Some(expiry) };
+                deploy::deploy_oco_sell(
+                    wallet_path,
+                    node,
+                    network,
+                    &token,
+                    tp_price_num,
+                    tp_price_den,
+                    tp_min_fill,
+                    sl_price_num,
+                    sl_price_den,
+                    sl_min_fill,
+                    amount,
+                    fee,
+                    expiry_opt,
+                    max_matcher_fee,
+                    token_utxo.as_deref(),
+                    fee_utxo.as_deref(),
                 )
                 .await?;
             }

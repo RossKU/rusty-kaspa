@@ -1420,7 +1420,57 @@ fn process_block_txs_all(
                 // with the full parsed state.
                 counters.prediction_added += 1;
             }
-            ScanResult::OcoSell(_, _, _) => { /* TODO: handle OCO sell registration */ }
+            ScanResult::OcoSell(parsed, p2sh_idx, p2sh_value) => {
+                if parsed.cpend != 0 {
+                    info!(
+                        "[SCANNER-ALL] Skipping OCO sell (cancel_pending=1): {}:{}",
+                        &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                    );
+                    continue;
+                }
+
+                let (tp_order, sl_order) = BlockScanner::oco_sell_to_book_orders(
+                    &parsed, &tx.tx_id, p2sh_idx, p2sh_value, Some(tx),
+                );
+                let tp_key = tp_order.outpoint_key();
+                let sl_key = sl_order.outpoint_key();
+
+                if order_book.contains_outpoint(&tp_key) {
+                    continue; // dedup (both keys share the same UTXO, checking one suffices)
+                }
+
+                if tp_order.token_cov_id == "0".repeat(64) {
+                    warn!(
+                        "[SCANNER-ALL] Skipping OCO sell with unknown token_cov_id: {}:{}",
+                        &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                    );
+                    continue;
+                }
+
+                info!(
+                    "[SCANNER-ALL] Discovered OCO sell: {}:{} value={} TP={}/{} SL={}/{}",
+                    &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                    p2sh_value, parsed.price_num_tp, parsed.price_den_tp,
+                    parsed.price_num_sl, parsed.price_den_sl,
+                );
+
+                if let Some(ws) = ws_tx {
+                    crate::matcher::api::emit_order_detected(
+                        ws, &tp_order.owner_hash, &tp_key,
+                        OrderSide::Sell, tp_order.price_num, tp_order.price_den,
+                        tp_order.value, &tp_order.token_cov_id,
+                    );
+                    crate::matcher::api::emit_order_detected(
+                        ws, &sl_order.owner_hash, &sl_key,
+                        OrderSide::Sell, sl_order.price_num, sl_order.price_den,
+                        sl_order.value, &sl_order.token_cov_id,
+                    );
+                }
+
+                order_book.add_sell_order(tp_order);
+                order_book.add_sell_order(sl_order);
+                counters.spot_added += 2;
+            }
         }
     }
 

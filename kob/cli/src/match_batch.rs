@@ -158,6 +158,7 @@ pub async fn run(
             utxo_value: value,
             counterparty_spk: seller_spk,
             counterparty_spk_version: 0,
+            oco_path: None,
         });
     }
 
@@ -228,6 +229,7 @@ pub async fn run(
             utxo_value: value,
             counterparty_spk: buyer_spk,
             counterparty_spk_version: 0,
+            oco_path: None,
         });
     }
 

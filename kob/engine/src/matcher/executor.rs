@@ -1993,6 +1993,9 @@ async fn run_scan_cycle(
                     }
 
                     if skip_group {
+                        for sell in &group.sells {
+                            spent_tracker.mark_failed(&sell.outpoint_key());
+                        }
                         continue;
                     }
 
@@ -2041,6 +2044,14 @@ async fn run_scan_cycle(
                     }
 
                     if skip_group || sells.is_empty() || buys.is_empty() {
+                        // C3 fix: mark all orders in the skipped group as
+                        // failed so they cooldown instead of infinite retry.
+                        for sell in &group.sells {
+                            spent_tracker.mark_failed(&sell.outpoint_key());
+                        }
+                        for buy in &group.buys {
+                            spent_tracker.mark_failed(&buy.outpoint_key());
+                        }
                         continue;
                     }
 
@@ -2461,10 +2472,15 @@ async fn run_scan_cycle(
                 warn!("[STP] Blocked self-trade in remaining-pair path");
                 continue;
             }
-
             let (sell_order, buy_order) = match pair_to_batch_orders(best, "REMAINING") {
                 Some(pair) => pair,
-                None => continue,
+                None => {
+                    // C3 fix: mark both orders as failed so they cooldown
+                    // instead of being retried every cycle.
+                    spent_tracker.mark_failed(&best.buy.outpoint_key());
+                    spent_tracker.mark_failed(&best.sell.outpoint_key());
+                    continue;
+                }
             };
 
             // Fetch wallet UTXOs
@@ -2746,6 +2762,9 @@ async fn run_scan_cycle(
                 }
 
                 if skip_group {
+                    for sell in &group.sells {
+                        spent_tracker.mark_failed(&sell.outpoint_key());
+                    }
                     continue;
                 }
 
@@ -2794,6 +2813,12 @@ async fn run_scan_cycle(
                 }
 
                 if skip_group || sells.is_empty() || buys.is_empty() {
+                    for sell in &group.sells {
+                        spent_tracker.mark_failed(&sell.outpoint_key());
+                    }
+                    for buy in &group.buys {
+                        spent_tracker.mark_failed(&buy.outpoint_key());
+                    }
                     continue;
                 }
 

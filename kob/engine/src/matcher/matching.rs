@@ -49,15 +49,31 @@ pub fn find_all_crossing_pairs(order_book: &OrderBook) -> Vec<CrossingPair> {
 ///
 /// When `allow_self_trade` is false (default), pairs where buy.owner_hash == sell.owner_hash
 /// are skipped. Set to true only for testing.
+///
+/// Orders whose outpoint keys appear in `spent_outpoints` are excluded from
+/// matching. Pass `None` when no SpentTracker context is available (e.g. tests).
 pub fn find_all_crossing_pairs_with_stp(order_book: &OrderBook, allow_self_trade: bool) -> Vec<CrossingPair> {
-    find_all_crossing_pairs_full(order_book, allow_self_trade, None)
+    find_all_crossing_pairs_full(order_book, allow_self_trade, None, None)
 }
 
-/// Internal: find crossing pairs with optional DAA-based expiry filtering.
+/// Find all crossing pairs, filtering out orders that are tracked as locally
+/// spent by the SpentTracker. This prevents Phase 1a-consumed orders from
+/// being re-matched in Phase 1b.
+pub fn find_all_crossing_pairs_with_spent(
+    order_book: &OrderBook,
+    allow_self_trade: bool,
+    spent_outpoints: &std::collections::HashSet<String>,
+) -> Vec<CrossingPair> {
+    find_all_crossing_pairs_full(order_book, allow_self_trade, None, Some(spent_outpoints))
+}
+
+/// Internal: find crossing pairs with optional DAA-based expiry filtering
+/// and optional SpentTracker-based exclusion.
 fn find_all_crossing_pairs_full(
     order_book: &OrderBook,
     allow_self_trade: bool,
     current_daa: Option<u64>,
+    spent_outpoints: Option<&std::collections::HashSet<String>>,
 ) -> Vec<CrossingPair> {
     let mut all_pairs = Vec::new();
 
@@ -68,6 +84,7 @@ fn find_all_crossing_pairs_full(
             &order_book.matched_outpoints,
             allow_self_trade,
             current_daa,
+            spent_outpoints,
         );
         all_pairs.extend(pairs);
     }
@@ -78,21 +95,30 @@ fn find_all_crossing_pairs_full(
 }
 
 /// Find crossing pairs for a specific token pair.
+///
+/// Orders whose outpoint keys appear in `spent_outpoints` are excluded.
+/// This prevents orders consumed by Phase 1a batch from being re-matched
+/// in Phase 1b remaining (deferred-removal race, commit 2a346a5b).
 fn find_crossing_pairs_for_token(
     token_cov_id: &str,
     book: &crate::matcher::order_book::PairBook,
     matched: &std::collections::HashMap<String, std::time::Instant>,
     allow_self_trade: bool,
     current_daa: Option<u64>,
+    spent_outpoints: Option<&std::collections::HashSet<String>>,
 ) -> Vec<CrossingPair> {
+    let empty_set = std::collections::HashSet::new();
+    let spent = spent_outpoints.unwrap_or(&empty_set);
     let mut pairs = Vec::new();
 
-    // Collect active bids and asks (filtered by matched set and expiry)
+    // Collect active bids and asks (filtered by matched set, spent tracker, and expiry)
     let bids: Vec<&BookOrder> = book
         .bids
         .values()
         .filter(|b| {
-            !matched.contains_key(&b.outpoint_key())
+            let key = b.outpoint_key();
+            !matched.contains_key(&key)
+                && !spent.contains(&key)
                 && !current_daa.is_some_and(|daa| b.is_expired(daa))
         })
         .collect();
@@ -101,7 +127,9 @@ fn find_crossing_pairs_for_token(
         .asks
         .values()
         .filter(|s| {
-            !matched.contains_key(&s.outpoint_key())
+            let key = s.outpoint_key();
+            !matched.contains_key(&key)
+                && !spent.contains(&key)
                 && !current_daa.is_some_and(|daa| s.is_expired(daa))
         })
         .collect();

@@ -784,6 +784,7 @@ mod tests {
     // Helper: build a KOB TX payload for an OCO pair (2 RS, v2 format)
     fn make_oco_payload(buy_rs: &[u8], sell_rs: &[u8]) -> Vec<u8> {
         kob_core::contract::build_oco_order_payload(buy_rs, sell_rs, false)
+            .expect("test RS within u16 limit")
     }
 
     // test_parse_buy_rs — parse known buy v12 RS

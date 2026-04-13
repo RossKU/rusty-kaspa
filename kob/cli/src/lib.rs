@@ -1123,6 +1123,66 @@ pub enum DeployCommands {
         matcher_url: String,
     },
 
+    /// Deploy a trustless IFO (bracket) order via IFD payload.
+    ///
+    /// Buy entry + OCO sell (TP+SL) exit, all embedded in the deploy TX
+    /// payload. No Matcher API needed. When the buy fills, the OCO sell
+    /// is auto-deployed as an extra output. Scanner detects 333B OCO sell
+    /// RS and inserts TP/SL virtual orders into the order book.
+    IfoTrustless {
+        /// Token covenant ID (hex, 64 chars).
+        #[arg(long)]
+        token: String,
+
+        /// Buy (entry) price numerator.
+        #[arg(long)]
+        buy_price_num: u64,
+
+        /// Buy (entry) price denominator.
+        #[arg(long)]
+        buy_price_den: u64,
+
+        /// Buy amount in sompi.
+        #[arg(long)]
+        buy_amount: u64,
+
+        /// Buy minimum fill.
+        #[arg(long)]
+        buy_min_fill: u64,
+
+        /// Take-profit price numerator.
+        #[arg(long)]
+        tp_price_num: u64,
+
+        /// Take-profit price denominator.
+        #[arg(long)]
+        tp_price_den: u64,
+
+        /// Take-profit minimum fill.
+        #[arg(long)]
+        tp_min_fill: u64,
+
+        /// Stop-loss price numerator.
+        #[arg(long)]
+        sl_price_num: u64,
+
+        /// Stop-loss price denominator.
+        #[arg(long)]
+        sl_price_den: u64,
+
+        /// Stop-loss minimum fill.
+        #[arg(long)]
+        sl_min_fill: u64,
+
+        /// GTD expiry: DAA score after which exit orders expire (0 = GTC).
+        #[arg(long, default_value = "0")]
+        expiry: u64,
+
+        /// Maximum fee (in sompi) the matcher may extract per fill.
+        #[arg(long, default_value = "10000000")]
+        max_matcher_fee: u64,
+    },
+
     /// Deploy a single-UTXO OCO sell order (take-profit + stop-loss in one UTXO).
     ///
     /// One P2SH UTXO encodes both TP and SL sell orders. The UTXO model
@@ -1888,6 +1948,43 @@ pub async fn dispatch(
                     sl_price_num,
                     sl_price_den,
                     sl_min_fill,
+                    fee,
+                )
+                .await?;
+            }
+            DeployCommands::IfoTrustless {
+                token,
+                buy_price_num,
+                buy_price_den,
+                buy_amount,
+                buy_min_fill,
+                tp_price_num,
+                tp_price_den,
+                tp_min_fill,
+                sl_price_num,
+                sl_price_den,
+                sl_min_fill,
+                expiry,
+                max_matcher_fee,
+            } => {
+                let token = token::resolve_token(&token, None)?;
+                ifd::deploy_ifo_trustless(
+                    wallet_path,
+                    node,
+                    network,
+                    &token,
+                    buy_price_num,
+                    buy_price_den,
+                    buy_amount,
+                    buy_min_fill,
+                    tp_price_num,
+                    tp_price_den,
+                    tp_min_fill,
+                    sl_price_num,
+                    sl_price_den,
+                    sl_min_fill,
+                    expiry,
+                    max_matcher_fee,
                     fee,
                 )
                 .await?;

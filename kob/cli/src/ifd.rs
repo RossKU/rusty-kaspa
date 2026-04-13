@@ -427,7 +427,294 @@ pub async fn deploy_ifd(
     Ok(txid)
 }
 
-// IFO deploy
+
+// IFO deploy (trustless, payload-based)
+
+/// Deploy a trustless IFO (bracket) order: buy A at entry, auto-deploy
+/// OCO sell (TP+SL) when A fills. Fully on-chain via IFD payload --
+/// no Matcher API registration required.
+///
+/// Order A = buy RS with bspkh pointing to OCO sell P2SH.
+/// Order B = OCO sell RS (TP + SL paths in a single UTXO, 333B).
+///
+/// When Order A fills, the executor constructs Order B's UTXO from the
+/// fill TX output. The scanner discovers Order B as an OCO sell
+/// (333B -> `scan_oco_sell` path) and inserts TP/SL virtual orders
+/// into the order book.
+#[allow(clippy::too_many_arguments)]
+pub async fn deploy_ifo_trustless(
+    wallet_path: &Path,
+    node_url: &str,
+    _network: Network,
+    // Order A params
+    buy_token: &str,
+    buy_price_num: u64,
+    buy_price_den: u64,
+    buy_amount: u64,
+    buy_min_fill: u64,
+    // OCO sell B params
+    tp_price_num: u64,
+    tp_price_den: u64,
+    tp_min_fill: u64,
+    sl_price_num: u64,
+    sl_price_den: u64,
+    sl_min_fill: u64,
+    // Common
+    expiry_daa: u64,
+    max_matcher_fee: u64,
+    fee: u64,
+) -> anyhow::Result<String> {
+    // Validation
+    if buy_price_num == 0 || buy_price_den == 0 {
+        anyhow::bail!("buy price numerator and denominator must be > 0");
+    }
+    if tp_price_num == 0 || tp_price_den == 0 {
+        anyhow::bail!("TP price numerator and denominator must be > 0");
+    }
+    if sl_price_num == 0 || sl_price_den == 0 {
+        anyhow::bail!("SL price numerator and denominator must be > 0");
+    }
+    if buy_min_fill == 0 || tp_min_fill == 0 || sl_min_fill == 0 {
+        anyhow::bail!("min_fill must be > 0");
+    }
+    if buy_amount == 0 {
+        anyhow::bail!("buy amount must be > 0");
+    }
+
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
+
+    let owner_hash = blake2b_256(&pubkey);
+    let owner_spk_hash = compute_p2pk_spk_hash(&pubkey);
+
+    let token_cov_bytes = hex::decode(buy_token)?;
+    if token_cov_bytes.len() != 32 {
+        anyhow::bail!("token covenant ID must be 64 hex characters (32 bytes)");
+    }
+    let mut token_cov_id = [0u8; 32];
+    token_cov_id.copy_from_slice(&token_cov_bytes);
+
+    // Step 1: Build Order B (OCO sell) RS -- need its P2SH for Order A's bspkh
+    println!("Building IFO trustless bracket order...");
+    let order_b_rs = contract::build_oco_sell_redeem_script(
+        tp_price_num,
+        tp_price_den,
+        tp_min_fill,
+        sl_price_num,
+        sl_price_den,
+        sl_min_fill,
+        &owner_hash,
+        &owner_spk_hash, // sell proceeds go back to owner's wallet
+        max_matcher_fee,
+        0, // cancel_pending
+        expiry_daa,
+    )?;
+
+    // Compute Order B's P2SH SPK hash for Order A's bspkh
+    let b_p2sh_spk = build_p2sh(&order_b_rs);
+    // bspkh = blake2b(version_LE_2B + script_bytes) -- matches OpTxOutputSpk output
+    let mut b_spk_full = Vec::with_capacity(2 + b_p2sh_spk.script().len());
+    b_spk_full.extend_from_slice(&b_p2sh_spk.version.to_le_bytes());
+    b_spk_full.extend_from_slice(&b_p2sh_spk.script());
+    let buyer_spk_hash = blake2b_256(&b_spk_full);
+
+    println!("  Order B (OCO sell) RS: {} bytes", order_b_rs.len());
+    println!("  Order B P2SH:         {}", hex::encode(&b_p2sh_spk.script()));
+    println!("  Order A bspkh:        {}", hex::encode(&buyer_spk_hash));
+
+    // Step 2: Build Order A (buy) RS with bspkh pointing to OCO sell P2SH
+    let order_a_rs = contract::build_buy_redeem_script(
+        &token_cov_id,
+        buy_price_num,
+        buy_price_den,
+        buy_min_fill,
+        &owner_hash,
+        &buyer_spk_hash,
+        max_matcher_fee,
+        0, // cancel_pending
+        0, // GTC for entry order
+    )?;
+
+    let p2sh_spk = build_p2sh(&order_a_rs);
+    println!("  Order A (buy) RS:     {} bytes", order_a_rs.len());
+    println!("  Order A P2SH:         {}", hex::encode(&p2sh_spk.script()));
+
+    // Step 3: Build IFD payload (embeds both Order A and Order B RS)
+    let ifd_payload = contract::build_ifd_order_payload(
+        &order_a_rs, &order_b_rs, false, None,
+    )?;
+
+    // Connect and fetch UTXOs
+    let rpc = NodeClient::connect(node_url).await?;
+    let rpc_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
+
+    let p2pk_rpc: Vec<_> = rpc_utxos.iter().filter(|u| !u.is_p2sh()).collect();
+    let core_utxos: Vec<UtxoEntry> = p2pk_rpc
+        .iter()
+        .map(|u| UtxoEntry {
+            outpoint: Outpoint {
+                transaction_id: u.outpoint.transaction_id.clone(),
+                index: u.outpoint.index,
+            },
+            value: u.utxo_entry.amount,
+            script_public_key: format!(
+                "{:04x}{}",
+                u.utxo_entry.script_public_key.version,
+                u.utxo_entry.script_public_key.script
+            ),
+        })
+        .collect();
+
+    let min_fee_override = fee;
+    let selection_fee = if min_fee_override == 0 { 5000 } else { min_fee_override };
+
+    let coin_sel = select_utxos_mass_aware(&core_utxos, buy_amount, selection_fee, 2).map_err(|e| {
+        anyhow::anyhow!(
+            "UTXO selection failed: {}. {} P2PK UTXOs available.",
+            e,
+            core_utxos.len()
+        )
+    })?;
+
+    let selected_utxos = &coin_sel.utxos;
+    let total_input = coin_sel.total;
+    let tentative_change = total_input.saturating_sub(buy_amount).saturating_sub(min_fee_override);
+
+    println!(
+        "Selected {} funding UTXOs (total {} sompi)",
+        selected_utxos.len(),
+        total_input
+    );
+
+    // Build transaction
+    let mut tx = Transaction::new(0);
+
+    let first_rpc = p2pk_rpc
+        .iter()
+        .find(|u| {
+            u.outpoint.transaction_id == selected_utxos[0].outpoint.transaction_id
+                && u.outpoint.index == selected_utxos[0].outpoint.index
+        })
+        .ok_or_else(|| anyhow::anyhow!("UTXO spent during TX construction, please retry."))?;
+    let wallet_spk = hex::decode(&first_rpc.utxo_entry.script_public_key.script)?;
+    let wallet_spk_version = first_rpc.utxo_entry.script_public_key.version;
+
+    for sel in selected_utxos {
+        let rpc_utxo = p2pk_rpc
+            .iter()
+            .find(|u| {
+                u.outpoint.transaction_id == sel.outpoint.transaction_id
+                    && u.outpoint.index == sel.outpoint.index
+            })
+            .ok_or_else(|| anyhow::anyhow!("UTXO spent during TX construction, please retry."))?;
+        tx.inputs.push(TxInput {
+            prev_tx_id: rpc_utxo.outpoint.transaction_id.clone(),
+            prev_index: rpc_utxo.outpoint.index,
+            sequence: 0,
+            sig_op_count: 1,
+            script_version: rpc_utxo.utxo_entry.script_public_key.version,
+            script_bytes: rpc_utxo.script_bytes(),
+            value: rpc_utxo.utxo_entry.amount,
+        });
+    }
+
+    // Output 0: P2SH order
+    tx.outputs.push(TxOutput::new(buy_amount, 0, p2sh_spk.script().to_vec(), None));
+
+    // IFD payload (contains both order A + order B RS)
+    tx.payload = ifd_payload;
+
+    // Tentative change output for fee convergence
+    if tentative_change >= MIN_UTXO_VALUE {
+        tx.outputs.push(TxOutput::new(tentative_change, wallet_spk_version, wallet_spk.clone(), None));
+    }
+
+    // Phase 1: converge fee on change output.
+    // CRITICAL: output[0] (the P2SH order) MUST remain exactly buy_amount.
+    let has_change = tentative_change >= MIN_UTXO_VALUE;
+    let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
+
+    let est_fee = if has_change {
+        let (f, _) = converge_fee(&mut tx, total_input, change_idx, min_fee_override);
+        tx.outputs[0].value = buy_amount;
+        f
+    } else {
+        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
+        let excess = total_input.saturating_sub(buy_amount);
+        if excess < f {
+            anyhow::bail!(
+                "Insufficient funds for fee: need {} sompi fee but only {} excess above buy_amount {}.                  Fund the wallet with a larger UTXO or consolidate UTXOs.",
+                f, excess, buy_amount
+            );
+        }
+        f
+    };
+
+    // Remove change output if below MIN_UTXO_VALUE
+    if has_change && tx.outputs[change_idx].value < MIN_UTXO_VALUE {
+        let small_change = tx.outputs[change_idx].value;
+        tx.outputs.pop();
+        if small_change > 0 {
+            println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", small_change);
+        }
+    }
+
+    // Sign (phase 1)
+    let mut sigscripts: Vec<Vec<u8>> = Vec::new();
+    for i in 0..tx.inputs.len() {
+        let sighash = compute_sighash(&tx, i)?;
+        let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
+        sigscripts.push(signing::build_p2pk_sigscript(&signature));
+    }
+
+    // Phase 2: exact mass check with real sigscripts
+    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+    let exact_fee = exact_mass.max(min_fee_override);
+    if exact_fee != est_fee && tx.outputs.len() > 1 {
+        let change_idx = tx.outputs.len() - 1;
+        let new_change = total_input.saturating_sub(buy_amount + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_idx].value = new_change;
+        } else {
+            tx.outputs.pop();
+        }
+        sigscripts.clear();
+        for i in 0..tx.inputs.len() {
+            let sighash = compute_sighash(&tx, i)?;
+            let signature = signing::schnorr_sign_secure(&privkey, &sighash)?;
+            sigscripts.push(signing::build_p2pk_sigscript(&signature));
+        }
+    }
+
+    // Storage mass check
+    if let Err(e) = kob_core::check_tx_storage_mass(&tx) {
+        anyhow::bail!(
+            "Deploy TX would be rejected: {}. Increase amount or consolidate UTXOs.",
+            e
+        );
+    }
+
+    // Submit
+    let payload = to_rpc_payload(&tx, &sigscripts);
+    println!("Submitting transaction...");
+    let txid = rpc.submit_transaction(payload).await?;
+
+    println!();
+    println!("IFO Trustless Bracket Summary");
+    println!("=============================");
+    println!("  Order A (buy):           deployed, txid={}", txid);
+    println!("  Order B (OCO sell):      embedded in payload, auto-deploy on A fill");
+    println!("  Entry price:             {}/{}", buy_price_num, buy_price_den);
+    println!("  Take-profit price:       {}/{}", tp_price_num, tp_price_den);
+    println!("  Stop-loss price:         {}/{}", sl_price_num, sl_price_den);
+    println!("  Order B RS size:         {} bytes (OCO sell)", order_b_rs.len());
+    println!("  Order B P2SH:            {}", hex::encode(&b_p2sh_spk.script()));
+
+    Ok(txid)
+}
+
+// IFO deploy (Matcher-registered)
 
 /// Deploy an IFO order: buy A at entry, auto-deploy OCO (TP+SL) when A fills.
 #[allow(clippy::too_many_arguments)]

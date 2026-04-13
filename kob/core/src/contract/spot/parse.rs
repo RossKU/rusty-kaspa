@@ -82,7 +82,7 @@ pub struct ParsedOcoSell {
 pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
     match rs.len() {
         BUY_RS_SIZE | BUY_ORDER_V15_RS_EXPECTED_LEN => {
-            // Buy v14 (396B) or v15 (438B): body starts at offset 145, signature 0xb9 0xc9
+            // Buy v14 (396B) or v15 (479B): body starts at offset 145, signature 0xb9 0xc9
             if rs[BUY_STATE_SIZE] == 0xb9 && rs[BUY_STATE_SIZE + 1] == 0xc9
                 && rs[BUY_STATE_SIZE + 2] == 0x76
             {

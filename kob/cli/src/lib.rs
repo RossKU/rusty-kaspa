@@ -449,7 +449,7 @@ pub enum Commands {
         action: oco::OcoCommand,
     },
 
-    /// Bracket order (bracket_order_v4): deploy, fill, cancel.
+    /// Bracket order (bracket_order_v5): deploy, fill, cancel.
     Bracket {
         #[command(subcommand)]
         action: bracket::BracketCommand,
@@ -3080,9 +3080,9 @@ pub fn cmd_config(wallet_path: &std::path::Path, node: &str, network: kob_core::
     println!("  RECEIPT_VALUE: {} sompi", kob_core::RECEIPT_VALUE);
     println!();
     println!("Contract Sizes (v4):");
-    println!("  bracket_order: 380B redeemScript (238B state + 142B body)");
-    println!("    Fill:   384B sigscript (< 420 threshold)");
-    println!("    Cancel: 483B sigscript (>= 420 threshold)");
+    println!("  bracket_order: 430B redeemScript (271B state + 159B body)");
+    println!("    Fill:   434B sigscript (< 480 threshold)");
+    println!("    Cancel: 533B sigscript (>= 480 threshold)");
     println!();
     println!("Cross-Pair Matching (v8):");
     println!("  TX layout: sell[0] buy[1] token[2] fee[3]");

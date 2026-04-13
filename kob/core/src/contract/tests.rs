@@ -556,14 +556,14 @@ mod tests {
     fn bracket_body_length() {
         assert_eq!(
             BRACKET_ORDER_BODY.len(),
-            142,
-            "bracket_order body must be 142 bytes"
+            159,
+            "bracket_order body must be 159 bytes"
         );
     }
 
     #[test]
     fn bracket_body_hex_matches_spec() {
-        let expected = "b9c902a4019f6352c35879876952c25779a26953c35679876953c25579a26952be5379a26952cf527987695b79ce63b9be5a7995597996765579a26900c27ca269757575757575757575757575755167b9be5979965a7995765579a26951c27ca269757575757575757575757575755168675c7976aa527987695e7a7cad75757575757575757575757575755168";
+        let expected = "b9c902e0019f6352c35979876952c25879a26953c35779876953c25679a26952be5479a26952cf537987695c79ce63b9be5b79955a7996765679a26900c27ca26900c3aa5279876975757575757575757575757575755167b9be5a79965b7995765679a26951c27ca26951c3aa5279876975757575757575757575757575755168675d7976aa527987695f7a7cad7575757575757575757575757575755168";
         assert_eq!(
             hex::encode(BRACKET_ORDER_BODY),
             expected,
@@ -577,12 +577,13 @@ mod tests {
         let tp_spk = [0u8; 37];
         let sl_spk = [0u8; 37];
         let rcid = [0u8; 32];
+        let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
             1, &tcid, 1000, 1, &tp_spk, 5_000_000, &sl_spk, 5_000_000,
-            1_000_000, 5_000_000, &rcid, &ohash,
+            1_000_000, 5_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
-        assert_eq!(rs.len(), 380, "bracket_order RS must be 380 bytes (238 state + 142 body)");
+        assert_eq!(rs.len(), 430, "bracket_order RS must be 430 bytes (271 state + 159 body)");
     }
 
     #[test]
@@ -591,13 +592,14 @@ mod tests {
         let tp_spk = [0xBBu8; 37];
         let sl_spk = [0xCCu8; 37];
         let rcid = [0xDDu8; 32];
+        let tspk = [0x11u8; 32];
         let ohash = [0xEEu8; 32];
         let rs = build_bracket_redeem_script(
             1, &tcid, 100, 200, &tp_spk, 5_000_000, &sl_spk, 3_000_000,
-            1_000_000, 2_000_000, &rcid, &ohash,
+            1_000_000, 2_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
 
-        // State layout verification (238 bytes):
+        // State layout verification (271 bytes):
         // [0x08][entry_type 8B] = 9B
         assert_eq!(rs[0], 0x08, "entry_type push opcode");
         assert_eq!(u64::from_le_bytes(rs[1..9].try_into().unwrap()), 1, "entry_type");
@@ -638,16 +640,20 @@ mod tests {
         assert_eq!(rs[163], 0x08, "min_receipt_val push opcode");
         assert_eq!(u64::from_le_bytes(rs[164..172].try_into().unwrap()), 2_000_000, "min_receipt_val");
 
-        // [0x20][receipt_cov_id 32B] = 33B  <-- NEW in v4
+        // [0x20][receipt_cov_id 32B] = 33B
         assert_eq!(rs[172], 0x20, "receipt_cov_id push opcode");
         assert_eq!(&rs[173..205], &[0xDD; 32], "receipt_cov_id");
 
-        // [0x20][owner_hash 32B] = 33B
-        assert_eq!(rs[205], 0x20, "owner_hash push opcode");
-        assert_eq!(&rs[206..238], &[0xEE; 32], "owner_hash");
+        // [0x20][trade_spk_hash 32B] = 33B  <-- NEW in N5
+        assert_eq!(rs[205], 0x20, "trade_spk_hash push opcode");
+        assert_eq!(&rs[206..238], &[0x11; 32], "trade_spk_hash");
 
-        // Body starts at offset 238
-        assert_eq!(&rs[238..], BRACKET_ORDER_BODY, "body must match bytecode");
+        // [0x20][owner_hash 32B] = 33B
+        assert_eq!(rs[238], 0x20, "owner_hash push opcode");
+        assert_eq!(&rs[239..271], &[0xEE; 32], "owner_hash");
+
+        // Body starts at offset 271
+        assert_eq!(&rs[271..], BRACKET_ORDER_BODY, "body must match bytecode");
     }
 
     #[test]
@@ -656,15 +662,16 @@ mod tests {
         let tp_spk = [0u8; 37];
         let sl_spk = [0u8; 37];
         let rcid = [0u8; 32];
+        let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
             0, &tcid, 1000, 1, &tp_spk, 5_000_000, &sl_spk, 5_000_000,
-            1_000_000, 5_000_000, &rcid, &ohash,
+            1_000_000, 5_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
         let fill_ss = build_bracket_fill_sigscript(&rs);
-        // Fill: Op1(1) + OP_PUSHDATA2(3B) + RS(380B) = 384B
-        assert_eq!(fill_ss.len(), 384, "fill sigscript must be 384B");
-        assert!(fill_ss.len() < 420, "fill must be below dispatch threshold 420");
+        // Fill: Op1(1) + OP_PUSHDATA2(3B) + RS(430B) = 434B
+        assert_eq!(fill_ss.len(), 434, "fill sigscript must be 434B");
+        assert!(fill_ss.len() < 480, "fill must be below dispatch threshold 480");
         assert_eq!(fill_ss[0], 0x51, "first byte must be Op1 selector");
     }
 
@@ -674,17 +681,18 @@ mod tests {
         let tp_spk = [0u8; 37];
         let sl_spk = [0u8; 37];
         let rcid = [0u8; 32];
+        let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
             0, &tcid, 1000, 1, &tp_spk, 5_000_000, &sl_spk, 5_000_000,
-            1_000_000, 5_000_000, &rcid, &ohash,
+            1_000_000, 5_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
         let sig = [0u8; 64];
         let pk = [0u8; 32];
         let cancel_ss = build_bracket_cancel_sigscript(&sig, &pk, &rs);
-        // Cancel: Op0(1) + push_sig(66) + push_pk(33) + OP_PUSHDATA2(3) + RS(380) = 483B
-        assert_eq!(cancel_ss.len(), 483, "cancel sigscript must be 483B");
-        assert!(cancel_ss.len() >= 420, "cancel must be at or above dispatch threshold 420");
+        // Cancel: Op0(1) + push_sig(66) + push_pk(33) + OP_PUSHDATA2(3) + RS(430) = 533B
+        assert_eq!(cancel_ss.len(), 533, "cancel sigscript must be 533B");
+        assert!(cancel_ss.len() >= 480, "cancel must be at or above dispatch threshold 480");
         assert_eq!(cancel_ss[0], 0x00, "first byte must be Op0 selector");
     }
 
@@ -694,19 +702,20 @@ mod tests {
         let tp_spk = [0u8; 37];
         let sl_spk = [0u8; 37];
         let rcid = [0u8; 32];
+        let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
             1, &tcid, 1000, 1, &tp_spk, 5_000_000, &sl_spk, 5_000_000,
-            1_000_000, 5_000_000, &rcid, &ohash,
+            1_000_000, 5_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
         let fill_ss = build_bracket_fill_sigscript(&rs);
         let sig = [0u8; 64];
         let pk = [0u8; 32];
         let cancel_ss = build_bracket_cancel_sigscript(&sig, &pk, &rs);
 
-        // Verify both are well within their respective sides of threshold 420
-        assert!(420 - fill_ss.len() >= 20, "fill margin from threshold must be >= 20B");
-        assert!(cancel_ss.len() - 420 >= 50, "cancel margin from threshold must be >= 50B");
+        // Verify both are well within their respective sides of threshold 480
+        assert!(480 - fill_ss.len() >= 20, "fill margin from threshold must be >= 20B");
+        assert!(cancel_ss.len() - 480 >= 50, "cancel margin from threshold must be >= 50B");
     }
 
     #[test]
@@ -716,10 +725,17 @@ mod tests {
             BRACKET_ORDER_BODY.contains(&0xcf),
             "body must contain OpInputCovenantId (0xcf)"
         );
-        // Verify v4 has one more OpDrop than v3 in each section (13 vs 12, 14 vs 13)
+        // N5: SELL: 14, BUY: 14, CANCEL: 15 = 43 total drops
         let drop_count = BRACKET_ORDER_BODY.iter().filter(|&&b| b == 0x75).count();
-        // SELL: 13, BUY: 13, CANCEL: 14 = 40 total drops
-        assert_eq!(drop_count, 40, "body must have 40 total OpDrop opcodes");
+        assert_eq!(drop_count, 43, "body must have 43 total OpDrop opcodes");
+    }
+
+    #[test]
+    fn bracket_trade_spk_blake2b_in_body() {
+        // N5: Verify the body contains OpBlake2b (0xaa) for trade SPK verification.
+        // Should appear 3 times: cancel (pk hash) + sell (output SPK) + buy (output SPK)
+        let blake2b_count = BRACKET_ORDER_BODY.iter().filter(|&&b| b == 0xaa).count();
+        assert_eq!(blake2b_count, 3, "body must have 3 OpBlake2b opcodes (cancel + sell SPK + buy SPK)");
     }
 
     #[test]
@@ -729,9 +745,10 @@ mod tests {
         let tp_spk = [0u8; 37];
         let sl_spk = [0u8; 37];
         let rcid = [0u8; 32];
+        let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         build_bracket_redeem_script(
-            0, &tcid, 0, 1, &tp_spk, 1000, &sl_spk, 1000, 1000, 1000, &rcid, &ohash,
+            0, &tcid, 0, 1, &tp_spk, 1000, &sl_spk, 1000, 1000, 1000, &rcid, &tspk, &ohash,
         ).unwrap();
     }
 
@@ -742,9 +759,10 @@ mod tests {
         let tp_spk = [0u8; 37];
         let sl_spk = [0u8; 37];
         let rcid = [0u8; 32];
+        let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         build_bracket_redeem_script(
-            0, &tcid, 1, 0, &tp_spk, 1000, &sl_spk, 1000, 1000, 1000, &rcid, &ohash,
+            0, &tcid, 1, 0, &tp_spk, 1000, &sl_spk, 1000, 1000, 1000, &rcid, &tspk, &ohash,
         ).unwrap();
     }
 
@@ -755,9 +773,10 @@ mod tests {
         let tp_spk = [0u8; 37];
         let sl_spk = [0u8; 37];
         let rcid = [0u8; 32];
+        let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         build_bracket_redeem_script(
-            0, &tcid, 1, 1, &tp_spk, 1000, &sl_spk, 1000, 0, 1000, &rcid, &ohash,
+            0, &tcid, 1, 1, &tp_spk, 1000, &sl_spk, 1000, 0, 1000, &rcid, &tspk, &ohash,
         ).unwrap();
     }
 
@@ -1311,16 +1330,16 @@ mod tests {
     fn dca_order_body_length() {
         assert_eq!(
             DCA_ORDER_BODY.len(),
-            195,
-            "dca_order body must be 195 bytes"
+            216,
+            "dca_order body must be 216 bytes"
         );
     }
 
     #[test]
     fn dca_order_body_hex() {
         let hex = hex::encode(DCA_ORDER_BODY);
-        // Verify dispatch: Op8 OpRoll Op0 OpGreaterThan OpIf
-        assert_eq!(&hex[0..10], "587a00a063", "dispatch pattern");
+        // Verify dispatch: Op9 OpRoll Op0 OpGreaterThan OpIf
+        assert_eq!(&hex[0..10], "597a00a063", "dispatch pattern");
         // Verify CLTV presence
         assert!(hex.contains("b0"), "fill path must contain OpCheckLockTimeVerify");
         // Verify D&R Blake2b authenticity pattern
@@ -1333,18 +1352,20 @@ mod tests {
     fn dca_order_redeem_script_length() {
         let oh = [0u8; 32];
         let tcid = [0u8; 32];
+        let bspkh = [0u8; 32];
         let rs = build_dca_order_redeem_script(
-            &oh, &tcid, 100, 200, 50000, 100, 1000, 10,
+            &oh, &tcid, &bspkh, 100, 200, 50000, 100, 1000, 10,
         ).unwrap();
-        assert_eq!(rs.len(), 315, "dca_order RS must be 315 bytes (120 state + 195 body)");
+        assert_eq!(rs.len(), 369, "dca_order RS must be 369 bytes (153 state + 216 body)");
     }
 
     #[test]
     fn dca_order_state_layout() {
         let oh = [0xAAu8; 32];
         let tcid = [0xBBu8; 32];
+        let bspkh = [0xCCu8; 32];
         let rs = build_dca_order_redeem_script(
-            &oh, &tcid, 100, 200, 50000, 100, 1000, 10,
+            &oh, &tcid, &bspkh, 100, 200, 50000, 100, 1000, 10,
         ).unwrap();
 
         // [0x20][owner_hash 32B]
@@ -1355,54 +1376,59 @@ mod tests {
         assert_eq!(rs[33], 0x20, "target_cov_id push opcode");
         assert_eq!(&rs[34..66], &[0xBB; 32], "target_cov_id");
 
+        // [0x20][buyer_spk_hash 32B]
+        assert_eq!(rs[66], 0x20, "buyer_spk_hash push opcode");
+        assert_eq!(&rs[67..99], &[0xCC; 32], "buyer_spk_hash");
+
         // [0x08][price_num 8B]
-        assert_eq!(rs[66], 0x08, "price_num push opcode");
-        assert_eq!(u64::from_le_bytes(rs[67..75].try_into().unwrap()), 100, "price_num");
+        assert_eq!(rs[99], 0x08, "price_num push opcode");
+        assert_eq!(u64::from_le_bytes(rs[100..108].try_into().unwrap()), 100, "price_num");
 
         // [0x08][price_den 8B]
-        assert_eq!(rs[75], 0x08, "price_den push opcode");
-        assert_eq!(u64::from_le_bytes(rs[76..84].try_into().unwrap()), 200, "price_den");
+        assert_eq!(rs[108], 0x08, "price_den push opcode");
+        assert_eq!(u64::from_le_bytes(rs[109..117].try_into().unwrap()), 200, "price_den");
 
         // [0x08][amount_per_period 8B]
-        assert_eq!(rs[84], 0x08, "amount_per_period push opcode");
-        assert_eq!(u64::from_le_bytes(rs[85..93].try_into().unwrap()), 50000, "amount_per_period");
+        assert_eq!(rs[117], 0x08, "amount_per_period push opcode");
+        assert_eq!(u64::from_le_bytes(rs[118..126].try_into().unwrap()), 50000, "amount_per_period");
 
-        // [0x08][interval_daa 8B] — reordered: before next_exec in v2
-        assert_eq!(rs[93], 0x08, "interval_daa push opcode");
-        assert_eq!(u64::from_le_bytes(rs[94..102].try_into().unwrap()), 100, "interval_daa");
+        // [0x08][interval_daa 8B]
+        assert_eq!(rs[126], 0x08, "interval_daa push opcode");
+        assert_eq!(u64::from_le_bytes(rs[127..135].try_into().unwrap()), 100, "interval_daa");
 
         // [0x08][next_execution_daa 8B]
-        assert_eq!(rs[102], 0x08, "next_execution_daa push opcode");
-        assert_eq!(u64::from_le_bytes(rs[103..111].try_into().unwrap()), 1000, "next_execution_daa");
+        assert_eq!(rs[135], 0x08, "next_execution_daa push opcode");
+        assert_eq!(u64::from_le_bytes(rs[136..144].try_into().unwrap()), 1000, "next_execution_daa");
 
         // [0x08][periods_remaining 8B]
-        assert_eq!(rs[111], 0x08, "periods_remaining push opcode");
-        assert_eq!(u64::from_le_bytes(rs[112..120].try_into().unwrap()), 10, "periods_remaining");
+        assert_eq!(rs[144], 0x08, "periods_remaining push opcode");
+        assert_eq!(u64::from_le_bytes(rs[145..153].try_into().unwrap()), 10, "periods_remaining");
 
-        // Body starts at offset 120
-        assert_eq!(&rs[120..], DCA_ORDER_BODY, "body must match bytecode");
+        // Body starts at offset 153
+        assert_eq!(&rs[153..], DCA_ORDER_BODY, "body must match bytecode");
     }
 
     #[test]
     fn dca_order_state_mutable_zone() {
-        // The D&R mutable zone is [103..120) = next_exec value + push prefix + periods value
+        // The D&R mutable zone is [136..153) = next_exec value + push prefix + periods value
         let oh = [0xAAu8; 32];
         let tcid = [0xBBu8; 32];
+        let bspkh = [0xCCu8; 32];
         let rs = build_dca_order_redeem_script(
-            &oh, &tcid, 100, 200, 50000, 100, 1000, 10,
+            &oh, &tcid, &bspkh, 100, 200, 50000, 100, 1000, 10,
         ).unwrap();
 
-        // Locked prefix [0..103): owner_hash + tcid + pnum + pden + amt_pp + interval + push_prefix
-        let prefix = &rs[0..103];
-        assert_eq!(prefix[102], 0x08, "prefix ends with push prefix for next_exec");
+        // Locked prefix [0..136): owner_hash + tcid + bspkh + pnum + pden + amt_pp + interval + push_prefix
+        let prefix = &rs[0..136];
+        assert_eq!(prefix[135], 0x08, "prefix ends with push prefix for next_exec");
 
-        // Mutable zone [103..120): next_exec value (8B) + 0x08 (push prefix) + periods value (8B)
-        assert_eq!(u64::from_le_bytes(rs[103..111].try_into().unwrap()), 1000, "mutable next_exec");
-        assert_eq!(rs[111], 0x08, "push prefix for periods in mutable zone");
-        assert_eq!(u64::from_le_bytes(rs[112..120].try_into().unwrap()), 10, "mutable periods");
+        // Mutable zone [136..153): next_exec value (8B) + 0x08 (push prefix) + periods value (8B)
+        assert_eq!(u64::from_le_bytes(rs[136..144].try_into().unwrap()), 1000, "mutable next_exec");
+        assert_eq!(rs[144], 0x08, "push prefix for periods in mutable zone");
+        assert_eq!(u64::from_le_bytes(rs[145..153].try_into().unwrap()), 10, "mutable periods");
 
-        // Suffix [120..): body bytecode (locked)
-        assert_eq!(&rs[120..], DCA_ORDER_BODY, "suffix is body");
+        // Suffix [153..): body bytecode (locked)
+        assert_eq!(&rs[153..], DCA_ORDER_BODY, "suffix is body");
     }
 
     #[test]
@@ -1416,9 +1442,9 @@ mod tests {
     #[test]
     fn dca_order_contains_d_and_r_pattern() {
         let body = DCA_ORDER_BODY;
-        // Must contain OpBlake2b (0xaa) for RS authenticity and SPK verification
+        // Must contain OpBlake2b (0xaa) for RS authenticity, buyer SPK, and D&R SPK verification
         let blake2b_count = body.iter().filter(|&&b| b == 0xaa).count();
-        assert!(blake2b_count >= 3, "need at least 3 OpBlake2b: auth + SPK build x2, got {}", blake2b_count);
+        assert!(blake2b_count >= 4, "need at least 4 OpBlake2b: auth + buyer_spk + D&R SPK x2, got {}", blake2b_count);
         // Must contain OpSubstr (0x7f) for prefix/suffix/value extraction
         let substr_count = body.iter().filter(|&&b| b == 0x7f).count();
         assert!(substr_count >= 8, "need at least 8 OpSubstr, got {}", substr_count);
@@ -1442,9 +1468,9 @@ mod tests {
 
     #[test]
     fn dca_order_dispatch_opcodes() {
-        // Op8 OpRoll dispatch
-        assert_eq!(&DCA_ORDER_BODY[0..5], &[0x58, 0x7a, 0x00, 0xa0, 0x63],
-            "dispatch must be: Op8 OpRoll Op0 OpGreaterThan OpIf");
+        // Op9 OpRoll dispatch
+        assert_eq!(&DCA_ORDER_BODY[0..5], &[0x59, 0x7a, 0x00, 0xa0, 0x63],
+            "dispatch must be: Op9 OpRoll Op0 OpGreaterThan OpIf");
     }
 
     #[test]
@@ -1477,54 +1503,55 @@ mod tests {
     #[should_panic(expected = "periods_remaining must be > 0")]
     fn dca_order_panics_on_zero_periods() {
         let z = [0u8; 32];
-        build_dca_order_redeem_script(&z, &z, 1, 1, 1000, 10, 100, 0).unwrap();
+        build_dca_order_redeem_script(&z, &z, &z, 1, 1, 1000, 10, 100, 0).unwrap();
     }
 
     #[test]
     #[should_panic(expected = "amount_per_period must be > 0")]
     fn dca_order_panics_on_zero_amount_per_period() {
         let z = [0u8; 32];
-        build_dca_order_redeem_script(&z, &z, 1, 1, 0, 10, 100, 5).unwrap();
+        build_dca_order_redeem_script(&z, &z, &z, 1, 1, 0, 10, 100, 5).unwrap();
     }
 
     #[test]
     #[should_panic(expected = "interval_daa must be > 0")]
     fn dca_order_panics_on_zero_interval() {
         let z = [0u8; 32];
-        build_dca_order_redeem_script(&z, &z, 1, 1, 1000, 0, 100, 5).unwrap();
+        build_dca_order_redeem_script(&z, &z, &z, 1, 1, 1000, 0, 100, 5).unwrap();
     }
 
     #[test]
     #[should_panic(expected = "price_num must be > 0")]
     fn dca_order_panics_on_zero_price_num() {
         let z = [0u8; 32];
-        build_dca_order_redeem_script(&z, &z, 0, 1, 1000, 10, 100, 5).unwrap();
+        build_dca_order_redeem_script(&z, &z, &z, 0, 1, 1000, 10, 100, 5).unwrap();
     }
 
     #[test]
     #[should_panic(expected = "price_den must be > 0")]
     fn dca_order_panics_on_zero_price_den() {
         let z = [0u8; 32];
-        build_dca_order_redeem_script(&z, &z, 1, 0, 1000, 10, 100, 5).unwrap();
+        build_dca_order_redeem_script(&z, &z, &z, 1, 0, 1000, 10, 100, 5).unwrap();
     }
 
     #[test]
     fn dca_order_fill_sigscript_format() {
         let oh = [0xAAu8; 32];
         let tcid = [0xBBu8; 32];
+        let bspkh = [0xCCu8; 32];
         let old_rs = build_dca_order_redeem_script(
-            &oh, &tcid, 100, 200, 50000, 100, 1000, 10,
+            &oh, &tcid, &bspkh, 100, 200, 50000, 100, 1000, 10,
         ).unwrap();
         let new_rs = build_dca_order_redeem_script(
-            &oh, &tcid, 100, 200, 50000, 100, 1100, 9,
+            &oh, &tcid, &bspkh, 100, 200, 50000, 100, 1100, 9,
         ).unwrap();
 
         let ss = build_dca_order_fill_sigscript(0, &old_rs, &new_rs, &old_rs);
         // sigscript contains: pushData(new_rs) + pushData(old_rs) + ci + Op1 + pushData(RS)
-        // new_rs and old_rs are 315B each, pushData(315) = 4d + 2B len + 315B = 318B
-        // ci = Op0 (1B), selector Op1 (1B), pushData(RS=315B) = 318B
-        // Total ≈ 318 + 318 + 1 + 1 + 318 = 956B
-        assert!(ss.len() > 900, "fill sigscript should be >900B, got {}", ss.len());
+        // new_rs and old_rs are 369B each, pushData(369) = 4d + 2B len + 369B = 372B
+        // ci = Op0 (1B), selector Op1 (1B), pushData(RS=369B) = 372B
+        // Total ≈ 372 + 372 + 1 + 1 + 372 = 1118B
+        assert!(ss.len() > 1100, "fill sigscript should be >1100B, got {}", ss.len());
         // Last bytes should be pushData(RS)
         let rs_push = push_data(&old_rs);
         assert_eq!(&ss[ss.len()-rs_push.len()..], &rs_push, "sigscript must end with pushData(RS)");
@@ -1534,8 +1561,9 @@ mod tests {
     fn dca_order_cancel_sigscript_format() {
         let oh = [0xAAu8; 32];
         let tcid = [0xBBu8; 32];
+        let bspkh = [0xCCu8; 32];
         let rs = build_dca_order_redeem_script(
-            &oh, &tcid, 100, 200, 50000, 100, 1000, 10,
+            &oh, &tcid, &bspkh, 100, 200, 50000, 100, 1000, 10,
         ).unwrap();
 
         let sig = [0xCCu8; 64];
@@ -1560,15 +1588,15 @@ mod tests {
         // Verify the D&R bytecode uses correct offsets for prefix/suffix
         let body = DCA_ORDER_BODY;
         let hex = hex::encode(body);
-        // prefix size = 103 = 0x67
-        assert!(hex.contains("0167"), "body must push 103 (0x67) for prefix size");
-        // suffix offset = 120 = 0x78
-        assert!(hex.contains("0178"), "body must push 120 (0x78) for suffix offset");
-        // push prefix check at byte 111 = 0x6f
-        assert!(hex.contains("016f"), "body must push 111 (0x6f) for push prefix check");
-        // next_exec offset = 103 = 0x67 (same as prefix size, reused)
-        // periods offset = 112 = 0x70
-        assert!(hex.contains("0170"), "body must push 112 (0x70) for periods offset");
+        // prefix size = 136 = 0x88 (pushed as 2-byte: 0x02 0x88 0x00)
+        assert!(hex.contains("028800"), "body must push 136 (0x88,0x00) for prefix size");
+        // suffix offset = 153 = 0x99 (pushed as 2-byte: 0x02 0x99 0x00)
+        assert!(hex.contains("029900"), "body must push 153 (0x99,0x00) for suffix offset");
+        // push prefix check at byte 144 = 0x90 (pushed as 2-byte: 0x02 0x90 0x00)
+        assert!(hex.contains("029000"), "body must push 144 (0x90,0x00) for push prefix check");
+        // next_exec offset = 136 = 0x88 (same encoding as prefix size)
+        // periods offset = 145 = 0x91 (pushed as 2-byte: 0x02 0x91 0x00)
+        assert!(hex.contains("029100"), "body must push 145 (0x91,0x00) for periods offset");
     }
 
     #[test]
@@ -1576,38 +1604,39 @@ mod tests {
         // Build old RS with periods=5, next_exec=1000, interval=100
         let oh = [0xAAu8; 32];
         let tcid = [0xBBu8; 32];
+        let bspkh = [0xCCu8; 32];
         let old_rs = build_dca_order_redeem_script(
-            &oh, &tcid, 50, 100, 10000, 100, 1000, 5,
+            &oh, &tcid, &bspkh, 50, 100, 10000, 100, 1000, 5,
         ).unwrap();
 
         // Build expected continuation RS
         let new_rs = build_dca_order_redeem_script(
-            &oh, &tcid, 50, 100, 10000, 100, 1100, 4,
+            &oh, &tcid, &bspkh, 50, 100, 10000, 100, 1100, 4,
         ).unwrap();
 
-        // Prefix [0..103) must match
-        assert_eq!(&old_rs[0..103], &new_rs[0..103], "prefix must be identical");
+        // Prefix [0..136) must match
+        assert_eq!(&old_rs[0..136], &new_rs[0..136], "prefix must be identical");
 
-        // Suffix [120..end) must match (body bytecode)
-        assert_eq!(&old_rs[120..], &new_rs[120..], "suffix (body) must be identical");
+        // Suffix [153..end) must match (body bytecode)
+        assert_eq!(&old_rs[153..], &new_rs[153..], "suffix (body) must be identical");
 
-        // Mutable zone [103..120) must differ
-        assert_ne!(&old_rs[103..120], &new_rs[103..120], "mutable zone must differ");
+        // Mutable zone [136..153) must differ
+        assert_ne!(&old_rs[136..153], &new_rs[136..153], "mutable zone must differ");
 
         // Verify new_next_exec = old_next_exec + interval
-        let old_next = u64::from_le_bytes(old_rs[103..111].try_into().unwrap());
-        let new_next = u64::from_le_bytes(new_rs[103..111].try_into().unwrap());
-        let interval = u64::from_le_bytes(old_rs[94..102].try_into().unwrap());
+        let old_next = u64::from_le_bytes(old_rs[136..144].try_into().unwrap());
+        let new_next = u64::from_le_bytes(new_rs[136..144].try_into().unwrap());
+        let interval = u64::from_le_bytes(old_rs[127..135].try_into().unwrap());
         assert_eq!(new_next, old_next + interval, "new_next_exec must equal old + interval");
 
         // Verify new_periods = old_periods - 1
-        let old_periods = u64::from_le_bytes(old_rs[112..120].try_into().unwrap());
-        let new_periods = u64::from_le_bytes(new_rs[112..120].try_into().unwrap());
+        let old_periods = u64::from_le_bytes(old_rs[145..153].try_into().unwrap());
+        let new_periods = u64::from_le_bytes(new_rs[145..153].try_into().unwrap());
         assert_eq!(new_periods, old_periods - 1, "new_periods must equal old - 1");
 
-        // Push prefix at byte 111 preserved
-        assert_eq!(old_rs[111], 0x08, "old push prefix");
-        assert_eq!(new_rs[111], 0x08, "new push prefix");
+        // Push prefix at byte 144 preserved
+        assert_eq!(old_rs[144], 0x08, "old push prefix");
+        assert_eq!(new_rs[144], 0x08, "new push prefix");
     }
 
     #[test]
@@ -1615,16 +1644,17 @@ mod tests {
         // When periods == 1, the script takes the else branch (no D&R)
         let oh = [0xAAu8; 32];
         let tcid = [0xBBu8; 32];
+        let bspkh = [0xCCu8; 32];
         let rs = build_dca_order_redeem_script(
-            &oh, &tcid, 50, 100, 10000, 100, 1000, 1,
+            &oh, &tcid, &bspkh, 50, 100, 10000, 100, 1000, 1,
         ).unwrap();
 
         // For final fill, old_rs/new_rs can be empty (Op0 pushes empty)
         let ss = build_dca_order_fill_sigscript(0, &[], &[], &rs);
         // Should be valid: pushData(empty) + pushData(empty) + Op0 + Op1 + pushData(RS)
         // pushData(empty) = [0x00] (1 byte each)
-        // Total = 1 + 1 + 1 + 1 + pushData(315) = 4 + 318 = 322B
-        assert!(ss.len() < 330, "final fill sigscript should be compact, got {}", ss.len());
+        // Total = 1 + 1 + 1 + 1 + pushData(369) = 4 + 372 = 376B
+        assert!(ss.len() < 380, "final fill sigscript should be compact, got {}", ss.len());
     }
 
 }

@@ -48,9 +48,9 @@ const P2SH_SPK_SIZE: u64 = 35;
 const BUY_RS_SIZE: u64 = 387;
 /// sell_order v13 redeemScript: 112B state + 244B body = 356B.
 const SELL_RS_SIZE: u64 = 356;
-/// bracket_order v4 redeemScript: 238B state + 142B body = 380B.
+/// bracket_order v5 redeemScript: 271B state + 159B body = 430B.
 #[allow(dead_code)] // Kept for fee estimation reference
-const BRACKET_RS_SIZE: u64 = 380;
+const BRACKET_RS_SIZE: u64 = 430;
 /// oco_pair v4 redeemScript: 181B state + 147B body = 328B.
 #[allow(dead_code)] // Kept for fee estimation reference
 const OCO_RS_SIZE: u64 = 328;
@@ -1316,15 +1316,16 @@ mod tests {
     }
 
     #[test]
-    fn bracket_v4_rs_size_constant() {
+    fn bracket_v5_rs_size_constant() {
         use kob_core::contract::build_bracket_redeem_script;
         let tcid = [0u8; 32];
         let tp_spk = [0u8; 37];
         let sl_spk = [0u8; 37];
         let rcid = [0u8; 32];
+        let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
-            0, &tcid, 1, 2, &tp_spk, 1000, &sl_spk, 1000, 100, 1000, &rcid, &ohash,
+            0, &tcid, 1, 2, &tp_spk, 1000, &sl_spk, 1000, 100, 1000, &rcid, &tspk, &ohash,
         ).unwrap();
         assert_eq!(BRACKET_RS_SIZE, rs.len() as u64,
             "BRACKET_RS_SIZE ({}) != actual ({})", BRACKET_RS_SIZE, rs.len());

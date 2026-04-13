@@ -387,6 +387,73 @@ pub(crate) fn pair_to_batch_orders(
     Some((sell_order, buy_order))
 }
 
+/// Convert a single BookOrder into a BatchOrder.
+///
+/// Returns None if the order has invalid token_cov_id hex, unsupported RS size,
+/// or missing counterparty SPK.
+pub(crate) fn book_order_to_batch_order(
+    order: &crate::matcher::order_book::BookOrder,
+    label: &str,
+) -> Option<crate::matcher::batch::BatchOrder> {
+    let token_bytes: [u8; 32] = match hex::decode(&order.token_cov_id) {
+        Ok(v) if v.len() == 32 => {
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&v);
+            arr
+        }
+        _ => {
+            warn!("[{}] Invalid token_cov_id hex for {}, skipping", label, order.outpoint_key());
+            return None;
+        }
+    };
+
+    let rs = hex::decode(&order.redeem_script_hex).unwrap_or_default();
+
+    // v14 RS sizes: sell=416, OCO sell=333, buy=396
+    match order.side {
+        crate::matcher::order_book::OrderSide::Sell => {
+            if rs.len() != 416 && rs.len() != kob_core::OCO_SELL_RS_SIZE {
+                warn!("[{}] Unsupported sell RS size {} for {}", label, rs.len(), order.outpoint_key());
+                return None;
+            }
+        }
+        crate::matcher::order_book::OrderSide::Buy => {
+            if rs.len() != 396 {
+                warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
+                return None;
+            }
+        }
+    }
+
+    let (spk_ver, spk) = match order.resolve_counterparty_spk() {
+        Some(x) => x,
+        None => {
+            warn!("[{}] Order {} missing counterparty_spk, skipping", label, order.outpoint_key());
+            return None;
+        }
+    };
+
+    let order_type = match order.side {
+        crate::matcher::order_book::OrderSide::Buy => crate::matcher::batch::OrderType::Buy,
+        crate::matcher::order_book::OrderSide::Sell => crate::matcher::batch::OrderType::Sell,
+    };
+
+    Some(crate::matcher::batch::BatchOrder {
+        outpoint: (order.tx_id.clone(), order.index),
+        order_type,
+        version: 14,
+        token_cov_id: token_bytes,
+        price_num: order.price_num,
+        price_den: order.price_den,
+        amount: order.value,
+        redeem_script: rs,
+        utxo_value: order.value,
+        counterparty_spk: spk,
+        counterparty_spk_version: spk_ver,
+        oco_path: order.oco_path,
+    })
+}
+
 /// to sign the wallet input (P2PK, last input), then submits via RPC.
 ///
 /// The wallet input is the LAST input in the batch TX and needs `sigOpCount: 1`
@@ -2201,6 +2268,238 @@ async fn run_scan_cycle(
             }
         }
 
+        // Phase 0.5: Sweep matching (1 buy : N sells or 1 sell : N buys)
+        // Runs BEFORE Phase 1a batch grouping so that large sweepable orders
+        // are matched atomically instead of being broken into 1:1 pairs.
+        // Orders consumed here are added to batched_outpoints.
+        {
+            let sweep_spent: std::collections::HashSet<String> = batched_outpoints.iter().cloned()
+                .chain(spent_tracker.spent.keys().cloned())
+                .collect();
+            let sweep_groups = matching::find_sweep_groups(
+                order_book, allow_self_trade, Some(&sweep_spent),
+            );
+
+            if !sweep_groups.is_empty() {
+                info!(
+                    "[SWEEP] Found {} sweep group(s) with {} total fills",
+                    sweep_groups.len(),
+                    sweep_groups.iter().map(|g| g.fills.len()).sum::<usize>(),
+                );
+            }
+
+            for sg in &sweep_groups {
+                // Skip if anchor was already consumed
+                let anchor_key = sg.anchor.outpoint_key();
+                if batched_outpoints.contains(&anchor_key) {
+                    continue;
+                }
+                // Skip if any fill was already consumed
+                let any_fill_spent = sg.fills.iter().any(|f| batched_outpoints.contains(&f.outpoint_key()));
+                if any_fill_spent {
+                    continue;
+                }
+
+                // Convert BookOrders to BatchOrders
+                let anchor_batch = match book_order_to_batch_order(&sg.anchor, "SWEEP") {
+                    Some(o) => o,
+                    None => continue,
+                };
+                let fill_batches: Vec<crate::matcher::batch::BatchOrder> = sg.fills.iter()
+                    .filter_map(|f| book_order_to_batch_order(f, "SWEEP"))
+                    .collect();
+                if fill_batches.len() < 2 {
+                    continue; // need 2+ fills for a sweep
+                }
+
+                // Acquire wallet UTXOs
+                let sweep_utxos = match rpc
+                    .get_spendable_utxos(&config.address, Some(0))
+                    .await
+                {
+                    Ok(u) if !u.is_empty() => u,
+                    Ok(_) => {
+                        warn!("[SWEEP] No wallet UTXOs available, skipping");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("[SWEEP] Failed to get wallet UTXOs: {}, skipping", e);
+                        continue;
+                    }
+                };
+                let (wallet_spk_version, wallet_spk_script) = sweep_utxos[0].parse_spk();
+                let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
+                let token_p2sh_hex = hex::encode(&token_p2sh.script());
+                let wallet_utxo = sweep_utxos.iter()
+                    .filter(|u| {
+                        let (_, script) = u.parse_spk();
+                        hex::encode(&script) != token_p2sh_hex
+                            && !spent_tracker.is_spent(&u.outpoint_key())
+                    })
+                    .max_by_key(|u| u.utxo_entry.amount)
+                    .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
+
+                // Plan the sweep using the existing IOC planner
+                let plan_result = if sg.is_buy_sweep {
+                    info!(
+                        "[SWEEP] Planning buy sweep: 1 buy ({} KAS) x {} sells for [{}...]",
+                        anchor_batch.utxo_value,
+                        fill_batches.len(),
+                        &sg.anchor.token_cov_id[..sg.anchor.token_cov_id.len().min(16)],
+                    );
+                    crate::matcher::batch::plan_ioc_match(
+                        &fill_batches, &anchor_batch, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, None,
+                    )
+                } else {
+                    info!(
+                        "[SWEEP] Planning sell sweep: 1 sell ({} tokens) x {} buys for [{}...]",
+                        anchor_batch.utxo_value,
+                        fill_batches.len(),
+                        &sg.anchor.token_cov_id[..sg.anchor.token_cov_id.len().min(16)],
+                    );
+                    crate::matcher::batch::plan_sell_ioc_match(
+                        &anchor_batch, &fill_batches, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, None,
+                    )
+                };
+
+                let mut plan = match plan_result {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!("[SWEEP] Plan failed: {}, skipping", e);
+                        spent_tracker.mark_failed(&anchor_key);
+                        for f in &sg.fills {
+                            spent_tracker.mark_failed(&f.outpoint_key());
+                        }
+                        continue;
+                    }
+                };
+
+                match execute_batch_match(rpc, &mut plan, config, spent_tracker, None).await {
+                    Some(batch_result) => {
+                        info!(
+                            "[SWEEP] SUCCESS: tx={} anchor={} fills={} surplus={}",
+                            &batch_result.tx_id[..batch_result.tx_id.len().min(16)],
+                            if sg.is_buy_sweep { "buy" } else { "sell" },
+                            sg.fills.len(),
+                            batch_result.matcher_surplus,
+                        );
+
+                        // Mark anchor as spent
+                        batched_outpoints.insert(anchor_key.clone());
+                        spent_tracker.mark_spent(&anchor_key);
+
+                        // WS event for anchor
+                        if let Some(ws) = ws_tx {
+                            let (anchor_side, anchor_value) = if sg.is_buy_sweep {
+                                (OrderSide::Buy, sg.anchor.value)
+                            } else {
+                                (OrderSide::Sell, sg.anchor.value)
+                            };
+                            crate::matcher::api::emit_order_filled(
+                                ws, &sg.anchor.owner_hash, &anchor_key,
+                                &batch_result.tx_id,
+                                sg.anchor.price_num, sg.anchor.price_den,
+                                anchor_value, anchor_side,
+                                &sg.anchor.token_cov_id,
+                            );
+                        }
+
+                        // Mark fills as spent + emit events + record trades
+                        for fill in &sg.fills {
+                            let fk = fill.outpoint_key();
+                            batched_outpoints.insert(fk.clone());
+                            spent_tracker.mark_spent(&fk);
+
+                            if let Some(ws) = ws_tx {
+                                let (fill_side, fill_value) = if sg.is_buy_sweep {
+                                    (OrderSide::Sell, fill.value)
+                                } else {
+                                    (OrderSide::Buy, fill.value)
+                                };
+                                crate::matcher::api::emit_order_filled(
+                                    ws, &fill.owner_hash, &fk,
+                                    &batch_result.tx_id,
+                                    fill.price_num, fill.price_den,
+                                    fill_value, fill_side,
+                                    &fill.token_cov_id,
+                                );
+                            }
+
+                            // Record trade for each fill leg
+                            let trade_side = if sg.is_buy_sweep { Side::Buy } else { Side::Sell };
+                            let trade_qty = if sg.is_buy_sweep {
+                                // For buy sweep: trade volume = sell_kas
+                                let sell_kas_128 = fill.value as u128 * fill.price_num as u128
+                                    / fill.price_den as u128;
+                                sell_kas_128 as u64
+                            } else {
+                                fill.value
+                            };
+                            record_trade(
+                                shared_state,
+                                &batch_result.tx_id,
+                                &fill.token_cov_id,
+                                fill.price_num, fill.price_den,
+                                trade_qty,
+                                trade_side,
+                                None,
+                            ).await;
+
+                            // Mark OCO partner
+                            if let Some(ref partner_key) = fill.oco_partner_key {
+                                spent_tracker.mark_spent(partner_key);
+                                batched_outpoints.insert(partner_key.clone());
+                                info!("[OCO] Marked partner spent (pending): {}", partner_key);
+                            }
+                        }
+
+                        if let Some(ref wu) = plan.wallet_input {
+                            let wk = format!("{}:{}", wu.0, wu.1);
+                            spent_tracker.mark_spent(&wk);
+                        }
+
+                        // Push MatchResults for stop/trailing stop triggers
+                        for fill in &sg.fills {
+                            results.push(MatchResult {
+                                match_tx_id: batch_result.tx_id.clone(),
+                                match_type: MatchType::Full,
+                                seller_kas: if sg.is_buy_sweep {
+                                    let kas_128 = fill.value as u128 * fill.price_num as u128
+                                        / fill.price_den as u128;
+                                    kas_128 as u64
+                                } else {
+                                    sg.anchor.value
+                                },
+                                buyer_tokens: if sg.is_buy_sweep {
+                                    fill.value
+                                } else {
+                                    let tok_128 = fill.value as u128 * fill.price_num as u128
+                                        / fill.price_den as u128;
+                                    tok_128 as u64
+                                },
+                                receipt_tx_id: batch_result.tx_id.clone(),
+                                receipt_idx: 0,
+                                receipt_value: 0,
+                                token_cov_id: fill.token_cov_id.clone(),
+                                price_num: fill.price_num,
+                                price_den: fill.price_den,
+                            });
+                        }
+                    }
+                    None => {
+                        warn!("[SWEEP] Execution failed");
+                        spent_tracker.mark_failed(&anchor_key);
+                        for fill in &sg.fills {
+                            spent_tracker.mark_failed(&fill.outpoint_key());
+                        }
+                    }
+                }
+            }
+        }
+
+
         // Phase 1a: Batch matching (2+ full-fill pairs per token)
         // Try batch matching first — more efficient when multiple full-fill
         // pairs cross for the same token. Orders consumed by batch or
@@ -2444,6 +2743,7 @@ async fn run_scan_cycle(
                 }
             }
         }
+
 
         // Phase 1b: Remaining pairs (partials + failed-batch fallback) via IOC/batch
         let mut remaining_by_token: HashMap<String, &CrossingPair> = HashMap::new();

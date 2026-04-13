@@ -691,7 +691,7 @@ pub async fn run_deploy_test(
         .max_by_key(|u| u.utxo_entry.amount)
         .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-    let plan = match crate::matcher::batch::plan_batch_match(
+    let mut plan = match crate::matcher::batch::plan_batch_match(
         &[sell_order], &[buy_order], wallet_utxo,
         &wallet_spk_script, wallet_spk_version,
         None,
@@ -705,7 +705,7 @@ pub async fn run_deploy_test(
     };
 
     let mut spent_tracker = executor::SpentTracker::new();
-    let batch_result = executor::execute_batch_match(&rpc_lock, &plan, config, &mut spent_tracker, None).await;
+    let batch_result = executor::execute_batch_match(&rpc_lock, &mut plan, config, &mut spent_tracker, None).await;
     drop(rpc_lock);
 
     match batch_result {

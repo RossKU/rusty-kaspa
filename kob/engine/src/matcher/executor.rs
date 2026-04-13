@@ -514,6 +514,14 @@ pub async fn execute_batch_match(
     // lock_time=50 required for OP_CSV(50) in covenant inputs.
     let mut sighash_tx = kob_core::tx::Transaction::new(1);
     sighash_tx.lock_time = 50;
+    // IFD: set TX payload on sighash_tx so sighash computation includes it.
+    // The payload is part of the sighash in Kaspa — adding it only at RPC
+    // submission time would invalidate all pre-computed signatures.
+    if let Some(ref payload_hex) = ifd_payload {
+        if let Ok(payload_bytes) = hex::decode(payload_hex) {
+            sighash_tx.payload = payload_bytes;
+        }
+    }
 
     // Reconstruct inputs for sighash computation.
     // For covenant inputs: use P2SH script from the order's p2sh

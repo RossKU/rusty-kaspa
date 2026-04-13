@@ -22,7 +22,7 @@ use crate::primitives::{push_data, u64_le};
 ///   selector, etype, tcid, epnum, epden, oco_spk, oco_mv,
 ///   mfill, mrv, rcid, trade_spk_hash, owner_hash
 ///
-/// Dispatch threshold: 400 (fill sigscript=369B, cancel=469B).
+/// Dispatch threshold: 400 (fill sigscript=369B, cancel=468B).
 /// Body = 141B. RS = 224 + 141 = 365 bytes.
 ///
 /// OpPick depths (12-item fill stack, from top):
@@ -140,7 +140,7 @@ pub const BRACKET_ORDER_BODY: &[u8] = &[
     0x5b, 0x79,                         // Op11 OpPick -> pk (depth 11)
     0x76,                               // OpDup
     0xaa,                               // OpBlake2b -> hash(pk)
-    // Stack(17): 0=hash(pk), 1=pk_copy, 2=owner_hash, 3=trade_spk_hash, ...
+    // Stack(16): 0=hash(pk), 1=pk_copy, 2=owner_hash, 3=trade_spk_hash, ...
     0x52, 0x79,                         // Op2 OpPick -> owner_hash (depth 2)
     0x87, 0x69,                         // OpEqual OpVerify (blake2b(pk) == owner_hash)
     // Stack(15): 0=pk_copy, 1=owner_hash, 2=trade_spk_hash, ..., 12=pk, 13=sig, 14=Op0
@@ -258,7 +258,7 @@ pub fn build_bracket_fill_sigscript(redeem_script: &[u8]) -> Vec<u8> {
 /// `[Op0][pushData(sig+type 65B)][pushData(pk 32B)][pushData(redeemScript)]`
 ///
 /// sigOpCount = 1 for this input.
-/// sigscript length = 469B (>= 400 threshold -> cancel path).
+/// sigscript length = 468B (>= 400 threshold -> cancel path).
 pub fn build_bracket_cancel_sigscript(
     signature: &[u8; 64],
     pubkey: &[u8; 32],

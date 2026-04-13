@@ -2546,10 +2546,8 @@ pub async fn dispatch(
                 entry_type,
                 entry_num,
                 entry_den,
-                tp_spk,
-                tp_min_value,
-                sl_spk,
-                sl_min_value,
+                oco_spk,
+                oco_min_value,
                 min_fill,
                 receipt_cov_id,
                 amount,
@@ -2562,10 +2560,8 @@ pub async fn dispatch(
                     entry_type,
                     entry_num,
                     entry_den,
-                    &tp_spk,
-                    tp_min_value,
-                    &sl_spk,
-                    sl_min_value,
+                    &oco_spk,
+                    oco_min_value,
                     min_fill,
                     &receipt_cov_id,
                     amount,
@@ -2580,8 +2576,7 @@ pub async fn dispatch(
                 receipt_value,
                 seller_kas,
                 buyer_tokens,
-                tp_value,
-                sl_value,
+                oco_value,
                 receipt_rs,
                 fee_input,
             } => {
@@ -2596,8 +2591,7 @@ pub async fn dispatch(
                     receipt_value,
                     seller_kas,
                     buyer_tokens,
-                    tp_value,
-                    sl_value,
+                    oco_value,
                     &receipt_rs,
                     fee_input.as_deref(),
                 )
@@ -3069,10 +3063,10 @@ pub fn cmd_config(wallet_path: &std::path::Path, node: &str, network: kob_core::
     println!("  MIN_UTXO:      {} sompi", kob_core::MIN_UTXO_VALUE);
     println!("  RECEIPT_VALUE: {} sompi", kob_core::RECEIPT_VALUE);
     println!();
-    println!("Contract Sizes (v4):");
-    println!("  bracket_order: 430B redeemScript (271B state + 159B body)");
-    println!("    Fill:   434B sigscript (< 480 threshold)");
-    println!("    Cancel: 533B sigscript (>= 480 threshold)");
+    println!("Contract Sizes (v6):");
+    println!("  bracket_order: 365B redeemScript (224B state + 141B body)");
+    println!("    Fill:   369B sigscript (< 400 threshold)");
+    println!("    Cancel: 468B sigscript (>= 400 threshold)");
     println!();
     println!("Cross-Pair Matching (v8):");
     println!("  TX layout: sell[0] buy[1] token[2] fee[3]");

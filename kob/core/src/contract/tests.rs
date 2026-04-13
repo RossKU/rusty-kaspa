@@ -308,20 +308,20 @@ mod tests {
         assert_eq!(rs.len(), 119);
     }
 
-    // bracket_order tests (N4 fix: receipt covenant_id check)
+    // bracket_order tests (N6: single oco_sell output)
 
     #[test]
     fn bracket_body_length() {
         assert_eq!(
             BRACKET_ORDER_BODY.len(),
-            159,
-            "bracket_order body must be 159 bytes"
+            141,
+            "bracket_order body must be 141 bytes"
         );
     }
 
     #[test]
     fn bracket_body_hex_matches_spec() {
-        let expected = "b9c902e0019f6352c35979876952c25879a26953c35779876953c25679a26952be5479a26952cf537987695c79ce63b9be5b79955a7996765679a26900c27ca26900c3aa5279876975757575757575757575757575755167b9be5a79965b7995765679a26951c27ca26951c3aa5279876975757575757575757575757575755168675d7976aa527987695f7a7cad7575757575757575757575757575755168";
+        let expected = "b9c90290019f6352c35779876952c25679a26952be5479a26952cf537987695a79ce63b9be597995587996765679a26900c27ca26900c3aa527987697575757575757575757575755167b9be587996597995765679a26951c27ca26951c3aa527987697575757575757575757575755168675b7976aa527987695d7a7cad757575757575757575757575755168";
         assert_eq!(
             hex::encode(BRACKET_ORDER_BODY),
             expected,
@@ -332,32 +332,30 @@ mod tests {
     #[test]
     fn bracket_redeem_length() {
         let tcid = [0u8; 32];
-        let tp_spk = [0u8; 37];
-        let sl_spk = [0u8; 37];
+        let oco_spk = [0u8; 37];
         let rcid = [0u8; 32];
         let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
-            1, &tcid, 1000, 1, &tp_spk, 5_000_000, &sl_spk, 5_000_000,
+            1, &tcid, 1000, 1, &oco_spk, 5_000_000,
             1_000_000, 5_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
-        assert_eq!(rs.len(), 430, "bracket_order RS must be 430 bytes (271 state + 159 body)");
+        assert_eq!(rs.len(), 365, "bracket_order RS must be 365 bytes (224 state + 141 body)");
     }
 
     #[test]
     fn bracket_redeem_state_layout() {
         let tcid = [0xAAu8; 32];
-        let tp_spk = [0xBBu8; 37];
-        let sl_spk = [0xCCu8; 37];
+        let oco_spk = [0xBBu8; 37];
         let rcid = [0xDDu8; 32];
         let tspk = [0x11u8; 32];
         let ohash = [0xEEu8; 32];
         let rs = build_bracket_redeem_script(
-            1, &tcid, 100, 200, &tp_spk, 5_000_000, &sl_spk, 3_000_000,
+            1, &tcid, 100, 200, &oco_spk, 5_000_000,
             1_000_000, 2_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
 
-        // State layout verification (271 bytes):
+        // State layout verification (224 bytes):
         // [0x08][entry_type 8B] = 9B
         assert_eq!(rs[0], 0x08, "entry_type push opcode");
         assert_eq!(u64::from_le_bytes(rs[1..9].try_into().unwrap()), 1, "entry_type");
@@ -374,96 +372,85 @@ mod tests {
         assert_eq!(rs[51], 0x08, "epden push opcode");
         assert_eq!(u64::from_le_bytes(rs[52..60].try_into().unwrap()), 200, "epden");
 
-        // [0x25][tp_spk 37B] = 38B
-        assert_eq!(rs[60], 0x25, "tp_spk push opcode");
-        assert_eq!(&rs[61..98], &[0xBB; 37], "tp_spk");
+        // [0x25][oco_spk 37B] = 38B
+        assert_eq!(rs[60], 0x25, "oco_spk push opcode");
+        assert_eq!(&rs[61..98], &[0xBB; 37], "oco_spk");
 
-        // [0x08][tp_min_val 8B] = 9B
-        assert_eq!(rs[98], 0x08, "tp_min_val push opcode");
-        assert_eq!(u64::from_le_bytes(rs[99..107].try_into().unwrap()), 5_000_000, "tp_min_val");
-
-        // [0x25][sl_spk 37B] = 38B
-        assert_eq!(rs[107], 0x25, "sl_spk push opcode");
-        assert_eq!(&rs[108..145], &[0xCC; 37], "sl_spk");
-
-        // [0x08][sl_min_val 8B] = 9B
-        assert_eq!(rs[145], 0x08, "sl_min_val push opcode");
-        assert_eq!(u64::from_le_bytes(rs[146..154].try_into().unwrap()), 3_000_000, "sl_min_val");
+        // [0x08][oco_min_val 8B] = 9B
+        assert_eq!(rs[98], 0x08, "oco_min_val push opcode");
+        assert_eq!(u64::from_le_bytes(rs[99..107].try_into().unwrap()), 5_000_000, "oco_min_val");
 
         // [0x08][min_fill 8B] = 9B
-        assert_eq!(rs[154], 0x08, "min_fill push opcode");
-        assert_eq!(u64::from_le_bytes(rs[155..163].try_into().unwrap()), 1_000_000, "min_fill");
+        assert_eq!(rs[107], 0x08, "min_fill push opcode");
+        assert_eq!(u64::from_le_bytes(rs[108..116].try_into().unwrap()), 1_000_000, "min_fill");
 
         // [0x08][min_receipt_val 8B] = 9B
-        assert_eq!(rs[163], 0x08, "min_receipt_val push opcode");
-        assert_eq!(u64::from_le_bytes(rs[164..172].try_into().unwrap()), 2_000_000, "min_receipt_val");
+        assert_eq!(rs[116], 0x08, "min_receipt_val push opcode");
+        assert_eq!(u64::from_le_bytes(rs[117..125].try_into().unwrap()), 2_000_000, "min_receipt_val");
 
         // [0x20][receipt_cov_id 32B] = 33B
-        assert_eq!(rs[172], 0x20, "receipt_cov_id push opcode");
-        assert_eq!(&rs[173..205], &[0xDD; 32], "receipt_cov_id");
+        assert_eq!(rs[125], 0x20, "receipt_cov_id push opcode");
+        assert_eq!(&rs[126..158], &[0xDD; 32], "receipt_cov_id");
 
-        // [0x20][trade_spk_hash 32B] = 33B  <-- NEW in N5
-        assert_eq!(rs[205], 0x20, "trade_spk_hash push opcode");
-        assert_eq!(&rs[206..238], &[0x11; 32], "trade_spk_hash");
+        // [0x20][trade_spk_hash 32B] = 33B
+        assert_eq!(rs[158], 0x20, "trade_spk_hash push opcode");
+        assert_eq!(&rs[159..191], &[0x11; 32], "trade_spk_hash");
 
         // [0x20][owner_hash 32B] = 33B
-        assert_eq!(rs[238], 0x20, "owner_hash push opcode");
-        assert_eq!(&rs[239..271], &[0xEE; 32], "owner_hash");
+        assert_eq!(rs[191], 0x20, "owner_hash push opcode");
+        assert_eq!(&rs[192..224], &[0xEE; 32], "owner_hash");
 
-        // Body starts at offset 271
-        assert_eq!(&rs[271..], BRACKET_ORDER_BODY, "body must match bytecode");
+        // Body starts at offset 224
+        assert_eq!(&rs[224..], BRACKET_ORDER_BODY, "body must match bytecode");
     }
 
     #[test]
     fn bracket_fill_sigscript_below_threshold() {
         let tcid = [0u8; 32];
-        let tp_spk = [0u8; 37];
-        let sl_spk = [0u8; 37];
+        let oco_spk = [0u8; 37];
         let rcid = [0u8; 32];
         let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
-            0, &tcid, 1000, 1, &tp_spk, 5_000_000, &sl_spk, 5_000_000,
+            0, &tcid, 1000, 1, &oco_spk, 5_000_000,
             1_000_000, 5_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
         let fill_ss = build_bracket_fill_sigscript(&rs);
-        // Fill: Op1(1) + OP_PUSHDATA2(3B) + RS(430B) = 434B
-        assert_eq!(fill_ss.len(), 434, "fill sigscript must be 434B");
-        assert!(fill_ss.len() < 480, "fill must be below dispatch threshold 480");
+        // Fill: Op1(1) + OP_PUSHDATA2(3B) + RS(365B) = 369B
+        assert_eq!(fill_ss.len(), 369, "fill sigscript must be 369B");
+        assert!(fill_ss.len() < 400, "fill must be below dispatch threshold 400");
         assert_eq!(fill_ss[0], 0x51, "first byte must be Op1 selector");
     }
 
     #[test]
     fn bracket_cancel_sigscript_above_threshold() {
         let tcid = [0u8; 32];
-        let tp_spk = [0u8; 37];
-        let sl_spk = [0u8; 37];
+        let oco_spk = [0u8; 37];
         let rcid = [0u8; 32];
         let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
-            0, &tcid, 1000, 1, &tp_spk, 5_000_000, &sl_spk, 5_000_000,
+            0, &tcid, 1000, 1, &oco_spk, 5_000_000,
             1_000_000, 5_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
         let sig = [0u8; 64];
         let pk = [0u8; 32];
         let cancel_ss = build_bracket_cancel_sigscript(&sig, &pk, &rs);
-        // Cancel: Op0(1) + push_sig(66) + push_pk(33) + OP_PUSHDATA2(3) + RS(430) = 533B
-        assert_eq!(cancel_ss.len(), 533, "cancel sigscript must be 533B");
-        assert!(cancel_ss.len() >= 480, "cancel must be at or above dispatch threshold 480");
+        // Cancel: Op0(1) + push_sig(66) + push_pk(33) + OP_PUSHDATA2(3) + RS(365) = 468B
+        assert_eq!(cancel_ss.len(), 468, "cancel sigscript must be 468B");
+        assert!(cancel_ss.len() >= 400, "cancel must be at or above dispatch threshold 400");
         assert_eq!(cancel_ss[0], 0x00, "first byte must be Op0 selector");
     }
 
     #[test]
     fn bracket_dispatch_margin_sufficient() {
         let tcid = [0u8; 32];
-        let tp_spk = [0u8; 37];
-        let sl_spk = [0u8; 37];
+        let oco_spk = [0u8; 37];
         let rcid = [0u8; 32];
         let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         let rs = build_bracket_redeem_script(
-            1, &tcid, 1000, 1, &tp_spk, 5_000_000, &sl_spk, 5_000_000,
+            1, &tcid, 1000, 1, &oco_spk, 5_000_000,
             1_000_000, 5_000_000, &rcid, &tspk, &ohash,
         ).unwrap();
         let fill_ss = build_bracket_fill_sigscript(&rs);
@@ -471,9 +458,9 @@ mod tests {
         let pk = [0u8; 32];
         let cancel_ss = build_bracket_cancel_sigscript(&sig, &pk, &rs);
 
-        // Verify both are well within their respective sides of threshold 480
-        assert!(480 - fill_ss.len() >= 20, "fill margin from threshold must be >= 20B");
-        assert!(cancel_ss.len() - 480 >= 50, "cancel margin from threshold must be >= 50B");
+        // Verify both are well within their respective sides of threshold 400
+        assert!(400 - fill_ss.len() >= 20, "fill margin from threshold must be >= 20B");
+        assert!(cancel_ss.len() - 400 >= 50, "cancel margin from threshold must be >= 50B");
     }
 
     #[test]
@@ -483,9 +470,9 @@ mod tests {
             BRACKET_ORDER_BODY.contains(&0xcf),
             "body must contain OpInputCovenantId (0xcf)"
         );
-        // N5: SELL: 14, BUY: 14, CANCEL: 15 = 43 total drops
+        // N6: SELL: 12, BUY: 12, CANCEL: 13 = 37 total drops
         let drop_count = BRACKET_ORDER_BODY.iter().filter(|&&b| b == 0x75).count();
-        assert_eq!(drop_count, 43, "body must have 43 total OpDrop opcodes");
+        assert_eq!(drop_count, 37, "body must have 37 total OpDrop opcodes");
     }
 
     #[test]
@@ -500,13 +487,12 @@ mod tests {
     #[should_panic(expected = "entry_price_num must be > 0")]
     fn bracket_rejects_zero_price_num() {
         let tcid = [0u8; 32];
-        let tp_spk = [0u8; 37];
-        let sl_spk = [0u8; 37];
+        let oco_spk = [0u8; 37];
         let rcid = [0u8; 32];
         let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         build_bracket_redeem_script(
-            0, &tcid, 0, 1, &tp_spk, 1000, &sl_spk, 1000, 1000, 1000, &rcid, &tspk, &ohash,
+            0, &tcid, 0, 1, &oco_spk, 1000, 1000, 1000, &rcid, &tspk, &ohash,
         ).unwrap();
     }
 
@@ -514,13 +500,12 @@ mod tests {
     #[should_panic(expected = "entry_price_den must be > 0")]
     fn bracket_rejects_zero_price_den() {
         let tcid = [0u8; 32];
-        let tp_spk = [0u8; 37];
-        let sl_spk = [0u8; 37];
+        let oco_spk = [0u8; 37];
         let rcid = [0u8; 32];
         let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         build_bracket_redeem_script(
-            0, &tcid, 1, 0, &tp_spk, 1000, &sl_spk, 1000, 1000, 1000, &rcid, &tspk, &ohash,
+            0, &tcid, 1, 0, &oco_spk, 1000, 1000, 1000, &rcid, &tspk, &ohash,
         ).unwrap();
     }
 
@@ -528,13 +513,12 @@ mod tests {
     #[should_panic(expected = "min_fill must be > 0")]
     fn bracket_rejects_zero_min_fill() {
         let tcid = [0u8; 32];
-        let tp_spk = [0u8; 37];
-        let sl_spk = [0u8; 37];
+        let oco_spk = [0u8; 37];
         let rcid = [0u8; 32];
         let tspk = [0u8; 32];
         let ohash = [0u8; 32];
         build_bracket_redeem_script(
-            0, &tcid, 1, 1, &tp_spk, 1000, &sl_spk, 1000, 0, 1000, &rcid, &tspk, &ohash,
+            0, &tcid, 1, 1, &oco_spk, 1000, 0, 1000, &rcid, &tspk, &ohash,
         ).unwrap();
     }
 

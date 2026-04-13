@@ -59,6 +59,14 @@ struct PersistOrder {
     max_matcher_fee: u64,
     #[serde(rename = "ifdOrderBRsHex", default, skip_serializing_if = "Option::is_none")]
     ifd_order_b_rs_hex: Option<String>,
+    /// OCO path: which path this virtual order represents (TP or SL).
+    /// Backward-compatible: absent in old JSON deserializes as None.
+    #[serde(rename = "ocoPath", default, skip_serializing_if = "Option::is_none")]
+    oco_path: Option<kob_core::OcoPath>,
+    /// OCO partner: outpoint_key of the partner virtual order.
+    /// Backward-compatible: absent in old JSON deserializes as None.
+    #[serde(rename = "ocoPartnerKey", default, skip_serializing_if = "Option::is_none")]
+    oco_partner_key: Option<String>,
 }
 
 fn persist_default_mmfee() -> u64 {
@@ -99,6 +107,8 @@ pub fn save_order_book(path: &str, order_book: &OrderBook) -> Result<(), String>
                     is_freezable: order.is_freezable,
                     max_matcher_fee: order.max_matcher_fee,
                     ifd_order_b_rs_hex: order.ifd_order_b_rs_hex.clone(),
+                    oco_path: order.oco_path,
+                    oco_partner_key: order.oco_partner_key.clone(),
                 },
             );
         }
@@ -125,6 +135,8 @@ pub fn save_order_book(path: &str, order_book: &OrderBook) -> Result<(), String>
                     is_freezable: order.is_freezable,
                     max_matcher_fee: order.max_matcher_fee,
                     ifd_order_b_rs_hex: order.ifd_order_b_rs_hex.clone(),
+                    oco_path: order.oco_path,
+                    oco_partner_key: order.oco_partner_key.clone(),
                 },
             );
         }
@@ -194,8 +206,8 @@ pub async fn load_order_book(
                 is_freezable: order.is_freezable,
                 max_matcher_fee: order.max_matcher_fee,
                 ifd_order_b_rs_hex: order.ifd_order_b_rs_hex,
-                oco_path: None,
-                oco_partner_key: None,
+                oco_path: order.oco_path,
+                oco_partner_key: order.oco_partner_key,
             });
             loaded += 1;
         }
@@ -228,8 +240,8 @@ pub async fn load_order_book(
                 is_freezable: order.is_freezable,
                 max_matcher_fee: order.max_matcher_fee,
                 ifd_order_b_rs_hex: order.ifd_order_b_rs_hex,
-                oco_path: None,
-                oco_partner_key: None,
+                oco_path: order.oco_path,
+                oco_partner_key: order.oco_partner_key,
             });
             loaded += 1;
         }

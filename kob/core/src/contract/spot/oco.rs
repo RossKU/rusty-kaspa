@@ -1,6 +1,35 @@
 use crate::primitives::{push_data, u64_le};
 use crate::contract::helpers::{gcd, opn, push_index};
 
+// ===========================================================================
+// KNOWN LIMITATION: oco_pair nonce exposure (griefing, NOT theft)
+// ===========================================================================
+//
+// oco_pair links two UTXOs via a shared plaintext nonce in each RS.
+// When either leg fills, the P2SH sigscript reveals the full RS including
+// the nonce. An observer can then construct a CBP sigscript for the
+// remaining leg, forcing its cancellation.
+//
+// Impact: GRIEFING ONLY. OCO2-F3 guarantees:
+//   - CBP output goes to the owner's ospk (not attacker)
+//   - Value floor: output >= input_value - 10_000 sompi
+//   - Input count must be exactly 2
+// Attacker cannot profit; they pay their own TX fee.
+//
+// Why OP_CSV on CBP doesn't help: by the time a leg fills, the partner
+// UTXO is typically old enough for any CSV threshold to pass.
+//
+// Why commit-reveal doesn't help: both fill and CBP paths require the
+// nonce for cross-input verification. Revealing H(nonce) instead would
+// still require the preimage in the sigscript, exposing it.
+//
+// Mitigation path:
+//   1. Prefer oco_sell (single-UTXO) for sell+sell OCO — no nonce needed.
+//   2. For buy+sell or bracket: accept griefing risk (funds safe).
+//   3. Future: expand oco_sell to support buy+sell in a single UTXO,
+//      eliminating oco_pair entirely.
+// ===========================================================================
+
 /// oco_pair body bytecode (147 bytes).
 ///
 /// **OCO2-F3 fix**: cancel_by_partner (CBP) path now has two critical guards:

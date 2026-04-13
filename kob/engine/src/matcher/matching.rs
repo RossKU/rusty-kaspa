@@ -1127,6 +1127,18 @@ pub fn find_optimal_groups(
     let mut groups: Vec<BatchGroup> = Vec::new();
     let mut used: HashSet<String> = HashSet::new();
 
+    // H1-fix: helper to mark an order key as used AND also exclude its
+    // OCO partner.  OCO orders (TP + SL) share a single UTXO; if one
+    // path is selected for a group the other must be excluded from all
+    // subsequent groups to prevent a double-spend within the same cycle.
+    let mut use_order = |used: &mut HashSet<String>, order: &BookOrder| {
+        let key = order.outpoint_key();
+        used.insert(key);
+        if let Some(ref partner) = order.oco_partner_key {
+            used.insert(partner.clone());
+        }
+    };
+
     // ---------------------------------------------------------------
     // Step 1: Sweep groups (1:N)  -- highest priority because they
     // atomically fill large orders that would otherwise be broken into
@@ -1146,10 +1158,10 @@ pub fn find_optimal_groups(
         if sg.fills.iter().any(|f| used.contains(&f.outpoint_key())) {
             continue;
         }
-        // Claim all outpoints
-        used.insert(anchor_key);
+        // Claim all outpoints (+ OCO partners via H1-fix)
+        use_order(&mut used, &sg.anchor);
         for f in &sg.fills {
-            used.insert(f.outpoint_key());
+            use_order(&mut used, f);
         }
 
         let total_surplus = sg.total_fill_cost; // approximate
@@ -1202,8 +1214,8 @@ pub fn find_optimal_groups(
             if used.contains(&bk) || used.contains(&sk) {
                 continue;
             }
-            used.insert(bk);
-            used.insert(sk);
+            use_order(&mut used, &p.buy);
+            use_order(&mut used, &p.sell);
             deduped.push(p);
         }
 
@@ -1262,8 +1274,8 @@ pub fn find_optimal_groups(
             if used.contains(&bk) || used.contains(&sk) {
                 continue;
             }
-            used.insert(bk);
-            used.insert(sk);
+            use_order(&mut used, &best.buy);
+            use_order(&mut used, &best.sell);
 
             let kind = match best.match_type {
                 MatchType::Full => GroupKind::Batch,

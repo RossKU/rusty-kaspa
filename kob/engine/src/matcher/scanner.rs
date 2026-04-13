@@ -8,6 +8,7 @@ pub use kob_core::contract::spot::parse::{ParsedOrder, ParsedOcoSell, parse_rede
 pub use kob_core::contract::perp::parse::{ParsedPerpOrder, PerpDeploySide, PERP_DEPLOY_V1_RS_SIZE, PERP_DEPLOY_V1_STATE_SIZE, parse_perp_deploy_rs};
 pub use kob_core::contract::lending::parse::{ParsedLendingOrder, LendingOrderType, parse_lending_rs, LOAN_OFFER_RS_SIZE, BORROW_REQUEST_RS_SIZE};
 pub use kob_core::contract::prediction::parse::{ParsedPredictionItem, PredictionItemType, parse_prediction_rs};
+pub use kob_core::{ParsedDcaOrder, parse_dca_order_rs, DCA_V2_RS_SIZE};
 
 // Re-export spot RS size constants used by tests.
 pub use kob_core::contract::spot::parse::{BUY_RS_SIZE, SELL_RS_SIZE};
@@ -55,6 +56,8 @@ pub enum ScanResult {
     Lending(ParsedLendingOrder, u32, u64),
     /// Prediction market covenant detected.
     Prediction(ParsedPredictionItem, u32, u64),
+    /// DCA order detected (dca_order_v2, 315B RS).
+    Dca(ParsedDcaOrder, u32, u64),
 }
 
 /// Scanner for detecting KOB deploy transactions and spent orders.
@@ -475,6 +478,29 @@ impl BlockScanner {
                     let (rs_bytes, p2sh_idx, p2sh_value) = result;
                     if let Some(parsed) = parse_prediction_rs(&rs_bytes) {
                         return Some(ScanResult::Prediction(parsed, p2sh_idx, p2sh_value));
+                    }
+                }
+            }
+        }
+
+        // 5. Try DCA (KOB:2: payload with 315B RS)
+        if let Some(v2) = kob_core::contract::parse_order_payload(&tx.payload) {
+            if v2.rs_data.len() == DCA_V2_RS_SIZE {
+                let rs_hash = kob_core::blake2b_256(&v2.rs_data);
+                let p2sh_outputs: Vec<(u32, &TxOutputData, [u8; 32])> = tx
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, out)| {
+                        parse_p2sh_script(&out.script, out.script_version)
+                            .map(|hash| (idx as u32, out, hash))
+                    })
+                    .collect();
+                for &(p2sh_idx, p2sh_out, ref p2sh_hash) in &p2sh_outputs {
+                    if rs_hash == *p2sh_hash {
+                        if let Some(parsed) = parse_dca_order_rs(&v2.rs_data) {
+                            return Some(ScanResult::Dca(parsed, p2sh_idx, p2sh_out.value));
+                        }
                     }
                 }
             }

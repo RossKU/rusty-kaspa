@@ -48,6 +48,77 @@ use crate::contract::helpers::opn;
 /// Cancel sigscript: [pushData(sig+type 65B)][pushData(pk 32B)][Op0][pushData(RS)]
 ///
 /// Body = 195B, RS = 120 + 195 = 315 bytes.
+/// DCA order V2 state size (120 bytes).
+pub const DCA_V2_STATE_SIZE: usize = 120;
+
+/// DCA order V2 body size (195 bytes).
+pub const DCA_V2_BODY_SIZE: usize = 195;
+
+/// DCA order V2 redeemScript size (120 + 195 = 315 bytes).
+pub const DCA_V2_RS_SIZE: usize = DCA_V2_STATE_SIZE + DCA_V2_BODY_SIZE;
+
+/// Parsed DCA order V2 state fields.
+#[derive(Debug, Clone)]
+pub struct ParsedDcaOrder {
+    /// Blake2b-256 of owner's public key.
+    pub owner_hash: [u8; 32],
+    /// Target token covenant ID.
+    pub target_cov_id: [u8; 32],
+    /// Price numerator.
+    pub price_num: u64,
+    /// Price denominator.
+    pub price_den: u64,
+    /// KAS to spend per period.
+    pub amount_per_period: u64,
+    /// DAA score interval between periods.
+    pub interval_daa: u64,
+    /// Earliest DAA score for next execution.
+    pub next_execution_daa: u64,
+    /// Number of periods remaining.
+    pub periods_remaining: u64,
+    /// Full redeemScript bytes.
+    pub redeem_script: Vec<u8>,
+}
+
+/// Parse a DCA order V2 redeemScript.
+///
+/// Returns  if the RS length doesn't match 315B or the push-prefix
+/// bytes are inconsistent.
+pub fn parse_dca_order_rs(rs: &[u8]) -> Option<ParsedDcaOrder> {
+    if rs.len() != DCA_V2_RS_SIZE {
+        return None;
+    }
+    // Validate push prefixes
+    if rs[0] != 0x20 || rs[33] != 0x20 || rs[66] != 0x08
+        || rs[75] != 0x08 || rs[84] != 0x08 || rs[93] != 0x08
+        || rs[102] != 0x08 || rs[111] != 0x08
+    {
+        return None;
+    }
+    let mut owner_hash = [0u8; 32];
+    owner_hash.copy_from_slice(&rs[1..33]);
+    let mut target_cov_id = [0u8; 32];
+    target_cov_id.copy_from_slice(&rs[34..66]);
+
+    fn read_u64(data: &[u8], offset: usize) -> u64 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&data[offset..offset + 8]);
+        u64::from_le_bytes(buf)
+    }
+
+    Some(ParsedDcaOrder {
+        owner_hash,
+        target_cov_id,
+        price_num: read_u64(rs, 67),
+        price_den: read_u64(rs, 76),
+        amount_per_period: read_u64(rs, 85),
+        interval_daa: read_u64(rs, 94),
+        next_execution_daa: read_u64(rs, 103),
+        periods_remaining: read_u64(rs, 112),
+        redeem_script: rs.to_vec(),
+    })
+}
+
 pub const DCA_ORDER_BODY: &[u8] = &[
     // --- DISPATCH (5B) ---
     0x58, 0x7a,       // Op8 OpRoll -> selector to top

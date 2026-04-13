@@ -40,4 +40,6 @@ pub mod prediction_book;
 pub mod prediction_executor;
 #[allow(dead_code)] // Items used in tests
 pub mod prediction_tracker;
+#[allow(dead_code)] // Items used in tests
+pub mod dca_book;
 

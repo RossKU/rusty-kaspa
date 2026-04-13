@@ -1089,6 +1089,8 @@ pub struct ScanCounters {
     pub lending_removed: usize,
     pub prediction_added: usize,
     pub prediction_removed: usize,
+    pub dca_added: usize,
+    pub dca_removed: usize,
 }
 
 /// Process a batch of transactions using the multi-product scanner.
@@ -1109,6 +1111,7 @@ fn process_block_txs_all(
     ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
     current_daa: u64,
     mut ifd_book: Option<&mut crate::matcher::ifd::IfdBook>,
+    mut dca_book: Option<&mut crate::matcher::dca_book::DcaBook>,
 ) -> ScanCounters {
     let mut counters = ScanCounters::default();
 
@@ -1128,6 +1131,10 @@ fn process_block_txs_all(
         }
         set
     };
+    let dca_outpoints: HashSet<String> = dca_book
+        .as_ref()
+        .map(|db| db.all_outpoint_keys())
+        .unwrap_or_default();
 
     for tx in txs {
         // Phase 1: Remove spent orders from ALL books
@@ -1173,6 +1180,16 @@ fn process_block_txs_all(
             info!("[SCANNER-ALL] Prediction item spent: {}", &key[..key.len().min(20)]);
             prediction_book.remove_by_outpoint(key);
             counters.prediction_removed += 1;
+        }
+
+        // DCA book
+        let dca_spent = BlockScanner::find_spent_in_keys(tx, &dca_outpoints);
+        for key in &dca_spent {
+            info!("[SCANNER-ALL] DCA order spent: {}", &key[..key.len().min(20)]);
+            if let Some(ref mut db) = dca_book {
+                db.remove(key);
+            }
+            counters.dca_removed += 1;
         }
 
         // Phase 2: Detect new deploys (all products)
@@ -1457,6 +1474,41 @@ fn process_block_txs_all(
                 order_book.add_sell_order(sl_order);
                 counters.spot_added += 2;
             }
+            ScanResult::Dca(parsed, p2sh_idx, p2sh_value) => {
+                let outpoint_key = format!("{}:{}", tx.tx_id, p2sh_idx);
+                if let Some(ref mut db) = dca_book {
+                    if db.contains(&outpoint_key) {
+                        continue; // dedup
+                    }
+                    let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
+                    let entry = crate::matcher::dca_book::DcaEntry {
+                        tx_id: tx.tx_id.clone(),
+                        index: p2sh_idx,
+                        value: p2sh_value,
+                        target_cov_id: hex::encode(parsed.target_cov_id),
+                        price_num: parsed.price_num,
+                        price_den: parsed.price_den,
+                        amount_per_period: parsed.amount_per_period,
+                        interval_daa: parsed.interval_daa,
+                        next_execution_daa: parsed.next_execution_daa,
+                        periods_remaining: parsed.periods_remaining,
+                        owner_hash: hex::encode(parsed.owner_hash),
+                        redeem_script_hex: hex::encode(&parsed.redeem_script),
+                        p2sh_script_hex: hex::encode(&p2sh_spk.script()),
+                        p2sh_version: p2sh_spk.version,
+                        discovered_daa: current_daa,
+                    };
+                    info!(
+                        "[SCANNER-ALL] Discovered DCA order: {} periods={} next_exec={} amt/period={}",
+                        &outpoint_key[..outpoint_key.len().min(20)],
+                        parsed.periods_remaining,
+                        parsed.next_execution_daa,
+                        parsed.amount_per_period,
+                    );
+                    db.add(entry);
+                    counters.dca_added += 1;
+                }
+            }
         }
     }
 
@@ -1606,6 +1658,7 @@ async fn scan_new_blocks(
                 ws_tx,
                 current_daa,
                 None, // No IFD book in scan_new_blocks (unused path)
+                None, // No DCA book in scan_new_blocks
             );
 
             total_counters.spot_added += counters.spot_added;
@@ -1616,6 +1669,8 @@ async fn scan_new_blocks(
             total_counters.lending_removed += counters.lending_removed;
             total_counters.prediction_added += counters.prediction_added;
             total_counters.prediction_removed += counters.prediction_removed;
+            total_counters.dca_added += counters.dca_added;
+            total_counters.dca_removed += counters.dca_removed;
         }
     }
 
@@ -1928,6 +1983,7 @@ async fn run_scan_cycle(
     loan_tracker: &Arc<Mutex<crate::matcher::lending_tracker::LoanTracker>>,
     prediction_book: &Arc<Mutex<crate::matcher::prediction_book::PredictionBook>>,
     market_tracker: &Arc<Mutex<crate::matcher::prediction_tracker::MarketTracker>>,
+    dca_book: &Arc<Mutex<crate::matcher::dca_book::DcaBook>>,
 ) -> Vec<MatchResult> {
     let mut results = Vec::new();
 
@@ -3259,6 +3315,57 @@ async fn run_scan_cycle(
         }
     }
 
+    // DCA auto-fill: check for executable DCA orders
+    {
+        let dcab = dca_book.lock().await;
+        if !dcab.is_empty() {
+            let current_daa = rpc.get_daa_score().await.unwrap_or(0);
+            let executable = dcab.executable_entries(current_daa);
+            if !executable.is_empty() {
+                info!(
+                    "[DCA] {} executable DCA order(s) at DAA {} (of {} tracked)",
+                    executable.len(), current_daa, dcab.len(),
+                );
+                for entry in &executable {
+                    info!(
+                        "[DCA] Executable: {} token={} periods={} amt/period={} next_exec={}",
+                        &entry.outpoint_key()[..entry.outpoint_key().len().min(20)],
+                        &entry.target_cov_id[..entry.target_cov_id.len().min(12)],
+                        entry.periods_remaining,
+                        entry.amount_per_period,
+                        entry.next_execution_daa,
+                    );
+                    // Check if there is a matching sell order in the spot order book
+                    // for the target token. DCA buys tokens at the specified limit price.
+                    let target_token = &entry.target_cov_id;
+                    let has_matching_sell = order_book.pair_books.get(target_token)
+                        .map(|pb| !pb.asks.is_empty())
+                        .unwrap_or(false);
+                    if has_matching_sell {
+                        info!(
+                            "[DCA] Sell orders available for token {}... -- DCA fill candidate",
+                            &target_token[..target_token.len().min(12)],
+                        );
+                        // Full DCA auto-fill TX construction:
+                        // 1. Select best sell order from asks
+                        // 2. Verify sell price <= DCA limit price (price_num/price_den)
+                        // 3. Build fill TX with lock_time = next_execution_daa (CLTV)
+                        // 4. Build continuation RS (D&R) if periods > 1
+                        // 5. Submit TX
+                        // Note: This requires the batch TX builder to support CLTV lock_time
+                        // instead of the usual OP_CSV lock_time=50. Implementation deferred
+                        // to a follow-up PR once the batch builder supports per-TX lock_time.
+                    } else {
+                        debug!(
+                            "[DCA] No sell orders for token {}... -- DCA fill deferred",
+                            &target_token[..target_token.len().min(12)],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     results
 }
 
@@ -3285,6 +3392,7 @@ pub async fn run_continuous_with_ws(
     shared_loan_tracker: Arc<Mutex<crate::matcher::lending_tracker::LoanTracker>>,
     shared_prediction_book: Arc<Mutex<crate::matcher::prediction_book::PredictionBook>>,
     shared_market_tracker: Arc<Mutex<crate::matcher::prediction_tracker::MarketTracker>>,
+    shared_dca_book: Arc<Mutex<crate::matcher::dca_book::DcaBook>>,
 ) {
     info!("======================================================================");
     info!("KOB MATCHER BOT -- CONTINUOUS MODE (HARDENED)");
@@ -3421,11 +3529,13 @@ pub async fn run_continuous_with_ws(
                 let mut lb = shared_lending_book.lock().await;
                 let mut pred = shared_prediction_book.lock().await;
                 let mut ib = shared_ifd_book.lock().await;
+                let mut dcab = shared_dca_book.lock().await;
 
                 for txs in &block_txs_batch {
                     let counters = process_block_txs_all(
                         txs, &mut ob, &scanner, &mut pb, &mut lb, &mut pred,
                         ws_tx.as_ref(), current_daa, Some(&mut ib),
+                        Some(&mut dcab),
                     );
                     total_counters.spot_added += counters.spot_added;
                     total_counters.spot_removed += counters.spot_removed;
@@ -3435,6 +3545,8 @@ pub async fn run_continuous_with_ws(
                     total_counters.lending_removed += counters.lending_removed;
                     total_counters.prediction_added += counters.prediction_added;
                     total_counters.prediction_removed += counters.prediction_removed;
+                    total_counters.dca_added += counters.dca_added;
+                    total_counters.dca_removed += counters.dca_removed;
                 }
             }
 
@@ -3442,13 +3554,15 @@ pub async fn run_continuous_with_ws(
                 let any_found = total_counters.spot_added > 0
                     || total_counters.perp_added > 0
                     || total_counters.lending_added > 0
-                    || total_counters.prediction_added > 0;
+                    || total_counters.prediction_added > 0
+                    || total_counters.dca_added > 0;
                 if any_found {
                     info!(
-                        "[NOTIFY] Processed {} block(s): spot(+{}), perp(+{}), lending(+{}), prediction(+{})",
+                        "[NOTIFY] Processed {} block(s): spot(+{}), perp(+{}), lending(+{}), prediction(+{}), dca(+{})",
                         blocks_processed,
                         total_counters.spot_added, total_counters.perp_added,
                         total_counters.lending_added, total_counters.prediction_added,
+                        total_counters.dca_added,
                     );
                 } else {
                     debug!("[NOTIFY] Processed {} block(s), no new orders", blocks_processed);
@@ -3468,7 +3582,7 @@ pub async fn run_continuous_with_ws(
         let rpc_lock = rpc.lock().await;
         let scan_result = {
             let mut ob = order_book.lock().await;
-            run_scan_cycle(&rpc_lock, &mut ob, config, &mut spent_tracker, enable_cross_pair, allow_self_trade, ws_tx.as_ref(), shared_state.as_ref(), &shared_ifd_book, &shared_perp_book, &shared_perp_tracker, &shared_lending_book, &shared_loan_tracker, &shared_prediction_book, &shared_market_tracker).await
+            run_scan_cycle(&rpc_lock, &mut ob, config, &mut spent_tracker, enable_cross_pair, allow_self_trade, ws_tx.as_ref(), shared_state.as_ref(), &shared_ifd_book, &shared_perp_book, &shared_perp_tracker, &shared_lending_book, &shared_loan_tracker, &shared_prediction_book, &shared_market_tracker, &shared_dca_book).await
         };
 
         // Receipt chaining: the receipt from the last successful match

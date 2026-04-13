@@ -41,6 +41,10 @@ pub use contract::{
     build_oco_sell_redeem_script,
     build_oco_sell_tp_fill_sigscript, build_oco_sell_sl_fill_sigscript,
     build_oco_sell_cancel_sigscript, build_oco_sell_expire_sigscript,
+    // DCA
+    DCA_V2_RS_SIZE, DCA_V2_STATE_SIZE, DCA_V2_BODY_SIZE,
+    ParsedDcaOrder, parse_dca_order_rs,
+    build_dca_order_redeem_script, build_dca_order_fill_sigscript,
     build_buy_redeem_script, build_sell_redeem_script,
     build_buy_fill_sigscript, build_sell_fill_sigscript,
     build_buy_partial_fill_sigscript, build_sell_partial_fill_sigscript,

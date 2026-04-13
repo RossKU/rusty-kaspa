@@ -227,6 +227,7 @@ pub async fn run_engine(
                 Arc::new(Mutex::new(book))
             };
             let shared_market_tracker = Arc::new(Mutex::new(matcher::prediction_tracker::MarketTracker::new()));
+            let shared_dca_book = Arc::new(Mutex::new(matcher::dca_book::DcaBook::new()));
 
             // Start API server if port > 0
             let (ws_broadcaster, shared_state_for_executor) = if api_port > 0 {
@@ -373,6 +374,7 @@ pub async fn run_engine(
                 shared_loan_tracker,
                 shared_prediction_book,
                 shared_market_tracker,
+                shared_dca_book,
             )
             .await;
         }

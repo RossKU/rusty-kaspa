@@ -3153,4 +3153,56 @@ mod tests {
         assert_eq!(gtc_groups[0].buys.len(), 1, "Should have 1 buy");
         assert!(gtc_groups[0].sells.len() >= 2, "Should have 2+ sells");
     }
+
+    /// Post-only buy resting on the book should be matchable when a
+    /// non-post-only sell arrives and crosses it.
+    /// This verifies that post-only is a registration-time check (maker
+    /// enforcement), NOT a match-time filter.  Once the order is on the
+    /// book it IS the maker and any taker can cross it.
+    #[test]
+    fn test_post_only_maker_matches_regular_taker() {
+        let mut ob = OrderBook::new();
+
+        // Step 1: post-only buy at price 3/1 (no asks, accepted as maker)
+        let mut buy = make_buy(5_000_000_000, 3, 1, FAKE_TOKEN);
+        buy.tx_id = format!("{:0>64}", "po_buy");
+        buy.owner_hash = "aa".repeat(32);
+        buy.post_only = true;
+        assert!(ob.add_buy_order(buy), "post-only buy with no asks must be accepted");
+
+        // Step 2: regular sell at price 2/1 (crosses the buy at 3/1)
+        let mut sell = make_sell(1_000_000_000, 2, 1, FAKE_TOKEN);
+        sell.tx_id = format!("{:0>64}", "reg_sell");
+        sell.owner_hash = "bb".repeat(32);
+        sell.post_only = false;
+        assert!(ob.add_sell_order(sell), "non-post-only sell must be accepted");
+
+        // The matcher should find a crossing pair.
+        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
+        assert!(!pairs.is_empty(),
+            "post-only maker buy + regular taker sell should produce a crossing pair");
+    }
+
+    /// Two post-only orders cannot both rest at crossing prices because
+    /// the second one is rejected at registration.
+    #[test]
+    fn test_two_post_only_cannot_cross() {
+        let mut ob = OrderBook::new();
+
+        // Post-only buy at price 5/1
+        let mut buy = make_buy(5_000_000_000, 5, 1, FAKE_TOKEN);
+        buy.tx_id = format!("{:0>64}", "po_buy");
+        buy.owner_hash = "aa".repeat(32);
+        buy.post_only = true;
+        assert!(ob.add_buy_order(buy));
+
+        // Post-only sell at price 3/1 (would cross buy at 5/1)
+        let mut sell = make_sell(1_000_000_000, 3, 1, FAKE_TOKEN);
+        sell.tx_id = format!("{:0>64}", "po_sell");
+        sell.owner_hash = "bb".repeat(32);
+        sell.post_only = true;
+        assert!(!ob.add_sell_order(sell),
+            "post-only sell that would cross existing bid must be rejected");
+    }
+
 }

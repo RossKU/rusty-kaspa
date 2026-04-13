@@ -1,6 +1,6 @@
 //! Crossing pair detection and match output computation.
 
-use kob_core::{MIN_UTXO_VALUE, RECEIPT_VALUE};
+use kob_core::MIN_UTXO_VALUE;
 use crate::matcher::order_book::{BookOrder, OrderBook};
 use crate::matcher::routing;
 
@@ -465,49 +465,6 @@ fn compute_partial_fill_match(
     None
 }
 
-/// Compute match TX output amounts for a full fill.
-///
-/// Receipt value is a fixed constant (RECEIPT_VALUE = 1 KAS) funded by the
-/// matcher wallet, NOT from order surplus. Surplus goes entirely to
-/// matcher_change (minus estimated miner fee).
-///
-/// The miner fee is pre-estimated from compute mass for a typical match TX
-/// (3 inputs, 4 outputs). The actual fee is verified after TX construction
-/// in the executor.
-pub fn compute_match_outputs(pair: &CrossingPair) -> MatchOutputs {
-    let receipt_value = RECEIPT_VALUE;
-    // Pre-estimate miner fee from compute mass.
-    // Typical match TX: 2 covenant inputs (0 sig_ops) + 1 fee input (1 sig_op),
-    // 3-4 outputs, ~0 payload. Overestimate with 4 inputs, 4 outputs.
-    let estimated_fee = kob_core::mass::estimate_compute_mass(4, 4, 0);
-    let raw_matcher_change = pair.surplus.saturating_sub(estimated_fee);
-
-    // If matcher change is below minimum, add it to seller_kas
-    let (final_seller_kas, matcher_change) = if raw_matcher_change >= MIN_UTXO_VALUE {
-        (pair.seller_kas, raw_matcher_change)
-    } else {
-        (pair.seller_kas + raw_matcher_change, 0)
-    };
-
-    MatchOutputs {
-        seller_kas: final_seller_kas,
-        buyer_tokens: pair.buyer_tokens,
-        receipt_value,
-        matcher_change,
-        fee: estimated_fee,
-    }
-}
-
-/// Computed match TX output amounts.
-#[derive(Debug, Clone)]
-pub struct MatchOutputs {
-    pub seller_kas: u64,
-    pub buyer_tokens: u64,
-    pub receipt_value: u64,
-    pub matcher_change: u64,
-    pub fee: u64,
-}
-
 /// Maximum number of crossing pairs per batch group.
 ///
 /// Constrained by Kaspa's OpN range (0..=16). A batch TX with N same-token
@@ -522,7 +479,7 @@ pub const MAX_BATCH_GROUP_SIZE: usize = 7;
 /// Only **full-fill** pairs are eligible for batching (partial fills have
 /// residual outputs that complicate TX layout). Groups are partitioned by
 /// `token_cov_id` and each group contains at least 2 pairs (a single pair
-/// is more efficiently handled by the 1:1 path). Groups are capped at
+/// is handled by the remaining-pair path as a single-pair batch). Groups are capped at
 /// [`MAX_BATCH_GROUP_SIZE`] pairs due to OpN index limits.
 ///
 /// Returns a vec of groups, where each group is a vec of crossing pairs
@@ -738,7 +695,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -761,7 +718,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -817,10 +774,6 @@ mod tests {
         let p = &pairs[0];
         // buyer_tokens = sell_tokens (1B), surplus = 2B - 500M - 1B = 500M
         assert_eq!(p.surplus, 500_000_000);
-
-        let outputs = compute_match_outputs(p);
-        assert_eq!(outputs.receipt_value, RECEIPT_VALUE);
-        assert!(outputs.matcher_change >= MIN_UTXO_VALUE);
     }
 
     #[test]
@@ -905,34 +858,6 @@ mod tests {
         assert_eq!(division_first, 4_666_666);
     }
 
-    #[test]
-    fn test_match_outputs_small_change() {
-        // With small surplus: change < MIN_UTXO_VALUE gets added to seller
-        let pair = CrossingPair {
-            token_cov_id: FAKE_TOKEN.to_string(),
-            buy: make_buy(3_500_000, 1, 2, FAKE_TOKEN),
-            sell: make_sell(3_500_000, 1, 2, FAKE_TOKEN),
-            seller_kas: 1_750_000,
-            buyer_tokens: 1_750_000,
-            surplus: 500_000, // small surplus
-            expected_tokens: 1_750_000,
-            expected_kas: 1_750_000,
-            match_type: MatchType::Full,
-            fill_kas: None,
-            residual_kas: None,
-            fill_token_amount: None,
-            residual_tokens: None,
-        };
-
-        let outputs = compute_match_outputs(&pair);
-        // raw_change = 500_000 - estimated_fee < MIN_UTXO_VALUE (3M)
-        // So it gets added to seller_kas
-        let estimated_fee = kob_core::mass::estimate_compute_mass(4, 4, 0);
-        let expected_raw_change = 500_000 - estimated_fee;
-        assert_eq!(outputs.matcher_change, 0);
-        assert_eq!(outputs.seller_kas, 1_750_000 + expected_raw_change);
-    }
-
     // M-3: orders with price_num=0 or price_den=0 must not cause division by zero.
     #[test]
     fn test_zero_price_fields_skipped() {
@@ -956,7 +881,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         // sell with price_den=0 (would divide by 0 in expected_kas)
         let bad_sell = BookOrder {
@@ -977,7 +902,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         ob.add_buy_order(bad_buy);
         ob.add_sell_order(bad_sell);
@@ -1122,31 +1047,6 @@ mod tests {
         assert_eq!(pairs.len(), 1, "exact MIN_UTXO_VALUE should be accepted");
     }
 
-    #[test]
-    fn test_compute_match_outputs_zero_surplus_regression() {
-        // Manually construct a pair with surplus = estimated miner fee (minimum viable)
-        let estimated_fee = kob_core::mass::estimate_compute_mass(4, 4, 0);
-        let pair = CrossingPair {
-            token_cov_id: FAKE_TOKEN.to_string(),
-            buy: make_buy(10_000_000, 1, 2, FAKE_TOKEN),
-            sell: make_sell(10_000_000, 1, 2, FAKE_TOKEN),
-            seller_kas: 5_000_000,
-            buyer_tokens: 5_000_000,
-            surplus: estimated_fee, // exactly the miner fee
-            expected_tokens: 5_000_000,
-            expected_kas: 5_000_000,
-            match_type: MatchType::Full,
-            fill_kas: None,
-            residual_kas: None,
-            fill_token_amount: None,
-            residual_tokens: None,
-        };
-        let outputs = compute_match_outputs(&pair);
-        // raw_matcher_change = estimated_fee - estimated_fee = 0
-        assert_eq!(outputs.matcher_change, 0);
-        assert_eq!(outputs.seller_kas, 5_000_000); // no change to add
-    }
-
     // Batch group tests
 
     /// Helper: create a CrossingPair for batch group tests.
@@ -1176,7 +1076,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
             },
             sell: BookOrder {
                 tx_id: sell_tx,
@@ -1196,7 +1096,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
             },
             seller_kas: 5_000_000,
             buyer_tokens: 5_000_000,
@@ -1339,7 +1239,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -1368,7 +1268,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -1473,7 +1373,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -1496,7 +1396,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -1555,7 +1455,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -1586,7 +1486,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -1798,38 +1698,6 @@ mod tests {
         assert!(group.total_surplus > 0);
     }
 
-    /// E2E: Match outputs computation verifies KAS conservation.
-    #[test]
-    fn e2e_match_outputs_conserve_kas() {
-        let mut ob = OrderBook::new();
-        let token = FAKE_TOKEN;
-        let owner_a = "aa".repeat(32);
-        let owner_b = "bb".repeat(32);
-
-        ob.add_buy_order(make_buy_e2e(
-            &"a".repeat(64), 0, 50_000_000, 1, 2, token, &owner_a,
-        ));
-        ob.add_sell_order(make_sell_e2e(
-            &"c".repeat(64), 1, 50_000_000, 1, 2, token, &owner_b,
-        ));
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let full_fills: Vec<_> = pairs.iter()
-            .filter(|p| p.match_type == MatchType::Full)
-            .collect();
-
-        if !full_fills.is_empty() {
-            let pair = full_fills[0];
-            let outputs = compute_match_outputs(pair);
-            // Surplus conservation: order inputs = seller_kas + buyer_tokens + matcher_change + fee
-            // (Receipt value is funded by matcher wallet, not from order inputs)
-            let total_in = pair.buy.value + pair.sell.value;
-            let total_out = outputs.seller_kas + outputs.buyer_tokens
-                + outputs.matcher_change + outputs.fee;
-            assert_eq!(total_in, total_out, "KAS must be conserved: in={} out={}", total_in, total_out);
-        }
-    }
-
     /// E2E: Multiple pairs independently matched.
     #[test]
     fn e2e_multi_pair_matching() {
@@ -1944,7 +1812,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         let sell2 = BookOrder {
             tx_id: "c".repeat(64),
@@ -1964,7 +1832,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         // expected_tokens = 50M * 1 / 100M = 0 -> Case 1 won't trigger (0 <= 5M)
         // expected_kas = 5M * 1 / 100M = 0 -> Case 2 won't trigger (0 <= 50M)
@@ -2000,7 +1868,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         let sell = BookOrder {
             tx_id: "c".repeat(64),
@@ -2020,7 +1888,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         // expected_tokens = 5M * 1 / 1 = 5M
         // expected_kas = 500M * 1 / 100M = 5

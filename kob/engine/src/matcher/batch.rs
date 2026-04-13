@@ -1482,6 +1482,7 @@ mod tests {
             utxo_value: amount,
             counterparty_spk: vec![0xDD; 34], // fake seller SPK
             counterparty_spk_version: 0,
+            oco_path: None,
         }
     }
 
@@ -1504,6 +1505,7 @@ mod tests {
             utxo_value: amount,
             counterparty_spk: vec![0xEE; 34], // fake buyer SPK
             counterparty_spk_version: 0,
+            oco_path: None,
         }
     }
 
@@ -1991,6 +1993,7 @@ mod tests {
             utxo_value: 10_000_000,
             counterparty_spk: vec![0xDD; 34],
             counterparty_spk_version: 0,
+            oco_path: None,
         };
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
 
@@ -2024,6 +2027,7 @@ mod tests {
             utxo_value: 10_000_000,
             counterparty_spk: vec![0xEE; 34],
             counterparty_spk_version: 0,
+            oco_path: None,
         };
 
         let result = plan_batch_match(

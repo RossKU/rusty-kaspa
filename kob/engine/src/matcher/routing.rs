@@ -30,7 +30,7 @@
 
 use std::collections::HashMap;
 
-use kob_core::{MIN_UTXO_VALUE, RECEIPT_VALUE};
+use kob_core::MIN_UTXO_VALUE;
 use crate::matcher::order_book::{BookOrder, OrderBook};
 #[cfg(test)]
 use crate::matcher::order_book::OrderSide;
@@ -56,23 +56,6 @@ pub struct CrossPairRoute {
     pub buy_kas_input: u64,
     /// Tokens the buy order expects to receive (buy.value * buy.price_num / buy.price_den).
     pub buy_expected_tokens: u64,
-}
-
-/// Computed output amounts for a cross-pair match TX.
-/// Only used by tests now (the execution path uses the batch engine).
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Used in tests
-pub struct CrossPairMatchOutputs {
-    /// KAS sent to the seller (output[0]).
-    pub seller_kas: u64,
-    /// Tokens sent to the buyer (output[1]).
-    pub buyer_tokens: u64,
-    /// Receipt value (output[2]).
-    pub receipt_value: u64,
-    /// Matcher profit/change (output[3], may be 0 if below MIN_UTXO_VALUE).
-    pub matcher_change: u64,
-    /// Fee paid to miners.
-    pub fee: u64,
 }
 
 /// Find cross-pair routes across all token pairs in the order book.
@@ -259,39 +242,6 @@ pub fn find_cross_pair_routes_with_stp(
     // Return top N
     routes.truncate(max_routes);
     routes
-}
-
-/// Compute match TX output amounts for a cross-pair route.
-///
-/// Receipt value (RECEIPT_VALUE = 1 KAS) is funded by matcher wallet,
-/// NOT from order surplus. Surplus goes entirely to matcher_change (minus miner fee).
-///
-/// Returns the output layout:
-///   output[0]: seller KAS
-///   output[1]: buyer tokens (Token B)
-///   output[2]: receipt (1 KAS, matcher-funded)
-///   output[3]: matcher change (if >= MIN_UTXO_VALUE)
-#[allow(dead_code)] // Used in tests
-pub fn compute_cross_pair_outputs(route: &CrossPairRoute) -> CrossPairMatchOutputs {
-    let receipt_value = RECEIPT_VALUE;
-    // Pre-estimate miner fee from compute mass (3 inputs, 4 outputs)
-    let estimated_fee = kob_core::mass::estimate_compute_mass(3, 4, 0);
-    let raw_change = route.surplus.saturating_sub(estimated_fee);
-
-    let (final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
-        (route.sell_kas_output, raw_change)
-    } else {
-        // Add dust change to seller's output
-        (route.sell_kas_output + raw_change, 0)
-    };
-
-    CrossPairMatchOutputs {
-        seller_kas: final_seller_kas,
-        buyer_tokens: route.buy_expected_tokens,
-        receipt_value,
-        matcher_change,
-        fee: estimated_fee,
-    }
 }
 
 /// Check if two routes conflict (share an order).
@@ -501,7 +451,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -530,7 +480,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -653,51 +603,6 @@ mod tests {
 
         let routes = find_cross_pair_routes(&ob, 100);
         assert!(routes.is_empty(), "Matched outpoints should be excluded");
-    }
-
-    /// Test: output computation produces valid amounts.
-    #[test]
-    fn cross_pair_output_computation() {
-        let route = CrossPairRoute {
-            sell_leg: make_sell('c', 20_000_000, 1, 2, TOKEN_A),
-            buy_leg: make_buy('a', 15_000_000, 1, 3, TOKEN_B),
-            kas_amount: 10_000_000,
-            surplus: 5_000_000,
-            sell_kas_output: 10_000_000,
-            buy_kas_input: 15_000_000,
-            buy_expected_tokens: 5_000_000,
-        };
-
-        let outputs = compute_cross_pair_outputs(&route);
-
-        let estimated_fee = kob_core::mass::estimate_compute_mass(3, 4, 0);
-        assert_eq!(outputs.receipt_value, RECEIPT_VALUE);
-        assert_eq!(outputs.fee, estimated_fee);
-        // surplus = 5M, fee is mass-based (receipt funded by matcher, not surplus)
-        assert_eq!(outputs.matcher_change, 5_000_000 - estimated_fee);
-        assert_eq!(outputs.seller_kas, 10_000_000);
-        assert_eq!(outputs.buyer_tokens, 5_000_000);
-    }
-
-    /// Test: large surplus produces non-zero matcher_change.
-    #[test]
-    fn cross_pair_output_large_surplus() {
-        let route = CrossPairRoute {
-            sell_leg: make_sell('c', 20_000_000, 1, 2, TOKEN_A),
-            buy_leg: make_buy('a', 20_000_000, 1, 3, TOKEN_B),
-            kas_amount: 10_000_000,
-            surplus: 10_000_000,
-            sell_kas_output: 10_000_000,
-            buy_kas_input: 20_000_000,
-            buy_expected_tokens: 6_666_666,
-        };
-
-        let outputs = compute_cross_pair_outputs(&route);
-
-        // surplus = 10M, fee is mass-based (receipt funded by matcher, not surplus)
-        let estimated_fee = kob_core::mass::estimate_compute_mass(3, 4, 0);
-        assert_eq!(outputs.matcher_change, 10_000_000 - estimated_fee);
-        assert_eq!(outputs.seller_kas, 10_000_000);
     }
 
     /// Test: conflict detection between routes.
@@ -866,7 +771,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -896,7 +801,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -971,7 +876,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -1002,7 +907,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         }
     }
 
@@ -1155,26 +1060,6 @@ mod tests {
         assert_eq!(route.sell_kas_output, 10_000_000, "sell expects 10M KAS");
         assert_eq!(route.buy_kas_input, 20_000_000, "buy provides 20M KAS");
         assert_eq!(route.surplus, 10_000_000, "surplus = 20M - 10M = 10M");
-    }
-
-    /// E2E: Cross-pair output amounts pass conservation check.
-    #[test]
-    fn e2e_cross_pair_output_conservation() {
-        let mut ob = OrderBook::new();
-
-        ob.add_sell_order(make_sell_unique("s1", 0, 20_000_000, 1, 2, TOKEN_A));
-        ob.add_buy_order(make_buy_unique("b1", 0, 20_000_000, 1, 2, TOKEN_B));
-
-        let routes = find_cross_pair_routes_with_stp(&ob, 10, true);
-        assert!(!routes.is_empty());
-
-        let outputs = compute_cross_pair_outputs(&routes[0]);
-        // Surplus conservation: buy_kas_input = seller_kas + matcher_change + fee
-        // (Receipt value is funded by matcher wallet, not from buy surplus)
-        let total_kas_in = routes[0].buy_kas_input; // KAS from buy order
-        let total_kas_out = outputs.seller_kas
-            + outputs.matcher_change + outputs.fee;
-        assert_eq!(total_kas_in, total_kas_out, "KAS conservation: in={} out={}", total_kas_in, total_kas_out);
     }
 
     /// E2E: Non-conflicting route selection works greedily.

@@ -8,7 +8,7 @@ use tracing::{debug, error, info, warn};
 use zeroize::Zeroize;
 
 use crate::config::AppConfig;
-use kob_core::{MIN_UTXO_VALUE, RECEIPT_VALUE};
+use kob_core::MIN_UTXO_VALUE;
 use crate::matcher::deploy;
 use crate::matcher::matching::{self, CrossingPair, MatchType};
 use crate::matcher::order_book::{OrderBook, OrderSide};
@@ -214,95 +214,6 @@ fn check_mass_presubmit(
             None
         }
     }
-}
-
-
-
-// Cross-pair Match Execution (v8 contracts)
-
-/// Result of a successful cross-pair match.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Used in tests
-pub struct CrossPairMatchResult {
-    pub match_tx_id: String,
-    pub seller_kas: u64,
-    pub buyer_tokens: u64,
-    pub sell_token_cov_id: String,
-    pub buy_token_cov_id: String,
-    pub receipt_tx_id: String,
-    /// Index of the receipt output in the match TX, or None if no receipt
-    /// was included (M-4). When None, receipt consumption must be skipped.
-    pub receipt_idx: Option<u32>,
-    pub receipt_value: u64,
-}
-
-/// A Token B UTXO available for cross-pair matching.
-///
-/// The matcher must hold Token B UTXOs to supply buyer outputs in cross-pair TXs.
-/// These are tracked in the matcher's token inventory.
-#[derive(Debug, Clone)]
-#[allow(dead_code)] // Fields used in tests
-pub struct TokenUtxo {
-    /// Transaction ID of the UTXO.
-    pub tx_id: String,
-    /// Output index.
-    pub index: u32,
-    /// Token amount in sompi.
-    pub value: u64,
-    /// Token covenant ID (hex).
-    pub token_cov_id: String,
-    /// P2SH script version of the UTXO.
-    pub spk_version: u16,
-    /// P2SH script bytes of the UTXO.
-    pub spk_script: Vec<u8>,
-}
-
-impl TokenUtxo {
-    #[allow(dead_code)] // Used in tests
-    pub fn outpoint_key(&self) -> String {
-        format!("{}:{}", self.tx_id, self.index)
-    }
-}
-
-/// Find a token UTXO from the matcher's wallet UTXOs that matches the TOKEN_RS P2SH.
-///
-/// Scans the wallet's UTXOs for P2SH outputs matching TOKEN_RS (minimal covenant
-/// checker, 7 bytes). Returns the first UTXO with sufficient value, or None.
-///
-/// NOTE: This relies on the matcher owning Token B UTXOs locked with TOKEN_RS.
-/// The RPC `getUtxosByAddresses` does not include covenant metadata, so we
-/// identify token UTXOs by their scriptPublicKey matching the TOKEN_RS P2SH hash.
-/// For production, the matcher should maintain an explicit token inventory.
-pub fn find_token_utxo_from_wallet(
-    utxos: &[RpcUtxo],
-    min_value: u64,
-    spent_tracker: &SpentTracker,
-) -> Option<TokenUtxo> {
-    let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
-    let token_p2sh_hex = hex::encode(&token_p2sh.script());
-
-    for utxo in utxos {
-        let key = utxo.outpoint_key();
-        if spent_tracker.is_spent(&key) {
-            continue;
-        }
-        if utxo.utxo_entry.amount < min_value {
-            continue;
-        }
-        let (_version, script) = utxo.parse_spk();
-        let script_hex = hex::encode(&script);
-        if script_hex == token_p2sh_hex {
-            return Some(TokenUtxo {
-                tx_id: utxo.outpoint.transaction_id.clone(),
-                index: utxo.outpoint.index,
-                value: utxo.utxo_entry.amount,
-                token_cov_id: String::new(), // Covenant ID not available from RPC
-                spk_version: token_p2sh.version,
-                spk_script: token_p2sh.script().to_vec(),
-            });
-        }
-    }
-    None
 }
 
 
@@ -1994,7 +1905,7 @@ async fn run_scan_cycle(
         // Phase 1a: Batch matching (2+ full-fill pairs per token)
         // Try batch matching first — more efficient when multiple full-fill
         // pairs cross for the same token. Orders consumed by batch are
-        // excluded from the 1:1 path below.
+        // excluded from the remaining-pair path below.
         let batch_groups = matching::find_batch_groups(&all_pairs);
         let mut batched_outpoints: HashSet<String> = HashSet::new();
 
@@ -4228,6 +4139,7 @@ pub async fn run_dry_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kob_core::RECEIPT_VALUE;
 
     #[test]
     fn spent_tracker_basic() {
@@ -4481,267 +4393,6 @@ mod tests {
         assert_eq!(mr_sell.seller_kas, 5_000_000);
     }
 
-    // Cross-pair executor tests
-
-    use crate::rpc::{RpcUtxo, RpcOutpoint, RpcUtxoEntry, RpcSpk};
-
-    fn make_rpc_utxo(tx_id: &str, index: u32, amount: u64, spk_hex: &str) -> RpcUtxo {
-        // spk_hex has version (4 hex chars) + script hex
-        let version = if spk_hex.len() >= 4 {
-            u16::from_str_radix(&spk_hex[..4], 16).unwrap_or(0)
-        } else {
-            0
-        };
-        let script = if spk_hex.len() > 4 { &spk_hex[4..] } else { "" };
-        RpcUtxo {
-            outpoint: RpcOutpoint {
-                transaction_id: tx_id.to_string(),
-                index,
-            },
-            utxo_entry: RpcUtxoEntry {
-                amount,
-                script_public_key: RpcSpk { version, script: script.to_string() },
-                block_daa_score: 100,
-                is_coinbase: false,
-            },
-        }
-    }
-
-    /// Build the full SPK hex (version LE + script) for a TOKEN_RS P2SH UTXO.
-    fn token_rs_spk_hex() -> String {
-        let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
-        let version_bytes = token_p2sh.version.to_le_bytes();
-        let mut spk_hex = hex::encode(version_bytes);
-        spk_hex.push_str(&hex::encode(&token_p2sh.script()));
-        spk_hex
-    }
-
-    #[test]
-    fn token_utxo_outpoint_key() {
-        let tu = TokenUtxo {
-            tx_id: "abc123".to_string(),
-            index: 2,
-            value: 10_000_000,
-            token_cov_id: "aa".repeat(32),
-            spk_version: 0,
-            spk_script: vec![],
-        };
-        assert_eq!(tu.outpoint_key(), "abc123:2");
-    }
-
-    #[test]
-    fn find_token_utxo_matches_token_rs_p2sh() {
-        let spk_hex = token_rs_spk_hex();
-        let utxos = vec![
-            // Non-matching UTXO (regular P2PK)
-            make_rpc_utxo(
-                &"a".repeat(64), 0, 50_000_000,
-                "000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
-            ),
-            // Matching TOKEN_RS P2SH UTXO
-            make_rpc_utxo(&"b".repeat(64), 0, 15_000_000, &spk_hex),
-            // Another matching but smaller
-            make_rpc_utxo(&"c".repeat(64), 0, 5_000_000, &spk_hex),
-        ];
-
-        let tracker = SpentTracker::new();
-
-        // Should find the matching UTXO with sufficient value
-        let result = find_token_utxo_from_wallet(&utxos, 10_000_000, &tracker);
-        assert!(result.is_some(), "Should find TOKEN_RS UTXO");
-        let tu = result.unwrap();
-        assert_eq!(tu.tx_id, "b".repeat(64));
-        assert_eq!(tu.value, 15_000_000);
-    }
-
-    #[test]
-    fn find_token_utxo_respects_min_value() {
-        let spk_hex = token_rs_spk_hex();
-        let utxos = vec![
-            make_rpc_utxo(&"b".repeat(64), 0, 5_000_000, &spk_hex),
-        ];
-
-        let tracker = SpentTracker::new();
-        let result = find_token_utxo_from_wallet(&utxos, 10_000_000, &tracker);
-        assert!(result.is_none(), "Should not find UTXO below min value");
-    }
-
-    #[test]
-    fn find_token_utxo_skips_spent() {
-        let spk_hex = token_rs_spk_hex();
-        let tx_id = "b".repeat(64);
-        let utxos = vec![
-            make_rpc_utxo(&tx_id, 0, 15_000_000, &spk_hex),
-        ];
-
-        let mut tracker = SpentTracker::new();
-        tracker.mark_spent(&format!("{}:0", tx_id));
-
-        let result = find_token_utxo_from_wallet(&utxos, 10_000_000, &tracker);
-        assert!(result.is_none(), "Should skip spent UTXOs");
-    }
-
-    #[test]
-    fn find_token_utxo_no_match_for_non_token_rs() {
-        let utxos = vec![
-            make_rpc_utxo(
-                &"a".repeat(64), 0, 100_000_000,
-                "000020aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
-            ),
-        ];
-
-        let tracker = SpentTracker::new();
-        let result = find_token_utxo_from_wallet(&utxos, 1_000_000, &tracker);
-        assert!(result.is_none(), "Should not match non-TOKEN_RS UTXOs");
-    }
-
-    #[test]
-    fn cross_pair_output_layout_has_token_a_forward() {
-        // Verify that compute_cross_pair_outputs produces correct amounts
-        use crate::matcher::routing::{CrossPairRoute, compute_cross_pair_outputs};
-
-        let sell = BookOrder {
-            tx_id: "s".repeat(64),
-            index: 0,
-            value: 20_000_000,
-            token_cov_id: "aa".repeat(32),
-            price_num: 1,
-            price_den: 2,
-            min_fill: 1_000_000,
-            owner_hash: "bb".repeat(32),
-            spk_hash: "11".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Sell,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
-        };
-        let buy = BookOrder {
-            tx_id: "b".repeat(64),
-            index: 0,
-            value: 15_000_000,
-            token_cov_id: "cc".repeat(32),
-            price_num: 1,
-            price_den: 3,
-            min_fill: 1_000_000,
-            owner_hash: "dd".repeat(32),
-            spk_hash: "22".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Buy,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
-        };
-
-        let route = CrossPairRoute {
-            sell_leg: sell.clone(),
-            buy_leg: buy.clone(),
-            kas_amount: 10_000_000,
-            surplus: 5_000_000,
-            sell_kas_output: 10_000_000,
-            buy_kas_input: 15_000_000,
-            buy_expected_tokens: 5_000_000,
-        };
-
-        let outputs = compute_cross_pair_outputs(&route);
-
-        // surplus = 5M, fee = 10K (receipt funded by matcher, not surplus)
-        // raw_change = 5M - 10K = 4_990_000 >= MIN_UTXO_VALUE (3M)
-        assert_eq!(outputs.seller_kas, 10_000_000);
-        assert_eq!(outputs.buyer_tokens, 5_000_000);
-        assert_eq!(outputs.receipt_value, RECEIPT_VALUE);
-        let expected_fee = kob_core::mass::estimate_compute_mass(3, 4, 0);
-        assert_eq!(outputs.matcher_change, 5_000_000 - expected_fee);
-        assert_eq!(outputs.fee, expected_fee);
-
-        // Token A forward = sell.value (required by sell_v8 F4)
-        assert_eq!(sell.value, 20_000_000);
-    }
-
-    #[test]
-    fn cross_pair_value_balance_with_receipt() {
-        // Verify the complete TX value balance for a cross-pair match.
-        // Receipt (RECEIPT_VALUE = 1 KAS) is funded by matcher wallet,
-        // not from order surplus.
-        let sell_value = 20_000_000u64;
-        let buy_value = 15_000_000u64;
-        let token_b_value = 5_000_000u64;
-        let sell_kas_output = 10_000_000u64;
-
-        let surplus = buy_value - sell_kas_output; // 5M
-        let receipt = RECEIPT_VALUE; // 100M (funded by matcher, not surplus)
-
-        // Surplus only needs to cover miner fee (mass-based estimate)
-        let estimated_fee = kob_core::mass::estimate_compute_mass(3, 4, 0);
-        assert!(surplus >= estimated_fee);
-
-        let raw_change = surplus - estimated_fee;
-        assert!(raw_change >= MIN_UTXO_VALUE);
-
-        // Change large enough for separate output
-        let final_seller_kas = sell_kas_output;
-        let token_a_forward = sell_value;
-
-        // Total in includes matcher fee UTXOs that cover the receipt
-        let total_in = sell_value + buy_value + token_b_value;
-        let total_out = final_seller_kas + token_b_value + token_a_forward + raw_change;
-        let fee = total_in - total_out;
-        assert_eq!(fee, estimated_fee, "TX fee from surplus must equal mass-based estimate");
-        assert_eq!(receipt, RECEIPT_VALUE);
-    }
-
-    #[test]
-    fn cross_pair_value_balance_small_surplus() {
-        // When surplus is small, it still only needs to cover the mass-based miner fee.
-        // Receipt is always funded by matcher wallet.
-        let sell_value = 10_000_000u64;
-        let buy_value = 10_050_000u64; // just 50K surplus
-        let token_b_value = 5_000_000u64;
-        let sell_kas_output = 10_000_000u64;
-
-        let surplus = buy_value - sell_kas_output; // 50K
-        // surplus must cover mass-based miner fee
-        let estimated_fee = kob_core::mass::estimate_compute_mass(3, 4, 0);
-        assert!(surplus >= estimated_fee);
-
-        // raw_change = surplus - fee; if < MIN_UTXO_VALUE -> added to seller
-        let raw_change = surplus - estimated_fee;
-        assert!(raw_change < MIN_UTXO_VALUE);
-        let final_seller_kas = sell_kas_output + raw_change;
-        let token_a_forward = sell_value;
-
-        let total_in = sell_value + buy_value + token_b_value;
-        let total_out = final_seller_kas + token_b_value + token_a_forward;
-        let fee = total_in - total_out;
-        assert_eq!(fee, estimated_fee, "TX fee must equal mass-based estimate");
-    }
-
-    #[test]
-    fn cross_pair_match_result_fields() {
-        let result = CrossPairMatchResult {
-            match_tx_id: "abc".to_string(),
-            seller_kas: 10_000_000,
-            buyer_tokens: 15_000_000,
-            sell_token_cov_id: "aa".repeat(32),
-            buy_token_cov_id: "bb".repeat(32),
-            receipt_tx_id: "abc".to_string(),
-            receipt_idx: Some(3),
-            receipt_value: RECEIPT_VALUE,
-        };
-        assert_eq!(result.sell_token_cov_id.len(), 64);
-        assert_eq!(result.buy_token_cov_id.len(), 64);
-        assert_ne!(result.sell_token_cov_id, result.buy_token_cov_id);
-        assert_eq!(result.receipt_idx, Some(3));
-    }
-
     // H-3: Sell orders with zero token_cov_id are skipped in process_block_txs
     #[test]
     fn process_block_txs_skips_sell_with_zero_token_cov_id() {
@@ -4798,71 +4449,6 @@ mod tests {
         assert_eq!(ss.len(), 8, "pushData(TOKEN_RS) = 1 length byte + 7 body bytes");
         assert_eq!(ss[0], 7, "length prefix for 7-byte TOKEN_RS");
         assert_eq!(&ss[1..], kob_core::TOKEN_RS);
-    }
-
-    #[test]
-    fn cross_pair_large_surplus_has_matcher_change() {
-        // When surplus is large enough, matcher_change is a separate output
-        use crate::matcher::routing::{CrossPairRoute, compute_cross_pair_outputs};
-
-        let sell = BookOrder {
-            tx_id: "s".repeat(64),
-            index: 0,
-            value: 10_000_000,
-            token_cov_id: "aa".repeat(32),
-            price_num: 1,
-            price_den: 2,
-            min_fill: 1_000_000,
-            owner_hash: "bb".repeat(32),
-            spk_hash: "11".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Sell,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
-        };
-        let buy = BookOrder {
-            tx_id: "b".repeat(64),
-            index: 0,
-            value: 20_000_000, // 20M KAS, expects 5M KAS for sell
-            token_cov_id: "cc".repeat(32),
-            price_num: 1,
-            price_den: 3,
-            min_fill: 1_000_000,
-            owner_hash: "dd".repeat(32),
-            spk_hash: "22".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Buy,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
-        };
-
-        let route = CrossPairRoute {
-            sell_leg: sell,
-            buy_leg: buy,
-            kas_amount: 5_000_000,
-            surplus: 15_000_000, // 20M - 5M = 15M
-            sell_kas_output: 5_000_000,
-            buy_kas_input: 20_000_000,
-            buy_expected_tokens: 6_666_666,
-        };
-
-        let outputs = compute_cross_pair_outputs(&route);
-
-        // surplus = 15M, fee is mass-based (receipt funded by matcher, not surplus)
-        let expected_fee = kob_core::mass::estimate_compute_mass(3, 4, 0);
-        assert_eq!(outputs.seller_kas, 5_000_000);
-        assert_eq!(outputs.matcher_change, 15_000_000 - expected_fee);
-        assert!(outputs.matcher_change >= MIN_UTXO_VALUE);
     }
 
     // H-5: SpentTracker failure cooldown tests
@@ -4928,125 +4514,6 @@ mod tests {
         assert_eq!(tracker.cooldown_secs, 120);
         assert!(tracker.spent.is_empty());
         assert!(tracker.failed.is_empty());
-    }
-
-    // C-2: Token UTXO covenant_id validation tests
-
-    #[test]
-    fn token_utxo_cov_id_empty_is_unknown() {
-        // When token_cov_id is empty, it means covenant_id is unknown (from wallet search)
-        let tu = TokenUtxo {
-            tx_id: "a".repeat(64),
-            index: 0,
-            value: 10_000_000,
-            token_cov_id: String::new(),
-            spk_version: 0,
-            spk_script: vec![],
-        };
-        assert!(tu.token_cov_id.is_empty(), "empty cov_id = unknown from RPC");
-    }
-
-    #[test]
-    fn token_utxo_cov_id_mismatch_detected() {
-        // Simulates the check that execute_cross_pair_match_with_token performs
-        let token_b_cov_id = "aa".repeat(32);
-        let buy_expected_cov_id = "bb".repeat(32);
-
-        // The validation logic: non-empty cov_id must match
-        let mismatch = !token_b_cov_id.is_empty() && token_b_cov_id != buy_expected_cov_id;
-        assert!(mismatch, "mismatched covenant IDs should be detected");
-    }
-
-    #[test]
-    fn token_utxo_cov_id_match_passes() {
-        let cov_id = "aa".repeat(32);
-        let buy_expected = "aa".repeat(32);
-        let mismatch = !cov_id.is_empty() && cov_id != buy_expected;
-        assert!(!mismatch, "matching covenant IDs should pass validation");
-    }
-
-    #[test]
-    fn token_utxo_cov_id_empty_skips_check() {
-        let cov_id = String::new();
-        let buy_expected = "aa".repeat(32);
-        // Empty cov_id means unknown, should not be treated as mismatch
-        let mismatch = !cov_id.is_empty() && cov_id != buy_expected;
-        assert!(!mismatch, "empty covenant_id should skip validation (not flag as mismatch)");
-    }
-
-    #[test]
-    fn find_token_utxo_returns_empty_cov_id() {
-        // Verify that find_token_utxo_from_wallet returns empty token_cov_id
-        // (since RPC doesn't provide covenant metadata)
-        let spk_hex = token_rs_spk_hex();
-        let utxos = vec![
-            make_rpc_utxo(&"b".repeat(64), 0, 15_000_000, &spk_hex),
-        ];
-        let tracker = SpentTracker::new();
-        let result = find_token_utxo_from_wallet(&utxos, 10_000_000, &tracker);
-        assert!(result.is_some());
-        let tu = result.unwrap();
-        assert!(tu.token_cov_id.is_empty(), "wallet-found token should have empty cov_id");
-    }
-
-    // M-4: CrossPairMatchResult receipt_idx is Option<u32>
-
-    #[test]
-    fn m4_cross_pair_result_receipt_idx_none_when_no_receipt() {
-        let result = CrossPairMatchResult {
-            match_tx_id: "tx1".to_string(),
-            seller_kas: 10_000_000,
-            buyer_tokens: 5_000_000,
-            sell_token_cov_id: "aa".repeat(32),
-            buy_token_cov_id: "bb".repeat(32),
-            receipt_tx_id: "tx1".to_string(),
-            receipt_idx: None,
-            receipt_value: 0,
-        };
-        assert!(result.receipt_idx.is_none(), "receipt_idx must be None when no receipt");
-    }
-
-    #[test]
-    fn m4_cross_pair_result_receipt_idx_some_when_receipt() {
-        let result = CrossPairMatchResult {
-            match_tx_id: "tx1".to_string(),
-            seller_kas: 10_000_000,
-            buyer_tokens: 5_000_000,
-            sell_token_cov_id: "aa".repeat(32),
-            buy_token_cov_id: "bb".repeat(32),
-            receipt_tx_id: "tx1".to_string(),
-            receipt_idx: Some(3),
-            receipt_value: RECEIPT_VALUE,
-        };
-        assert_eq!(result.receipt_idx, Some(3), "receipt_idx must be Some(3)");
-    }
-
-    #[test]
-    fn m4_no_receipt_converts_to_max_sentinel() {
-        let cp = CrossPairMatchResult {
-            match_tx_id: "tx1".to_string(),
-            seller_kas: 10_000_000,
-            buyer_tokens: 5_000_000,
-            sell_token_cov_id: "aa".repeat(32),
-            buy_token_cov_id: "bb".repeat(32),
-            receipt_tx_id: "tx1".to_string(),
-            receipt_idx: None,
-            receipt_value: 0,
-        };
-        // Simulate the conversion done in run_scan_cycle
-        let mr = MatchResult {
-            match_tx_id: cp.match_tx_id.clone(),
-            match_type: MatchType::Full,
-            seller_kas: cp.seller_kas,
-            buyer_tokens: cp.buyer_tokens,
-            receipt_tx_id: cp.receipt_tx_id.clone(),
-            receipt_idx: cp.receipt_idx.unwrap_or(u32::MAX),
-            receipt_value: cp.receipt_value,
-            token_cov_id: cp.buy_token_cov_id.clone(),
-            price_num: 1,
-            price_den: 2,
-        };
-        assert_eq!(mr.receipt_idx, u32::MAX, "sentinel must be u32::MAX");
     }
 
     // Receipt consumption in continuous mode
@@ -5207,7 +4674,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         });
 
         assert!(ob.contains_outpoint(&outpoint), "should contain outpoint after add");

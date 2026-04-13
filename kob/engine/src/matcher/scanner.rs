@@ -902,7 +902,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         let buy_key = buy.outpoint_key();
         ob.add_buy_order(buy);
@@ -929,7 +929,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         let sell_key = sell.outpoint_key();
         ob.add_sell_order(sell);
@@ -1056,7 +1056,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         ob.add_buy_order(buy);
         assert_eq!(ob.stats().total_bids, 1);
@@ -2109,7 +2109,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         ob.add_buy_order(gtc_order);
 
@@ -2132,7 +2132,7 @@ mod tests {
             post_only: false,
             expiry_daa: Some(1000),
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         ob.add_buy_order(gtd_order);
 
@@ -2155,7 +2155,7 @@ mod tests {
             post_only: false,
             expiry_daa: Some(2000),
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
         };
         ob.add_sell_order(gtd_sell);
 

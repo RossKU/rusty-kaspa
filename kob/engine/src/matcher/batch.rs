@@ -37,6 +37,13 @@
 use std::collections::{HashMap, HashSet};
 
 use kob_core::MIN_UTXO_VALUE;
+use kob_core::contract::spot::order::{
+    BUY_ORDER_V15_RS_EXPECTED_LEN,
+    build_buy_v15_fill_sigscript,
+    build_buy_v15_ioc_fill_sigscript,
+    build_sell_fill_sigscript_v15,
+    build_sell_ioc_fill_sigscript_v15,
+};
 
 /// Order type (buy or sell) for batch matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -149,7 +156,7 @@ impl std::fmt::Display for BatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BatchError::UnsupportedVersion { outpoint, version } => {
-                write!(f, "Order {} is v{}, unsupported (v14 only)", outpoint, version)
+                write!(f, "Order {} is v{}, unsupported (v14/v15 only)", outpoint, version)
             }
             BatchError::EmptyBatch => write!(f, "No orders in batch"),
             BatchError::OutputBelowMinimum { index, value } => {
@@ -260,6 +267,11 @@ impl BatchPlan {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
 
+        // V15 detection: if any buy in the batch uses the v15 contract (438B RS),
+        // all sells must use v15 sigscript format (fixed 2-byte koi push) so the
+        // v15 buy can read sell's pnum/pden at fixed offsets via OpTxInputScriptSigSubstr.
+        let has_v15_buy = self.buys.iter().any(|(b, _)| b.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN);
+
         // === Build sell inputs ===
         for (i, (sell, input_idx)) in self.sells.iter().enumerate() {
             let koi = *input_idx; // seller's KAS output is at output[input_idx]
@@ -269,7 +281,13 @@ impl BatchPlan {
             } else if self.ioc_mode == Some(IocSide::Sell) && !self.sell_fill_amounts.is_empty() {
                 // Sell IOC: use fta-based sigscript
                 let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
-                build_sell_ioc_fill_sigscript_batch(koi as u16, fta, &sell.redeem_script)?
+                if has_v15_buy {
+                    build_sell_ioc_fill_sigscript_v15(koi as u16, fta, &sell.redeem_script)
+                } else {
+                    build_sell_ioc_fill_sigscript_batch(koi as u16, fta, &sell.redeem_script)?
+                }
+            } else if has_v15_buy {
+                build_sell_fill_sigscript_v15(koi as u16, &sell.redeem_script)
             } else {
                 build_sell_fill_sigscript_batch(koi as u16, &sell.redeem_script)?
             };
@@ -299,15 +317,38 @@ impl BatchPlan {
             *cov_out_counter.entry(token_hex).or_insert(0) += 1;
 
             // Indices >16 are handled by data-push encoding (no OpN limit).
+            let is_v15 = buy.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN;
 
             let ss = if self.ioc_mode == Some(IocSide::Buy) {
-                // Buy IOC: use Op5 selector
-                build_buy_ioc_fill_sigscript_batch(
+                if is_v15 {
+                    // V15 buy IOC: [sii] [toi] [tii] [coi] [Op5] [pushData(RS)]
+                    // sii = sell input index (= tii, the sell carrying this buy's token covenant)
+                    build_buy_v15_ioc_fill_sigscript(
+                        *tii as u16,
+                        toi as u16,
+                        *tii as u16,
+                        coi,
+                        &buy.redeem_script,
+                    )
+                } else {
+                    // V14 buy IOC: use Op5 selector
+                    build_buy_ioc_fill_sigscript_batch(
+                        toi as u16,
+                        *tii as u16,
+                        coi,
+                        &buy.redeem_script,
+                    )?
+                }
+            } else if is_v15 {
+                // V15 buy fill: [sii] [toi] [tii] [coi] [Op1] [pushData(RS)]
+                // sii = sell input index (= tii, the sell carrying this buy's token covenant)
+                build_buy_v15_fill_sigscript(
+                    *tii as u16,
                     toi as u16,
                     *tii as u16,
                     coi,
                     &buy.redeem_script,
-                )?
+                )
             } else {
                 build_buy_fill_sigscript_batch(
                     toi as u16,
@@ -353,7 +394,7 @@ impl BatchPlan {
 
     /// Validate the plan: all contracts satisfied, fees covered, amounts balanced.
     pub fn validate(&self) -> Result<(), BatchError> {
-        // Check: order versions (v14 only)
+        // Check: order versions (v14 or v15 for buys)
         for (sell, _) in &self.sells {
             if sell.version != 14 {
                 return Err(BatchError::UnsupportedVersion {
@@ -363,7 +404,7 @@ impl BatchPlan {
             }
         }
         for (buy, _) in &self.buys {
-            if buy.version != 14 {
+            if buy.version != 14 && buy.version != 15 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                     version: buy.version,
@@ -621,7 +662,7 @@ pub fn plan_batch_match(
         }
     }
 
-    // Validate order versions (v14 only)
+    // Validate order versions (v14 or v15 for buys)
     for sell in sells {
         if sell.version != 14 {
             return Err(BatchError::UnsupportedVersion {
@@ -631,7 +672,7 @@ pub fn plan_batch_match(
         }
     }
     for buy in buys {
-        if buy.version != 14 {
+        if buy.version != 14 && buy.version != 15 {
             return Err(BatchError::UnsupportedVersion {
                 outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                 version: buy.version,
@@ -780,12 +821,14 @@ pub fn plan_batch_match(
 
     // Sell remainder: if sell input value > buyer token output value for a
     // covenant, the excess sell value needs a non-covenant output.
+    // Returned to the last seller (not the matcher).
     let sell_excess = total_sell_value.saturating_sub(total_buyer_tokens);
+    let last_sell = sells.last().unwrap();
     if sell_excess >= MIN_UTXO_VALUE {
         outputs.push(PlannedOutput {
             value: sell_excess,
-            script_public_key: matcher_spk.to_vec(),
-            spk_version: matcher_spk_version,
+            script_public_key: last_sell.counterparty_spk.clone(),
+            spk_version: last_sell.counterparty_spk_version,
             purpose: OutputPurpose::SellRemainder,
         });
     }
@@ -1051,12 +1094,14 @@ pub fn plan_ioc_match(
     let raw_surplus = total_kas_in - total_planned_out - total_fee;
 
     // Sell remainder (excess sell input value beyond token outputs)
+    // Returned to the last filled seller (not the matcher).
     let sell_excess = total_sell_value.saturating_sub(total_tokens_bought);
+    let last_filled_sell = filled_sells.last().unwrap();
     if sell_excess >= MIN_UTXO_VALUE {
         outputs.push(PlannedOutput {
             value: sell_excess,
-            script_public_key: matcher_spk.to_vec(),
-            spk_version: matcher_spk_version,
+            script_public_key: last_filled_sell.counterparty_spk.clone(),
+            spk_version: last_filled_sell.counterparty_spk_version,
             purpose: OutputPurpose::SellRemainder,
         });
     }

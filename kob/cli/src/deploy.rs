@@ -216,9 +216,10 @@ pub async fn deploy_buy(
     post_only: bool,
     expiry_daa: Option<u64>,
     max_matcher_fee: u64,
+    mmfee_bps: Option<u64>,
 ) -> anyhow::Result<String> {
-    if version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 is supported for deployment.", version);
+    if version != 14 && version != 15 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 and v15 are supported for deployment.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;
@@ -277,17 +278,32 @@ pub async fn deploy_buy(
     let owner_hash = blake2b_256(&pubkey);
     let buyer_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
-    let redeem_script = contract::build_buy_redeem_script(
-        &token_cov_id,
-        price_num,
-        price_den,
-        min_fill,
-        &owner_hash,
-        &buyer_spk_hash,
-        max_matcher_fee,
-        0, // cancel_pending = 0 (active order)
-        expiry_daa.unwrap_or(0),
-    )?;
+    let redeem_script = if version == 15 {
+        let bps = mmfee_bps.unwrap_or(30); // default 0.3% for v15
+        contract::build_buy_v15_redeem_script(
+            &token_cov_id,
+            price_num,
+            price_den,
+            min_fill,
+            &owner_hash,
+            &buyer_spk_hash,
+            bps,
+            0, // cancel_pending = 0 (active order)
+            expiry_daa.unwrap_or(0),
+        )?
+    } else {
+        contract::build_buy_redeem_script(
+            &token_cov_id,
+            price_num,
+            price_den,
+            min_fill,
+            &owner_hash,
+            &buyer_spk_hash,
+            max_matcher_fee,
+            0, // cancel_pending = 0 (active order)
+            expiry_daa.unwrap_or(0),
+        )?
+    };
 
     let p2sh = build_p2sh(&redeem_script);
 
@@ -306,7 +322,12 @@ pub async fn deploy_buy(
         amount,
         amount as f64 / 1e8
     );
-    println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
+    if version == 15 {
+        let bps = mmfee_bps.unwrap_or(30);
+        println!("Max Matcher Fee: {} bps ({}%)", bps, bps as f64 / 100.0);
+    } else {
+        println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
+    }
     println!("Owner:      {}", wallet.pubkey_hex());
     println!("Owner Hash: {}", hex::encode(owner_hash));
     println!("Buyer SPK Hash: {}", hex::encode(buyer_spk_hash));
@@ -549,7 +570,7 @@ pub async fn deploy_buy(
         token: Some(token_covenant_id.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
-        max_matcher_fee,
+        max_matcher_fee: if version == 15 { mmfee_bps.unwrap_or(30) } else { max_matcher_fee },
     };
     let mut cache = OrderCache::load(&cache_path);
     cache.orders.push(entry);
@@ -561,6 +582,9 @@ pub async fn deploy_buy(
 
     Ok(tx_id)
 }
+
+/// Default max_matcher_fee_bps for v15 buy orders (0.3%).
+pub const DEFAULT_MAX_MATCHER_FEE_BPS: u64 = 30;
 
 /// Deploy a sell order (lock tokens, request KAS at a given price).
 #[allow(clippy::too_many_arguments)]

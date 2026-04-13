@@ -893,11 +893,19 @@ pub enum DeployCommands {
         #[arg(long)]
         post_only: bool,
 
-        /// Maximum fee (in sompi) the matcher may extract per fill.
+        /// Maximum fee (in sompi) the matcher may extract per fill (v14).
         /// The on-chain F6 check enforces `kas_in - out[0].value <= mmfee`.
         /// mmfee=0 makes partial fills impossible. Default: 10_000_000 (0.1 KAS).
+        /// Ignored when --mmfee-bps is set (v15).
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
+
+        /// Maximum matcher fee in basis points (v15 contract).
+        /// Sets --version to 15 automatically.
+        /// E.g., 30 = 0.30% of trade value. Range: 0..=10000.
+        /// When set, --max-matcher-fee is ignored.
+        #[arg(long)]
+        mmfee_bps: Option<u64>,
     },
 
     /// Deploy a sell order (lock tokens, request KAS).
@@ -1658,7 +1666,11 @@ pub async fn dispatch(
                 expiry,
                 post_only,
                 max_matcher_fee,
+                mmfee_bps,
             } => {
+                // When --mmfee-bps is set, auto-upgrade to v15
+                let version = if mmfee_bps.is_some() { 15 } else { version };
+
                 // Resolve token alias
                 let token = token::resolve_token(&token, None)?;
 
@@ -1705,8 +1717,14 @@ pub async fn dispatch(
                 if post_only {
                     println!("Post-only order: will be rejected if it would cross the spread.");
                 }
-                if max_matcher_fee == 0 {
+                if version == 14 && max_matcher_fee == 0 {
                     println!("WARNING: --max-matcher-fee=0 prevents partial fills (F6 constraint).");
+                }
+                if let Some(bps) = mmfee_bps {
+                    if bps > 10000 {
+                        anyhow::bail!("--mmfee-bps must be 0..=10000 (basis points). Got {}.", bps);
+                    }
+                    println!("V15 buy order: mmfee_bps = {} ({}%)", bps, bps as f64 / 100.0);
                 }
                 let deploy_txid = deploy::deploy_buy(
                     wallet_path,
@@ -1722,6 +1740,7 @@ pub async fn dispatch(
                     post_only,
                     expiry,
                     max_matcher_fee,
+                    mmfee_bps,
                 )
                 .await?;
                 if tif_policy != tif::TimeInForce::Gtc {

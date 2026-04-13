@@ -334,8 +334,8 @@ pub(crate) fn pair_to_batch_orders(
         warn!("[{}] Unsupported sell RS size {}, skipping (v14=416, oco={})", label, sell_rs.len(), kob_core::OCO_SELL_RS_SIZE);
         return None;
     }
-    if buy_rs.len() != 396 {
-        warn!("[{}] Unsupported buy RS size {}, skipping (v14=396)", label, buy_rs.len());
+    if buy_rs.len() != 396 && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+        warn!("[{}] Unsupported buy RS size {}, skipping (v14=396, v15={})", label, buy_rs.len(), kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN);
         return None;
     }
 
@@ -369,10 +369,11 @@ pub(crate) fn pair_to_batch_orders(
         oco_path: pair.sell.oco_path,
     };
 
+    let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN { 15u8 } else { 14u8 };
     let buy_order = crate::matcher::batch::BatchOrder {
         outpoint: (pair.buy.tx_id.clone(), pair.buy.index),
         order_type: crate::matcher::batch::OrderType::Buy,
-        version: 14,
+        version: buy_version,
         token_cov_id: token_bytes,
         price_num: pair.buy.price_num,
         price_den: pair.buy.price_den,
@@ -418,7 +419,7 @@ pub(crate) fn book_order_to_batch_order(
             }
         }
         crate::matcher::order_book::OrderSide::Buy => {
-            if rs.len() != 396 {
+            if rs.len() != 396 && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
                 warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
                 return None;
             }
@@ -438,10 +439,11 @@ pub(crate) fn book_order_to_batch_order(
         crate::matcher::order_book::OrderSide::Sell => crate::matcher::batch::OrderType::Sell,
     };
 
+    let version = if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN { 15u8 } else { 14u8 };
     Some(crate::matcher::batch::BatchOrder {
         outpoint: (order.tx_id.clone(), order.index),
         order_type,
-        version: 14,
+        version,
         token_cov_id: token_bytes,
         price_num: order.price_num,
         price_den: order.price_den,
@@ -2150,28 +2152,28 @@ async fn run_scan_cycle(
                 // 1 buy (in buys[0]) sweeps N sells
                 crate::matcher::batch::plan_ioc_match(
                     &sells, &buys[0], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, None,
+                    &wallet_spk_script, wallet_spk_version, Some(30u16),
                 )
             }
             matching::GroupKind::SellSweep => {
                 // 1 sell (in sells[0]) sweeps N buys
                 crate::matcher::batch::plan_sell_ioc_match(
                     &sells[0], &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, None,
+                    &wallet_spk_script, wallet_spk_version, Some(30u16),
                 )
             }
             matching::GroupKind::PartialBuy => {
                 // 1:1 partial buy: buy IOC sweeps 1 sell
                 crate::matcher::batch::plan_ioc_match(
                     &sells, &buys[0], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, None,
+                    &wallet_spk_script, wallet_spk_version, Some(30u16),
                 )
             }
             matching::GroupKind::PartialSell => {
                 // 1:1 partial sell: sell IOC sweeps 1 buy
                 crate::matcher::batch::plan_sell_ioc_match(
                     &sells[0], &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, None,
+                    &wallet_spk_script, wallet_spk_version, Some(30u16),
                 )
             }
             matching::GroupKind::Batch
@@ -2184,7 +2186,7 @@ async fn run_scan_cycle(
                 // fill tokens >= expected_tokens.
                 crate::matcher::batch::plan_batch_match(
                     &sells, &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, None,
+                    &wallet_spk_script, wallet_spk_version, Some(30u16),
                 )
             }
         };
@@ -2491,12 +2493,12 @@ async fn run_scan_cycle(
                             break;
                         }
                     };
-                    if buy_rs.len() != 396 {
-                        warn!("[TRI-BATCH] Unsupported buy RS size {}, skipping group (v14=396)", buy_rs.len());
+                    if buy_rs.len() != 396 && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+                        warn!("[TRI-BATCH] Unsupported buy RS size {}, skipping group (v14=396, v15={})", buy_rs.len(), kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN);
                         skip_group = true;
                         break;
                     }
-                    let buy_version = 14u8;
+                    let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN { 15u8 } else { 14u8 };
                     let (buyer_spk_ver, buyer_spk) = match buy.resolve_counterparty_spk() {
                         Some(x) => x,
                         None => {
@@ -2564,7 +2566,7 @@ async fn run_scan_cycle(
                 let mut plan = match crate::matcher::batch::plan_batch_match(
                     &sells, &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version,
-                    None,
+                    Some(30u16),
                 ) {
                     Ok(p) => p,
                     Err(e) => {
@@ -3426,8 +3428,31 @@ pub async fn run_continuous_with_ws(
     let mut cycle = 0u64;
     let mut spent_tracker = SpentTracker::new();
 
+    // H2: Track the last seen block hash for catchup after WS reconnection.
+    // Initialized from the current sink hash so scan_new_blocks can use
+    // getVirtualChainFromBlock to discover blocks missed during downtime.
+    let mut last_seen_hash: Option<String> = {
+        let rpc_lock = rpc.lock().await;
+        match rpc_lock.get_sink_hash().await {
+            Ok(h) => {
+                info!("[H2] Initial last_seen_hash = {}...", &h[..h.len().min(16)]);
+                Some(h)
+            }
+            Err(e) => {
+                warn!("[H2] Failed to get initial sink hash: {}", e);
+                None
+            }
+        }
+    };
+
     // Subscribe to BlockAdded notifications for event-driven scanning.
     // This replaces the old getVirtualChainFromBlock polling loop.
+    info!("==========================================================");
+    info!("  KOB Engine ready — listening for new blocks.");
+    info!("  IMPORTANT: Deploy orders AFTER this message appears.");
+    info!("  Orders deployed before the engine starts will NOT be");
+    info!("  discovered (no full UTXO rescan on startup).");
+    info!("==========================================================");
     let mut notif_rx = {
         let rpc_lock = rpc.lock().await;
         match rpc_lock.subscribe("BlockAdded").await {
@@ -3460,6 +3485,40 @@ pub async fn run_continuous_with_ws(
                 }
                 if let Some(new_rx) = rpc_lock.take_notification_receiver().await {
                     notif_rx = new_rx;
+                }
+
+                // H2: Catch up on blocks missed during WS disconnect.
+                // Uses the old polling-based scan_new_blocks (getVirtualChainFromBlock)
+                // to discover and process any blocks added while we were disconnected.
+                if let Some(ref hash) = last_seen_hash {
+                    info!("[H2] Catching up from last_seen_hash={}...", &hash[..hash.len().min(16)]);
+                    let current_daa = rpc_lock.get_daa_score().await.unwrap_or(0);
+                    let catchup_hash = hash.clone();
+                    drop(rpc_lock);
+                    let rpc_catchup = rpc.lock().await;
+                    let mut ob = order_book.lock().await;
+                    let mut pb = shared_perp_book.lock().await;
+                    let mut lb = shared_lending_book.lock().await;
+                    let mut pred = shared_prediction_book.lock().await;
+                    let (new_hash, counters) = scan_new_blocks(
+                        &*rpc_catchup, &mut ob, &mut pb, &mut lb, &mut pred,
+                        &catchup_hash, ws_tx.as_ref(), current_daa,
+                    ).await;
+                    if new_hash != catchup_hash {
+                        info!(
+                            "[H2] Catchup complete: {} new tip, spot(+{}), perp(+{})",
+                            &new_hash[..new_hash.len().min(16)],
+                            counters.spot_added, counters.perp_added,
+                        );
+                        last_seen_hash = Some(new_hash);
+                    } else {
+                        debug!("[H2] Catchup: no new blocks since disconnect");
+                    }
+                } else {
+                    // No last_seen_hash: initialize from current sink
+                    if let Ok(h) = rpc_lock.get_sink_hash().await {
+                        last_seen_hash = Some(h);
+                    }
                 }
             }
         }
@@ -3499,6 +3558,16 @@ pub async fn run_continuous_with_ws(
                             Some(b) => b,
                             None => continue,
                         };
+                        // H2: Extract block hash for catchup tracking.
+                        // Kaspa wRPC: block.verboseData.hash or block.header.hash
+                        if let Some(bh) = block
+                            .get("verboseData").and_then(|vd| vd.get("hash"))
+                            .or_else(|| block.get("header").and_then(|h| h.get("hash")))
+                            .and_then(|v| v.as_str())
+                        {
+                            last_seen_hash = Some(bh.to_string());
+                        }
+
                         let txs: Vec<TransactionData> = block
                             .get("transactions")
                             .and_then(|t| t.as_array())

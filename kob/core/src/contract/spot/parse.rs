@@ -2,6 +2,7 @@
 
 use crate::types::OrderSide;
 use crate::contract::spot::oco::{OCO_SELL_STATE_SIZE, OCO_SELL_RS_SIZE, OcoPath};
+use crate::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN;
 
 /// OpZkPrecompile opcode byte (0xa6).
 pub const OP_ZK_PRECOMPILE: u8 = 0xa6;
@@ -80,8 +81,8 @@ pub struct ParsedOcoSell {
 /// then extracts parameters from the fixed-offset state portion.
 pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
     match rs.len() {
-        BUY_RS_SIZE => {
-            // Buy: body starts at offset 145, signature 0xb9 0xc9
+        BUY_RS_SIZE | BUY_ORDER_V15_RS_EXPECTED_LEN => {
+            // Buy v14 (396B) or v15 (438B): body starts at offset 145, signature 0xb9 0xc9
             if rs[BUY_STATE_SIZE] == 0xb9 && rs[BUY_STATE_SIZE + 1] == 0xc9
                 && rs[BUY_STATE_SIZE + 2] == 0x76
             {

@@ -246,7 +246,24 @@ impl BlockScanner {
             let mut spk_bytes = Vec::with_capacity(2 + b_p2sh_spk.script().len());
             spk_bytes.extend_from_slice(&b_p2sh_spk.version.to_le_bytes());
             spk_bytes.extend_from_slice(&b_p2sh_spk.script());
-            (Some(hex::encode(&spk_bytes)), Some(hex::encode(b_rs)))
+            // H-3: Verify that the computed SPK matches the bspkh embedded in Order A's RS.
+            // Without this check an attacker could deploy Order A with a valid bspkh but put
+            // a different B RS in the payload, causing the Matcher to waste fee UTXOs on
+            // invalid fill TXs.
+            let computed_hash = kob_core::blake2b_256(&spk_bytes);
+            if computed_hash != parsed.spk_hash {
+                tracing::warn!(
+                    "[IFD] payload B RS does not match bspkh in Order A RS — \
+                     ignoring IFD linkage (possible spoofing)"
+                );
+                // Fall through to normal SPK extraction; do NOT trust the payload B RS.
+                let spk = tx.and_then(|tx_data| {
+                    extract_owner_spk(tx_data, &parsed.spk_hash)
+                });
+                (spk, None)
+            } else {
+                (Some(hex::encode(&spk_bytes)), Some(hex::encode(b_rs)))
+            }
         } else {
             let spk = tx.and_then(|tx_data| {
                 extract_owner_spk(tx_data, &parsed.spk_hash)

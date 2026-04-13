@@ -88,6 +88,7 @@ pub fn build_ifd_order_payload(
     if expiry_daa.is_some() {
         flags |= PAYLOAD_FLAG_GTD;
     }
+    assert!(order_a_rs.len() <= u16::MAX as usize, "order A RS exceeds u16::MAX");
     let a_len = order_a_rs.len() as u16;
     let gtd_len = if expiry_daa.is_some() { 8 } else { 0 };
     let mut payload = Vec::with_capacity(
@@ -125,6 +126,7 @@ pub fn build_oco_order_payload_full(
     if expiry_daa.is_some() {
         flags |= PAYLOAD_FLAG_GTD;
     }
+    assert!(buy_rs.len() <= u16::MAX as usize, "buy RS exceeds u16::MAX");
     let buy_len = buy_rs.len() as u16;
     let gtd_len = if expiry_daa.is_some() { 8 } else { 0 };
     let mut payload = Vec::with_capacity(

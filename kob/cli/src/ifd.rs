@@ -281,7 +281,7 @@ pub async fn deploy_ifd(
 
     let selected_utxos = &coin_sel.utxos;
     let total_input = coin_sel.total;
-    let tentative_change = total_input - buy_amount - min_fee_override;
+    let tentative_change = total_input.saturating_sub(buy_amount).saturating_sub(min_fee_override);
 
     println!(
         "Selected {} funding UTXOs (total {} sompi)",
@@ -558,7 +558,7 @@ pub async fn deploy_ifo(
 
     let selected_utxos = &coin_sel.utxos;
     let total_input = coin_sel.total;
-    let tentative_change = total_input - buy_amount - min_fee_override;
+    let tentative_change = total_input.saturating_sub(buy_amount).saturating_sub(min_fee_override);
 
     let mut tx = Transaction::new(0);
 

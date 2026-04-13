@@ -171,16 +171,20 @@ impl WalletContext {
     }
 
     fn from_legacy(legacy: LegacyWalletJson) -> crate::Result<Self> {
-        let privkey_bytes = hex::decode(&legacy.private_key)?;
+        let mut privkey_bytes = hex::decode(&legacy.private_key)?;
         if privkey_bytes.len() != 32 {
+            privkey_bytes.zeroize();
             return Err(crate::KobError::Wallet("private key must be 32 bytes".into()));
         }
         let mut key = [0u8; 32];
         key.copy_from_slice(&privkey_bytes);
+        privkey_bytes.zeroize();
         let pubkey = get_public_key(&key)?;
         let address = legacy.address.clone();
+        let secure_key = SecureKey::from_bytes(key);
+        key.zeroize();
         Ok(Self {
-            privkey: SecureKey::from_bytes(key),
+            privkey: secure_key,
             pubkey,
             address,
         })
@@ -202,12 +206,22 @@ impl WalletContext {
 
 /// Legacy wallet file structure (matches wallet.json from test scripts).
 /// For wallet creation/migration only — use `WalletContext` for loading.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LegacyWalletJson {
     pub private_key: String,
     pub public_key: String,
     pub address: String,
+}
+
+impl std::fmt::Debug for LegacyWalletJson {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LegacyWalletJson")
+            .field("public_key", &self.public_key)
+            .field("address", &self.address)
+            .field("private_key", &"[REDACTED]")
+            .finish()
+    }
 }
 
 impl LegacyWalletJson {

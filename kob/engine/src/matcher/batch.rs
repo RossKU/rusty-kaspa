@@ -597,12 +597,18 @@ impl BatchPlan {
                 self.matcher_surplus += to_matcher;
             }
             if to_seller > 0 {
-                // Overflow goes to first seller output
-                self.outputs[0].value += to_seller;
+                // Overflow goes to first SellerKas output
+                let seller_idx = self.outputs.iter()
+                    .position(|o| o.purpose == OutputPurpose::SellerKas)
+                    .expect("batch plan must have at least one SellerKas output");
+                self.outputs[seller_idx].value += to_seller;
             }
         } else {
-            // No matcher fee output — give delta to first seller
-            self.outputs[0].value += delta;
+            // No matcher fee output — give delta to first SellerKas output
+            let seller_idx = self.outputs.iter()
+                .position(|o| o.purpose == OutputPurpose::SellerKas)
+                .expect("batch plan must have at least one SellerKas output");
+            self.outputs[seller_idx].value += delta;
         }
 
         self.total_fee = exact_fee;
@@ -821,16 +827,32 @@ pub fn plan_batch_match(
 
     // Sell remainder: if sell input value > buyer token output value for a
     // covenant, the excess sell value needs a non-covenant output.
-    // Returned to the last seller (not the matcher).
+    // Compute per-sell fill amounts: fills are assigned in order within each
+    // covenant.  The last sell for a covenant absorbs any partial remainder.
     let sell_excess = total_sell_value.saturating_sub(total_buyer_tokens);
-    let last_sell = sells.last().unwrap();
-    if sell_excess >= MIN_UTXO_VALUE {
-        outputs.push(PlannedOutput {
-            value: sell_excess,
-            script_public_key: last_sell.counterparty_spk.clone(),
-            spk_version: last_sell.counterparty_spk_version,
-            purpose: OutputPurpose::SellRemainder,
-        });
+    let per_sell_fill: Vec<u64> = {
+        // Track remaining buyer demand per covenant
+        let mut remaining_by_cov: HashMap<String, u64> = total_buyer_tokens_by_cov.clone();
+        sells.iter().map(|sell| {
+            let token_hex = hex::encode(sell.token_cov_id);
+            let remaining = remaining_by_cov.get(&token_hex).copied().unwrap_or(0);
+            let fill = remaining.min(sell.utxo_value);
+            *remaining_by_cov.entry(token_hex).or_insert(0) = remaining.saturating_sub(fill);
+            fill
+        }).collect()
+    };
+    if sell_excess > 0 {
+        for (i, sell) in sells.iter().enumerate() {
+            let this_excess = sell.utxo_value.saturating_sub(per_sell_fill[i]);
+            if this_excess >= MIN_UTXO_VALUE {
+                outputs.push(PlannedOutput {
+                    value: this_excess,
+                    script_public_key: sell.counterparty_spk.clone(),
+                    spk_version: sell.counterparty_spk_version,
+                    purpose: OutputPurpose::SellRemainder,
+                });
+            }
+        }
     }
 
     // Matcher KAS surplus = raw_surplus minus sell excess
@@ -925,15 +947,8 @@ pub fn plan_batch_match(
     // which fails when buyers don't absorb all tokens.
     // IOC fill F4 only checks covenant_output_count >= 1 (existence).
     let (ioc_mode, sell_fill_amounts) = if sell_excess > 0 {
-        // Each sell's fta = total_buyer_tokens allocated to that sell's token.
-        // For single-token batches, all buyer tokens go to the single sell.
-        let mut sfa = Vec::with_capacity(sells.len());
-        for sell in sells.iter() {
-            let token_hex = hex::encode(sell.token_cov_id);
-            let allocated = total_buyer_tokens_by_cov.get(&token_hex).copied().unwrap_or(0);
-            sfa.push(allocated);
-        }
-        (Some(IocSide::Sell), sfa)
+        // Use per-sell fill amounts computed above (order-aware allocation).
+        (Some(IocSide::Sell), per_sell_fill.clone())
     } else {
         (None, Vec::new())
     };
@@ -1093,17 +1108,22 @@ pub fn plan_ioc_match(
 
     let raw_surplus = total_kas_in - total_planned_out - total_fee;
 
-    // Sell remainder (excess sell input value beyond token outputs)
-    // Returned to the last filled seller (not the matcher).
+    // Sell remainder (excess sell input value beyond token outputs).
+    // All fills are full-fill (amount == tokens consumed), so per-sell
+    // excess = utxo_value - amount.  Distribute individually.
     let sell_excess = total_sell_value.saturating_sub(total_tokens_bought);
-    let last_filled_sell = filled_sells.last().unwrap();
-    if sell_excess >= MIN_UTXO_VALUE {
-        outputs.push(PlannedOutput {
-            value: sell_excess,
-            script_public_key: last_filled_sell.counterparty_spk.clone(),
-            spk_version: last_filled_sell.counterparty_spk_version,
-            purpose: OutputPurpose::SellRemainder,
-        });
+    if sell_excess > 0 {
+        for sell in &filled_sells {
+            let this_excess = sell.utxo_value.saturating_sub(sell.amount);
+            if this_excess >= MIN_UTXO_VALUE {
+                outputs.push(PlannedOutput {
+                    value: this_excess,
+                    script_public_key: sell.counterparty_spk.clone(),
+                    spk_version: sell.counterparty_spk_version,
+                    purpose: OutputPurpose::SellRemainder,
+                });
+            }
+        }
     }
 
     // raw_surplus includes kas_remaining (unspent buy KAS) + wallet excess.
@@ -1324,7 +1344,7 @@ pub fn plan_sell_ioc_match(
     let matcher_kas = raw_surplus;
 
     // Apply bps cap
-    let (capped_matcher_kas, _buyer_refund_from_bps) = if let Some(bps) = fee_bps {
+    let (capped_matcher_kas, buyer_refund_from_bps) = if let Some(bps) = fee_bps {
         let max_fee_128 = total_seller_kas as u128 * bps as u128 / 10000;
         let max_fee = if max_fee_128 > u64::MAX as u128 { u64::MAX } else { max_fee_128 as u64 };
         if matcher_kas > max_fee {
@@ -1335,6 +1355,33 @@ pub fn plan_sell_ioc_match(
     } else {
         (matcher_kas, 0u64)
     };
+
+    // Refund BPS cap excess to buyers pro-rata by KAS input
+    if buyer_refund_from_bps > 0 {
+        let mut refunded = 0u64;
+        for (j, buy) in filled_buys.iter().enumerate() {
+            let share = if j == filled_buys.len() - 1 {
+                buyer_refund_from_bps - refunded
+            } else {
+                ((buyer_refund_from_bps as u128 * buy.utxo_value as u128
+                    / total_buy_value as u128) as u64)
+                    .min(buyer_refund_from_bps - refunded)
+            };
+            if share >= MIN_UTXO_VALUE {
+                outputs.push(PlannedOutput {
+                    value: share,
+                    script_public_key: buy.counterparty_spk.clone(),
+                    spk_version: buy.counterparty_spk_version,
+                    purpose: OutputPurpose::BuyerChange,
+                });
+                refunded += share;
+            } else if share > 0 {
+                // Dust: add to this buyer's token output (at index 1 + j)
+                outputs[1 + j].value += share;
+                refunded += share;
+            }
+        }
+    }
 
     let matcher_surplus = capped_matcher_kas;
 

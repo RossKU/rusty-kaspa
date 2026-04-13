@@ -809,14 +809,14 @@ pub fn plan_batch_match(
 
     // Refund excess surplus to buyers pro-rata by KAS input
     if buyer_refund > 0 {
-        let total_buy_kas_f = total_buy_kas as f64;
         let mut refunded = 0u64;
         for (j, buy) in buys.iter().enumerate() {
             let share = if j == buys.len() - 1 {
                 // Last buyer gets remainder to avoid rounding loss
                 buyer_refund - refunded
             } else {
-                ((buyer_refund as f64 * buy.utxo_value as f64 / total_buy_kas_f) as u64)
+                // u128 intermediate to avoid precision loss above 2^53 sompi (~9,007 KAS)
+                ((buyer_refund as u128 * buy.utxo_value as u128 / total_buy_kas as u128) as u64)
                     .min(buyer_refund - refunded)
             };
             if share >= MIN_UTXO_VALUE {

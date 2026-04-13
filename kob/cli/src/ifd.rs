@@ -271,7 +271,12 @@ pub async fn deploy_ifd(
 
     let min_fee_override = fee;
 
-    let coin_sel = select_utxos_mass_aware(&core_utxos, buy_amount, min_fee_override, 2).map_err(|e| {
+    // When fee=0 (auto), request a fee buffer so UTXO selection always leaves
+    // room for the miner fee. Without this, an exact-match UTXO leaves 0 excess
+    // and the TX fails with "Insufficient funds for fee" (the deploy fee gap bug).
+    let selection_fee = if min_fee_override == 0 { 5000 } else { min_fee_override };
+
+    let coin_sel = select_utxos_mass_aware(&core_utxos, buy_amount, selection_fee, 2).map_err(|e| {
         anyhow::anyhow!(
             "UTXO selection failed: {}. {} P2PK UTXOs available.",
             e,
@@ -567,7 +572,10 @@ pub async fn deploy_ifo(
 
     let min_fee_override = fee;
 
-    let coin_sel = select_utxos_mass_aware(&core_utxos, buy_amount, min_fee_override, 2).map_err(|e| {
+    // Same fee-gap fix as deploy_ifd: ensure UTXO selection leaves room for fee.
+    let selection_fee = if min_fee_override == 0 { 5000 } else { min_fee_override };
+
+    let coin_sel = select_utxos_mass_aware(&core_utxos, buy_amount, selection_fee, 2).map_err(|e| {
         anyhow::anyhow!("UTXO selection failed: {}", e)
     })?;
 

@@ -1890,7 +1890,6 @@ async fn run_scan_cycle(
     // Phase 1: Same-pair matches
     let all_pairs_raw = matching::find_all_crossing_pairs_with_stp(order_book, allow_self_trade);
     // H-5: Filter out pairs whose outpoints are under failure cooldown
-    // ZK-GATE: Filter out pairs where either order is freezable and no prover is configured
     let all_pairs: Vec<_> = all_pairs_raw
         .into_iter()
         .filter(|p| {
@@ -1899,16 +1898,6 @@ async fn run_scan_cycle(
             if spent_tracker.is_failed(&bk) || spent_tracker.is_failed(&sk) {
                 info!(
                     "[SCAN] Skipping pair (outpoint under cooldown): buy={}... sell={}...",
-                    &bk[..bk.len().min(20)],
-                    &sk[..sk.len().min(20)],
-                );
-                return false;
-            }
-            // ZK-GATE: Skip pairs involving freezable tokens when no ZK prover is configured
-            if !config.zk_prover_enabled && (p.buy.is_freezable || p.sell.is_freezable) {
-                warn!(
-                    "[SCAN] Skipping pair (freezable token, no ZK prover): buy={}... sell={}... \
-                     (use --zk-prover to enable)",
                     &bk[..bk.len().min(20)],
                     &sk[..sk.len().min(20)],
                 );
@@ -2028,9 +2017,77 @@ async fn run_scan_cycle(
                 }
             };
 
+            // IFD: scan batch group for the first order with ifd_order_b_rs_hex
+            let batch_ifd_b_rs_hex: Option<&String> = group.iter().find_map(|pair| {
+                pair.buy.ifd_order_b_rs_hex.as_ref()
+                    .or(pair.sell.ifd_order_b_rs_hex.as_ref())
+            });
+
+            let (batch_ifd_ctx, batch_ifd_payload) = if let Some(b_rs_hex) = batch_ifd_b_rs_hex {
+                // Payload-based IFD: order B RS came from deploy TX payload
+                match hex::decode(b_rs_hex) {
+                    Ok(rs_bytes) => {
+                        let b_expiry = kob_core::contract::spot::parse_redeem_script(&rs_bytes)
+                            .and_then(|p| p.expiry_daa);
+                        let kob_payload = kob_core::contract::build_order_payload_full(
+                            &rs_bytes, false, b_expiry,
+                        );
+                        (None, Some(hex::encode(&kob_payload)))
+                    }
+                    Err(e) => {
+                        warn!("[BATCH-IFD] Failed to decode order B RS from BookOrder: {}", e);
+                        (None, None)
+                    }
+                }
+            } else {
+                // Fallback: check IfdBook for engine-registered rules
+                let ctx = {
+                    let ifd = ifd_book.lock().await;
+                    group.iter().find_map(|pair| {
+                        let buy_outpoint = pair.buy.outpoint_key();
+                        let sell_outpoint = pair.sell.outpoint_key();
+                        let rule = ifd.find_by_a_outpoint(&buy_outpoint)
+                            .or_else(|| ifd.find_by_a_outpoint(&sell_outpoint));
+                        rule.and_then(|r| {
+                            if r.status == crate::matcher::ifd::IfdStatus::Active {
+                                match hex::decode(&r.order_b_rs_hex) {
+                                    Ok(rs_bytes) => Some(IfdFillContext {
+                                        rule_id: r.id,
+                                        order_b_rs: rs_bytes,
+                                        order_b_p2sh: r.order_b_p2sh.clone(),
+                                        expiry_daa: r.order_b.expiry_daa(),
+                                    }),
+                                    Err(e) => {
+                                        warn!("[BATCH-IFD] Failed to decode order B RS hex for rule {}: {}", r.id, e);
+                                        None
+                                    }
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                };
+                let payload = ctx.as_ref().map(|c| {
+                    let expiry = if c.expiry_daa > 0 { Some(c.expiry_daa) } else { None };
+                    let kob_payload = kob_core::contract::build_order_payload_full(
+                        &c.order_b_rs, false, expiry,
+                    );
+                    hex::encode(&kob_payload)
+                });
+                (ctx, payload)
+            };
+
             // Execute the batch match
-            match execute_batch_match(rpc, &mut plan, config, spent_tracker, None).await {
+            match execute_batch_match(rpc, &mut plan, config, spent_tracker, batch_ifd_payload).await {
                 Some(batch_result) => {
+                    // IFD trigger: mark rule as triggered after successful batch
+                    if let Some(ctx) = &batch_ifd_ctx {
+                        let mut ifd = ifd_book.lock().await;
+                        ifd.trigger(ctx.rule_id, &batch_result.tx_id);
+                        drop(ifd);
+                    }
+
                     info!(
                         "[BATCH] SUCCESS: tx={} sells={} buys={} surplus={}",
                         &batch_result.tx_id[..batch_result.tx_id.len().min(16)],

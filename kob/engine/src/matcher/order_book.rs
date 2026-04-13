@@ -165,6 +165,15 @@ pub struct BookOrder {
     /// order B as payload so the scanner discovers it on-chain.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ifd_order_b_rs_hex: Option<String>,
+    /// OCO path: which path this virtual order represents (TP or SL).
+    /// None for regular (non-OCO) orders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oco_path: Option<kob_core::OcoPath>,
+    /// OCO partner: outpoint_key of the partner virtual order.
+    /// When this order is filled or removed, the partner must also be removed
+    /// (the UTXO is shared, spending it cancels both paths).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oco_partner_key: Option<String>,
 }
 
 fn default_max_matcher_fee() -> u64 {
@@ -173,6 +182,17 @@ fn default_max_matcher_fee() -> u64 {
 
 impl BookOrder {
     pub fn outpoint_key(&self) -> String {
+        let base = format!("{}:{}", self.tx_id, self.index);
+        match self.oco_path {
+            Some(kob_core::OcoPath::TakeProfit) => format!("{}:tp", base),
+            Some(kob_core::OcoPath::StopLoss) => format!("{}:sl", base),
+            None => base,
+        }
+    }
+
+    /// Returns the raw UTXO outpoint key (without OCO suffix).
+    /// Use this for UTXO lookups and TX building.
+    pub fn utxo_outpoint_key(&self) -> String {
         format!("{}:{}", self.tx_id, self.index)
     }
 

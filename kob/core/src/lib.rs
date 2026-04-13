@@ -37,6 +37,10 @@ pub use contract::{
     build_oco_pair_redeem_script,
     build_oco_pair_fill_sigscript, build_oco_pair_cbp_sigscript,
     build_oco_pair_cancel_sigscript,
+    OCO_SELL_BODY, OCO_SELL_RS_SIZE, OCO_SELL_STATE_SIZE, OcoPath,
+    build_oco_sell_redeem_script,
+    build_oco_sell_tp_fill_sigscript, build_oco_sell_sl_fill_sigscript,
+    build_oco_sell_cancel_sigscript, build_oco_sell_expire_sigscript,
     build_buy_redeem_script, build_sell_redeem_script,
     build_buy_fill_sigscript, build_sell_fill_sigscript,
     build_buy_partial_fill_sigscript, build_sell_partial_fill_sigscript,
@@ -45,7 +49,8 @@ pub use contract::{
     build_order_payload, build_oco_order_payload, parse_order_payload,
     KOB_PAYLOAD_PREFIX,
     // Spot parse
-    ParsedOrder, parse_redeem_script, has_zk_opcode, OP_ZK_PRECOMPILE,
+    ParsedOrder, ParsedOcoSell, parse_redeem_script, parse_oco_sell_redeem_script,
+    has_zk_opcode, OP_ZK_PRECOMPILE,
     BUY_RS_SIZE, SELL_RS_SIZE,
 };
 pub use p2sh::{blake2b_256, build_p2sh, compute_spk_hash, compute_p2pk_spk_hash};

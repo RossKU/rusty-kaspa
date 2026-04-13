@@ -76,6 +76,10 @@ pub struct BatchOrder {
     pub counterparty_spk: Vec<u8>,
     /// Counterparty SPK version.
     pub counterparty_spk_version: u16,
+    /// OCO path: when set, this sell order is part of a single-UTXO OCO
+    /// and must use the TP (Op1) or SL (Op2) selector instead of the
+    /// standard sell fill selector (Op1).
+    pub oco_path: Option<kob_core::OcoPath>,
 }
 
 /// Purpose of a planned output.
@@ -259,7 +263,10 @@ impl BatchPlan {
         // === Build sell inputs ===
         for (i, (sell, input_idx)) in self.sells.iter().enumerate() {
             let koi = *input_idx; // seller's KAS output is at output[input_idx]
-            let ss = if self.ioc_mode == Some(IocSide::Sell) && !self.sell_fill_amounts.is_empty() {
+            let ss = if let Some(oco_path) = sell.oco_path {
+                // OCO sell: use TP (Op1) or SL (Op2) path selector
+                build_oco_sell_fill_sigscript_batch(koi as u16, oco_path, &sell.redeem_script)?
+            } else if self.ioc_mode == Some(IocSide::Sell) && !self.sell_fill_amounts.is_empty() {
                 // Sell IOC: use fta-based sigscript
                 let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
                 build_sell_ioc_fill_sigscript_batch(koi as u16, fta, &sell.redeem_script)?
@@ -1358,6 +1365,25 @@ fn push_index(ss: &mut Vec<u8>, n: u16) {
             ss.push((n >> 8) as u8);  // high byte
         }
     }
+}
+
+/// Build OCO sell fill sigscript for batch: `[koi] [selector] [pushData(RS)]`
+///
+/// * `kas_output_idx`: which output receives the seller's KAS
+/// * `path`: TakeProfit uses Op1, StopLoss uses Op2
+fn build_oco_sell_fill_sigscript_batch(
+    kas_output_idx: u16,
+    path: kob_core::OcoPath,
+    redeem_script: &[u8],
+) -> Result<Vec<u8>, BatchError> {
+    let mut ss = Vec::with_capacity(3 + redeem_script.len() + 3);
+    push_index(&mut ss, kas_output_idx);
+    match path {
+        kob_core::OcoPath::TakeProfit => ss.push(0x51), // Op1
+        kob_core::OcoPath::StopLoss => ss.push(0x52),   // Op2
+    }
+    ss.extend_from_slice(&kob_core::push_data(redeem_script));
+    Ok(ss)
 }
 
 /// Build sell fill sigscript for batch: `[koi] [Op1] [pushData(RS)]`

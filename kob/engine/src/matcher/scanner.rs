@@ -4,7 +4,7 @@ use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
 
 
 // Parse types and functions imported from kob-core.
-pub use kob_core::contract::spot::parse::{ParsedOrder, parse_redeem_script};
+pub use kob_core::contract::spot::parse::{ParsedOrder, ParsedOcoSell, parse_redeem_script, parse_oco_sell_redeem_script};
 pub use kob_core::contract::perp::parse::{ParsedPerpOrder, PerpDeploySide, PERP_DEPLOY_V1_RS_SIZE, PERP_DEPLOY_V1_STATE_SIZE, parse_perp_deploy_rs};
 pub use kob_core::contract::lending::parse::{ParsedLendingOrder, LendingOrderType, parse_lending_rs, LOAN_OFFER_RS_SIZE, BORROW_REQUEST_RS_SIZE};
 pub use kob_core::contract::prediction::parse::{ParsedPredictionItem, PredictionItemType, parse_prediction_rs};
@@ -47,6 +47,8 @@ pub struct TxOutputData {
 pub enum ScanResult {
     /// Spot order detected.
     Spot(ParsedOrder, u32, u64),
+    /// OCO sell: two virtual spot sell orders from a single UTXO (TP + SL paths).
+    OcoSell(ParsedOcoSell, u32, u64),
     /// Perp deploy order detected.
     Perp(ParsedPerpOrder, u32, u64),
     /// Lending order detected.
@@ -165,18 +167,59 @@ impl BlockScanner {
         parse_redeem_script(rs)
     }
 
+    /// Scan for a single-UTXO OCO sell deploy.
+    ///
+    /// Uses the same KOB:2: payload format as regular spot but the RS is 333B.
+    /// Returns `ParsedOcoSell` instead of `ParsedOrder`.
+    fn scan_oco_sell(&self, tx: &TransactionData) -> Option<(ParsedOcoSell, u32, u64)> {
+        let v2 = kob_core::contract::parse_order_payload(&tx.payload)?;
+        if v2.rs_data.len() != kob_core::OCO_SELL_RS_SIZE {
+            return None;
+        }
+        let rs_hash = kob_core::blake2b_256(&v2.rs_data);
+        let p2sh_outputs: Vec<(u32, &TxOutputData, [u8; 32])> = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, out)| {
+                parse_p2sh_script(&out.script, out.script_version)
+                    .map(|hash| (idx as u32, out, hash))
+            })
+            .collect();
+        for &(p2sh_idx, p2sh_out, ref p2sh_hash) in &p2sh_outputs {
+            if rs_hash == *p2sh_hash {
+                if let Some(parsed) = parse_oco_sell_redeem_script(&v2.rs_data) {
+                    return Some((parsed, p2sh_idx, p2sh_out.value));
+                }
+            }
+        }
+        None
+    }
+
     /// Check which outpoints in a TX's inputs are present in the order book.
     ///
     /// Returns outpoint keys for orders that are being spent (filled/cancelled).
+    /// For OCO orders, also returns the virtual suffixed keys (`:tp`, `:sl`).
     pub fn find_spent_orders(tx: &TransactionData, book: &OrderBook) -> Vec<String> {
         let mut spent = Vec::new();
         for input in &tx.inputs {
             let key = format!("{}:{}", input.prev_tx_id, input.prev_index);
-            // Check all pair books for this outpoint
+            // Check direct key (regular orders)
             for pair_book in book.pair_books.values() {
                 if pair_book.contains_outpoint(&key) {
                     spent.push(key.clone());
                     break;
+                }
+            }
+            // Check OCO virtual keys (txid:index:tp and txid:index:sl)
+            let tp_key = format!("{}:tp", key);
+            let sl_key = format!("{}:sl", key);
+            for pair_book in book.pair_books.values() {
+                if pair_book.contains_outpoint(&tp_key) {
+                    spent.push(tp_key.clone());
+                }
+                if pair_book.contains_outpoint(&sl_key) {
+                    spent.push(sl_key.clone());
                 }
             }
         }
@@ -294,7 +337,75 @@ impl BlockScanner {
             is_freezable: parsed.requires_zk,
             max_matcher_fee: parsed._max_matcher_fee,
             ifd_order_b_rs_hex,
+            oco_path: None,
+            oco_partner_key: None,
         }
+    }
+
+    /// Convert a `ParsedOcoSell` into two virtual BookOrders (TP + SL).
+    ///
+    /// Each virtual order gets a suffixed outpoint key (`txid:index:tp` / `txid:index:sl`)
+    /// and a `oco_partner_key` pointing to the other. The batch engine uses `oco_path`
+    /// to select the correct fill sigscript selector (Op1 for TP, Op2 for SL).
+    pub fn oco_sell_to_book_orders(
+        parsed: &ParsedOcoSell,
+        tx_id: &str,
+        output_index: u32,
+        value: u64,
+        tx: Option<&TransactionData>,
+    ) -> (BookOrder, BookOrder) {
+        let base_key = format!("{}:{}", tx_id, output_index);
+        let tp_key = format!("{}:tp", base_key);
+        let sl_key = format!("{}:sl", base_key);
+
+        // Extract counterparty SPK from deploy TX (same for both paths)
+        let counterparty_spk = tx.and_then(|tx_data| {
+            extract_owner_spk(tx_data, &parsed.spk_hash)
+        });
+
+        // Extract token covenant ID from the P2SH output
+        let tcid_hex = tx.and_then(|tx_data| {
+            tx_data.outputs.get(output_index as usize)
+                .and_then(|out| out.covenant_id.as_ref())
+                .map(hex::encode)
+        }).unwrap_or_else(|| hex::encode([0u8; 32]));
+
+        let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
+        let p2sh_script_hex = hex::encode(&p2sh_spk.script());
+
+        let make_order = |path: kob_core::OcoPath, partner: &str| -> BookOrder {
+            let (pnum, pden, mfill) = match path {
+                kob_core::OcoPath::TakeProfit => (parsed.price_num_tp, parsed.price_den_tp, parsed.min_fill_tp),
+                kob_core::OcoPath::StopLoss => (parsed.price_num_sl, parsed.price_den_sl, parsed.min_fill_sl),
+            };
+            BookOrder {
+                tx_id: tx_id.to_string(),
+                index: output_index,
+                value,
+                token_cov_id: tcid_hex.clone(),
+                price_num: pnum,
+                price_den: pden,
+                min_fill: mfill,
+                owner_hash: hex::encode(parsed.owner_hash),
+                spk_hash: hex::encode(parsed.spk_hash),
+                counterparty_spk: counterparty_spk.clone(),
+                redeem_script_hex: hex::encode(&parsed.redeem_script),
+                p2sh_script_hex: p2sh_script_hex.clone(),
+                p2sh_version: p2sh_spk.version,
+                side: OrderSide::Sell,
+                post_only: false,
+                expiry_daa: parsed.expiry_daa,
+                is_freezable: false,
+                max_matcher_fee: parsed._max_matcher_fee,
+                ifd_order_b_rs_hex: None,
+                oco_path: Some(path),
+                oco_partner_key: Some(partner.to_string()),
+            }
+        };
+
+        let tp_order = make_order(kob_core::OcoPath::TakeProfit, &sl_key);
+        let sl_order = make_order(kob_core::OcoPath::StopLoss, &tp_key);
+        (tp_order, sl_order)
     }
 
     // Unified multi-product scanner
@@ -304,6 +415,11 @@ impl BlockScanner {
     /// Checks payload prefixes in order: Spot (KOB:2:), Perp (KOB:P:),
     /// Lending (KOB:L:), Prediction (KOB:M:). Returns the first match.
     pub fn scan_tx_all(&self, tx: &TransactionData) -> Option<ScanResult> {
+        // 0. Try OCO sell (single-UTXO, KOB:2: payload with 333B RS)
+        if let Some((oco, idx, val)) = self.scan_oco_sell(tx) {
+            return Some(ScanResult::OcoSell(oco, idx, val));
+        }
+
         // 1. Try Spot (existing path)
         if let Some((parsed, idx, val)) = self.scan_tx(tx) {
             return Some(ScanResult::Spot(parsed, idx, val));

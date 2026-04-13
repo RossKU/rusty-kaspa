@@ -447,6 +447,7 @@ pub(crate) fn pair_to_batch_orders(
         utxo_value: pair.sell.value,
         counterparty_spk: seller_spk,
         counterparty_spk_version: seller_spk_ver,
+        oco_path: None,
     };
 
     let buy_order = crate::matcher::batch::BatchOrder {
@@ -461,6 +462,7 @@ pub(crate) fn pair_to_batch_orders(
         utxo_value: pair.buy.value,
         counterparty_spk: buyer_spk,
         counterparty_spk_version: buyer_spk_ver,
+        oco_path: None,
     };
 
     Some((sell_order, buy_order))
@@ -1418,6 +1420,7 @@ fn process_block_txs_all(
                 // with the full parsed state.
                 counters.prediction_added += 1;
             }
+            ScanResult::OcoSell(_, _, _) => { /* TODO: handle OCO sell registration */ }
         }
     }
 
@@ -2471,6 +2474,7 @@ async fn run_scan_cycle(
                         utxo_value: sell.value,
                         counterparty_spk: seller_spk,
                         counterparty_spk_version: seller_spk_ver,
+                        oco_path: None,
                     });
                 }
 
@@ -2518,6 +2522,7 @@ async fn run_scan_cycle(
                         utxo_value: buy.value,
                         counterparty_spk: buyer_spk,
                         counterparty_spk_version: buyer_spk_ver,
+                        oco_path: None,
                     });
                 }
 
@@ -2706,6 +2711,7 @@ async fn run_scan_cycle(
                         utxo_value: sell.value,
                         counterparty_spk: seller_spk,
                         counterparty_spk_version: seller_spk_ver,
+                        oco_path: None,
                     });
                 }
 
@@ -2753,6 +2759,7 @@ async fn run_scan_cycle(
                         utxo_value: buy.value,
                         counterparty_spk: buyer_spk,
                         counterparty_spk_version: buyer_spk_ver,
+                        oco_path: None,
                     });
                 }
 

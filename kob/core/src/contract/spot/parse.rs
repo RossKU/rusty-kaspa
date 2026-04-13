@@ -1,6 +1,7 @@
 //! Parse spot order redeemScripts to extract on-chain state.
 
 use crate::types::OrderSide;
+use crate::contract::spot::oco::{OCO_SELL_STATE_SIZE, OCO_SELL_RS_SIZE, OcoPath};
 
 /// OpZkPrecompile opcode byte (0xa6).
 pub const OP_ZK_PRECOMPILE: u8 = 0xa6;
@@ -56,6 +57,23 @@ pub const BUY_RS_SIZE: usize = BUY_STATE_SIZE + BUY_BODY_SIZE;
 /// Sell RS size: 112 + 304 = 416.
 pub const SELL_RS_SIZE: usize = SELL_STATE_SIZE + SELL_BODY_SIZE;
 
+/// Parsed OCO sell order (single-UTXO, two price paths).
+#[derive(Debug, Clone)]
+pub struct ParsedOcoSell {
+    pub price_num_tp: u64,
+    pub price_den_tp: u64,
+    pub min_fill_tp: u64,
+    pub price_num_sl: u64,
+    pub price_den_sl: u64,
+    pub min_fill_sl: u64,
+    pub owner_hash: [u8; 32],
+    pub spk_hash: [u8; 32],
+    pub _max_matcher_fee: u64,
+    pub cpend: u8,
+    pub expiry_daa: Option<u64>,
+    pub redeem_script: Vec<u8>,
+}
+
 /// Parse a redeemScript to extract order parameters.
 ///
 /// Identifies the contract type by RS length and body signature bytes,
@@ -80,6 +98,20 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
         }
         _ => None,
     }
+}
+
+/// Try to parse an OCO sell redeemScript.
+///
+/// Returns `None` if the RS is not an OCO sell (wrong size or signature).
+pub fn parse_oco_sell_redeem_script(rs: &[u8]) -> Option<ParsedOcoSell> {
+    if rs.len() != OCO_SELL_RS_SIZE {
+        return None;
+    }
+    // Body signature: 0x5b 0x7a (Op11 OpRoll) at offset 139
+    if rs[OCO_SELL_STATE_SIZE] != 0x5b || rs[OCO_SELL_STATE_SIZE + 1] != 0x7a {
+        return None;
+    }
+    parse_oco_sell_state(rs)
 }
 
 /// Parse buy state (145B).
@@ -215,6 +247,103 @@ fn parse_sell_state(rs: &[u8]) -> Option<ParsedOrder> {
     })
 }
 
+/// Parse OCO sell state (139B).
+///
+/// State layout:
+///   [0x08][pnum_tp 8B]   = bytes 0..9
+///   [0x08][pden_tp 8B]   = bytes 9..18
+///   [0x08][mfill_tp 8B]  = bytes 18..27
+///   [0x08][pnum_sl 8B]   = bytes 27..36
+///   [0x08][pden_sl 8B]   = bytes 36..45
+///   [0x08][mfill_sl 8B]  = bytes 45..54
+///   [0x20][ohash 32B]    = bytes 54..87
+///   [0x20][sspkh 32B]    = bytes 87..120
+///   [0x08][mmfee 8B]     = bytes 120..129
+///   [cpend 1B]           = byte 129
+///   [0x08][expiry 8B]    = bytes 130..139
+fn parse_oco_sell_state(rs: &[u8]) -> Option<ParsedOcoSell> {
+    if rs.len() < OCO_SELL_STATE_SIZE {
+        return None;
+    }
+    // Verify push-size markers
+    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x08 { return None; }
+    if rs[27] != 0x08 || rs[36] != 0x08 || rs[45] != 0x08 { return None; }
+    if rs[54] != 0x20 || rs[87] != 0x20 { return None; }
+    if rs[120] != 0x08 { return None; }
+    if rs[130] != 0x08 { return None; }
+
+    let pnum_tp = u64::from_le_bytes(rs[1..9].try_into().ok()?);
+    let pden_tp = u64::from_le_bytes(rs[10..18].try_into().ok()?);
+    let mfill_tp = u64::from_le_bytes(rs[19..27].try_into().ok()?);
+    let pnum_sl = u64::from_le_bytes(rs[28..36].try_into().ok()?);
+    let pden_sl = u64::from_le_bytes(rs[37..45].try_into().ok()?);
+    let mfill_sl = u64::from_le_bytes(rs[46..54].try_into().ok()?);
+
+    let mut ohash = [0u8; 32];
+    ohash.copy_from_slice(&rs[55..87]);
+
+    let mut sspkh = [0u8; 32];
+    sspkh.copy_from_slice(&rs[88..120]);
+
+    let mmfee = u64::from_le_bytes(rs[121..129].try_into().ok()?);
+
+    let cpend = match rs[129] {
+        0x00 => 0,
+        0x51 => 1,
+        _ => return None,
+    };
+
+    let expiry_daa_raw = u64::from_le_bytes(rs[131..139].try_into().ok()?);
+
+    if pnum_tp == 0 || pden_tp == 0 || mfill_tp == 0 { return None; }
+    if pnum_sl == 0 || pden_sl == 0 || mfill_sl == 0 { return None; }
+
+    Some(ParsedOcoSell {
+        price_num_tp: pnum_tp,
+        price_den_tp: pden_tp,
+        min_fill_tp: mfill_tp,
+        price_num_sl: pnum_sl,
+        price_den_sl: pden_sl,
+        min_fill_sl: mfill_sl,
+        owner_hash: ohash,
+        spk_hash: sspkh,
+        _max_matcher_fee: mmfee,
+        cpend,
+        expiry_daa: if expiry_daa_raw > 0 { Some(expiry_daa_raw) } else { None },
+        redeem_script: rs.to_vec(),
+    })
+}
+
+/// Convert a `ParsedOcoSell` into a `ParsedOrder` for a specific path.
+///
+/// The scanner uses this to register virtual orders in the order book.
+impl ParsedOcoSell {
+    /// Convert to a ParsedOrder for the given OCO path.
+    pub fn to_parsed_order(&self, path: OcoPath) -> ParsedOrder {
+        let (pnum, pden, mfill) = match path {
+            OcoPath::TakeProfit => (self.price_num_tp, self.price_den_tp, self.min_fill_tp),
+            OcoPath::StopLoss => (self.price_num_sl, self.price_den_sl, self.min_fill_sl),
+        };
+        ParsedOrder {
+            order_type: OrderSide::Sell,
+            version: 0,
+            token_cov_id: [0u8; 32], // sell orders have no tcid in state
+            price_num: pnum,
+            price_den: pden,
+            min_fill: mfill,
+            owner_hash: self.owner_hash,
+            spk_hash: self.spk_hash,
+            _max_matcher_fee: self._max_matcher_fee,
+            cpend: self.cpend,
+            requires_zk: false,
+            redeem_script: self.redeem_script.clone(),
+            post_only: false,
+            expiry_daa: self.expiry_daa,
+            ifd_order_b_rs: None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +414,97 @@ mod tests {
     #[test]
     fn has_zk_opcode_negative() {
         assert!(!has_zk_opcode(&[0x51, 0x52, 0x87]));
+    }
+
+    #[test]
+    fn roundtrip_oco_sell() {
+        use crate::contract::spot::oco::{
+            build_oco_sell_redeem_script, OCO_SELL_RS_SIZE, OcoPath,
+        };
+        let ohash = [0xAA; 32];
+        let sspkh = [0xBB; 32];
+        let rs = build_oco_sell_redeem_script(
+            5, 1, 500_000,   // TP: price 5/1, mfill 500k
+            2, 1, 200_000,   // SL: price 2/1, mfill 200k
+            &ohash, &sspkh, 10_000, 0, 0,
+        ).unwrap();
+        assert_eq!(rs.len(), OCO_SELL_RS_SIZE);
+
+        let parsed = parse_oco_sell_redeem_script(&rs).expect("should parse OCO sell");
+        assert_eq!(parsed.price_num_tp, 5);
+        assert_eq!(parsed.price_den_tp, 1);
+        assert_eq!(parsed.min_fill_tp, 500_000);
+        assert_eq!(parsed.price_num_sl, 2);
+        assert_eq!(parsed.price_den_sl, 1);
+        assert_eq!(parsed.min_fill_sl, 200_000);
+        assert_eq!(parsed.owner_hash, ohash);
+        assert_eq!(parsed.spk_hash, sspkh);
+        assert_eq!(parsed._max_matcher_fee, 10_000);
+        assert_eq!(parsed.cpend, 0);
+        assert_eq!(parsed.expiry_daa, None);
+
+        // Convert to ParsedOrder for each path
+        let tp = parsed.to_parsed_order(OcoPath::TakeProfit);
+        assert_eq!(tp.order_type, OrderSide::Sell);
+        assert_eq!(tp.price_num, 5);
+        assert_eq!(tp.price_den, 1);
+        assert_eq!(tp.min_fill, 500_000);
+
+        let sl = parsed.to_parsed_order(OcoPath::StopLoss);
+        assert_eq!(sl.price_num, 2);
+        assert_eq!(sl.price_den, 1);
+        assert_eq!(sl.min_fill, 200_000);
+    }
+
+    #[test]
+    fn oco_sell_with_expiry() {
+        use crate::contract::spot::oco::build_oco_sell_redeem_script;
+        let t = [0u8; 32];
+        let rs = build_oco_sell_redeem_script(
+            3, 1, 100, 1, 1, 100, &t, &t, 0, 0, 999_999,
+        ).unwrap();
+        let parsed = parse_oco_sell_redeem_script(&rs).expect("should parse");
+        assert_eq!(parsed.expiry_daa, Some(999_999));
+    }
+
+    #[test]
+    fn oco_sell_with_cpend() {
+        use crate::contract::spot::oco::build_oco_sell_redeem_script;
+        let t = [0u8; 32];
+        let rs = build_oco_sell_redeem_script(
+            1, 2, 100, 1, 3, 100, &t, &t, 0, 1, 0,
+        ).unwrap();
+        let parsed = parse_oco_sell_redeem_script(&rs).expect("should parse");
+        assert_eq!(parsed.cpend, 1);
+    }
+
+    #[test]
+    fn oco_sell_gcd_normalization() {
+        use crate::contract::spot::oco::build_oco_sell_redeem_script;
+        let t = [0u8; 32];
+        let rs = build_oco_sell_redeem_script(
+            10, 4, 100,  // TP: 10/4 → 5/2
+            6, 9, 100,   // SL: 6/9 → 2/3
+            &t, &t, 0, 0, 0,
+        ).unwrap();
+        let parsed = parse_oco_sell_redeem_script(&rs).expect("should parse");
+        assert_eq!(parsed.price_num_tp, 5);
+        assert_eq!(parsed.price_den_tp, 2);
+        assert_eq!(parsed.price_num_sl, 2);
+        assert_eq!(parsed.price_den_sl, 3);
+    }
+
+    #[test]
+    fn oco_sell_wrong_size_returns_none() {
+        assert!(parse_oco_sell_redeem_script(&vec![0x51; 200]).is_none());
+    }
+
+    #[test]
+    fn oco_sell_wrong_signature_returns_none() {
+        // Right size but wrong body signature
+        let mut fake = vec![0x08; 333];
+        fake[139] = 0x58; // sell signature, not OCO sell
+        fake[140] = 0x7a;
+        assert!(parse_oco_sell_redeem_script(&fake).is_none());
     }
 }

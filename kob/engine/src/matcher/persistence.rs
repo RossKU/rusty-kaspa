@@ -194,6 +194,8 @@ pub async fn load_order_book(
                 is_freezable: order.is_freezable,
                 max_matcher_fee: order.max_matcher_fee,
                 ifd_order_b_rs_hex: order.ifd_order_b_rs_hex,
+                oco_path: None,
+                oco_partner_key: None,
             });
             loaded += 1;
         }
@@ -226,6 +228,8 @@ pub async fn load_order_book(
                 is_freezable: order.is_freezable,
                 max_matcher_fee: order.max_matcher_fee,
                 ifd_order_b_rs_hex: order.ifd_order_b_rs_hex,
+                oco_path: None,
+                oco_partner_key: None,
             });
             loaded += 1;
         }

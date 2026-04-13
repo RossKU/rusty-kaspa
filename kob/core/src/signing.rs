@@ -200,16 +200,16 @@ mod tests {
         assert_eq!(pk_raw, pk_secure);
     }
 
-    /// SecureKey from wallet file works for signing.
+    /// SecureKey from legacy wallet file works for signing.
     #[test]
     fn secure_key_from_wallet_signs() {
-        use crate::wallet::WalletFile;
-        let wallet = WalletFile {
+        use crate::wallet::LegacyWalletJson;
+        let wallet = LegacyWalletJson {
             private_key: "ae4ef0f30537c81653c2213b4b1ad84053fec52c547cb590277a7015850359a4".into(),
             public_key: "3509e6f574e705aa233b7f9713e979bb27f463116d6a754369c19479d3fe6583".into(),
             address: "kaspatest:qxapemh4t8qp4rf3eek88m98u0a2y78xzes52jrjd8gclj5c0l9svhkkwmwc5".into(),
         };
-        let key = SecureKey::from_wallet(&wallet).unwrap();
+        let key = SecureKey::from_legacy(&wallet).unwrap();
         let sighash = [0x42; 32];
         let sig = schnorr_sign_secure(&sighash, &key).unwrap();
         let pubkey = wallet.public_key_bytes().unwrap();

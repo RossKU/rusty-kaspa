@@ -1692,6 +1692,23 @@ pub fn parse_block_notification(notification: &serde_json::Value) -> Vec<Transac
     }
 }
 
+/// Cancel an OCO partner leg after a fill or spent detection.
+///
+/// When an OCO sell order is matched (or its UTXO is spent on-chain), the
+/// partner leg sharing the same UTXO must be removed from the book to prevent
+/// stale matching attempts.  Call this **after** removing the primary order.
+fn cancel_oco_partner(
+    order_book: &mut OrderBook,
+    partner_key: &str,
+    spent_tracker: &mut SpentTracker,
+) {
+    if order_book.get_order(partner_key).is_some() {
+        order_book.remove_order(partner_key);
+        spent_tracker.mark_spent(partner_key);
+        info!("[OCO] Cancelled partner leg: {}", partner_key);
+    }
+}
+
 /// Record a trade to SharedState (trade_log + candle aggregator) and broadcast
 /// WsEvent::Trade and WsEvent::Kline via the WebSocket broadcaster.
 ///
@@ -2191,10 +2208,19 @@ async fn run_scan_cycle(
                             None,
                         ).await;
 
+                        // Capture OCO partner key before removal
+                        let sell_oco_partner = order_book.get_order(&sk)
+                            .and_then(|o| o.oco_partner_key.clone());
+
                         order_book.remove_order(&bk);
                         order_book.remove_order(&sk);
                         spent_tracker.mark_spent(&bk);
                         spent_tracker.mark_spent(&sk);
+
+                        // Cancel OCO partner leg if the filled sell was part of an OCO pair
+                        if let Some(ref partner_key) = sell_oco_partner {
+                            cancel_oco_partner(order_book, partner_key, spent_tracker);
+                        }
 
                         // Push MatchResult for stop/trailing stop trigger
                         results.push(MatchResult {
@@ -2421,10 +2447,20 @@ async fn run_scan_cycle(
                         None,
                     ).await;
 
+                    // Capture OCO partner key before removal
+                    let sell_oco_partner = order_book.get_order(&sell_key)
+                        .and_then(|o| o.oco_partner_key.clone());
+
                     order_book.remove_order(&buy_key);
                     order_book.remove_order(&sell_key);
                     spent_tracker.mark_spent(&buy_key);
                     spent_tracker.mark_spent(&sell_key);
+
+                    // Cancel OCO partner leg if the filled sell was part of an OCO pair
+                    if let Some(ref partner_key) = sell_oco_partner {
+                        cancel_oco_partner(order_book, partner_key, spent_tracker);
+                    }
+
                     if let Some(ref wu) = plan.wallet_input {
                         let wk = format!("{}:{}", wu.0, wu.1);
                         spent_tracker.mark_spent(&wk);
@@ -2652,8 +2688,15 @@ async fn run_scan_cycle(
                                 Side::Sell,
                                 None,
                             ).await;
+                            // Capture OCO partner key before removal
+                            let sell_oco_partner = order_book.get_order(&sk)
+                                .and_then(|o| o.oco_partner_key.clone());
                             order_book.remove_order(&sk);
                             spent_tracker.mark_spent(&sk);
+                            // Cancel OCO partner leg if the filled sell was part of an OCO pair
+                            if let Some(ref partner_key) = sell_oco_partner {
+                                cancel_oco_partner(order_book, partner_key, spent_tracker);
+                            }
                         }
                         for buy in &group.buys {
                             let bk = buy.outpoint_key();
@@ -2889,8 +2932,15 @@ async fn run_scan_cycle(
                                 Side::Sell,
                                 None,
                             ).await;
+                            // Capture OCO partner key before removal
+                            let sell_oco_partner = order_book.get_order(&sk)
+                                .and_then(|o| o.oco_partner_key.clone());
                             order_book.remove_order(&sk);
                             spent_tracker.mark_spent(&sk);
+                            // Cancel OCO partner leg if the filled sell was part of an OCO pair
+                            if let Some(ref partner_key) = sell_oco_partner {
+                                cancel_oco_partner(order_book, partner_key, spent_tracker);
+                            }
                         }
                         for buy in &group.buys {
                             let bk = buy.outpoint_key();

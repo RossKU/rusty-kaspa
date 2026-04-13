@@ -219,6 +219,36 @@ impl BookOrder {
         })
     }
 
+
+    /// Expected output amount for a full fill.
+    ///
+    /// - Buy side: `expected_tokens = value * price_num / price_den`
+    ///   (how many tokens the buyer expects for their KAS).
+    /// - Sell side: `expected_kas = value * price_num / price_den`
+    ///   (how much KAS the seller expects for their tokens).
+    ///
+    /// Returns 0 if `price_den == 0` (corrupt order).
+    pub fn expected_output(&self) -> u64 {
+        if self.price_den == 0 {
+            return 0;
+        }
+        self.value.checked_mul(self.price_num)
+            .map(|v| v / self.price_den)
+            .unwrap_or(0)
+    }
+
+    /// Returns true if this order can accept partial fills via the IOC
+    /// (selector=Op5) path.  IOC-eligible orders have `min_fill` strictly
+    /// less than their full expected output, so the L1 contracts relaxed
+    /// check (`output >= mfill`) allows partial fills.
+    ///
+    /// GTC orders where `min_fill >= expected_output` must use the normal
+    /// fill path (selector=Op1), which enforces `output >= exp_tok`.
+    pub fn is_ioc_eligible(&self) -> bool {
+        let exp = self.expected_output();
+        exp > 0 && self.min_fill < exp
+    }
+
     /// Return the counterparty SPK bytes for building a match TX output.
     ///
     /// Returns `Some((version, script_bytes))` when `counterparty_spk` is

@@ -605,6 +605,11 @@ pub struct SweepGroup {
     /// Total KAS the anchor needs across all fills (buy sweep) or total
     /// tokens needed (sell sweep).
     pub total_fill_cost: u64,
+    /// True when the anchor is a GTC order (not IOC-eligible) and the
+    /// fills collectively provide enough output to satisfy a full fill.
+    /// When true, the executor must use `plan_batch_match` (Op1 selector)
+    /// instead of `plan_ioc_match` (Op5 selector).
+    pub is_gtc_multi_fill: bool,
 }
 
 /// Find sweep groups: detect when one large order can fill multiple
@@ -738,17 +743,32 @@ pub fn find_sweep_groups(
 
             // Only emit if 2+ sells swept (1:1 is handled elsewhere)
             if sweep_sells.len() >= 2 {
-                let buy_key = buy.outpoint_key();
-                claimed.insert(buy_key);
-                for s in &sweep_sells {
-                    claimed.insert(s.outpoint_key());
+                // IOC/GTC distinction: GTC buys must be fully filled
+                // across all sweep sells.  IOC buys tolerate partial fill.
+                let is_ioc = buy.is_ioc_eligible();
+                let emit = if is_ioc {
+                    true // IOC: partial fill OK
+                } else {
+                    // GTC: total tokens from fills must satisfy expected_tokens.
+                    let total_tokens: u64 = sweep_sells.iter().map(|s| s.value).sum();
+                    let expected_tokens = buy.expected_output();
+                    total_tokens >= expected_tokens && expected_tokens > 0
+                };
+
+                if emit {
+                    let buy_key = buy.outpoint_key();
+                    claimed.insert(buy_key);
+                    for s in &sweep_sells {
+                        claimed.insert(s.outpoint_key());
+                    }
+                    groups.push(SweepGroup {
+                        anchor: (*buy).clone(),
+                        fills: sweep_sells,
+                        is_buy_sweep: true,
+                        total_fill_cost,
+                        is_gtc_multi_fill: !is_ioc,
+                    });
                 }
-                groups.push(SweepGroup {
-                    anchor: (*buy).clone(),
-                    fills: sweep_sells,
-                    is_buy_sweep: true,
-                    total_fill_cost,
-                });
             }
         }
 
@@ -812,17 +832,37 @@ pub fn find_sweep_groups(
 
             // Only emit if 2+ buys swept
             if sweep_buys.len() >= 2 {
-                let sell_key = sell.outpoint_key();
-                claimed.insert(sell_key);
-                for b in &sweep_buys {
-                    claimed.insert(b.outpoint_key());
+                // IOC/GTC distinction for sell anchor
+                let is_ioc = sell.is_ioc_eligible();
+                let emit = if is_ioc {
+                    true // IOC: partial fill OK
+                } else {
+                    // GTC: total KAS from buys must satisfy expected_kas.
+                    let total_kas: u64 = sweep_buys.iter()
+                        .map(|b| {
+                            let kas_128 = b.value as u128 * b.price_num as u128
+                                / b.price_den.max(1) as u128;
+                            kas_128.min(u64::MAX as u128) as u64
+                        })
+                        .sum();
+                    let expected_kas = sell.expected_output();
+                    total_kas >= expected_kas && expected_kas > 0
+                };
+
+                if emit {
+                    let sell_key = sell.outpoint_key();
+                    claimed.insert(sell_key);
+                    for b in &sweep_buys {
+                        claimed.insert(b.outpoint_key());
+                    }
+                    groups.push(SweepGroup {
+                        anchor: (*sell).clone(),
+                        fills: sweep_buys,
+                        is_buy_sweep: false,
+                        total_fill_cost,
+                        is_gtc_multi_fill: !is_ioc,
+                    });
                 }
-                groups.push(SweepGroup {
-                    anchor: (*sell).clone(),
-                    fills: sweep_buys,
-                    is_buy_sweep: false,
-                    total_fill_cost,
-                });
             }
         }
     }
@@ -1031,6 +1071,14 @@ pub enum GroupKind {
     PartialBuy,
     /// 1:1 partial sell (seller larger than buyer). Uses `plan_sell_ioc_match`.
     PartialSell,
+    /// GTC 1:N multi-fill: 1 GTC buy fully filled by N sells.
+    /// Total sell tokens >= buy expected_tokens, so the buy uses Op1 (full fill).
+    /// Uses `plan_batch_match` (not IOC).
+    GtcBuyMultiFill,
+    /// GTC N:1 multi-fill: 1 GTC sell fully filled by N buys.
+    /// Total buy KAS >= sell expected_kas, so the sell uses Op1 (full fill).
+    /// Uses `plan_batch_match` (not IOC).
+    GtcSellMultiFill,
 }
 
 /// A unified batch group that the executor processes in one loop.
@@ -1106,9 +1154,19 @@ pub fn find_optimal_groups(
 
         let total_surplus = sg.total_fill_cost; // approximate
         let (sells, buys, kind) = if sg.is_buy_sweep {
-            (sg.fills.clone(), vec![sg.anchor.clone()], GroupKind::BuySweep)
+            let k = if sg.is_gtc_multi_fill {
+                GroupKind::GtcBuyMultiFill
+            } else {
+                GroupKind::BuySweep
+            };
+            (sg.fills.clone(), vec![sg.anchor.clone()], k)
         } else {
-            (vec![sg.anchor.clone()], sg.fills.clone(), GroupKind::SellSweep)
+            let k = if sg.is_gtc_multi_fill {
+                GroupKind::GtcSellMultiFill
+            } else {
+                GroupKind::SellSweep
+            };
+            (vec![sg.anchor.clone()], sg.fills.clone(), k)
         };
 
         groups.push(BatchGroup {
@@ -2870,7 +2928,7 @@ mod tests {
         let groups = find_optimal_groups(&pairs, &ob, true, None);
 
         let sweep_groups: Vec<_> = groups.iter()
-            .filter(|g| g.kind == GroupKind::BuySweep || g.kind == GroupKind::SellSweep)
+            .filter(|g| g.kind == GroupKind::BuySweep || g.kind == GroupKind::SellSweep || g.kind == GroupKind::GtcBuyMultiFill || g.kind == GroupKind::GtcSellMultiFill)
             .collect();
         assert!(!sweep_groups.is_empty(), "Should find sweep groups when 1:N relationship exists");
     }
@@ -2944,5 +3002,155 @@ mod tests {
                 "Groups should be sorted by surplus descending"
             );
         }
+    }
+
+    // ----------------------------------------------------------------
+    // IOC / GTC distinction tests
+    // ----------------------------------------------------------------
+
+    #[test]
+    fn test_is_ioc_eligible_low_min_fill() {
+        // Buy: 5B KAS at 3/1 -> expected_tokens = 15B
+        // min_fill = 1M << 15B -> IOC eligible
+        let buy = make_buy(5_000_000_000, 3, 1, FAKE_TOKEN);
+        assert_eq!(buy.expected_output(), 15_000_000_000);
+        assert!(buy.is_ioc_eligible(), "low min_fill should be IOC eligible");
+    }
+
+    #[test]
+    fn test_is_ioc_eligible_high_min_fill() {
+        // Buy: 5B KAS at 3/1 -> expected_tokens = 15B
+        // min_fill = 15B (== expected_tokens) -> NOT IOC eligible (GTC)
+        let mut buy = make_buy(5_000_000_000, 3, 1, FAKE_TOKEN);
+        buy.min_fill = 15_000_000_000;
+        assert_eq!(buy.expected_output(), 15_000_000_000);
+        assert!(!buy.is_ioc_eligible(), "min_fill == expected should NOT be IOC eligible");
+    }
+
+    #[test]
+    fn test_gtc_buy_no_sweep_when_partial() {
+        // GTC buy (min_fill == expected_tokens) should NOT sweep when
+        // total sell tokens < expected_tokens.
+        let mut ob = OrderBook::new();
+
+        // Buy 5B KAS at 3/1 -> expects 15B tokens.  min_fill = 15B (GTC).
+        let mut buy = make_buy(5_000_000_000, 3, 1, FAKE_TOKEN);
+        buy.tx_id = format!("{:0>64}", "gtc_buy");
+        buy.owner_hash = "aa".repeat(32);
+        buy.min_fill = 15_000_000_000; // GTC: must fully fill
+        ob.add_buy_order(buy);
+
+        // 3 sells of 2B tokens each at price 2/1 -> total 6B tokens < 15B expected
+        for i in 0..3u32 {
+            let mut sell = make_sell(2_000_000_000, 2, 1, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("s{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let groups = find_sweep_groups(&ob, true, None);
+        // GTC buy cannot be partially filled, so no sweep group should exist
+        let buy_sweeps: Vec<_> = groups.iter()
+            .filter(|g| g.is_buy_sweep)
+            .collect();
+        assert!(buy_sweeps.is_empty(),
+            "GTC buy should NOT produce sweep when total tokens < expected");
+    }
+
+    #[test]
+    fn test_gtc_buy_multi_fill_when_sufficient() {
+        // GTC buy with 3 sells providing >= expected_tokens -> should emit
+        // as a GTC multi-fill group (not a sweep).
+        let mut ob = OrderBook::new();
+
+        // Buy 9B KAS at 1/1 -> expects 9B tokens.  min_fill = 9B (GTC).
+        let mut buy = make_buy(9_000_000_000, 1, 1, FAKE_TOKEN);
+        buy.tx_id = format!("{:0>64}", "gtc_buy");
+        buy.owner_hash = "aa".repeat(32);
+        buy.min_fill = 9_000_000_000;
+        ob.add_buy_order(buy);
+
+        // 3 sells of 3B tokens each at price 1/1.
+        // Each sell needs sell.value * sell.price_num / sell.price_den = 3B * 1/1 = 3B KAS.
+        // Buy can afford all 3 (3B * 3 = 9B KAS = buy value).
+        // Total tokens = 9B >= 9B expected -> GTC multi-fill.
+        for i in 0..3u32 {
+            let mut sell = make_sell(3_000_000_000, 1, 1, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("s{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let groups = find_sweep_groups(&ob, true, None);
+        let buy_groups: Vec<_> = groups.iter()
+            .filter(|g| g.is_buy_sweep)
+            .collect();
+        assert!(!buy_groups.is_empty(),
+            "GTC buy should produce a group when total tokens >= expected");
+        assert!(buy_groups[0].is_gtc_multi_fill,
+            "Group should be flagged as GTC multi-fill");
+    }
+
+    #[test]
+    fn test_ioc_buy_sweep_normal() {
+        // IOC buy (low min_fill) should sweep normally even when partial.
+        let mut ob = OrderBook::new();
+
+        // Buy 5B KAS at 4/1 -> expects 20B tokens.  min_fill = 1M (IOC).
+        let mut buy = make_buy(5_000_000_000, 4, 1, FAKE_TOKEN);
+        buy.tx_id = format!("{:0>64}", "ioc_buy");
+        buy.owner_hash = "aa".repeat(32);
+        // min_fill = 1_000_000 (default) -- IOC eligible
+        ob.add_buy_order(buy);
+
+        // 3 sells of 500M tokens at price 2/1 -> total 1.5B << 20B expected
+        for i in 0..3u32 {
+            let mut sell = make_sell(500_000_000, 2, 1, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("s{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let groups = find_sweep_groups(&ob, true, None);
+        let buy_sweeps: Vec<_> = groups.iter()
+            .filter(|g| g.is_buy_sweep)
+            .collect();
+        assert!(!buy_sweeps.is_empty(),
+            "IOC buy should still produce sweep with partial tokens");
+        assert!(!buy_sweeps[0].is_gtc_multi_fill,
+            "IOC sweep should NOT be flagged as GTC multi-fill");
+    }
+
+    #[test]
+    fn test_gtc_multi_fill_uses_batch_kind() {
+        // When find_optimal_groups processes a GTC multi-fill sweep,
+        // it should produce a GtcBuyMultiFill GroupKind.
+        let mut ob = OrderBook::new();
+
+        // Buy 9B KAS at 1/1 -> expected 9B tokens, min_fill=9B (GTC)
+        let mut buy = make_buy(9_000_000_000, 1, 1, FAKE_TOKEN);
+        buy.tx_id = format!("{:0>64}", "gtc_buy");
+        buy.owner_hash = "aa".repeat(32);
+        buy.min_fill = 9_000_000_000;
+        ob.add_buy_order(buy);
+
+        // 3 sells of 3B tokens at 1/1 -> total 9B tokens, each costs 3B KAS
+        for i in 0..3u32 {
+            let mut sell = make_sell(3_000_000_000, 1, 1, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("s{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
+        let groups = find_optimal_groups(&pairs, &ob, true, None);
+
+        let gtc_groups: Vec<_> = groups.iter()
+            .filter(|g| g.kind == GroupKind::GtcBuyMultiFill)
+            .collect();
+        assert!(!gtc_groups.is_empty(),
+            "Should produce GtcBuyMultiFill group for GTC buy with sufficient sells");
+        assert_eq!(gtc_groups[0].buys.len(), 1, "Should have 1 buy");
+        assert!(gtc_groups[0].sells.len() >= 2, "Should have 2+ sells");
     }
 }

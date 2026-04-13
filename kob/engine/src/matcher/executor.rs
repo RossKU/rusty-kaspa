@@ -2118,7 +2118,14 @@ async fn run_scan_cycle(
                     &wallet_spk_script, wallet_spk_version, None,
                 )
             }
-            matching::GroupKind::Batch => {
+            matching::GroupKind::Batch
+            | matching::GroupKind::GtcBuyMultiFill
+            | matching::GroupKind::GtcSellMultiFill => {
+                // GTC multi-fill uses plan_batch_match (Op1 for the anchor)
+                // just like a normal N:N batch.  The buy contract's F3 check
+                // requires output[toi] >= exp_tok, which is satisfied because
+                // the sweep grouper only emits GTC multi-fill when total
+                // fill tokens >= expected_tokens.
                 crate::matcher::batch::plan_batch_match(
                     &sells, &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version, None,
@@ -2293,13 +2300,17 @@ async fn run_scan_cycle(
                     }
                 } else {
                     // Sweep groups: generate MatchResult per fill
-                    let fills = if group.kind == matching::GroupKind::BuySweep {
+                    let fills = if group.kind == matching::GroupKind::BuySweep
+                        || group.kind == matching::GroupKind::GtcBuyMultiFill
+                    {
                         &group.sells
                     } else {
                         &group.buys
                     };
                     for fill in fills {
-                        let (seller_kas_val, buyer_tokens_val) = if group.kind == matching::GroupKind::BuySweep {
+                        let (seller_kas_val, buyer_tokens_val) = if group.kind == matching::GroupKind::BuySweep
+                            || group.kind == matching::GroupKind::GtcBuyMultiFill
+                        {
                             let kas_128 = fill.value as u128 * fill.price_num as u128
                                 / fill.price_den as u128;
                             (kas_128 as u64, fill.value)

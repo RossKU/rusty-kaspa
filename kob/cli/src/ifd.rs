@@ -332,17 +332,32 @@ pub async fn deploy_ifd(
         tx.outputs.push(TxOutput::new(tentative_change, wallet_spk_version, wallet_spk.clone(), None));
     }
 
-    // Phase 1: converge fee on change output
+    // Phase 1: converge fee on change output.
+    // CRITICAL: output[0] (the P2SH order) MUST remain exactly buy_amount.
+    // The fee is always absorbed by the change output or donated as excess fee.
+    // Never reduce the order output -- the matcher expects the full buy_amount.
     let has_change = tentative_change >= MIN_UTXO_VALUE;
     let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
 
-    let (est_fee, _) = if has_change {
-        converge_fee(&mut tx, total_input, change_idx, min_fee_override)
+    let est_fee = if has_change {
+        let (f, _) = converge_fee(&mut tx, total_input, change_idx, min_fee_override);
+        // Restore order output in case converge_fee touched it (it shouldn't for change_idx != 0)
+        tx.outputs[0].value = buy_amount;
+        f
     } else {
+        // No change output -- order stays at buy_amount, all excess is miner fee.
+        // Verify we have enough to cover order + minimum fee.
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-        let adjusted = buy_amount.saturating_sub(f);
-        tx.outputs[0].value = adjusted;
-        (f, adjusted)
+        let excess = total_input.saturating_sub(buy_amount);
+        if excess < f {
+            anyhow::bail!(
+                "Insufficient funds for fee: need {} sompi fee but only {} excess above buy_amount {}. \
+                 Fund the wallet with a larger UTXO or consolidate UTXOs.",
+                f, excess, buy_amount
+            );
+        }
+        // Order output stays at buy_amount; excess beyond fee is donated.
+        f
     };
 
     // Remove change output if below MIN_UTXO_VALUE
@@ -599,17 +614,32 @@ pub async fn deploy_ifo(
         tx.outputs.push(TxOutput::new(tentative_change, wallet_spk_version, wallet_spk.clone(), None));
     }
 
-    // Phase 1: converge fee
+    // Phase 1: converge fee on change output.
+    // CRITICAL: output[0] (the P2SH order) MUST remain exactly buy_amount.
+    // The fee is always absorbed by the change output or donated as excess fee.
+    // Never reduce the order output -- the matcher expects the full buy_amount.
     let has_change = tentative_change >= MIN_UTXO_VALUE;
     let change_idx = if has_change { tx.outputs.len() - 1 } else { 0 };
 
-    let (est_fee, _) = if has_change {
-        converge_fee(&mut tx, total_input, change_idx, min_fee_override)
+    let est_fee = if has_change {
+        let (f, _) = converge_fee(&mut tx, total_input, change_idx, min_fee_override);
+        // Restore order output in case converge_fee touched it (it shouldn't for change_idx != 0)
+        tx.outputs[0].value = buy_amount;
+        f
     } else {
+        // No change output -- order stays at buy_amount, all excess is miner fee.
+        // Verify we have enough to cover order + minimum fee.
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-        let adjusted = buy_amount.saturating_sub(f);
-        tx.outputs[0].value = adjusted;
-        (f, adjusted)
+        let excess = total_input.saturating_sub(buy_amount);
+        if excess < f {
+            anyhow::bail!(
+                "Insufficient funds for fee: need {} sompi fee but only {} excess above buy_amount {}. \
+                 Fund the wallet with a larger UTXO or consolidate UTXOs.",
+                f, excess, buy_amount
+            );
+        }
+        // Order output stays at buy_amount; excess beyond fee is donated.
+        f
     };
 
     if has_change && tx.outputs[change_idx].value < MIN_UTXO_VALUE {

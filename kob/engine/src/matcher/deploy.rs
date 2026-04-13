@@ -653,12 +653,63 @@ pub async fn run_deploy_test(
         best.match_type, best.surplus, best.seller_kas, best.buyer_tokens
     );
 
+    // Convert to batch orders and execute via batch engine
+    let (sell_order, buy_order) = match executor::pair_to_batch_orders(best, "DEPLOY-TEST") {
+        Some(orders) => orders,
+        None => {
+            warn!("Failed to convert crossing pair to batch orders");
+            return;
+        }
+    };
+
     let rpc_lock = rpc.lock().await;
-    let match_result = executor::execute_full_match_pub(&rpc_lock, best, config).await;
+
+    // Get wallet UTXOs for fee input
+    let batch_utxos = match rpc_lock.get_spendable_utxos(&config.address, Some(0)).await {
+        Ok(u) => u,
+        Err(e) => {
+            error!("Failed to get UTXOs for batch: {}", e);
+            drop(rpc_lock);
+            return;
+        }
+    };
+    if batch_utxos.is_empty() {
+        error!("No wallet UTXOs for batch match");
+        drop(rpc_lock);
+        return;
+    }
+    let (wallet_spk_version, wallet_spk_script) = batch_utxos[0].parse_spk();
+
+    // Find the best wallet UTXO for fee payment (largest non-token UTXO)
+    let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
+    let token_p2sh_hex = hex::encode(&token_p2sh.script());
+    let wallet_utxo = batch_utxos.iter()
+        .filter(|u| {
+            let (_, script) = u.parse_spk();
+            hex::encode(&script) != token_p2sh_hex
+        })
+        .max_by_key(|u| u.utxo_entry.amount)
+        .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
+
+    let plan = match crate::matcher::batch::plan_batch_match(
+        &[sell_order], &[buy_order], wallet_utxo,
+        &wallet_spk_script, wallet_spk_version,
+        None,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("Batch plan failed: {}", e);
+            drop(rpc_lock);
+            return;
+        }
+    };
+
+    let mut spent_tracker = executor::SpentTracker::new();
+    let batch_result = executor::execute_batch_match(&rpc_lock, &plan, config, &mut spent_tracker, None).await;
     drop(rpc_lock);
 
-    match match_result {
-        Some(mr) => {
+    match batch_result {
+        Some(br) => {
             // Remove matched orders
             {
                 let mut ob = order_book.lock().await;
@@ -666,15 +717,11 @@ pub async fn run_deploy_test(
                 ob.remove_order(&best.sell.outpoint_key());
             }
 
-            // Receipt chaining: the receipt from this trade will be reused
-            // as fee input in the next trade. No separate consume TX needed.
-
             info!("======================================================================");
             info!("DEPLOY-TEST COMPLETE");
             info!("======================================================================");
             info!("  Deploy TX:    {}", dr.deploy_tx_id);
-            info!("  Match TX:     {}", mr.match_tx_id);
-            info!("  Receipt at:   {}:2 (chained for next trade)", mr.match_tx_id);
+            info!("  Match TX:     {}", br.tx_id);
         }
         None => {
             warn!("Match execution failed.");

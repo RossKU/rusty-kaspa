@@ -164,317 +164,6 @@ pub struct IfdFillContext {
     pub expiry_daa: u64,
 }
 
-/// Public interface for execute_full_match (called from deploy.rs).
-pub async fn execute_full_match_pub(
-    rpc: &RpcClient,
-    pair: &CrossingPair,
-    config: &AppConfig,
-) -> Option<MatchResult> {
-    let mut tracker = SpentTracker::new();
-    execute_full_match(rpc, pair, config, None, &mut tracker).await
-}
-
-/// Execute a full match between a buy and sell order.
-///
-/// When `ifd_ctx` is `Some`, the fill TX embeds a `KOB:2:<flags><B_RS>` (v2)
-/// payload so the scanner discovers order B (the contingent IFD order) in the next
-/// scan cycle. The buyer_tokens output already targets B's P2SH (because
-/// A's `bspkh` was set to B's SPK hash at registration time).
-async fn execute_full_match(
-    rpc: &RpcClient,
-    pair: &CrossingPair,
-    config: &AppConfig,
-    ifd_ctx: Option<&IfdFillContext>,
-    spent_tracker: &mut SpentTracker,
-) -> Option<MatchResult> {
-    let buy_key = pair.buy.outpoint_key();
-    let sell_key = pair.sell.outpoint_key();
-
-    info!("======================================================================");
-    info!(
-        "EXECUTING FULL MATCH [{}...]",
-        &pair.token_cov_id[..pair.token_cov_id.len().min(16)]
-    );
-    info!("======================================================================");
-    info!(
-        "  BUY:  {}... value={} price={}/{}",
-        &buy_key[..buy_key.len().min(20)],
-        pair.buy.value,
-        pair.buy.price_num,
-        pair.buy.price_den
-    );
-    info!(
-        "  SELL: {}... value={} price={}/{}",
-        &sell_key[..sell_key.len().min(20)],
-        pair.sell.value,
-        pair.sell.price_num,
-        pair.sell.price_den
-    );
-    info!(
-        "  Expected tokens (buy contract): {}",
-        pair.expected_tokens
-    );
-    info!("  Expected KAS (sell contract):   {}", pair.expected_kas);
-
-    // Get wallet UTXOs (needed for fee input and output SPK)
-    let (utxos, wallet_spk_version, wallet_spk_script, wallet_spk_hex) =
-        fetch_wallet_utxos(rpc, &config.address, "MATCH").await?;
-
-    // Compute match outputs first (needed for mass-aware fee UTXO selection)
-    let outputs = matching::compute_match_outputs(pair);
-
-    // Select fee UTXOs using mass-aware accumulation.
-    //
-    // A fee input is required because:
-    //  1. The miner fee must come from somewhere (order UTXOs are fully consumed).
-    //  2. Extra input credit (C / fee_val) offsets storage mass from small outputs
-    //     (e.g. receipt at 3M sompi creates C/3M = 1,333,333 mass alone).
-    //
-    // Strategy: accumulate UTXOs smallest-first until storage_mass == 0.
-    // Small UTXOs give MORE credit (C/small > C/big), so this converges fast.
-    let fee_utxos = select_fee_utxos_mass_aware(&utxos, pair, &outputs, "MATCH", spent_tracker);
-    if fee_utxos.is_empty() {
-        warn!("[MATCH] No fee UTXOs available. Skipping.");
-        return None;
-    }
-    let fee_utxo_total: u64 = fee_utxos.iter().map(|u| u.utxo_entry.amount).sum();
-
-    // Build receipt
-    let tcid = &pair.token_cov_id;
-    let tcid_bytes: [u8; 32] = match hex::decode(tcid) {
-        Ok(v) if v.len() == 32 => v.try_into().expect("length verified as 32"),
-        _ => {
-            warn!("[MATCH] Invalid hex for token_cov_id: {}", &tcid[..tcid.len().min(16)]);
-            return None;
-        }
-    };
-    let exec_amount = pair.expected_tokens.min(pair.sell.value);
-    let (_receipt_rs_hex, receipt_p2sh_hex, receipt_p2sh_version) = deploy::build_receipt_scripts(
-        &tcid_bytes,
-        pair.buy.price_num,
-        pair.buy.price_den,
-        exec_amount,
-    );
-
-    // Recalculate matcher_change to include fee UTXO(s) value minus receipt.
-    // The receipt output is funded from the matcher's fee UTXOs (running capital).
-    // Single receipt output only — no oracle receipt splitting (attack amplification prevention).
-    let (adj_seller_kas, adj_matcher_change) = {
-        let raw_change = (outputs.matcher_change + fee_utxo_total)
-            .saturating_sub(outputs.receipt_value)
-            .saturating_sub(outputs.fee);
-        compute_change_allocation(outputs.seller_kas, raw_change)
-    };
-
-    debug!("  Seller KAS (out[0]):        {}", adj_seller_kas);
-    debug!("  Buyer tokens (out[1]):      {}", outputs.buyer_tokens);
-    debug!("  Receipt (out[2]):           {}", outputs.receipt_value);
-    debug!("  Matcher change:             {}", adj_matcher_change);
-    debug!("  Fee:                        {}", outputs.fee);
-    debug!("  Fee UTXOs:                  {} inputs, {} sompi total", fee_utxos.len(), fee_utxo_total);
-
-    // Build fill sigscripts
-    let buy_rs = pair.buy.redeem_script();
-    let sell_rs = pair.sell.redeem_script();
-    // v13: buy fill has 4 items (toi, tii, coi, Op1), sell fill has 2 items (koi, Op1)
-    let buy_fill_ss = kob_core::contract::build_buy_fill_sigscript(1, 1, 0, &buy_rs);
-    let sell_fill_ss = kob_core::contract::build_sell_fill_sigscript(0, &sell_rs);
-
-    debug!("  Buy fill SS:  {}B", buy_fill_ss.len());
-    debug!("  Sell fill SS: {}B", sell_fill_ss.len());
-
-    // Resolve counterparty SPKs.  Both orders must carry an explicit SPK
-    // (populated via payload v2 deploy); if either is missing we cannot build
-    // a valid match TX (the contract checks Blake2b(output.spk) == spk_hash).
-    let (seller_spk_version, seller_spk_script) = match pair.sell.resolve_counterparty_spk() {
-        Some(spk) => spk,
-        None => {
-            error!(
-                "[MATCH] SELL order {} missing counterparty_spk — \
-                 deploy TX used payload v1 (no SPK). Cannot route seller_kas. Skipping.",
-                &sell_key[..sell_key.len().min(20)]
-            );
-            return None;
-        }
-    };
-    let seller_spk_hex = hex::encode(&seller_spk_script);
-    let (buyer_spk_version, buyer_spk_script) = match pair.buy.resolve_counterparty_spk() {
-        Some(spk) => spk,
-        None => {
-            error!(
-                "[MATCH] BUY order {} missing counterparty_spk — \
-                 deploy TX used payload v1 (no SPK). Cannot route buyer_tokens. Skipping.",
-                &buy_key[..buy_key.len().min(20)]
-            );
-            return None;
-        }
-    };
-    let buyer_spk_hex = hex::encode(&buyer_spk_script);
-
-    // Build TX for sighash computation (needed to sign fee input).
-    // Version 1 required for covenant output bindings.
-    // lock_time must satisfy OP_CSV(50) in covenant inputs (sequence=50).
-    let mut tx = kob_core::tx::Transaction::new(1);
-    tx.lock_time = 50;
-
-    push_covenant_input(&mut tx, &pair.buy.tx_id, pair.buy.index,
-        pair.buy.p2sh_version, &pair.buy.p2sh_script(), pair.buy.value);
-    push_covenant_input(&mut tx, &pair.sell.tx_id, pair.sell.index,
-        pair.sell.p2sh_version, &pair.sell.p2sh_script(), pair.sell.value);
-    for fu in &fee_utxos {
-        push_p2pk_input(&mut tx, fu);
-    }
-
-    push_output(&mut tx, adj_seller_kas, seller_spk_version, seller_spk_script.clone());
-    // buyer_tokens output carries the token covenant (auth from sell input[1])
-    tx.outputs.push(kob_core::tx::TxOutput::new(outputs.buyer_tokens, buyer_spk_version, buyer_spk_script.clone(), Some(kob_core::tx::CovenantBinding::new(1, kob_core::compat::parse_hash(&pair.token_cov_id.clone()).unwrap()))));
-    let receipt_p2sh_bytes = decode_hex(&receipt_p2sh_hex, "receipt_p2sh")?;
-    push_output(&mut tx, outputs.receipt_value, receipt_p2sh_version, receipt_p2sh_bytes);
-    if adj_matcher_change >= MIN_UTXO_VALUE {
-        push_output(&mut tx, adj_matcher_change, wallet_spk_version, wallet_spk_script);
-    }
-
-    // Sign each fee input (indices 2..2+N)
-    let mut privkey = config.private_key_bytes();
-    let mut fee_sigscripts = Vec::with_capacity(fee_utxos.len());
-    for i in 0..fee_utxos.len() {
-        let ss = sign_p2pk_input(&tx, 2 + i, &privkey, "MATCH")?;
-        fee_sigscripts.push(ss);
-    }
-    privkey.zeroize();
-
-    // Build RPC outputs.
-    // output[1] (buyer_tokens) carries the token covenant binding (auth from sell input[1]).
-    // This is required for OpCovOutCount(tcid) >= 1 check in the buy contract fill path.
-    let mut rpc_outputs = vec![
-        deploy::build_rpc_output(adj_seller_kas, seller_spk_version, &seller_spk_hex),
-        deploy::build_rpc_output_with_covenant(outputs.buyer_tokens, buyer_spk_version, &buyer_spk_hex, 1, &pair.token_cov_id),
-        deploy::build_rpc_output(outputs.receipt_value, receipt_p2sh_version, &receipt_p2sh_hex),
-    ];
-    if adj_matcher_change >= MIN_UTXO_VALUE {
-        rpc_outputs.push(deploy::build_rpc_output(
-            adj_matcher_change,
-            wallet_spk_version,
-            &wallet_spk_hex,
-        ));
-    }
-
-    // Build RPC inputs (sigOpCount = 0 for covenant inputs, 1 for fee P2PK)
-    // Covenant fill inputs use sequence=50 to satisfy OP_CSV in the redeemScript.
-    let mut rpc_inputs = vec![
-        deploy::build_rpc_input_with_sequence(
-            &pair.buy.tx_id,
-            pair.buy.index,
-            &hex::encode(&buy_fill_ss),
-            0,
-            50,
-        ),
-        deploy::build_rpc_input_with_sequence(
-            &pair.sell.tx_id,
-            pair.sell.index,
-            &hex::encode(&sell_fill_ss),
-            0,
-            50,
-        ),
-    ];
-    for (fu, ss) in fee_utxos.iter().zip(fee_sigscripts.iter()) {
-        rpc_inputs.push(deploy::build_rpc_input(
-            &fu.outpoint.transaction_id,
-            fu.outpoint.index,
-            &hex::encode(ss),
-            1,
-        ));
-    }
-
-    // Storage mass pre-check: reject before hitting the node
-    {
-        let mut in_vals = vec![pair.buy.value, pair.sell.value];
-        for fu in &fee_utxos {
-            in_vals.push(fu.utxo_entry.amount);
-        }
-        let mut out_vals = vec![adj_seller_kas, outputs.buyer_tokens, outputs.receipt_value];
-        if adj_matcher_change >= MIN_UTXO_VALUE {
-            out_vals.push(adj_matcher_change);
-        }
-        check_mass_presubmit(&in_vals, &out_vals, "MATCH")?;
-    }
-
-    // Build the submit payload. If an IFD rule is active, embed the
-    // contingent order B's RS as a KOB:2: (v2) payload so the scanner
-    // discovers it. Using v1 (KOB:1:) would cause the scanner to skip
-    // the order because v1 payloads lack the counterparty SPK flag.
-    let payload = if let Some(ctx) = ifd_ctx {
-        let expiry = if ctx.expiry_daa > 0 { Some(ctx.expiry_daa) } else { None };
-        let kob_payload = kob_core::contract::build_order_payload_full(
-            &ctx.order_b_rs,
-            false, // IFD-deployed orders are never post_only
-            expiry,
-        );
-        let kob_payload_hex = hex::encode(&kob_payload);
-        info!(
-            "[IFD] Embedding order B payload in fill TX ({} bytes RS, P2SH={}...)",
-            ctx.order_b_rs.len(),
-            &ctx.order_b_p2sh[..ctx.order_b_p2sh.len().min(16)],
-        );
-        deploy::build_submit_payload_with_tx_payload(1, rpc_inputs, rpc_outputs, &kob_payload_hex, tx.lock_time)
-    } else {
-        deploy::build_submit_payload_with_lock_time(1, rpc_inputs, rpc_outputs, tx.lock_time)
-    };
-    tracing::debug!("[MATCH] TX lockTime = {}", tx.lock_time);
-    let result = match rpc.submit_transaction(payload).await {
-        Ok(r) => r,
-        Err(e) => {
-            error!("[MATCH] Submit failed: {}", e);
-            return None;
-        }
-    };
-
-    if result.ok {
-        let match_tx_id = result.tx_id.unwrap_or_else(|| {
-            warn!("[MATCH] Success response missing tx_id");
-            String::new()
-        });
-        info!("[MATCH] SUCCESS! TXID: {}", match_tx_id);
-        info!("  Seller received: {} sompi KAS", adj_seller_kas);
-        info!("  Buyer received:  {} sompi tokens", outputs.buyer_tokens);
-        info!("  Receipt at: {}:2", match_tx_id);
-
-        // Mark fee UTXOs as spent so subsequent matches in this cycle
-        // won't try to reuse them.
-        for fu in &fee_utxos {
-            spent_tracker.mark_spent(&fu.outpoint_key());
-        }
-
-        // Log IFD trigger
-        if let Some(ctx) = ifd_ctx {
-            info!(
-                "[IFD] Triggered: order B deployed at {} (rule_id={}, fill_tx={})",
-                ctx.order_b_p2sh, ctx.rule_id, match_tx_id,
-            );
-        }
-
-        return Some(MatchResult {
-            match_tx_id: match_tx_id.clone(),
-            match_type: MatchType::Full,
-            seller_kas: adj_seller_kas,
-            buyer_tokens: outputs.buyer_tokens,
-            receipt_tx_id: match_tx_id,
-            receipt_idx: 2,
-            receipt_value: outputs.receipt_value,
-            token_cov_id: tcid.to_string(),
-            price_num: pair.buy.price_num,
-            price_den: pair.buy.price_den,
-        });
-    }
-
-    error!(
-        "[MATCH] FAILED: {}",
-        result.error.unwrap_or_else(|| "Unknown error".to_string())
-    );
-    None
-}
-
-
 /// Fetch wallet UTXOs and extract the wallet SPK from the first entry.
 ///
 /// Returns (utxos, spk_version, spk_script, spk_hex) or None on failure.
@@ -499,183 +188,6 @@ async fn fetch_wallet_utxos(
     Some((utxos, spk_version, spk_script, spk_hex))
 }
 
-/// Find a fee UTXO from wallet UTXOs, optionally excluding a specific outpoint.
-///
-/// Prefers the largest eligible UTXO.  For partial fills this is fine because
-/// the order input already provides significant mass credit; for full matches
-/// use [`select_fee_utxo_for_mass`] instead.
-fn select_fee_utxo<'a>(
-    utxos: &'a [RpcUtxo],
-    exclude_key: Option<&str>,
-    label: &str,
-    spent_tracker: &SpentTracker,
-) -> Option<&'a RpcUtxo> {
-    // Conservative budget: 3 inputs, 5 outputs, no payload
-    let min_fee_budget = kob_core::mass::estimate_compute_mass(3, 5, 0);
-    let found = utxos
-        .iter()
-        .filter(|u| {
-            u.utxo_entry.amount >= min_fee_budget
-                && exclude_key.is_none_or(|k| u.outpoint_key() != k)
-                && !spent_tracker.is_spent(&u.outpoint_key())
-        })
-        .max_by_key(|u| u.utxo_entry.amount);
-    if found.is_none() {
-        warn!("[{}] No fee UTXO available. Skipping.", label);
-    }
-    found
-}
-
-/// Find the best fee UTXO for minimizing storage mass.
-///
-/// Smaller UTXOs provide *more* storage mass credit (C / small_val > C / big_val).
-/// This function picks the smallest UTXO that is >= the estimated compute mass,
-/// which maximizes the input credit contribution and reduces net storage mass.
-///
-/// Falls back to the largest eligible UTXO if no small UTXO is available.
-fn select_fee_utxo_for_mass<'a>(
-    utxos: &'a [RpcUtxo],
-    exclude_key: Option<&str>,
-    label: &str,
-    spent_tracker: &SpentTracker,
-) -> Option<&'a RpcUtxo> {
-    // Conservative budget: 3 inputs, 5 outputs, no payload
-    let min_fee_budget = kob_core::mass::estimate_compute_mass(3, 5, 0);
-    let eligible: Vec<_> = utxos
-        .iter()
-        .filter(|u| {
-            u.utxo_entry.amount >= min_fee_budget
-                && exclude_key.is_none_or(|k| u.outpoint_key() != k)
-                && !spent_tracker.is_spent(&u.outpoint_key())
-        })
-        .collect();
-    if eligible.is_empty() {
-        warn!("[{}] No fee UTXO available. Skipping.", label);
-        return None;
-    }
-    // Prefer smallest UTXO for maximum storage mass credit
-    eligible.into_iter().min_by_key(|u| u.utxo_entry.amount)
-}
-
-/// Select fee UTXOs with iterative mass-aware accumulation for match TXs.
-///
-/// Iterates: add UTXO → recompute change → recompute storage mass → repeat.
-/// Adding fee UTXOs changes matcher_change, which can add/resize the change
-/// output, altering out_mass. So we must recalculate mass after each addition.
-/// Small UTXOs give more credit (C/small_val > C/big_val), so this converges fast.
-fn select_fee_utxos_mass_aware<'a>(
-    utxos: &'a [RpcUtxo],
-    pair: &matching::CrossingPair,
-    outputs: &matching::MatchOutputs,
-    label: &str,
-    spent_tracker: &SpentTracker,
-) -> Vec<&'a RpcUtxo> {
-    use kob_core::mass::compute_storage_mass;
-
-    // Sort eligible UTXOs smallest-first for maximum credit per UTXO.
-    // Exclude UTXOs already claimed by another match in this cycle.
-    // Conservative budget: 3 inputs, 5 outputs, no payload
-    let min_fee_budget = kob_core::mass::estimate_compute_mass(3, 5, 0);
-    let mut eligible: Vec<&RpcUtxo> = utxos.iter()
-        .filter(|u| u.utxo_entry.amount >= min_fee_budget && !spent_tracker.is_spent(&u.outpoint_key()))
-        .collect();
-    eligible.sort_by_key(|u| u.utxo_entry.amount);
-
-    if eligible.is_empty() {
-        warn!("[{}] No fee UTXOs available. Skipping.", label);
-        return Vec::new();
-    }
-
-    let mut selected: Vec<&RpcUtxo> = Vec::new();
-
-    // Always need at least 1 fee UTXO (for miner fee)
-    selected.push(eligible[0]);
-    let mut ei = 1; // next index into eligible
-
-    loop {
-        // Recompute with current selection (single receipt, no oracle splitting).
-        let fee_total: u64 = selected.iter().map(|u| u.utxo_entry.amount).sum();
-        let raw_change = (outputs.matcher_change + fee_total)
-            .saturating_sub(outputs.receipt_value)
-            .saturating_sub(outputs.fee);
-        let (adj_seller_kas, adj_change) =
-            compute_change_allocation(outputs.seller_kas, raw_change);
-
-        // Build input/output value arrays for compute_storage_mass
-        let mut in_vals: Vec<u64> = vec![pair.buy.value, pair.sell.value];
-        for u in &selected {
-            in_vals.push(u.utxo_entry.amount);
-        }
-        let mut out_vals: Vec<u64> = vec![adj_seller_kas, outputs.buyer_tokens, outputs.receipt_value];
-        if adj_change >= MIN_UTXO_VALUE {
-            out_vals.push(adj_change);
-        }
-
-        // Use the same formula as Kaspad (relaxed/arithmetic dispatch + integer division order)
-        let mass = compute_storage_mass(&in_vals, &out_vals) as u128;
-        if mass == 0 {
-            debug!(
-                "[{}] Storage mass = 0 with {} fee UTXO(s), total {} sompi",
-                label, selected.len(), fee_total
-            );
-            break;
-        }
-
-        // Need more credit — add next smallest UTXO
-        if ei < eligible.len() {
-            selected.push(eligible[ei]);
-            ei += 1;
-        } else {
-            error!(
-                "[{}] Storage mass still {} after exhausting all {} fee UTXOs — transaction will likely be rejected by Kaspad (need more small UTXOs to provide mass credit)",
-                label, mass, selected.len()
-            );
-            break;
-        }
-    }
-
-    selected
-}
-
-/// Compute change allocation: absorb dust change into the primary output.
-///
-/// Returns (adjusted_primary_amount, matcher_change).
-fn compute_change_allocation(primary_amount: u64, raw_change: u64) -> (u64, u64) {
-    if raw_change >= MIN_UTXO_VALUE {
-        (primary_amount, raw_change)
-    } else {
-        (primary_amount + raw_change, 0)
-    }
-}
-
-/// Sign a P2PK input and return the sigscript bytes.
-fn sign_p2pk_input(
-    tx: &kob_core::tx::Transaction,
-    input_idx: usize,
-    privkey: &[u8; 32],
-    label: &str,
-) -> Option<Vec<u8>> {
-    let sighash = kob_core::compute_sighash(tx, input_idx).ok()?;
-    let sig = match kob_core::schnorr_sign(&sighash, privkey) {
-        Ok(s) => s,
-        Err(e) => {
-            error!("[{}] Signing input {} failed: {}", label, input_idx, e);
-            return None;
-        }
-    };
-    Some(kob_core::contract::build_p2pk_sigscript(&sig))
-}
-
-/// Decode a hex string into bytes, logging on failure.
-fn decode_hex(hex_str: &str, name: &str) -> Option<Vec<u8>> {
-    match hex::decode(hex_str) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            warn!("[MATCH] Invalid hex for {}: {}", name, e);
-            None
-        }
-    }
-}
 
 /// Pre-check storage mass for a match TX before submission.
 ///
@@ -705,50 +217,6 @@ fn check_mass_presubmit(
 }
 
 
-/// Push a P2SH covenant input onto a transaction's input list.
-/// Uses sequence=50 for CSV exposure delay (OP_CSV(50) in BuySell fill/partial paths).
-fn push_covenant_input(
-    tx: &mut kob_core::tx::Transaction,
-    tx_id: &str,
-    index: u32,
-    p2sh_version: u16,
-    p2sh_bytes: &[u8],
-    value: u64,
-) {
-    tx.inputs.push(kob_core::tx::TxInput {
-        prev_tx_id: tx_id.to_string(),
-        prev_index: index,
-        sequence: 50,
-        sig_op_count: 0,
-        script_version: p2sh_version,
-        script_bytes: p2sh_bytes.to_vec(),
-        value,
-    });
-}
-
-/// Push a P2PK signed input onto a transaction's input list.
-fn push_p2pk_input(tx: &mut kob_core::tx::Transaction, utxo: &RpcUtxo) {
-    let (spk_ver, spk_script) = utxo.parse_spk();
-    tx.inputs.push(kob_core::tx::TxInput {
-        prev_tx_id: utxo.outpoint.transaction_id.clone(),
-        prev_index: utxo.outpoint.index,
-        sequence: 0,
-        sig_op_count: 1,
-        script_version: spk_ver,
-        script_bytes: spk_script,
-        value: utxo.utxo_entry.amount,
-    });
-}
-
-/// Push a standard (non-covenant) output onto a transaction's output list.
-fn push_output(
-    tx: &mut kob_core::tx::Transaction,
-    value: u64,
-    script_version: u16,
-    script_bytes: Vec<u8>,
-) {
-    tx.outputs.push(kob_core::tx::TxOutput::new(value, script_version, script_bytes, None));
-}
 
 // Cross-pair Match Execution (v8 contracts)
 
@@ -923,7 +391,7 @@ fn trace_batch_inputs(
 /// Builds the batch TX via `BatchPlan::build_tx()`, constructs a sighash TX
 /// Convert a CrossingPair into (sell BatchOrder, buy BatchOrder).
 /// Returns None if RS sizes are invalid or counterparty SPKs are missing.
-fn pair_to_batch_orders(
+pub(crate) fn pair_to_batch_orders(
     pair: &matching::CrossingPair,
     label: &str,
 ) -> Option<(crate::matcher::batch::BatchOrder, crate::matcher::batch::BatchOrder)> {
@@ -1007,7 +475,7 @@ fn pair_to_batch_orders(
 /// TX version = 1 (required for covenant output bindings on buyer token outputs).
 pub async fn execute_batch_match(
     rpc: &RpcClient,
-    plan: &crate::matcher::batch::BatchPlan,
+    plan: &mut crate::matcher::batch::BatchPlan,
     config: &AppConfig,
     spent_tracker: &mut SpentTracker,
     ifd_payload: Option<String>,
@@ -1205,6 +673,109 @@ pub async fn execute_batch_match(
             1, // sigOpCount = 1 for P2PK
         ));
         wallet_sigscript = Some(wallet_ss);
+    }
+
+    // Phase 2: exact fee convergence with real sigscripts.
+    // The plan's estimated fee (from estimate_compute_mass) is conservative.
+    // Compute exact mass from real sigscripts and reclaim the overpayment.
+    {
+        let sigscripts_for_conv: Vec<Vec<u8>> = batch_tx.inputs.iter().enumerate().map(|(i, inp)| {
+            if has_wallet && i == wallet_input_idx {
+                wallet_sigscript.clone().unwrap_or_default()
+            } else {
+                inp.sigscript.clone()
+            }
+        }).collect();
+        let (exact_fee, delta) = plan.converge_fee_exact(&sighash_tx, &sigscripts_for_conv);
+        if delta > 0 {
+            info!(
+                "[BATCH] Phase 2 fee convergence: exact={}, delta={} (recovered)",
+                exact_fee, delta
+            );
+            plan.apply_exact_fee(exact_fee);
+
+            // Rebuild sighash_tx outputs from adjusted plan
+            sighash_tx.outputs.clear();
+            rpc_outputs.clear();
+            let n = plan.sells.len();
+            for (i, out) in plan.outputs.iter().enumerate() {
+                let spk_hex = hex::encode(&out.script_public_key);
+
+                if out.purpose == OutputPurpose::BuyerTokens {
+                    let buy_j = i.saturating_sub(n);
+                    if buy_j < plan.buys.len() {
+                        let (buy, _) = &plan.buys[buy_j];
+                        let token_hex = hex::encode(buy.token_cov_id);
+                        if let Some(&tii) = plan.token_input_map.get(&token_hex) {
+                            rpc_outputs.push(deploy::build_rpc_output_with_covenant(
+                                out.value, out.spk_version, &spk_hex,
+                                tii as u16, &token_hex,
+                            ));
+                            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                                out.value, out.spk_version, out.script_public_key.clone(),
+                                Some(kob_core::tx::CovenantBinding::new(
+                                    tii as u16,
+                                    kob_core::compat::parse_hash(&token_hex).unwrap(),
+                                )),
+                            ));
+                            continue;
+                        }
+                    }
+                    rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
+                } else if out.purpose == OutputPurpose::SellRemainder {
+                    if let Some((sell, _)) = plan.sells.first() {
+                        let token_hex = hex::encode(sell.token_cov_id);
+                        if let Some(&tii) = plan.token_input_map.get(&token_hex) {
+                            rpc_outputs.push(deploy::build_rpc_output_with_covenant(
+                                out.value, out.spk_version, &spk_hex,
+                                tii as u16, &token_hex,
+                            ));
+                            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                                out.value, out.spk_version, out.script_public_key.clone(),
+                                Some(kob_core::tx::CovenantBinding::new(
+                                    tii as u16,
+                                    kob_core::compat::parse_hash(&token_hex).unwrap(),
+                                )),
+                            ));
+                            continue;
+                        }
+                    }
+                    rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
+                } else {
+                    rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
+                }
+
+                sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                    out.value, out.spk_version, out.script_public_key.clone(), None,
+                ));
+            }
+
+            // Re-sign wallet input (outputs changed -> sighash changed)
+            if has_wallet {
+                // Remove old wallet rpc_input (last one) and re-sign
+                rpc_inputs.pop();
+                let mut privkey = config.private_key_bytes();
+                let sighash = kob_core::compute_sighash(&sighash_tx, wallet_input_idx).ok()?;
+                let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        privkey.zeroize();
+                        error!("[BATCH] Phase 2 wallet re-sign failed: {}", e);
+                        return None;
+                    }
+                };
+                privkey.zeroize();
+                let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
+                let wallet_inp = &batch_tx.inputs[wallet_input_idx];
+                rpc_inputs.push(deploy::build_rpc_input(
+                    &wallet_inp.tx_id,
+                    wallet_inp.index,
+                    &hex::encode(&wallet_ss),
+                    1,
+                ));
+                wallet_sigscript = Some(wallet_ss);
+            }
+        }
     }
 
     // Mass pre-check: storage mass + compute mass (with real sigscripts)
@@ -2445,7 +2016,7 @@ async fn run_scan_cycle(
                 .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
             // Plan the batch match (sell inputs provide covenant lineage directly)
-            let plan = match crate::matcher::batch::plan_batch_match(
+            let mut plan = match crate::matcher::batch::plan_batch_match(
                 &sells, &buys, wallet_utxo,
                 &wallet_spk_script, wallet_spk_version,
                 None,
@@ -2458,7 +2029,7 @@ async fn run_scan_cycle(
             };
 
             // Execute the batch match
-            match execute_batch_match(rpc, &plan, config, spent_tracker, None).await {
+            match execute_batch_match(rpc, &mut plan, config, spent_tracker, None).await {
                 Some(batch_result) => {
                     info!(
                         "[BATCH] SUCCESS: tx={} sells={} buys={} surplus={}",
@@ -2682,7 +2253,7 @@ async fn run_scan_cycle(
                 }
             };
 
-            let plan = match plan_result {
+            let mut plan = match plan_result {
                 Ok(p) => p,
                 Err(e) => {
                     warn!("[REMAINING] Plan failed for [{}...]: {}", &token_cov_id[..token_cov_id.len().min(16)], e);
@@ -2692,7 +2263,7 @@ async fn run_scan_cycle(
                 }
             };
 
-            match execute_batch_match(rpc, &plan, config, spent_tracker, ifd_payload).await {
+            match execute_batch_match(rpc, &mut plan, config, spent_tracker, ifd_payload).await {
                 Some(batch_result) => {
                     // IFD trigger
                     if let Some(ctx) = &ifd_ctx {
@@ -2919,7 +2490,7 @@ async fn run_scan_cycle(
                     .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
                 // Plan and execute via batch engine (sell inputs provide covenant lineage)
-                let plan = match crate::matcher::batch::plan_batch_match(
+                let mut plan = match crate::matcher::batch::plan_batch_match(
                     &sells, &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version,
                     None,
@@ -2931,7 +2502,7 @@ async fn run_scan_cycle(
                     }
                 };
 
-                match execute_batch_match(rpc, &plan, config, spent_tracker, None).await {
+                match execute_batch_match(rpc, &mut plan, config, spent_tracker, None).await {
                     Some(batch_result) => {
                         info!(
                             "[CROSS-BATCH] SUCCESS: tx={} sells={} buys={} surplus={}",
@@ -3154,7 +2725,7 @@ async fn run_scan_cycle(
                     .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
                 // Plan and execute via batch engine (sell inputs provide covenant lineage)
-                let plan = match crate::matcher::batch::plan_batch_match(
+                let mut plan = match crate::matcher::batch::plan_batch_match(
                     &sells, &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version,
                     None,
@@ -3166,7 +2737,7 @@ async fn run_scan_cycle(
                     }
                 };
 
-                match execute_batch_match(rpc, &plan, config, spent_tracker, None).await {
+                match execute_batch_match(rpc, &mut plan, config, spent_tracker, None).await {
                     Some(batch_result) => {
                         info!(
                             "[TRI-BATCH] SUCCESS: tx={} sells={} buys={} surplus={}",
@@ -4717,163 +4288,6 @@ mod tests {
         assert!(txs.is_empty());
     }
 
-    // Partial Fill Dispatch Tests
-
-    #[test]
-    fn execute_match_dispatches_partial_buy() {
-        // Verify that PartialBuy type is recognized (not skipped with warning)
-        let pair = CrossingPair {
-            token_cov_id: "aa".repeat(32),
-            buy: BookOrder {
-                tx_id: "a".repeat(64),
-                index: 0,
-                value: 50_000_000,
-                token_cov_id: "aa".repeat(32),
-                price_num: 2,
-                price_den: 1,
-                min_fill: 3_000_000,
-                owner_hash: "bb".repeat(32),
-                spk_hash: "11".repeat(32),
-                counterparty_spk: None,
-                redeem_script_hex: hex::encode(&[0x51u8; 348]),
-                p2sh_script_hex: hex::encode(&[0xaau8; 35]),
-                p2sh_version: 0,
-                side: OrderSide::Buy,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
-            },
-            sell: BookOrder {
-                tx_id: "b".repeat(64),
-                index: 0,
-                value: 10_000_000,
-                token_cov_id: "aa".repeat(32),
-                price_num: 2,
-                price_den: 1,
-                min_fill: 3_000_000,
-                owner_hash: "cc".repeat(32),
-                spk_hash: "22".repeat(32),
-                counterparty_spk: None,
-                redeem_script_hex: hex::encode(&[0x51u8; 284]),
-                p2sh_script_hex: hex::encode(&[0xaau8; 35]),
-                p2sh_version: 0,
-                side: OrderSide::Sell,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
-            },
-            seller_kas: 20_000_000,
-            buyer_tokens: 10_000_000,
-            surplus: 5_000_000,
-            expected_tokens: 10_000_000,
-            expected_kas: 20_000_000,
-            match_type: MatchType::PartialBuy,
-            fill_kas: Some(10_000_000),
-            residual_kas: Some(40_000_000),
-            fill_token_amount: None,
-            residual_tokens: None,
-        };
-
-        // Verify the pair has the partial buy fields set
-        assert_eq!(pair.match_type, MatchType::PartialBuy);
-        assert_eq!(pair.fill_kas, Some(10_000_000));
-        assert_eq!(pair.residual_kas, Some(40_000_000));
-    }
-
-    #[test]
-    fn execute_match_dispatches_partial_sell() {
-        let pair = CrossingPair {
-            token_cov_id: "aa".repeat(32),
-            buy: BookOrder {
-                tx_id: "a".repeat(64),
-                index: 0,
-                value: 10_000_000,
-                token_cov_id: "aa".repeat(32),
-                price_num: 2,
-                price_den: 1,
-                min_fill: 3_000_000,
-                owner_hash: "bb".repeat(32),
-                spk_hash: "11".repeat(32),
-                counterparty_spk: None,
-                redeem_script_hex: hex::encode(&[0x51u8; 348]),
-                p2sh_script_hex: hex::encode(&[0xaau8; 35]),
-                p2sh_version: 0,
-                side: OrderSide::Buy,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
-            },
-            sell: BookOrder {
-                tx_id: "b".repeat(64),
-                index: 0,
-                value: 50_000_000,
-                token_cov_id: "aa".repeat(32),
-                price_num: 2,
-                price_den: 1,
-                min_fill: 3_000_000,
-                owner_hash: "cc".repeat(32),
-                spk_hash: "22".repeat(32),
-                counterparty_spk: None,
-                redeem_script_hex: hex::encode(&[0x51u8; 284]),
-                p2sh_script_hex: hex::encode(&[0xaau8; 35]),
-                p2sh_version: 0,
-                side: OrderSide::Sell,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
-            },
-            seller_kas: 20_000_000,
-            buyer_tokens: 20_000_000,
-            surplus: 5_000_000,
-            expected_tokens: 20_000_000,
-            expected_kas: 100_000_000,
-            match_type: MatchType::PartialSell,
-            fill_kas: None,
-            residual_kas: None,
-            fill_token_amount: Some(10_000_000),
-            residual_tokens: Some(40_000_000),
-        };
-
-        // Verify the pair has the partial sell fields set
-        assert_eq!(pair.match_type, MatchType::PartialSell);
-        assert_eq!(pair.fill_token_amount, Some(10_000_000));
-        assert_eq!(pair.residual_tokens, Some(40_000_000));
-    }
-
-    #[test]
-    fn partial_buy_fill_sigscript_builds_correctly() {
-        // Test that the buy partial fill sigscript is correctly constructed
-        let pk = [0x02u8; 32];
-        let tcid = [0x01u8; 32];
-        let owner = kob_core::blake2b_256(&pk);
-        let spk_hash = kob_core::compute_p2pk_spk_hash(&pk);
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, 1, 2, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let fill_kas = 5_000_000u64;
-        let ss = kob_core::contract::build_buy_partial_fill_sigscript(&rs, fill_kas, 0, 1);
-        // Must not be empty and must start with output index opcodes
-        assert!(!ss.is_empty(), "Partial fill SS must not be empty");
-        assert_eq!(ss[0], 0x00, "residual_idx=0 -> Op0");
-        assert_eq!(ss[1], 0x51, "token_idx=1 -> Op1");
-    }
-
-    #[test]
-    fn partial_sell_fill_sigscript_builds_correctly() {
-        let pk = [0x02u8; 32];
-        let owner = kob_core::blake2b_256(&pk);
-        let spk_hash = kob_core::compute_p2pk_spk_hash(&pk);
-        let rs = kob_core::contract::build_sell_redeem_script(
-            1, 2, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let fill_amount = 3_000_000u64;
-        let ss = kob_core::contract::build_sell_partial_fill_sigscript(&rs, fill_amount, 0, 1);
-        assert!(!ss.is_empty(), "Partial fill SS must not be empty");
-        assert_eq!(ss[0], 0x00, "kas_idx=0 -> Op0");
-        assert_eq!(ss[1], 0x51, "residual_idx=1 -> Op1");
-    }
 
     #[test]
     fn match_result_partial_types() {

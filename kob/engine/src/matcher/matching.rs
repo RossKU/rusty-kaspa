@@ -204,7 +204,11 @@ fn find_crossing_pairs_for_token(
             if seller_kas.checked_add(buyer_tokens).is_none_or(|sum| sum > total_in) {
                 // Prices don't cross for full fill, or overflow
             } else {
-                let surplus = total_in - seller_kas - buyer_tokens;
+                let raw_surplus = total_in - seller_kas - buyer_tokens;
+                // C4 fix: cap surplus at both orders max_matcher_fee
+                let surplus = raw_surplus
+                    .min(buy.max_matcher_fee)
+                    .min(sell.max_matcher_fee);
 
                 // surplus=0 is valid when mmfee=0 (matcher pays miner fee from fee UTXOs).
                 if seller_kas >= MIN_UTXO_VALUE
@@ -375,7 +379,11 @@ fn compute_partial_fill_match(
             {
                 if let Some(after_seller) = (buy_kas + sell_tokens).checked_sub(seller_kas) {
                     if let Some(after_tokens) = after_seller.checked_sub(fill_tokens) {
-                        if let Some(surplus) = after_tokens.checked_sub(residual_kas) {
+                        if let Some(raw_surplus) = after_tokens.checked_sub(residual_kas) {
+                            // C4 fix: cap surplus at both orders max_matcher_fee
+                            let surplus = raw_surplus
+                                .min(buy.max_matcher_fee)
+                                .min(sell.max_matcher_fee);
                             // surplus=0 is valid when mmfee=0 (matcher pays miner fee from fee UTXOs).
                             return Some(CrossingPair {
                                 token_cov_id: token_cov_id.to_string(),
@@ -466,7 +474,9 @@ fn compute_partial_fill_match(
                             // Buy contract enforces buy_kas - seller_kas <= mmfee.
                             let mmfee_floor = buy_kas.saturating_sub(buy.max_matcher_fee);
                             let adj_seller_kas = std::cmp::max(fill_kas, mmfee_floor);
-                            let adj_surplus = surplus.saturating_sub(adj_seller_kas - fill_kas);
+                            let adj_surplus = surplus.saturating_sub(adj_seller_kas - fill_kas)
+                                .min(buy.max_matcher_fee)
+                                .min(sell.max_matcher_fee); // C4 fix
                             // surplus=0 is valid when mmfee=0 (matcher pays miner fee from fee UTXOs).
                             return Some(CrossingPair {
                                 token_cov_id: token_cov_id.to_string(),

@@ -2391,9 +2391,16 @@ async fn run_scan_cycle(
         }
     }
 
-    // Phase 2: Cross-pair routes via batch engine
+    // Phase 2: Cross-pair batch — combine same-pair crossings from different
+    // tokens into one atomic TX for fee efficiency.
+    // The BATCH path (Phase 1a) and REMAINING path (Phase 1b) already called
+    // spent_tracker.mark_spent() for all claimed outpoints, so passing
+    // spent_tracker.spent is sufficient to avoid double-matching.
     if enable_cross_pair {
-        let cross_groups = matching::find_cross_pair_batch_groups(order_book, 10, allow_self_trade);
+        let cross_spent: HashSet<String> = spent_tracker.spent.keys().cloned().collect();
+        let cross_groups = matching::find_cross_pair_batch_groups(
+            order_book, 10, allow_self_trade, Some(&cross_spent),
+        );
 
         if cross_groups.is_empty() {
             info!("[SCAN] No cross-pair routes found");
@@ -4102,7 +4109,7 @@ pub async fn run_dry_run(
     }
 
     // Cross-pair batch groups (unified through batch engine)
-    let cross_groups = matching::find_cross_pair_batch_groups(&ob, 20, false);
+    let cross_groups = matching::find_cross_pair_batch_groups(&ob, 20, false, None);
     info!("  Cross-pair batch groups: {}", cross_groups.len());
 
     for (i, g) in cross_groups.iter().enumerate() {

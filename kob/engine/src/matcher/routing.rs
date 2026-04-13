@@ -1,21 +1,14 @@
-//! Cross-pair route finding for batch matching engine.
+//! Cross-pair route finding for triangular arbitrage.
 //!
-//! Implements 2-hop (Token A -> KAS -> Token B) and 3-hop triangular
-//! (A -> B -> C -> A) arbitrage routing across token pairs.
+//! # 2-hop routes (building blocks for triangular routes)
 //!
-//! # 2-hop (cross-pair) flow
+//! A `CrossPairRoute` pairs a sell from Token A with a buy for Token B (A != B).
+//! These routes assume the matcher provides Token B via a token_unit UTXO.
 //!
-//!   input[0]: sell order   (Token A, freed when seller's KAS output verified)
-//!   input[1]: buy order    (KAS, freed when buyer's Token B output verified)
-//!   input[2]: token unit   (Token B, provides tokens for buyer)
-//!   input[3]: fee UTXO     (optional, matcher wallet)
-//!
-//!   output[0]: seller KAS
-//!   output[1]: buyer Token B
-//!   output[2]: receipt (1 KAS)
-//!   output[3]: matcher change
-//!
-//! Compute mass: ~5,242 gram (3 in, 4 out) -- well below 500K limit.
+//! **Important**: 2-hop routes are NOT used directly for cross-pair batch
+//! matching. The cross-pair batch path in `matching::find_cross_pair_batch_groups`
+//! combines same-pair crossings from different tokens instead. 2-hop routes
+//! exist here solely as building blocks for 3-hop triangular arbitrage.
 //!
 //! # 3-hop (triangular) flow
 //!

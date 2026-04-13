@@ -555,74 +555,129 @@ pub struct CrossPairBatchGroup {
     pub total_surplus: u64,
 }
 
-/// Find cross-pair routes and group them into batch-eligible groups.
+/// Combine same-pair crossings from different tokens into multi-pair batch groups.
 ///
-/// Uses `routing::find_cross_pair_routes_with_stp` to discover routes across
-/// different token pairs, then selects non-conflicting routes and packages
-/// them into `CrossPairBatchGroup`s suitable for `plan_batch_match`.
+/// Algorithm:
+/// 1. Find all same-pair crossings via `find_all_crossing_pairs_with_stp`.
+/// 2. Filter out orders already claimed by the BATCH path (`spent_outpoints`).
+/// 3. Keep only full-fill pairs (partials handled by REMAINING path).
+/// 4. Group by token, pick the best (highest surplus) crossing per token.
+/// 5. Combine crossings from 2+ different tokens into one `CrossPairBatchGroup`.
 ///
-/// Each group contains 1+ non-conflicting cross-pair routes. The batch engine
-/// handles multi-token batches natively (one token_unit per unique buy token).
+/// Each crossing pair adds 1 sell + 1 buy to the TX. With `MAX_BATCH_GROUP_SIZE`
+/// as the per-group cap on crossing pairs, we can fit that many token pairs plus
+/// 1 wallet input. The batch engine's `token_input_map` routes each buy's `tii`
+/// to the correct sell (same `token_cov_id`), so multi-token batches work natively.
 ///
 /// # Arguments
 /// * `order_book` - The order book to scan.
-/// * `max_routes` - Maximum number of routes to discover.
-/// * `allow_self_trade` - If true, allow same-owner cross-pair matches.
+/// * `_max_routes` - Reserved for future use (capped by `MAX_BATCH_GROUP_SIZE`).
+/// * `allow_self_trade` - If true, allow same-owner matches (testing only).
+/// * `spent_outpoints` - Outpoints already claimed by BATCH or spent_tracker.
+///   Pass `None` when no prior phase has run (e.g. diagnostics, tests).
 ///
 /// # Returns
 /// A vec of `CrossPairBatchGroup`s, sorted by total surplus descending.
+/// Each group contains crossings from >= 2 different token pairs.
 pub fn find_cross_pair_batch_groups(
     order_book: &OrderBook,
-    max_routes: usize,
+    _max_routes: usize,
     allow_self_trade: bool,
+    spent_outpoints: Option<&std::collections::HashSet<String>>,
 ) -> Vec<CrossPairBatchGroup> {
-    let routes = routing::find_cross_pair_routes_with_stp(order_book, max_routes, allow_self_trade);
-    if routes.is_empty() {
+    use std::collections::{HashMap, HashSet};
+
+    let all_pairs = find_all_crossing_pairs_with_stp(order_book, allow_self_trade);
+    if all_pairs.is_empty() {
         return Vec::new();
     }
 
-    let selected = routing::select_non_conflicting_routes(&routes);
-    if selected.is_empty() {
+    let empty_set = HashSet::new();
+    let spent = spent_outpoints.unwrap_or(&empty_set);
+
+    // Step 1: Filter to full-fill pairs not already claimed.
+    // Step 2: Group by token, keeping best (highest surplus) per token.
+    // Each outpoint may appear in multiple CrossingPair candidates; we
+    // track used outpoints to avoid double-spending across tokens.
+    let mut best_by_token: HashMap<&str, &CrossingPair> = HashMap::new();
+
+    for p in &all_pairs {
+        if p.match_type != MatchType::Full {
+            continue;
+        }
+        let bk = p.buy.outpoint_key();
+        let sk = p.sell.outpoint_key();
+        if spent.contains(&bk) || spent.contains(&sk) {
+            continue;
+        }
+        let entry = best_by_token
+            .entry(&p.token_cov_id)
+            .or_insert(p);
+        if p.surplus > entry.surplus {
+            *entry = p;
+        }
+    }
+
+    // Need crossings from at least 2 different tokens to form a cross-pair group.
+    if best_by_token.len() < 2 {
         return Vec::new();
     }
 
-    // Package all non-conflicting routes into a single batch group.
-    // The batch engine supports multi-token batches, so we can include
-    // sells and buys from different token pairs in one atomic TX.
-    //
-    // Cap the group size to respect OpN index limits (max 16 inputs/outputs).
-    // Each route adds 1 sell + 1 buy = 2 inputs and 2 outputs, plus we need
-    // token_unit inputs (1 per unique buy token) + 1 wallet input.
-    // Conservative limit: 7 routes = 14 order inputs + up to 7 token units + 1 wallet.
-    // But OpN max is 16, so we cap at a safe number.
-    let max_group = MAX_BATCH_GROUP_SIZE; // 7 routes max per group
+    // Step 3: Sort candidates by surplus descending, then deduplicate outpoints.
+    let mut candidates: Vec<&CrossingPair> = best_by_token.values().copied().collect();
+    candidates.sort_by(|a, b| b.surplus.cmp(&a.surplus));
 
+    let mut used_outpoints = HashSet::new();
+    let mut deduped: Vec<&CrossingPair> = Vec::new();
+
+    for p in &candidates {
+        let bk = p.buy.outpoint_key();
+        let sk = p.sell.outpoint_key();
+        if used_outpoints.contains(&bk) || used_outpoints.contains(&sk) {
+            continue;
+        }
+        used_outpoints.insert(bk);
+        used_outpoints.insert(sk);
+        deduped.push(p);
+    }
+
+    // After dedup, still need >= 2 different tokens.
+    if deduped.len() < 2 {
+        return Vec::new();
+    }
+
+    // Step 4: Chunk into groups of MAX_BATCH_GROUP_SIZE crossing pairs.
+    // Each crossing pair = 1 sell + 1 buy = 2 order inputs + 2 outputs.
+    // TX layout: (2 * N_pairs) order inputs + 1 wallet = total inputs,
+    // (2 * N_pairs) outputs + receipt + change = total outputs.
+    // Both must be <= 16 (OpN limit), so N_pairs <= 7.
     let mut groups = Vec::new();
-    let mut i = 0;
 
-    while i < selected.len() {
-        let end = (i + max_group).min(selected.len());
-        let chunk = &selected[i..end];
+    for chunk in deduped.chunks(MAX_BATCH_GROUP_SIZE) {
+        // Each chunk must contain crossings from >= 2 tokens to be a cross-pair group.
+        let mut token_set = HashSet::new();
+        for p in chunk {
+            token_set.insert(&p.token_cov_id);
+        }
+        if token_set.len() < 2 {
+            continue;
+        }
 
         let mut sells = Vec::new();
         let mut buys = Vec::new();
         let mut total_surplus = 0u64;
 
-        for route in chunk {
-            sells.push(route.sell_leg.clone());
-            buys.push(route.buy_leg.clone());
-            total_surplus += route.surplus;
+        for p in chunk {
+            sells.push(p.sell.clone());
+            buys.push(p.buy.clone());
+            total_surplus = total_surplus.saturating_add(p.surplus);
         }
 
-        if !sells.is_empty() && !buys.is_empty() {
-            groups.push(CrossPairBatchGroup {
-                sells,
-                buys,
-                total_surplus,
-            });
-        }
-
-        i = end;
+        groups.push(CrossPairBatchGroup {
+            sells,
+            buys,
+            total_surplus,
+        });
     }
 
     // Sort by total surplus descending
@@ -1272,80 +1327,109 @@ mod tests {
         }
     }
 
-    /// Test: finds a single cross-pair batch group from two different token pairs.
+    /// Test: combines same-pair crossings from two different tokens into one group.
     #[test]
     fn test_cross_pair_batch_groups_basic() {
         let mut ob = OrderBook::new();
-        // Sell Token A at price 1/2 -> expects 10M KAS
+        // Token A: crossing pair (sell + buy same token)
+        // Sell 20M Token A at price 1/2 (expects 10M KAS)
         ob.add_sell_order(make_sell_cp('c', 20_000_000, 1, 2, TOKEN_A_CP));
-        // Buy Token B with 15M KAS at price 1/3 -> expects 5M Token B
-        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 3, TOKEN_B_CP));
+        // Buy Token A with 15M KAS at price 1/1 (expects 15M tokens)
+        // Crossing: buyer pays 15M KAS, seller expects 10M -> surplus = 5M
+        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 1, TOKEN_A_CP));
 
-        let groups = find_cross_pair_batch_groups(&ob, 100, false);
+        // Token B: crossing pair (sell + buy same token)
+        // Sell 10M Token B at price 1/3 (expects ~3.3M KAS)
+        ob.add_sell_order(make_sell_cp('f', 10_000_000, 1, 3, TOKEN_B_CP));
+        // Buy Token B with 5_000_000 KAS at price 1/1 (expects 5M tokens)
+        // Crossing: buyer pays 5M KAS, seller expects ~3.3M -> surplus ~ 1.7M
+        ob.add_buy_order(make_buy_cp('e', 5_000_000, 1, 1, TOKEN_B_CP));
+
+        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
 
         assert_eq!(groups.len(), 1, "Should find 1 cross-pair batch group");
-        assert_eq!(groups[0].sells.len(), 1);
-        assert_eq!(groups[0].buys.len(), 1);
+        assert_eq!(groups[0].sells.len(), 2, "Group should have 2 sells (one per token)");
+        assert_eq!(groups[0].buys.len(), 2, "Group should have 2 buys (one per token)");
         assert!(groups[0].total_surplus > 0);
     }
 
-    /// Test: no crossing prices across pairs -> empty result.
+    /// Test: no same-pair crossings -> empty (sell A + buy B is not a valid crossing).
     #[test]
     fn test_cross_pair_batch_groups_no_route() {
         let mut ob = OrderBook::new();
-        // Sell Token A at very high price (3 KAS per token) -> expects 60M KAS
-        ob.add_sell_order(make_sell_cp('c', 20_000_000, 3, 1, TOKEN_A_CP));
-        // Buy Token B with only 5M KAS
-        ob.add_buy_order(make_buy_cp('a', 5_000_000, 1, 3, TOKEN_B_CP));
-
-        let groups = find_cross_pair_batch_groups(&ob, 100, false);
-        assert!(groups.is_empty(), "No crossing prices should yield no groups");
-    }
-
-    /// Test: same-pair matches are excluded from cross-pair batch groups.
-    #[test]
-    fn test_cross_pair_batch_groups_skips_same_pair() {
-        let mut ob = OrderBook::new();
+        // Only a sell in Token A and a buy in Token B -- no same-pair crossing
         ob.add_sell_order(make_sell_cp('c', 20_000_000, 1, 2, TOKEN_A_CP));
-        ob.add_buy_order(make_buy_cp('a', 20_000_000, 1, 3, TOKEN_A_CP));
+        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 3, TOKEN_B_CP));
 
-        let groups = find_cross_pair_batch_groups(&ob, 100, false);
-        assert!(groups.is_empty(), "Same-pair should not appear in cross-pair groups");
+        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
+        assert!(groups.is_empty(), "No same-pair crossings should yield no groups");
     }
 
-    /// Test: multiple non-conflicting routes grouped together.
+    /// Test: single token with a crossing pair -> not a cross-pair group (needs >= 2 tokens).
     #[test]
-    fn test_cross_pair_batch_groups_multiple_routes() {
+    fn test_cross_pair_batch_groups_skips_single_token() {
         let mut ob = OrderBook::new();
-        // Route 1: sell Token A -> buy Token B
-        // sell 10M Token A at price 1/2 -> expects 5M KAS
-        // buy Token B with 20M KAS at price 1/3 -> expects ~6.67M tokens
-        // surplus = 20M - 5M = 15M
+        // Only Token A has a crossing pair
+        ob.add_sell_order(make_sell_cp('c', 20_000_000, 1, 2, TOKEN_A_CP));
+        ob.add_buy_order(make_buy_cp('a', 20_000_000, 1, 1, TOKEN_A_CP));
+
+        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
+        assert!(groups.is_empty(), "Single-token crossing is not a cross-pair group");
+    }
+
+    /// Test: crossings from 3 different tokens combined into one group.
+    #[test]
+    fn test_cross_pair_batch_groups_multiple_tokens() {
+        let mut ob = OrderBook::new();
+        // Token A crossing: surplus = 15M - 5M = 10M
         ob.add_sell_order(make_sell_cp('c', 10_000_000, 1, 2, TOKEN_A_CP));
-        ob.add_buy_order(make_buy_cp('a', 20_000_000, 1, 3, TOKEN_B_CP));
-        // Route 2: sell Token B -> buy Token C (different sell, different buy)
-        // sell 15M Token B at price 1/3 -> expects 5M KAS
-        // buy Token C with 15M KAS at price 1/2 -> expects 7.5M tokens (> MIN_UTXO_VALUE)
-        // surplus = 15M - 5M = 10M
+        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 1, TOKEN_A_CP));
+        // Token B crossing: surplus = 15M - 5M = 10M
         ob.add_sell_order(make_sell_cp('f', 15_000_000, 1, 3, TOKEN_B_CP));
-        ob.add_buy_order(make_buy_cp('e', 15_000_000, 1, 2, TOKEN_C_CP));
+        ob.add_buy_order(make_buy_cp('e', 15_000_000, 1, 1, TOKEN_B_CP));
+        // Token C crossing: surplus = 20M - 10M = 10M
+        ob.add_sell_order(make_sell_cp('h', 20_000_000, 1, 2, TOKEN_C_CP));
+        ob.add_buy_order(make_buy_cp('g', 20_000_000, 1, 1, TOKEN_C_CP));
 
-        let groups = find_cross_pair_batch_groups(&ob, 100, false);
+        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
 
-        // Both routes are non-conflicting, so they should be in one group
-        assert!(!groups.is_empty(), "Should find at least 1 group");
-        let total_sells: usize = groups.iter().map(|g| g.sells.len()).sum();
-        let total_buys: usize = groups.iter().map(|g| g.buys.len()).sum();
-        assert!(total_sells >= 2, "Should have at least 2 sell legs across groups");
-        assert!(total_buys >= 2, "Should have at least 2 buy legs across groups");
+        assert_eq!(groups.len(), 1, "All 3 token crossings fit in one group");
+        assert_eq!(groups[0].sells.len(), 3);
+        assert_eq!(groups[0].buys.len(), 3);
+        assert!(groups[0].total_surplus > 0);
     }
 
     /// Test: empty order book returns no groups.
     #[test]
     fn test_cross_pair_batch_groups_empty() {
         let ob = OrderBook::new();
-        let groups = find_cross_pair_batch_groups(&ob, 100, false);
+        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
         assert!(groups.is_empty());
+    }
+
+    /// Test: spent_outpoints filters out already-claimed orders.
+    #[test]
+    fn test_cross_pair_batch_groups_spent_filter() {
+        use std::collections::HashSet;
+        let mut ob = OrderBook::new();
+        // Token A crossing
+        let sell_a = make_sell_cp('c', 20_000_000, 1, 2, TOKEN_A_CP);
+        let sell_a_key = sell_a.outpoint_key();
+        ob.add_sell_order(sell_a);
+        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 1, TOKEN_A_CP));
+        // Token B crossing
+        ob.add_sell_order(make_sell_cp('f', 10_000_000, 1, 3, TOKEN_B_CP));
+        ob.add_buy_order(make_buy_cp('e', 5_000_000, 1, 1, TOKEN_B_CP));
+
+        // Without spent filter: should find 1 group
+        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
+        assert_eq!(groups.len(), 1);
+
+        // Mark Token A sell as spent: only Token B crossing remains -> not enough for cross-pair
+        let mut spent = HashSet::new();
+        spent.insert(sell_a_key);
+        let groups = find_cross_pair_batch_groups(&ob, 100, false, Some(&spent));
+        assert!(groups.is_empty(), "With Token A sell spent, only 1 token crossing remains");
     }
 
     // Triangular batch group tests
@@ -1668,7 +1752,7 @@ mod tests {
         assert!(pairs_after.is_empty(), "No match after buy order removed");
     }
 
-    /// E2E: Cross-pair batch group creation from two different token pairs.
+    /// E2E: Cross-pair batch group combines same-pair crossings from two tokens.
     #[test]
     fn e2e_cross_pair_batch_group() {
         let mut ob = OrderBook::new();
@@ -1676,25 +1760,30 @@ mod tests {
         let token_b = "0b".repeat(32);
         let owner_a = "aa".repeat(32);
         let owner_b = "bb".repeat(32);
+        let owner_c = "cc".repeat(32);
+        let owner_d = "dd".repeat(32);
 
-        // Sell Token A for KAS (ask in pair A)
+        // Token A: same-pair crossing (sell A + buy A)
         ob.add_sell_order(make_sell_e2e(
             &"s".repeat(64), 0, 20_000_000, 1, 2, &token_a, &owner_a,
         ));
-        // Buy Token B with KAS (bid in pair B)
         ob.add_buy_order(make_buy_e2e(
-            &"b".repeat(64), 0, 20_000_000, 1, 2, &token_b, &owner_b,
+            &"b".repeat(64), 0, 20_000_000, 1, 1, &token_a, &owner_b,
+        ));
+        // Token B: same-pair crossing (sell B + buy B)
+        ob.add_sell_order(make_sell_e2e(
+            &"t".repeat(64), 0, 15_000_000, 1, 3, &token_b, &owner_c,
+        ));
+        ob.add_buy_order(make_buy_e2e(
+            &"u".repeat(64), 0, 10_000_000, 1, 1, &token_b, &owner_d,
         ));
 
-        let groups = find_cross_pair_batch_groups(&ob, 10, true);
-        // Cross-pair route: sell A -> KAS -> buy B
-        // sell_kas_output = 20M * 1/2 = 10M
-        // buy_kas_input = 20M
-        // surplus = 20M - 10M = 10M (covers receipt + fee easily)
+        let groups = find_cross_pair_batch_groups(&ob, 10, true, None);
+        // Two same-pair crossings from different tokens -> 1 cross-pair group
         assert!(!groups.is_empty(), "Should find cross-pair batch group");
         let group = &groups[0];
-        assert_eq!(group.sells.len(), 1);
-        assert_eq!(group.buys.len(), 1);
+        assert_eq!(group.sells.len(), 2, "Should have sell from each token");
+        assert_eq!(group.buys.len(), 2, "Should have buy from each token");
         assert!(group.total_surplus > 0);
     }
 

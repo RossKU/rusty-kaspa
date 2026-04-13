@@ -158,7 +158,6 @@ pub async fn deploy_ifd(
     wallet_path: &Path,
     node_url: &str,
     _network: Network,
-    _matcher_url: &str,
     // Order A params
     buy_token: &str,
     buy_price_num: u64,

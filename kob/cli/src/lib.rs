@@ -1033,9 +1033,8 @@ pub enum DeployCommands {
 
     /// Deploy an IFD order (If Done: buy entry, auto-deploy sell exit on fill).
     ///
-    /// Registers an IFD rule with the Matcher, then deploys the entry (buy) order.
-    /// When the buy fills, the Matcher auto-deploys the sell order as an extra
-    /// output in the fill TX.
+    /// Payload-based: both order RSs are embedded in the deploy TX.
+    /// No Matcher API needed. Fully trustless.
     Ifd {
         /// Token covenant ID (hex, 64 chars).
         #[arg(long)]
@@ -1073,9 +1072,9 @@ pub enum DeployCommands {
         #[arg(long, default_value = "0")]
         sell_expiry: u64,
 
-        /// Matcher API URL.
+        /// Matcher API URL (unused, kept for backwards compatibility).
         #[arg(long)]
-        matcher_url: String,
+        matcher_url: Option<String>,
     },
 
     /// Deploy an IFO order (If Done + OCO: buy entry, auto-deploy TP+SL on fill).
@@ -1915,14 +1914,13 @@ pub async fn dispatch(
                 sell_price_den,
                 sell_min_fill,
                 sell_expiry,
-                matcher_url,
+                matcher_url: _,
             } => {
                 let token = token::resolve_token(&token, None)?;
                 ifd::deploy_ifd(
                     wallet_path,
                     node,
                     network,
-                    &matcher_url,
                     &token,
                     buy_price_num,
                     buy_price_den,

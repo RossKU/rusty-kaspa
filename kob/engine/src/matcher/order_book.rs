@@ -161,6 +161,10 @@ pub struct BookOrder {
     /// Defaults to u64::MAX (unlimited) for backward compatibility.
     #[serde(default = "default_max_matcher_fee")]
     pub max_matcher_fee: u64,
+    /// IFD: order B's redeemScript hex. When set, the fill TX must include
+    /// order B as payload so the scanner discovers it on-chain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ifd_order_b_rs_hex: Option<String>,
 }
 
 fn default_max_matcher_fee() -> u64 {
@@ -797,7 +801,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -983,7 +987,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         ob.add_buy_order(buy);
         let buy_key = format!("{}:1", "b".repeat(64));
@@ -1090,7 +1094,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1288,7 +1292,7 @@ mod tests {
             post_only,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1311,7 +1315,7 @@ mod tests {
             post_only,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1528,7 +1532,7 @@ mod tests {
             post_only: false,
             expiry_daa: expiry,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 

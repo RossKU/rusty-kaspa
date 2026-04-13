@@ -275,8 +275,9 @@ fn compute_partial_fill_match(
             // surplus=0 is valid when mmfee=0 (matcher pays miner fee from fee UTXOs).
             if full_seller_kas >= MIN_UTXO_VALUE
                 && full_buyer_tokens >= MIN_UTXO_VALUE
+                && sell_tokens >= expected_tokens
             {
-                return None; // Full fill is better
+                return None; // Full fill is better (buyer's demand fully met)
             }
         }
     }
@@ -737,7 +738,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -760,7 +761,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -955,7 +956,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         // sell with price_den=0 (would divide by 0 in expected_kas)
         let bad_sell = BookOrder {
@@ -976,7 +977,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         ob.add_buy_order(bad_buy);
         ob.add_sell_order(bad_sell);
@@ -1175,7 +1176,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
             },
             sell: BookOrder {
                 tx_id: sell_tx,
@@ -1195,7 +1196,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
             },
             seller_kas: 5_000_000,
             buyer_tokens: 5_000_000,
@@ -1338,7 +1339,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1367,7 +1368,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1472,7 +1473,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1495,7 +1496,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1554,7 +1555,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1585,7 +1586,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -1943,7 +1944,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         let sell2 = BookOrder {
             tx_id: "c".repeat(64),
@@ -1963,7 +1964,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         // expected_tokens = 50M * 1 / 100M = 0 -> Case 1 won't trigger (0 <= 5M)
         // expected_kas = 5M * 1 / 100M = 0 -> Case 2 won't trigger (0 <= 50M)
@@ -1999,7 +2000,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         let sell = BookOrder {
             tx_id: "c".repeat(64),
@@ -2019,7 +2020,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         // expected_tokens = 5M * 1 / 1 = 5M
         // expected_kas = 500M * 1 / 100M = 5

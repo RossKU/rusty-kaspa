@@ -13,7 +13,7 @@ use crate::cancel::kaspa_address_encode;
 use crate::node::NodeClient;
 use crate::scan::extract_p2sh_hash;
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use std::path::Path;
 use tracing::info;
 
@@ -109,7 +109,7 @@ pub async fn run(
     network: Network,
     json_output: bool,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
 
     let network_prefix = match network {
         Network::Mainnet => "kaspa",
@@ -144,7 +144,7 @@ pub async fn run(
     info!(address = %wallet.address, "listing my orders from cache");
 
     // Compute owner hash from wallet to filter orders
-    let pubkey = wallet.public_key_bytes()?;
+    let pubkey = wallet.pubkey;
     let owner_hash = hex::encode(kob_core::p2sh::blake2b_256(&pubkey));
 
     // Collect all cached orders for this owner

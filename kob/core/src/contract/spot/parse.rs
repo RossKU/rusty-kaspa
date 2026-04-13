@@ -37,6 +37,8 @@ pub struct ParsedOrder {
     /// True if the redeemScript contains OpZkPrecompile (0xa6).
     #[allow(dead_code)]
     pub requires_zk: bool,
+    /// IFD: order B's redeemScript bytes (from IFD payload flag).
+    pub ifd_order_b_rs: Option<Vec<u8>>,
 }
 
 /// Buy state size: 145B.
@@ -145,6 +147,7 @@ fn parse_buy_state(rs: &[u8]) -> Option<ParsedOrder> {
         redeem_script: rs.to_vec(),
         post_only: false,
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
+        ifd_order_b_rs: None,
     })
 }
 
@@ -208,6 +211,7 @@ fn parse_sell_state(rs: &[u8]) -> Option<ParsedOrder> {
         redeem_script: rs.to_vec(),
         post_only: false,
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
+        ifd_order_b_rs: None,
     })
 }
 

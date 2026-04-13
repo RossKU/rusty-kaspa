@@ -22,7 +22,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_miner_fee, calc_mass_with_sigscripts};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
 
@@ -243,7 +243,7 @@ pub async fn submit_match(
     sell: &DetectedOrder,
     outputs: &MatchOutputs,
     pair_id_hex: &str,
-    _wallet: &WalletFile,
+    _wallet: &WalletContext,
     privkey: &[u8; 32],
     fee_utxo: &RpcUtxo,
 ) -> anyhow::Result<SubmitResult> {
@@ -291,7 +291,7 @@ pub async fn submit_match(
     // Use FEE_BUDGET as initial estimate; will be refined after signing.
     let est_fee = FEE_BUDGET;
     let raw_change = new_surplus.saturating_sub(receipt_value + est_fee);
-    let (mut final_seller_kas, mut matcher_change) = if raw_change >= MIN_UTXO_VALUE {
+    let (mut final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
         (seller_kas_base, raw_change)
     } else {
         (seller_kas_base + raw_change, 0u64)
@@ -366,7 +366,7 @@ pub async fn submit_match(
         tx.outputs.pop();
     }
     final_seller_kas = adj_seller;
-    matcher_change = adj_mc;
+    let _ = adj_mc; // matcher_change already applied to tx.outputs
 
     // Sign fee input (index 2)
     let sighash = compute_sighash(&tx, 2)?;
@@ -395,7 +395,7 @@ pub async fn submit_match(
             tx.outputs.pop();
         }
         final_seller_kas = adj_sk2;
-        matcher_change = adj_mc2;
+        let _ = adj_mc2;
         // Re-sign fee input
         let sh = compute_sighash(&tx, 2)?;
         let sf = signing::schnorr_sign(privkey, &sh)?;
@@ -505,7 +505,7 @@ pub async fn submit_partial_buy_fill(
              Add more funding UTXOs or reduce the fill amount.", total_in, needed);
     }
     let raw_change = total_in - fixed_outputs - expected_tokens - FEE_BUDGET;
-    let (mut final_buyer_tokens, mut matcher_change) = if raw_change >= MIN_UTXO_VALUE {
+    let (mut final_buyer_tokens, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
         (expected_tokens, raw_change)
     } else {
         (expected_tokens + raw_change, 0u64)
@@ -577,7 +577,7 @@ pub async fn submit_partial_buy_fill(
             tx.outputs.pop();
         }
         final_buyer_tokens = adj_bt;
-        matcher_change = adj_mc;
+        let _ = adj_mc;
     }
 
     // Sign input 1 (token UTXO)
@@ -611,7 +611,7 @@ pub async fn submit_partial_buy_fill(
             tx.outputs.pop();
         }
         final_buyer_tokens = adj_bt2;
-        matcher_change = adj_mc2;
+        let _ = adj_mc2;
         // Re-sign inputs 1 and 2
         let sh1 = compute_sighash(&tx, 1)?;
         let sf1 = signing::schnorr_sign(privkey, &sh1)?;
@@ -699,7 +699,7 @@ pub async fn submit_partial_sell_fill(
              Add more funding UTXOs or reduce the fill amount.", total_in, needed);
     }
     let raw_change = total_in - needed;
-    let (mut final_seller_kas, mut matcher_change) = if raw_change >= MIN_UTXO_VALUE {
+    let (mut final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
         (seller_kas, raw_change)
     } else {
         (seller_kas + raw_change, 0u64)
@@ -760,7 +760,7 @@ pub async fn submit_partial_sell_fill(
             tx.outputs.pop();
         }
         final_seller_kas = adj_sk;
-        matcher_change = adj_mc;
+        let _ = adj_mc;
     }
 
     // Sign input 1 (fee UTXO)
@@ -789,7 +789,7 @@ pub async fn submit_partial_sell_fill(
             tx.outputs.pop();
         }
         final_seller_kas = adj_sk2;
-        matcher_change = adj_mc2;
+        let _ = adj_mc2;
         // Re-sign fee input
         let sh = compute_sighash(&tx, 1)?;
         let sf = signing::schnorr_sign(privkey, &sh)?;
@@ -925,7 +925,7 @@ pub async fn submit_cross_pair_match(
     sell: &DetectedOrder,
     buy: &DetectedOrder,
     outputs: &CrossPairOutputs,
-    _wallet: &WalletFile,
+    _wallet: &WalletContext,
     privkey: &[u8; 32],
     fee_utxo: &RpcUtxo,
     token_b_utxo: &RpcUtxo,
@@ -1194,9 +1194,9 @@ pub async fn run(
     };
     config.validate()?;
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     println!("KOB Auto-Match");
     println!("===============");

@@ -175,7 +175,8 @@ pub fn create_book_order(
         post_only: false,
         expiry_daa: None,
         is_freezable: false,
-        max_matcher_fee: 0,
+        max_matcher_fee: 0, ifd_order_b_rs_hex: None,
+       
     }
 }
 

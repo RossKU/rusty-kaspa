@@ -24,13 +24,8 @@ use crate::signing::get_public_key;
 ///
 /// # Example
 /// ```
-/// # use kob_core::wallet::{WalletFile, SecureKey};
-/// let wallet = WalletFile {
-///     private_key: "ae4ef0f30537c81653c2213b4b1ad84053fec52c547cb590277a7015850359a4".into(),
-///     public_key: "3509e6f574e705aa233b7f9713e979bb27f463116d6a754369c19479d3fe6583".into(),
-///     address: "kaspatest:qxapemh4t8qp4rf3eek88m98u0a2y78xzes52jrjd8gclj5c0l9svhkkwmwc5".into(),
-/// };
-/// let key = SecureKey::from_wallet(&wallet).unwrap();
+/// # use kob_core::wallet::SecureKey;
+/// let key = SecureKey::from_bytes([1u8; 32]);
 /// assert_eq!(key.as_bytes().len(), 32);
 /// // key is zeroed when dropped
 /// ```
@@ -38,8 +33,8 @@ use crate::signing::get_public_key;
 pub struct SecureKey([u8; 32]);
 
 impl SecureKey {
-    /// Create a `SecureKey` from a `WalletFile`'s hex-encoded private key.
-    pub fn from_wallet(wallet: &WalletFile) -> crate::Result<Self> {
+    /// Create a `SecureKey` from a `LegacyWalletJson`'s hex-encoded private key.
+    pub fn from_legacy(wallet: &LegacyWalletJson) -> crate::Result<Self> {
         let bytes = hex::decode(&wallet.private_key)?;
         let mut key = [0u8; 32];
         if bytes.len() != 32 {
@@ -77,20 +72,145 @@ impl std::fmt::Debug for SecureKey {
     }
 }
 
-// WalletFile (legacy single-key, plaintext JSON)
+// ────────────────────────────────────────────────────────────────
+// WalletContext — unified wallet loader (production API)
+// ────────────────────────────────────────────────────────────────
 
-/// Wallet file structure (matches wallet.json from test scripts).
-#[deprecated(note = "use HdWallet")]
+/// Unified wallet context: the three values every CLI command needs.
+///
+/// Loads any supported wallet format (V2 HD, V1 encrypted, plaintext)
+/// and returns the private key, public key, and address for a single
+/// signing identity.
+pub struct WalletContext {
+    privkey: SecureKey,
+    pub pubkey: [u8; 32],
+    pub address: String,
+}
+
+impl WalletContext {
+    /// Load wallet from file, auto-detecting format.
+    ///
+    /// - V2 HD wallets: decrypts seed, derives key at `m/972'/111'/0'/0'`.
+    ///   Pass `KOB_PASSPHRASE` env var for the passphrase.
+    /// - V1 encrypted: decrypts with `KOB_PASSPHRASE` env var.
+    /// - V0 plaintext: loads directly (warns on insecure permissions).
+    pub fn load(path: &Path) -> crate::Result<Self> {
+        Self::load_full(path, None, None)
+    }
+
+    /// Load with explicit passphrase and HD account index.
+    pub fn load_full(
+        path: &Path,
+        passphrase: Option<&str>,
+        account_index: Option<u32>,
+    ) -> crate::Result<Self> {
+        let env_pass = std::env::var("KOB_PASSPHRASE").ok();
+        let pass = passphrase.or(env_pass.as_deref());
+
+        match WalletFileV2::detect_version(path) {
+            Some(2) => {
+                let pass = pass.ok_or_else(|| {
+                    crate::KobError::Wallet(
+                        "HD wallet requires a passphrase (set KOB_PASSPHRASE or pass --passphrase)"
+                            .into(),
+                    )
+                })?;
+                let v2 = WalletFileV2::load(path)?;
+                let hd = v2.decrypt_hd(pass)?;
+                let account = account_index.unwrap_or(0);
+                let key = hd.derive_key(account, 0)?;
+                let pubkey = get_public_key(key.as_bytes())?;
+                let address = pubkey_to_address(
+                    &pubkey,
+                    Self::detect_network_from_accounts(&v2.accounts),
+                );
+                Ok(Self {
+                    privkey: key,
+                    pubkey,
+                    address,
+                })
+            }
+            Some(1) => {
+                // V1 encrypted (legacy EncryptedWalletFile)
+                let pass = pass.ok_or_else(|| {
+                    crate::KobError::Wallet(
+                        "encrypted wallet requires a passphrase (set KOB_PASSPHRASE)".into(),
+                    )
+                })?;
+                let legacy = LegacyWalletJson::load_auto(path, Some(pass))?;
+                Self::from_legacy(legacy)
+            }
+            _ => {
+                // V0 plaintext, unknown, or future versions — try plaintext parse
+                if let Some(pass) = pass {
+                    // Might be encrypted without version field
+                    match LegacyWalletJson::load_auto(path, Some(pass)) {
+                        Ok(legacy) => return Self::from_legacy(legacy),
+                        Err(_) => {} // fall through to plaintext
+                    }
+                }
+                let legacy = LegacyWalletJson::load(path)?;
+                Self::from_legacy(legacy)
+            }
+        }
+    }
+
+    /// Get a reference to the private key.
+    pub fn privkey(&self) -> &SecureKey {
+        &self.privkey
+    }
+
+    /// Get private key bytes (for signing functions that take `&[u8; 32]`).
+    pub fn privkey_bytes(&self) -> &[u8; 32] {
+        self.privkey.as_bytes()
+    }
+
+    /// Get public key as hex string (for display).
+    pub fn pubkey_hex(&self) -> String {
+        hex::encode(self.pubkey)
+    }
+
+    fn from_legacy(legacy: LegacyWalletJson) -> crate::Result<Self> {
+        let privkey_bytes = hex::decode(&legacy.private_key)?;
+        if privkey_bytes.len() != 32 {
+            return Err(crate::KobError::Wallet("private key must be 32 bytes".into()));
+        }
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&privkey_bytes);
+        let pubkey = get_public_key(&key)?;
+        let address = legacy.address.clone();
+        Ok(Self {
+            privkey: SecureKey::from_bytes(key),
+            pubkey,
+            address,
+        })
+    }
+
+    fn detect_network_from_accounts(accounts: &[AccountEntry]) -> crate::types::Network {
+        if let Some(acc) = accounts.first() {
+            if acc.address.starts_with("kaspa:") {
+                return crate::types::Network::Mainnet;
+            }
+        }
+        crate::types::Network::Testnet
+    }
+}
+
+// ────────────────────────────────────────────────────────────────
+// LegacyWalletJson — internal deserialization target
+// ────────────────────────────────────────────────────────────────
+
+/// Legacy wallet file structure (matches wallet.json from test scripts).
+/// For wallet creation/migration only — use `WalletContext` for loading.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WalletFile {
+pub struct LegacyWalletJson {
     pub private_key: String,
     pub public_key: String,
     pub address: String,
 }
 
-#[allow(deprecated)]
-impl WalletFile {
+impl LegacyWalletJson {
     /// Load wallet from a JSON file.
     ///
     /// Supports both plaintext and encrypted formats. If the file contains
@@ -172,7 +292,7 @@ impl WalletFile {
 
     /// Get private key as a `SecureKey` (preferred over raw bytes).
     pub fn secure_key(&self) -> crate::Result<SecureKey> {
-        SecureKey::from_wallet(self)
+        SecureKey::from_legacy(self)
     }
 
     /// Get private key bytes (32 bytes).
@@ -194,11 +314,8 @@ impl WalletFile {
     }
 }
 
-#[allow(deprecated)]
-impl Drop for WalletFile {
+impl Drop for LegacyWalletJson {
     fn drop(&mut self) {
-        // Zero the private key string on drop
-        // SAFETY: We replace the string contents with zeros
         self.private_key.zeroize();
     }
 }
@@ -258,19 +375,8 @@ fn derive_key(passphrase: &str, salt: &[u8]) -> crate::Result<[u8; 32]> {
 ///
 /// # Example
 /// ```no_run
-/// # use kob_core::wallet::WalletFile;
-/// # use kob_core::wallet::encrypt_wallet;
-/// let wallet = WalletFile {
-///     private_key: "ae4ef0f3...".into(),
-///     public_key: "3509e6f5...".into(),
-///     address: "kaspatest:q...".into(),
-/// };
-/// let encrypted = encrypt_wallet(&wallet, "my-strong-passphrase").unwrap();
-/// // Write encrypted to file: serde_json::to_string_pretty(&encrypted)
-/// ```
-#[allow(deprecated)]
 pub fn encrypt_wallet(
-    wallet: &WalletFile,
+    wallet: &LegacyWalletJson,
     passphrase: &str,
 ) -> crate::Result<EncryptedWalletFile> {
     use rand::RngCore;
@@ -320,7 +426,7 @@ pub fn encrypt_wallet(
 pub fn decrypt_wallet(
     encrypted: &EncryptedWalletFile,
     passphrase: &str,
-) -> crate::Result<WalletFile> {
+) -> crate::Result<LegacyWalletJson> {
     use base64::Engine;
 
     // Decode salt, nonce, ciphertext
@@ -367,7 +473,7 @@ pub fn decrypt_wallet(
     // Parse the decrypted JSON
     let mut plaintext_str = String::from_utf8(plaintext)
         .map_err(|e| crate::KobError::Wallet(format!("decrypted data is not UTF-8: {}", e)))?;
-    let wallet: WalletFile = serde_json::from_str(&plaintext_str)?;
+    let wallet: LegacyWalletJson = serde_json::from_str(&plaintext_str)?;
     plaintext_str.zeroize();
 
     Ok(wallet)

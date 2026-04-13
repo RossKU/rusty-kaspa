@@ -7,7 +7,7 @@
 
 use crate::node::NodeClient;
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use std::path::Path;
 use tracing::info;
 
@@ -17,7 +17,7 @@ pub async fn run(
     network: Network,
     token_filter: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
 
     println!("Active Orders");
     println!("==============");

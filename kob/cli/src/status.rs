@@ -58,7 +58,7 @@ pub async fn run(wallet_path: &Path, node_url: &str, _network: Network) -> anyho
     }
 
     // Try loading the wallet (plaintext only for status; encrypted would need passphrase)
-    let wallet_result = kob_core::wallet::WalletFile::load(wallet_path);
+    let wallet_result = kob_core::wallet::WalletContext::load(wallet_path);
 
     match wallet_result {
         Ok(wallet) => {

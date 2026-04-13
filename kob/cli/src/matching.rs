@@ -32,7 +32,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, MAX_TX_MASS};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
 use std::path::Path;
@@ -67,12 +67,12 @@ pub async fn run(
     buy_expiry: u64,
     sell_expiry: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let buy_outpoint = Outpoint::parse(buy_outpoint_str)?;
     let sell_outpoint = Outpoint::parse(sell_outpoint_str)?;
     let _fee_outpoint = fee_input_str.map(Outpoint::parse).transpose()?;
-    let _pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let _pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Parse buyer/seller public keys and build their P2PK SPKs
     let buyer_pk_bytes = hex::decode(buyer_pubkey_hex)?;
@@ -595,13 +595,13 @@ pub async fn run_cross_pair(
              Redeploy the order with --version 13 or higher.", version);
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let buy_outpoint = Outpoint::parse(buy_outpoint_str)?;
     let sell_outpoint = Outpoint::parse(sell_outpoint_str)?;
     let token_outpoint = Outpoint::parse(token_outpoint_str)?;
     let _fee_outpoint = fee_input_str.map(Outpoint::parse).transpose()?;
-    let _pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let _pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Parse buyer/seller public keys and build their P2PK SPKs
     let buyer_pk_bytes = hex::decode(buyer_pubkey_hex)?;

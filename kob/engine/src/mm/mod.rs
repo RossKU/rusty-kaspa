@@ -563,7 +563,7 @@ pub async fn run(
             }
         };
 
-        let wallet = match kob_core::wallet::WalletFile::load(wallet_path) {
+        let wallet = match kob_core::wallet::WalletContext::load(wallet_path) {
             Ok(w) => w,
             Err(e) => {
                 warn!("[MM] Wallet load failed: {}. Retrying next cycle.", e);
@@ -835,14 +835,14 @@ async fn deploy_order(
     use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
     use kob_core::sighash::compute_sighash;
     use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
-    use kob_core::wallet::WalletFile;
+    use kob_core::wallet::WalletContext;
     use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
     use kob_core::MIN_UTXO_VALUE;
     use zeroize::Zeroize;
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let mut privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let mut privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
     let spk_hash = compute_p2pk_spk_hash(&pubkey);
 
@@ -979,14 +979,14 @@ async fn cancel_order(
     use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
     use kob_core::sighash::compute_sighash;
     use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
-    use kob_core::wallet::WalletFile;
+    use kob_core::wallet::WalletContext;
     use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
     use kob_core::MIN_UTXO_VALUE;
     use zeroize::Zeroize;
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let mut privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let mut privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
     let spk_hash = compute_p2pk_spk_hash(&pubkey);
 

@@ -38,7 +38,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
@@ -298,9 +298,9 @@ async fn deploy(
     let mut tcid = [0u8; 32];
     tcid.copy_from_slice(&token_bytes);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
     let owner_spk = build_owner_spk(&pubkey);
 
@@ -345,7 +345,7 @@ async fn deploy(
         sell_amount,
         sell_amount as f64 / 1e8
     );
-    println!("Owner:       {}", wallet.public_key);
+    println!("Owner:       {}", wallet.pubkey_hex());
     println!("Owner Hash:  {}", hex::encode(owner_hash));
     println!();
     println!("Buy RS:      {} bytes", buy_rs.len());
@@ -580,7 +580,7 @@ async fn fill(
         anyhow::bail!("Invalid --fill-role '{}'. Use 'buy' or 'sell' to specify which side of the OCO order to fill.", fill_role);
     }
 
-    let _wallet = WalletFile::load(wallet_path)?;
+    let _wallet = WalletContext::load(wallet_path)?;
 
     let buy_p2sh = build_p2sh(&buy_rs);
     let sell_p2sh = build_p2sh(&sell_rs);
@@ -622,7 +622,7 @@ async fn fill(
     println!("Buy Value:     {} sompi", buy_value);
     println!("Sell Value:    {} sompi", sell_value);
 
-    let total_in = buy_value + sell_value;
+    let _total_in = buy_value + sell_value;
     // Fill TX: two covenant inputs (sigOpCount=0 each), no separate fee input needed
     // output[0] = filler gets filling-leg value minus fee
     // output[1] = owner gets partner-leg value (cbp refund)
@@ -708,7 +708,7 @@ async fn fill(
 
     // Get the wallet SPK for outputs (use wallet address for now)
     let wallet_spk_bytes = {
-        let pubkey = _wallet.public_key_bytes()?;
+        let pubkey = _wallet.pubkey;
         let mut spk = Vec::with_capacity(34);
         spk.push(0x20);
         spk.extend_from_slice(&pubkey);
@@ -808,9 +808,9 @@ async fn cancel(
     }
     let oco_ver = buy_ver;
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let buy_p2sh = build_p2sh(&buy_rs);
     let sell_p2sh = build_p2sh(&sell_rs);
@@ -819,7 +819,7 @@ async fn cancel(
     println!("=======================");
     println!("Buy Outpoint:  {}", buy_outpoint);
     println!("Sell Outpoint: {}", sell_outpoint);
-    println!("Owner:         {}", wallet.public_key);
+    println!("Owner:         {}", wallet.pubkey_hex());
     println!();
 
     info!(

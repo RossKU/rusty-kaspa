@@ -43,7 +43,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
@@ -330,9 +330,9 @@ async fn deploy_call(
     holder_pk.copy_from_slice(&holder_bytes);
 
     // Load wallet
-    let wallet = WalletFile::load(wallet_path)?;
-    let wallet_pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let wallet_pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Writer PK: use provided or default to wallet
     let writer_pk = if let Some(wpk_hex) = writer_pk_hex {
@@ -551,9 +551,9 @@ async fn deploy_put(
     token_cov_id.copy_from_slice(&tcid_bytes);
 
     // Load wallet
-    let wallet = WalletFile::load(wallet_path)?;
-    let wallet_pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let wallet_pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Writer PK
     let writer_pk = if let Some(wpk_hex) = writer_pk_hex {
@@ -790,8 +790,8 @@ async fn exercise(
 
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = *wallet.privkey_bytes();
 
     println!("Exercise {} option", option_type);
     println!("========================");
@@ -1069,8 +1069,8 @@ async fn cancel(
 
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = *wallet.privkey_bytes();
 
     println!("Cancel {} option (writer recovers collateral)", option_type);
     println!("================================================");
@@ -1297,8 +1297,8 @@ async fn expire(
 
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = *wallet.privkey_bytes();
 
     println!("Expire {} option (writer reclaims collateral after expiry)", option_type);
     println!("=============================================================");

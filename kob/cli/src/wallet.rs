@@ -16,20 +16,20 @@
 use crate::node::NodeClient;
 use kob_core::wallet::{AccountEntry, HdWallet, WalletFileV2};
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::{WalletContext, LegacyWalletJson};
 use std::path::Path;
 
 pub async fn run(wallet_path: &Path, node_url: &str, network: Network) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
 
     println!("Wallet Information");
     println!("==================");
     println!("Address:    {}", wallet.address);
-    println!("Public Key: {}", wallet.public_key);
+    println!("Public Key: {}", wallet.pubkey_hex());
     println!("Network:    {:?}", network);
     println!("Node:       {}", node_url);
 
-    let pk_bytes = wallet.public_key_bytes()?;
+    let pk_bytes = wallet.pubkey;
     let owner_hash = kob_core::blake2b_256(&pk_bytes);
     println!("Owner Hash: {}", hex::encode(owner_hash));
     println!();
@@ -476,7 +476,7 @@ async fn cmd_create_legacy(
     let pubkey = kob_core::get_public_key(&privkey)?;
     let address = kob_core::wallet::pubkey_to_address(&pubkey, network);
 
-    let wallet = WalletFile {
+    let wallet = LegacyWalletJson {
         private_key: hex::encode(privkey),
         public_key: hex::encode(pubkey),
         address: address.clone(),
@@ -569,7 +569,7 @@ async fn cmd_import(
             let pubkey = kob_core::get_public_key(&privkey)?;
             let address = kob_core::wallet::pubkey_to_address(&pubkey, network);
 
-            let wallet = WalletFile {
+            let wallet = LegacyWalletJson {
                 private_key: hex::encode(privkey),
                 public_key: hex::encode(pubkey),
                 address: address.clone(),
@@ -752,7 +752,7 @@ async fn cmd_balance(
             let wallet = if version == Some(1) {
                 load_legacy_encrypted(wallet_path)?
             } else {
-                WalletFile::load(wallet_path)?
+                WalletContext::load(wallet_path)?
             };
 
             println!("Legacy Wallet Balance");
@@ -832,17 +832,17 @@ async fn cmd_info(wallet_path: &Path, node_url: &str, network: Network) -> anyho
                 // Encrypted v1 -- try KOB_PASSPHRASE env var, then prompt
                 load_legacy_encrypted(wallet_path)?
             } else {
-                WalletFile::load(wallet_path)?
+                WalletContext::load(wallet_path)?
             };
 
             println!("Legacy Wallet Information");
             println!("==================");
             println!("Type:       Legacy (single-key)");
             println!("Address:    {}", wallet.address);
-            println!("Public Key: {}", wallet.public_key);
+            println!("Public Key: {}", wallet.pubkey_hex());
             println!("Network:    {:?}", network);
 
-            let pk_bytes = wallet.public_key_bytes()?;
+            let pk_bytes = wallet.pubkey;
             let owner_hash = kob_core::blake2b_256(&pk_bytes);
             println!("Owner Hash: {}", hex::encode(owner_hash));
 
@@ -865,10 +865,10 @@ async fn cmd_info(wallet_path: &Path, node_url: &str, network: Network) -> anyho
 }
 
 /// Load an encrypted v1 legacy wallet, trying env var then prompting.
-fn load_legacy_encrypted(wallet_path: &Path) -> anyhow::Result<WalletFile> {
+fn load_legacy_encrypted(wallet_path: &Path) -> anyhow::Result<WalletContext> {
     // 1. Try KOB_PASSPHRASE env var
     if let Ok(env_pass) = std::env::var("KOB_PASSPHRASE") {
-        if let Ok(w) = WalletFile::load_auto(wallet_path, Some(&env_pass)) {
+        if let Ok(w) = WalletContext::load_full(wallet_path, Some(&env_pass), None) {
             return Ok(w);
         }
         eprintln!("WARNING: KOB_PASSPHRASE env var did not decrypt wallet.");
@@ -886,7 +886,7 @@ fn load_legacy_encrypted(wallet_path: &Path) -> anyhow::Result<WalletFile> {
         );
     }
 
-    WalletFile::load_auto(wallet_path, Some(passphrase))
+    WalletContext::load_full(wallet_path, Some(passphrase), None)
         .map_err(|e| anyhow::anyhow!("Failed to decrypt wallet: {}", e))
 }
 
@@ -977,7 +977,7 @@ fn resolve_passphrase(
 ///
 /// On Unix, creates the file with mode 0o600 atomically to prevent a TOCTOU
 /// window where private key material could be world-readable.
-fn save_plaintext_wallet(wallet: &WalletFile, path: &Path) -> anyhow::Result<()> {
+fn save_plaintext_wallet(wallet: &LegacyWalletJson, path: &Path) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(wallet)?;
 
     #[cfg(unix)]
@@ -1027,7 +1027,7 @@ async fn cmd_encrypt(
     }
 
     // Load plaintext wallet
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
 
     // Resolve passphrase
     let pass = match passphrase {
@@ -1057,7 +1057,13 @@ async fn cmd_encrypt(
         }
     };
 
-    let encrypted = kob_core::encrypt_wallet(&wallet, &pass)?;
+    let legacy = LegacyWalletJson {
+        private_key: hex::encode(wallet.privkey().as_bytes()),
+        public_key: wallet.pubkey_hex(),
+        address: wallet.address.clone(),
+    };
+    let encrypted = kob_core::encrypt_wallet(&legacy, &pass)?;
+    drop(legacy);
     let dest = if let Some(out) = output {
         std::path::PathBuf::from(out)
     } else {
@@ -1125,7 +1131,7 @@ async fn cmd_decrypt(
         }
     };
 
-    let wallet = WalletFile::load_auto(wallet_path, Some(&pass))?;
+    let wallet = WalletContext::load_full(wallet_path, Some(&pass), None)?;
 
     let dest = if let Some(out) = output {
         std::path::PathBuf::from(out)
@@ -1133,9 +1139,14 @@ async fn cmd_decrypt(
         wallet_path.to_path_buf()
     };
 
+    let legacy = LegacyWalletJson {
+        private_key: hex::encode(wallet.privkey().as_bytes()),
+        public_key: wallet.pubkey_hex(),
+        address: wallet.address.clone(),
+    };
     eprintln!("WARNING: Writing private key in PLAINTEXT to {}.", dest.display());
     eprintln!("         Anyone with file access can steal your funds.");
-    save_plaintext_wallet(&wallet, &dest)?;
+    save_plaintext_wallet(&legacy, &dest)?;
 
     println!("Wallet decrypted successfully.");
     println!("Output: {}", dest.display());

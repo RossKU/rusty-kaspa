@@ -16,11 +16,10 @@ use kob_core::contract;
 use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, MAX_TX_MASS};
 use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
-use kob_core::tx::{to_rpc_payload, CovenantBinding, TxInput, TxOutput};
+use kob_core::tx::{to_rpc_payload, CovenantBinding, TxOutput};
 use kob_core::types::{Network, Outpoint};
-use kob_core::wallet::WalletFile;
-use kob_core::MIN_UTXO_VALUE;
-use kob_engine::matcher::batch::{BatchOrder, BatchPlan, OrderType};
+use kob_core::wallet::WalletContext;
+use kob_engine::matcher::batch::{BatchOrder, OrderType};
 use std::path::Path;
 use tracing::info;
 
@@ -32,13 +31,13 @@ pub async fn run(
     sell_outpoint_strs: &[String],
     buy_outpoint_strs: &[String],
     token_hex: &str,
-    max_matcher_fee: u64,
+    _max_matcher_fee: u64,
     fee_bps: Option<u16>,
     ioc: bool,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.private_key_bytes()?;
-    let pubkey = wallet.public_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = *wallet.privkey_bytes();
+    let pubkey = wallet.pubkey;
 
     // Parse token covenant ID
     let token_bytes = hex::decode(token_hex)?;

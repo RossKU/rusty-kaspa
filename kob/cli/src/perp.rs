@@ -12,7 +12,7 @@ use kob_core::perp;
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, select_utxos_mass_aware, Transaction, TxInput, TxOutput, CoinSelection};
 use kob_core::types::{Network, UtxoEntry, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, estimate_compute_mass, MAX_TX_MASS};
 use kob_core::MIN_UTXO_VALUE;
 
@@ -359,9 +359,9 @@ async fn deploy_perp(
         anyhow::bail!("maint_pct_den must be > 0");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let spk_hash = blake2b_256(&pubkey);
 
     // Build perp_deploy_v1 redeemScript
@@ -397,7 +397,7 @@ async fn deploy_perp(
     println!("Keeper Fee:     {} sompi", keeper_fee);
     println!("Emergency DAA:  {}", emergency_daa);
     println!("Max Matcher Fee:{} sompi", max_matcher_fee);
-    println!("Owner:          {}", wallet.public_key);
+    println!("Owner:          {}", wallet.pubkey_hex());
     println!("Owner SPK Hash: {}", hex::encode(spk_hash));
     println!();
     println!("RedeemScript:   {} bytes", redeem_script.len());
@@ -637,10 +637,10 @@ async fn cancel_perp(
     fee: u64,
     fee_utxo_override: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let spk_hash = blake2b_256(&pubkey);
 
     // Reconstruct the redeemScript
@@ -663,7 +663,7 @@ async fn cancel_perp(
     println!("Outpoint:       {}", outpoint);
     println!("Price:          {}/{}", price_num, price_den);
     println!("Min Fill:       {}", min_fill);
-    println!("Owner:          {}", wallet.public_key);
+    println!("Owner:          {}", wallet.pubkey_hex());
     println!("RedeemScript:   {} bytes", redeem_script.len());
     println!("P2SH SPK:       {}", hex::encode(&p2sh.script()));
     println!();
@@ -916,8 +916,8 @@ async fn list_positions(
         }
     } else {
         // Scan node UTXOs for perp position covenants
-        let wallet = WalletFile::load(wallet_path)?;
-        let pubkey = wallet.public_key_bytes()?;
+        let wallet = WalletContext::load(wallet_path)?;
+        let pubkey = wallet.pubkey;
         let spk_hash = blake2b_256(&pubkey);
 
         println!("Scanning node UTXOs for perp positions...");
@@ -1011,9 +1011,9 @@ async fn liquidate_perp(
         anyhow::bail!("redeemScript cannot be empty");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
+    let pubkey = wallet.pubkey;
 
     let p2sh = build_p2sh(&redeem_script);
 
@@ -1106,7 +1106,7 @@ async fn liquidate_perp(
     println!("Liquidation SigScript: {} bytes", liq_sigscript.len());
 
     // Sign fee UTXO input (P2PK)
-    let privkey = wallet.secure_key()?;
+    let privkey = wallet.privkey();
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
     let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
@@ -1189,10 +1189,10 @@ async fn add_margin_perp(
         anyhow::bail!("redeemScript cannot be empty");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let p2sh = build_p2sh(&redeem_script);
 
@@ -1478,9 +1478,9 @@ async fn settle_perp(
         );
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let privkey = wallet.secure_key()?;
+    let privkey = wallet.privkey();
 
     let p2sh = build_p2sh(&redeem_script);
 

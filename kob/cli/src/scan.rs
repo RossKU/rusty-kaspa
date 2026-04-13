@@ -9,7 +9,7 @@
 use crate::node::NodeClient;
 use crate::rpc::RpcUtxo;
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -196,7 +196,7 @@ pub async fn run(
     let address = if let Some(addr) = address_override {
         addr.to_string()
     } else {
-        let wallet = WalletFile::load(wallet_path)?;
+        let wallet = WalletContext::load(wallet_path)?;
         wallet.address.clone()
     };
 

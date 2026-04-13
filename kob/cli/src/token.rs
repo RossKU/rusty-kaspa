@@ -21,7 +21,7 @@ use kob_core::p2sh::blake2b_256;
 use kob_core::sighash::{compute_covenant_id, compute_sighash};
 use kob_core::tx::{to_rpc_payload, AuthOutput, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
@@ -178,9 +178,9 @@ pub async fn token_create(
     decimals: u8,
     amount: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Build token_mint redeemScript
     let redeem_script = contract::build_token_mint_redeem_script(&pubkey);
@@ -196,7 +196,7 @@ pub async fn token_create(
         amount,
         amount as f64 / 1e8
     );
-    println!("Admin:      {}", wallet.public_key);
+    println!("Admin:      {}", wallet.pubkey_hex());
     println!();
     println!("RedeemScript: {} bytes", redeem_script.len());
     println!("P2SH SPK:   {}", hex::encode(&p2sh.script()));
@@ -394,9 +394,9 @@ pub async fn token_mint(
     recipient_pubkey_hex: Option<&str>,
     fee_utxo_override: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Validate token covenant ID
     let token_cov_bytes = hex::decode(token_covenant_id)?;
@@ -435,7 +435,7 @@ pub async fn token_mint(
         token_amount as f64 / 1e8
     );
     println!("Recipient PK:     {}", hex::encode(recipient_pk));
-    println!("Admin:            {}", wallet.public_key);
+    println!("Admin:            {}", wallet.pubkey_hex());
     println!();
     println!("Mint RS:          {} bytes", mint_rs.len());
     println!("Mint P2SH:        {}", hex::encode(&mint_p2sh.script()));
@@ -672,9 +672,9 @@ pub async fn token_burn(
     mint_index: u32,
     token_covenant_id: &str,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Validate token covenant ID
     let token_cov_bytes = hex::decode(token_covenant_id)?;
@@ -690,7 +690,7 @@ pub async fn token_burn(
     println!("====================================");
     println!("Token ID:         {}", token_covenant_id);
     println!("Mint Authority:   {}:{}", mint_txid, mint_index);
-    println!("Admin:            {}", wallet.public_key);
+    println!("Admin:            {}", wallet.pubkey_hex());
     println!();
 
     info!(
@@ -817,9 +817,9 @@ pub async fn token_transfer(
     amount: u64,
     token_covenant_id: &str,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Validate token covenant ID
     let token_cov_bytes = hex::decode(token_covenant_id)?;
@@ -837,7 +837,7 @@ pub async fn token_transfer(
         amount,
         amount as f64 / 1e8
     );
-    println!("Owner:      {}", wallet.public_key);
+    println!("Owner:      {}", wallet.pubkey_hex());
     println!();
 
     // Build the token_unit redeemScript for the current owner
@@ -1119,7 +1119,7 @@ pub async fn token_info(
     let mut chain_info = None;
     if let Ok(rpc) = &rpc_result {
         // Query the wallet for any token UTXOs
-        let wallet = kob_core::wallet::WalletFile::load(wallet_path)?;
+        let wallet = kob_core::wallet::WalletContext::load(wallet_path)?;
         let utxos = rpc.get_spendable_utxos(&wallet.address).await.unwrap_or_default();
 
         // P2SH UTXOs could be token_unit or order contracts
@@ -1611,7 +1611,7 @@ pub async fn run(
     _network: Network,
     tokens_file: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
 
     println!("Token Balances");
     println!("===============");

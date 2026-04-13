@@ -19,6 +19,7 @@ pub mod payload;
 #[cfg(test)]
 mod tests;
 
+#[allow(ambiguous_glob_reexports)]
 pub use spot::*;
 #[allow(ambiguous_glob_reexports)]
 pub use perp::*;

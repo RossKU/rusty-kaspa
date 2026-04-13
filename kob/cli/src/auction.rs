@@ -25,7 +25,7 @@ use kob_core::p2sh::build_p2sh;
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{select_utxos_mass_aware, to_rpc_payload, CoinSelection, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, UtxoEntry};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 
@@ -220,9 +220,9 @@ async fn deploy_english(
         anyhow::bail!("min_increment must be > 0");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let redeem_script = build_english_auction_redeem_script(&pubkey, min_increment)?;
     let p2sh = build_p2sh(&redeem_script);
@@ -231,7 +231,7 @@ async fn deploy_english(
     println!("==========================");
     println!("Reserve:       {} sompi ({:.8} KAS)", reserve, reserve as f64 / 1e8);
     println!("Min Increment: {} sompi ({:.8} KAS)", min_increment, min_increment as f64 / 1e8);
-    println!("Seller:        {}", wallet.public_key);
+    println!("Seller:        {}", wallet.pubkey_hex());
     println!("RS:            {} bytes", redeem_script.len());
     println!("P2SH SPK:      {}", hex::encode(&p2sh.script()));
     println!();
@@ -284,8 +284,8 @@ async fn bid_english(
         anyhow::bail!("bid amount {} must be > current value {}", amount, current_value);
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = wallet.privkey();
 
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
@@ -393,8 +393,8 @@ async fn settle_english(
     current_value: u64,
     fee: u64,
 ) -> anyhow::Result<String> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = wallet.privkey();
 
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
@@ -487,9 +487,9 @@ async fn deploy_dutch(
         anyhow::bail!("step must be > 0");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let redeem_script = build_dutch_auction_redeem_script(&pubkey, reserve, step)?;
     let p2sh = build_p2sh(&redeem_script);
@@ -500,7 +500,7 @@ async fn deploy_dutch(
     println!("Reserve:      {} sompi ({:.8} KAS)", reserve, reserve as f64 / 1e8);
     println!("Step:         {} sompi ({:.8} KAS)", step, step as f64 / 1e8);
     println!("Ticks to floor: {}", (start_price - reserve) / step);
-    println!("Seller:       {}", wallet.public_key);
+    println!("Seller:       {}", wallet.pubkey_hex());
     println!("RS:           {} bytes", redeem_script.len());
     println!();
 
@@ -550,8 +550,8 @@ async fn tick_dutch(
     let new_value = current_value.checked_sub(step)
         .ok_or_else(|| anyhow::anyhow!("tick would underflow (current {} < step {})", current_value, step))?;
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = wallet.privkey();
 
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
@@ -631,8 +631,8 @@ async fn buy_dutch(
     current_value: u64,
     fee: u64,
 ) -> anyhow::Result<String> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = wallet.privkey();
 
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
@@ -726,9 +726,9 @@ async fn cancel_dutch(
     current_value: u64,
     fee: u64,
 ) -> anyhow::Result<String> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
@@ -799,7 +799,7 @@ type RpcUtxo = crate::rpc::RpcUtxo;
 
 async fn fetch_p2pk_utxos(
     rpc: &NodeClient,
-    wallet: &WalletFile,
+    wallet: &WalletContext,
 ) -> anyhow::Result<(Vec<UtxoEntry>, Vec<RpcUtxo>)> {
     let rpc_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let p2pk_rpc: Vec<_> = rpc_utxos.into_iter().filter(|u| !u.is_p2sh()).collect();

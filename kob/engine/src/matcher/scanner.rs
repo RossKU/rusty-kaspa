@@ -1,7 +1,7 @@
 //! L1 block scanner for permissionless order discovery.
 
 use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
-use tracing::debug;
+
 
 // Parse types and functions imported from kob-core.
 pub use kob_core::contract::spot::parse::{ParsedOrder, parse_redeem_script};
@@ -82,15 +82,9 @@ impl BlockScanner {
         // Only accept v2 payloads (KOB:2:<flags><RS>). v1 payloads (KOB:1:) lack
         // the counterparty SPK and can never be matched — skip them to avoid
         // wasting order book memory and iteration time.
-        let (payload_data, post_only, expiry_daa) =
+        let (payload_data, post_only, expiry_daa, ifd_order_b_rs) =
             if let Some(v2) = kob_core::contract::parse_order_payload(&tx.payload) {
-                (v2.rs_data, v2.post_only, v2.expiry_daa)
-            } else if kob_core::contract::parse_order_payload(&tx.payload).is_some() {
-                debug!(
-                    "[SCANNER] Skipping v1 payload order (no counterparty_spk): {}",
-                    &tx.tx_id[..tx.tx_id.len().min(16)]
-                );
-                return None;
+                (v2.rs_data, v2.post_only, v2.expiry_daa, v2.ifd_order_b_rs)
             } else {
                 return None;
             };
@@ -120,6 +114,7 @@ impl BlockScanner {
                 if let Some(mut parsed) = Self::parse_redeem_script(&payload_data) {
                     parsed.post_only = post_only;
                     parsed.expiry_daa = expiry_daa;
+                    parsed.ifd_order_b_rs = ifd_order_b_rs.clone();
                     return Some((parsed, p2sh_idx, p2sh_out.value));
                 }
             }
@@ -243,12 +238,21 @@ impl BlockScanner {
             }
         };
 
-        // Extract counterparty SPK from the deploy TX's non-P2SH outputs.
-        // The deployer's change/wallet output has an SPK whose Blake2b hash
-        // matches the spk_hash embedded in the redeemScript state.
-        let counterparty_spk = tx.and_then(|tx_data| {
-            extract_owner_spk(tx_data, &parsed.spk_hash)
-        });
+        // Resolve counterparty SPK:
+        // - IFD orders: bspkh points to order B's P2SH, compute from order_b_rs
+        // - Normal orders: bspkh points to owner's P2PK wallet, extract from deploy TX
+        let (counterparty_spk, ifd_order_b_rs_hex) = if let Some(ref b_rs) = parsed.ifd_order_b_rs {
+            let b_p2sh_spk = kob_core::build_p2sh(b_rs);
+            let mut spk_bytes = Vec::with_capacity(2 + b_p2sh_spk.script().len());
+            spk_bytes.extend_from_slice(&b_p2sh_spk.version.to_le_bytes());
+            spk_bytes.extend_from_slice(&b_p2sh_spk.script());
+            (Some(hex::encode(&spk_bytes)), Some(hex::encode(b_rs)))
+        } else {
+            let spk = tx.and_then(|tx_data| {
+                extract_owner_spk(tx_data, &parsed.spk_hash)
+            });
+            (spk, None)
+        };
 
         let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
         let p2sh_script_hex = hex::encode(&p2sh_spk.script());
@@ -272,6 +276,7 @@ impl BlockScanner {
             expiry_daa: parsed.expiry_daa,
             is_freezable: parsed.requires_zk,
             max_matcher_fee: parsed._max_matcher_fee,
+            ifd_order_b_rs_hex,
         }
     }
 
@@ -764,7 +769,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         let buy_key = buy.outpoint_key();
         ob.add_buy_order(buy);
@@ -791,7 +796,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         let sell_key = sell.outpoint_key();
         ob.add_sell_order(sell);
@@ -918,7 +923,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         ob.add_buy_order(buy);
         assert_eq!(ob.stats().total_bids, 1);
@@ -1764,7 +1769,7 @@ mod tests {
         let t = [0u8; 32];
         let rs = kob_core::contract::build_sell_redeem_script(1, 2, 1, &t, &t, 0, 0, 0).unwrap();
         assert_eq!(rs.len(), SELL_RS_SIZE, "SELL_RS_SIZE constant must match actual RS length");
-        assert_eq!(SELL_RS_SIZE, 415);
+        assert_eq!(SELL_RS_SIZE, 416);
     }
 
     #[test]
@@ -1855,6 +1860,7 @@ mod tests {
             redeem_script: vec![0x51, 0x52],
             post_only: false,
             expiry_daa: None,
+            ifd_order_b_rs: None,
         };
         let book_order = BlockScanner::to_book_order(&parsed, "a".repeat(64).as_str(), 0, 10_000, None);
         assert!(!book_order.is_freezable, "requires_zk=false should propagate as is_freezable=false");
@@ -1877,6 +1883,7 @@ mod tests {
             redeem_script: vec![0x51, 0x20, 0xa6, 0x87],
             post_only: false,
             expiry_daa: None,
+            ifd_order_b_rs: None,
         };
         let book_order = BlockScanner::to_book_order(&parsed, "b".repeat(64).as_str(), 1, 20_000, None);
         assert!(book_order.is_freezable, "requires_zk=true should propagate as is_freezable=true");
@@ -1969,7 +1976,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         ob.add_buy_order(gtc_order);
 
@@ -1992,7 +1999,7 @@ mod tests {
             post_only: false,
             expiry_daa: Some(1000),
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         ob.add_buy_order(gtd_order);
 
@@ -2015,7 +2022,7 @@ mod tests {
             post_only: false,
             expiry_daa: Some(2000),
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         ob.add_sell_order(gtd_sell);
 

@@ -22,7 +22,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
@@ -75,10 +75,10 @@ pub async fn run(
     old_max_matcher_fee: u64,
     new_max_matcher_fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
     let spk_hash = compute_p2pk_spk_hash(&pubkey);
 

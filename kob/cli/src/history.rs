@@ -13,7 +13,7 @@ use crate::order_cache::OrderCache;
 use crate::cancel::kaspa_address_encode;
 use crate::node::NodeClient;
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::info;
@@ -287,7 +287,7 @@ pub async fn run(
     json_output: bool,
     engine_url: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
 
     let network_prefix = match network {
         Network::Mainnet => "kaspa",

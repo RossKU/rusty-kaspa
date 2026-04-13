@@ -16,7 +16,7 @@ use crate::rpc::RpcUtxo;
 use crate::signing;
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{Transaction, TxInput, TxOutput};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use std::collections::HashSet;
 use std::path::Path;
 use tracing::info;
@@ -35,8 +35,8 @@ const FEE_LEVELS: &[u64] = &[10_000, 100_000, 1_000_000];
 ///
 /// Prints a one-line summary per UTXO and a final total at the end.
 pub async fn recover(wallet_path: &Path, node_url: &str) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = *wallet.privkey_bytes();
 
     println!("RBF UTXO Recovery");
     println!("==================");
@@ -137,7 +137,7 @@ enum RbfResult {
 /// first acceptance, or `Stuck` after all levels are exhausted.
 async fn try_rbf_escalating(
     rpc: &NodeClient,
-    wallet: &WalletFile,
+    wallet: &WalletContext,
     utxo: &RpcUtxo,
     privkey: &[u8; 32],
 ) -> RbfResult {
@@ -180,7 +180,7 @@ async fn try_rbf_escalating(
 /// and calls `submitTransactionReplacement`.
 async fn try_rbf_once(
     rpc: &NodeClient,
-    _wallet: &WalletFile,
+    _wallet: &WalletContext,
     utxo: &RpcUtxo,
     privkey: &[u8; 32],
     fee: u64,
@@ -539,8 +539,8 @@ pub async fn recover_orders(
     output_path: Option<&str>,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
     let owner_hash = blake2b_256(&pubkey);
     let _spk_hash = compute_p2pk_spk_hash(&pubkey);
 

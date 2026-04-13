@@ -36,7 +36,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, Price};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
@@ -227,9 +227,9 @@ pub async fn deploy_bracket_v4(
     receipt_cov_id.copy_from_slice(&rcid_bytes);
 
     // Load wallet
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
 
     // Build bracket_order_v4 redeemScript (380B)
@@ -261,7 +261,7 @@ pub async fn deploy_bracket_v4(
     println!("Min Fill:        {}", min_fill);
     println!("Receipt Cov ID:  {}...", &receipt_cov_id_hex[..16]);
     println!("Amount:          {} sompi ({:.8} KAS)", amount, amount as f64 / 1e8);
-    println!("Owner:           {}", wallet.public_key);
+    println!("Owner:           {}", wallet.pubkey_hex());
     println!("Owner Hash:      {}", hex::encode(owner_hash));
     println!();
     println!("RedeemScript:    {} bytes (bracket_order_v4)", redeem_script.len());
@@ -443,9 +443,9 @@ pub async fn fill_bracket_v4(
     receipt_rs_hex: &str,
     fee_input_str: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let order_outpoint = Outpoint::parse(order_str)?;
     let receipt_outpoint = Outpoint::parse(receipt_str)?;
@@ -813,9 +813,9 @@ pub async fn cancel_bracket_v4(
     order_value_override: Option<u64>,
     rs_hex: &str,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let order_outpoint = Outpoint::parse(order_str)?;
 
@@ -834,7 +834,7 @@ pub async fn cancel_bracket_v4(
     println!("Order:         {}", order_outpoint);
     println!("RS:            {} bytes", redeem_script.len());
     println!("P2SH SPK:      {}", hex::encode(&p2sh.script()));
-    println!("Owner:         {}", wallet.public_key);
+    println!("Owner:         {}", wallet.pubkey_hex());
     println!();
 
     // Connect
@@ -1029,9 +1029,9 @@ pub async fn run(
     };
     params.validate()?;
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let owner_hash = blake2b_256(&pubkey);
     // Build TP / SL oco_pair redeemScripts to get their P2SH SPKs.
@@ -1134,7 +1134,7 @@ pub async fn run(
     if min_receipt_value > 0 {
         println!("Min Receipt:    {} sompi", min_receipt_value);
     }
-    println!("Owner:          {}", wallet.public_key);
+    println!("Owner:          {}", wallet.pubkey_hex());
     println!("Owner Hash:     {}", hex::encode(owner_hash));
     println!();
     println!("bracket_order_v4 RS: {} bytes", redeem_script.len());

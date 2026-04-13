@@ -13,7 +13,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, select_utxos_mass_aware, Transaction, TxInput, TxOutput, CoinSelection};
 use kob_core::types::{Network, Price, UtxoEntry, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, min_penalty_free_output, MAX_TX_MASS};
 use kob_core::MIN_UTXO_VALUE;
 use kob_core::contract::{build_order_payload, build_order_payload_full};
@@ -221,7 +221,7 @@ pub async fn deploy_buy(
         anyhow::bail!("Unsupported contract version {}. Only v14 is supported for deployment.", version);
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let _price = Price::new(price_num, price_den)?;
 
     // Input validation (defense-in-depth against zero-fill attack, TN12 T79)
@@ -263,8 +263,8 @@ pub async fn deploy_buy(
         println!();
     }
 
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     // Parse token covenant ID
     let token_cov_bytes = hex::decode(token_covenant_id)?;
@@ -307,7 +307,7 @@ pub async fn deploy_buy(
         amount as f64 / 1e8
     );
     println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
-    println!("Owner:      {}", wallet.public_key);
+    println!("Owner:      {}", wallet.pubkey_hex());
     println!("Owner Hash: {}", hex::encode(owner_hash));
     println!("Buyer SPK Hash: {}", hex::encode(buyer_spk_hash));
     println!();
@@ -585,7 +585,7 @@ pub async fn deploy_sell(
         anyhow::bail!("Unsupported contract version {}. Only v14 is supported for deployment.", version);
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let _price = Price::new(price_num, price_den)?;
 
     // Input validation (defense-in-depth against zero-fill attack, TN12 T79)
@@ -631,8 +631,8 @@ pub async fn deploy_sell(
         println!();
     }
 
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let owner_hash = blake2b_256(&pubkey);
     let seller_spk_hash = compute_p2pk_spk_hash(&pubkey);
@@ -664,7 +664,7 @@ pub async fn deploy_sell(
         amount as f64 / 1e8
     );
     println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
-    println!("Owner:      {}", wallet.public_key);
+    println!("Owner:      {}", wallet.pubkey_hex());
     println!("Owner Hash: {}", hex::encode(owner_hash));
     println!("Seller SPK Hash: {}", hex::encode(seller_spk_hash));
     println!();
@@ -1100,7 +1100,7 @@ pub async fn deploy_bracket(
     sl_den: u64,
     amount: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let entry_price = Price::new(entry_num, entry_den)?;
     let tp_price = Price::new(tp_num, tp_den)?;
     let sl_price = Price::new(sl_num, sl_den)?;
@@ -1117,7 +1117,7 @@ pub async fn deploy_bracket(
         amount,
         amount as f64 / 1e8
     );
-    println!("Owner:       {}", wallet.public_key);
+    println!("Owner:       {}", wallet.pubkey_hex());
     println!();
 
     info!(

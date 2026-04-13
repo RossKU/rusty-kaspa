@@ -28,7 +28,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
@@ -291,9 +291,9 @@ async fn deploy(
     target_cov_id.copy_from_slice(&tcid_bytes);
 
     // Load wallet
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // owner_hash = blake2b_256(pubkey)
     let owner_hash = blake2b_256(&pubkey);
@@ -564,8 +564,8 @@ async fn fill(
 
     let p2sh = build_p2sh(&old_rs);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = *wallet.privkey_bytes();
 
     info!(
         outpoint = %outpoint,
@@ -830,9 +830,9 @@ async fn cancel(
 
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let periods = parse_periods_remaining(&redeem_script);
 

@@ -30,7 +30,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{compute_storage_mass, MAX_TX_MASS};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
 use std::path::Path;
@@ -61,10 +61,10 @@ pub async fn run(
     if version != 14 {
         anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Validate side
     if side != "buy" && side != "sell" {
@@ -239,7 +239,7 @@ pub async fn run(
 #[allow(deprecated)]
 async fn run_buy_partial_fill(
     rpc: &NodeClient,
-    _wallet: &WalletFile,
+    _wallet: &WalletContext,
     _pubkey: &[u8; 32],
     privkey: &[u8; 32],
     outpoint: &Outpoint,
@@ -524,7 +524,7 @@ async fn run_buy_partial_fill(
 #[allow(clippy::too_many_arguments, deprecated)]
 async fn run_sell_partial_fill(
     rpc: &NodeClient,
-    _wallet: &WalletFile,
+    _wallet: &WalletContext,
     _pubkey: &[u8; 32],
     privkey: &[u8; 32],
     outpoint: &Outpoint,

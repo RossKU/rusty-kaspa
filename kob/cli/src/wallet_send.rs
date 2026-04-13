@@ -8,7 +8,7 @@ use crate::signing;
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee};
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
@@ -104,9 +104,9 @@ pub async fn run(
     amount_sompi: u64,
     fee_override: Option<u64>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let _pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let _pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     // Validate amount
     if amount_sompi == 0 {

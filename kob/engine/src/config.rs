@@ -119,23 +119,12 @@ impl AppConfig {
         }
 
         // Use kob_core's auto-detecting wallet loader
-        let wallet = kob_core::WalletFile::load_auto(wallet_path, passphrase)
-            .map_err(|e| format!("Failed to load wallet: {}", e))?;
+        let wallet = kob_core::WalletContext::load_full(
+            wallet_path, passphrase, None,
+        ).map_err(|e| format!("Failed to load wallet: {}", e))?;
 
-        let private_key = wallet
-            .secure_key()
-            .map_err(|e| format!("Invalid private key: {}", e))?;
-
-        let public_key = hex::decode(&wallet.public_key)
-            .map_err(|e| format!("Invalid public key hex: {}", e))?;
-
-        if public_key.len() != 32 {
-            return Err(format!(
-                "Public key must be 32 bytes, got {}",
-                public_key.len()
-            ));
-        }
-
+        let private_key = kob_core::SecureKey::from_bytes(*wallet.privkey().as_bytes());
+        let public_key = wallet.pubkey.to_vec();
         let address = wallet.address.clone();
 
         Ok(AppConfig {

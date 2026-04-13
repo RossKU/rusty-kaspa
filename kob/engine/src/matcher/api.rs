@@ -2376,7 +2376,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 
@@ -2399,7 +2399,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         }
     }
 

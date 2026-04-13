@@ -18,7 +18,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST};
 use std::path::Path;
@@ -251,9 +251,9 @@ pub async fn receipt_create(
     recipient_hash_hex: Option<&str>,
     amount: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let pair_id = parse_32_bytes(pair_id_hex, "pair_id")?;
 
@@ -425,11 +425,11 @@ pub async fn receipt_consume(
     receipt_value_override: Option<u64>,
     fee_input_str: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
     let fee_outpoint = fee_input_str.map(Outpoint::parse).transpose()?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let pair_id = parse_32_bytes(pair_id_hex, "pair_id")?;
 
@@ -625,11 +625,11 @@ pub async fn receipt_trigger(
     receipt_value_override: Option<u64>,
     fee_input_str: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
     let fee_outpoint = fee_input_str.map(Outpoint::parse).transpose()?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let pair_id = parse_32_bytes(pair_id_hex, "pair_id")?;
 
@@ -821,11 +821,11 @@ pub async fn receipt_consume_v1(
     receipt_value_override: Option<u64>,
     fee_input_str: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
     let fee_outpoint = fee_input_str.map(Outpoint::parse).transpose()?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.private_key_bytes()?;
+    let pubkey = wallet.pubkey;
+    let privkey = *wallet.privkey_bytes();
 
     let pair_id = parse_32_bytes(pair_id_hex, "pair_id")?;
     let recipient_hash = blake2b_256(&pubkey);

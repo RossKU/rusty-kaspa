@@ -22,7 +22,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee};
 use kob_core::tx::{to_rpc_payload, select_utxos_mass_aware, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, UtxoEntry};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::MIN_UTXO_VALUE;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -145,16 +145,20 @@ fn decode_chunked(body: &str) -> anyhow::Result<String> {
 
 /// Deploy an IFD order: buy A at entry price, auto-deploy sell B at exit price.
 ///
+/// Payload-based IFD: both order RSs are embedded in the deploy TX payload.
+/// No Matcher API registration needed. Fully trustless.
+///
 /// Steps:
-///   1. POST to Matcher `/api/v1/ifd` with both order params
-///   2. Get back A's P2SH (with bspkh set for token flow to B)
-///   3. Deploy A to L1
+///   1. Build Order B's RS (sell) with owner's SPK hash as bspkh
+///   2. Build Order A's RS (buy) with bspkh = blake2b(Order B's P2SH SPK)
+///   3. Build IFD payload: KOB:2:<flags|0x04><a_len><order_a_rs><order_b_rs>
+///   4. Deploy Order A to L1 with IFD payload
 #[allow(clippy::too_many_arguments)]
 pub async fn deploy_ifd(
     wallet_path: &Path,
     node_url: &str,
     _network: Network,
-    matcher_url: &str,
+    _matcher_url: &str,
     // Order A params
     buy_token: &str,
     buy_price_num: u64,
@@ -183,57 +187,12 @@ pub async fn deploy_ifd(
         anyhow::bail!("buy amount must be > 0");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let owner_hash = blake2b_256(&pubkey);
     let owner_spk_hash = compute_p2pk_spk_hash(&pubkey);
-
-    let owner_hash_hex = hex::encode(owner_hash);
-    let owner_spk_hash_hex = hex::encode(owner_spk_hash);
-    let owner_id = owner_hash_hex.clone();
-
-    // Step 1: Register IFD rule with the Matcher
-    println!("Registering IFD rule with matcher at {}...", matcher_url);
-
-    let ifd_req = serde_json::json!({
-        "order_a": {
-            "side": "buy",
-            "token": buy_token,
-            "price_num": buy_price_num,
-            "price_den": buy_price_den,
-            "amount": buy_amount,
-            "min_fill": buy_min_fill,
-            "expiry_daa": 0,
-        },
-        "order_b": {
-            "side": "sell",
-            "token": buy_token,
-            "price_num": sell_price_num,
-            "price_den": sell_price_den,
-            "amount": 0,
-            "min_fill": sell_min_fill,
-            "expiry_daa": sell_expiry_daa,
-        },
-        "owner_id": owner_id,
-        "owner_hash": owner_hash_hex,
-        "owner_spk_hash": owner_spk_hash_hex,
-    });
-
-    let ifd_resp = http_post_json(matcher_url, "/api/v1/ifd", &ifd_req)?;
-    let ifd_id = ifd_resp["ifd_id"].as_u64().unwrap_or(0);
-    let a_bspkh = ifd_resp["order_a_bspkh"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("Missing order_a_bspkh in response"))?;
-    let b_p2sh = ifd_resp["order_b_p2sh"].as_str().unwrap_or("unknown");
-
-    println!("IFD registered: id={}", ifd_id);
-    println!("  Order A bspkh (tokens -> B): {}", a_bspkh);
-    println!("  Order B P2SH: {}", b_p2sh);
-
-    // Step 2: Deploy order A to L1 with modified bspkh
-    println!("Deploying order A (buy) to L1...");
 
     let token_cov_bytes = hex::decode(buy_token)?;
     if token_cov_bytes.len() != 32 {
@@ -242,14 +201,33 @@ pub async fn deploy_ifd(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
-    let bspkh_bytes = hex::decode(a_bspkh)?;
-    if bspkh_bytes.len() != 32 {
-        anyhow::bail!("bspkh must be 64 hex characters (32 bytes)");
-    }
-    let mut buyer_spk_hash = [0u8; 32];
-    buyer_spk_hash.copy_from_slice(&bspkh_bytes);
+    // Step 1: Build Order B (sell) RS first — need its P2SH for Order A's bspkh
+    println!("Building IFD order pair...");
+    let order_b_rs = contract::build_sell_redeem_script(
+        sell_price_num,
+        sell_price_den,
+        sell_min_fill,
+        &owner_hash,
+        &owner_spk_hash, // sell proceeds go back to owner's wallet
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
+        0, // cancel_pending
+        sell_expiry_daa,
+    )?;
 
-    let rs = contract::build_buy_redeem_script(
+    // Compute Order B's P2SH SPK hash for Order A's bspkh
+    let b_p2sh_spk = build_p2sh(&order_b_rs);
+    // bspkh = blake2b(version_LE_2B + script_bytes) — matches OpTxOutputSpk output
+    let mut b_spk_full = Vec::with_capacity(2 + b_p2sh_spk.script().len());
+    b_spk_full.extend_from_slice(&b_p2sh_spk.version.to_le_bytes());
+    b_spk_full.extend_from_slice(&b_p2sh_spk.script());
+    let buyer_spk_hash = blake2b_256(&b_spk_full);
+
+    println!("  Order B (sell) RS: {} bytes", order_b_rs.len());
+    println!("  Order B P2SH:     {}", hex::encode(&b_p2sh_spk.script()));
+    println!("  Order A bspkh:    {}", hex::encode(&buyer_spk_hash));
+
+    // Step 2: Build Order A (buy) RS with bspkh pointing to Order B
+    let order_a_rs = contract::build_buy_redeem_script(
         &token_cov_id,
         buy_price_num,
         buy_price_den,
@@ -261,9 +239,14 @@ pub async fn deploy_ifd(
         0, // GTC for entry order
     )?;
 
-    let p2sh_spk = build_p2sh(&rs);
-    println!("  Buy RS length: {} bytes", rs.len());
-    println!("  P2SH SPK:      {}", hex::encode(&p2sh_spk.script()));
+    let p2sh_spk = build_p2sh(&order_a_rs);
+    println!("  Order A (buy) RS: {} bytes", order_a_rs.len());
+    println!("  Order A P2SH:     {}", hex::encode(&p2sh_spk.script()));
+
+    // Step 3: Build IFD payload
+    let ifd_payload = contract::build_ifd_order_payload(
+        &order_a_rs, &order_b_rs, false, None,
+    );
 
     // Connect and fetch UTXOs
     let rpc = NodeClient::connect(node_url).await?;
@@ -286,7 +269,6 @@ pub async fn deploy_ifd(
         })
         .collect();
 
-    // Use fee as minimum override; auto-compute via converge_fee
     let min_fee_override = fee;
 
     let coin_sel = select_utxos_mass_aware(&core_utxos, buy_amount, min_fee_override, 2).map_err(|e| {
@@ -342,8 +324,8 @@ pub async fn deploy_ifd(
     // Output 0: P2SH order
     tx.outputs.push(TxOutput::new(buy_amount, 0, p2sh_spk.script().to_vec(), None));
 
-    // Payload
-    tx.payload = deploy::build_payload_auto(&rs, false);
+    // IFD payload (contains both order A + order B RS)
+    tx.payload = ifd_payload;
 
     // Tentative change output for fee convergence
     if tentative_change >= MIN_UTXO_VALUE {
@@ -414,13 +396,13 @@ pub async fn deploy_ifd(
     let txid = rpc.submit_transaction(payload).await?;
 
     println!();
-    println!("IFD Summary");
-    println!("===========");
-    println!("  IFD ID:          {}", ifd_id);
+    println!("IFD Summary (payload-based, trustless)");
+    println!("======================================");
     println!("  Order A (buy):   deployed, txid={}", txid);
-    println!("  Order B (sell):  will auto-deploy when A fills");
+    println!("  Order B (sell):  embedded in payload, auto-deploy on A fill");
     println!("  Entry price:     {}/{}", buy_price_num, buy_price_den);
     println!("  Exit price:      {}/{}", sell_price_num, sell_price_den);
+    println!("  Order B P2SH:    {}", hex::encode(&b_p2sh_spk.script()));
 
     Ok(txid)
 }
@@ -463,9 +445,9 @@ pub async fn deploy_ifo(
         anyhow::bail!("buy amount must be > 0");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let owner_hash = blake2b_256(&pubkey);
     let owner_hash_hex = hex::encode(owner_hash);

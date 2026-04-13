@@ -1626,7 +1626,7 @@ fn process_block_txs_all(
                     continue;
                 }
 
-                let book_order = BlockScanner::to_book_order_with_tx(
+                let mut book_order = BlockScanner::to_book_order_with_tx(
                     &parsed, &tx.tx_id, p2sh_idx, p2sh_value, None, Some(tx),
                 );
                 let outpoint_key = book_order.outpoint_key();
@@ -1645,9 +1645,31 @@ fn process_block_txs_all(
                     p2sh_value, parsed.price_num, parsed.price_den,
                 );
 
-                // IFD activation: check if this order's P2SH matches a pending IFD rule
-                let p2sh_hex_for_ifd = book_order.p2sh_script_hex.clone();
-                let outpoint_for_ifd = outpoint_key.clone();
+                // IFD activation: check if this order's P2SH matches a pending IFD rule.
+                // If so, set counterparty_spk from the IFD rule's order B P2SH data
+                // (because bspkh points to order B's P2SH, not the owner's wallet).
+                if let Some(ref mut ifd) = ifd_book {
+                    let p2sh_hex = &book_order.p2sh_script_hex;
+                    if let Some(rule) = ifd.find_by_a_p2sh(p2sh_hex) {
+                        let rule_id = rule.id;
+                        if rule.status == crate::matcher::ifd::IfdStatus::Pending {
+                            // Compute order B's P2SH SPK as counterparty_spk
+                            if let Ok(b_rs_bytes) = hex::decode(&rule.order_b_rs_hex) {
+                                let b_p2sh_spk = kob_core::build_p2sh(&b_rs_bytes);
+                                let mut spk_bytes = Vec::with_capacity(2 + b_p2sh_spk.script().len());
+                                spk_bytes.extend_from_slice(&b_p2sh_spk.version.to_le_bytes());
+                                spk_bytes.extend_from_slice(&b_p2sh_spk.script());
+                                book_order.counterparty_spk = Some(hex::encode(&spk_bytes));
+                            }
+                            if ifd.activate(rule_id, &outpoint_key) {
+                                info!(
+                                    "[IFD] Activated rule #{} — order A detected at {}, counterparty_spk set to order B P2SH",
+                                    rule_id, &outpoint_key[..outpoint_key.len().min(20)],
+                                );
+                            }
+                        }
+                    }
+                }
 
                 match parsed.order_type {
                     OrderSide::Buy => {
@@ -1679,21 +1701,6 @@ fn process_block_txs_all(
                     }
                 }
                 counters.spot_added += 1;
-
-                // Activate IFD rule if this order matches a pending rule's P2SH
-                if let Some(ref mut ifd) = ifd_book {
-                    if let Some(rule) = ifd.find_by_a_p2sh(&p2sh_hex_for_ifd) {
-                        let rule_id = rule.id;
-                        if rule.status == crate::matcher::ifd::IfdStatus::Pending {
-                            if ifd.activate(rule_id, &outpoint_for_ifd) {
-                                info!(
-                                    "[IFD] Activated rule #{} — order A detected at {}",
-                                    rule_id, &outpoint_for_ifd[..outpoint_for_ifd.len().min(20)],
-                                );
-                            }
-                        }
-                    }
-                }
             }
 
             ScanResult::Perp(parsed, p2sh_idx, p2sh_value) => {
@@ -2591,41 +2598,64 @@ async fn run_scan_cycle(
                 .max_by_key(|u| u.utxo_entry.amount)
                 .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-            // Check IFD book for contingent orders
-            let ifd_ctx = {
-                let ifd = ifd_book.lock().await;
-                let buy_outpoint = best.buy.outpoint_key();
-                let sell_outpoint = best.sell.outpoint_key();
-                let rule = ifd.find_by_a_outpoint(&buy_outpoint)
-                    .or_else(|| ifd.find_by_a_outpoint(&sell_outpoint));
-                rule.and_then(|r| {
-                    if r.status == crate::matcher::ifd::IfdStatus::Active {
-                        match hex::decode(&r.order_b_rs_hex) {
-                            Ok(rs_bytes) => Some(IfdFillContext {
-                                rule_id: r.id,
-                                order_b_rs: rs_bytes,
-                                order_b_p2sh: r.order_b_p2sh.clone(),
-                                expiry_daa: r.order_b.expiry_daa(),
-                            }),
-                            Err(e) => {
-                                warn!("[IFD] Failed to decode order B RS hex for rule {}: {}", r.id, e);
-                                None
-                            }
-                        }
-                    } else {
-                        None
-                    }
-                })
-            };
+            // IFD: check BookOrder payload first, fall back to IfdBook
+            let ifd_b_rs_hex = best.buy.ifd_order_b_rs_hex.as_ref()
+                .or(best.sell.ifd_order_b_rs_hex.as_ref());
 
-            // Build IFD payload if active
-            let ifd_payload = ifd_ctx.as_ref().map(|ctx| {
-                let expiry = if ctx.expiry_daa > 0 { Some(ctx.expiry_daa) } else { None };
-                let kob_payload = kob_core::contract::build_order_payload_full(
-                    &ctx.order_b_rs, false, expiry,
-                );
-                hex::encode(&kob_payload)
-            });
+            let (ifd_ctx, ifd_payload) = if let Some(b_rs_hex) = ifd_b_rs_hex {
+                // Payload-based IFD: order B RS came from deploy TX payload
+                match hex::decode(b_rs_hex) {
+                    Ok(rs_bytes) => {
+                        // Extract expiry from order B's redeemScript state bytes.
+                        // Use spot::parse directly to avoid ambiguous glob reexport.
+                        let b_expiry = kob_core::contract::spot::parse_redeem_script(&rs_bytes)
+                            .and_then(|p| p.expiry_daa);
+                        let kob_payload = kob_core::contract::build_order_payload_full(
+                            &rs_bytes, false, b_expiry,
+                        );
+                        (None, Some(hex::encode(&kob_payload)))
+                    }
+                    Err(e) => {
+                        warn!("[IFD] Failed to decode order B RS from BookOrder: {}", e);
+                        (None, None)
+                    }
+                }
+            } else {
+                // Fallback: check IfdBook for engine-registered rules
+                let ctx = {
+                    let ifd = ifd_book.lock().await;
+                    let buy_outpoint = best.buy.outpoint_key();
+                    let sell_outpoint = best.sell.outpoint_key();
+                    let rule = ifd.find_by_a_outpoint(&buy_outpoint)
+                        .or_else(|| ifd.find_by_a_outpoint(&sell_outpoint));
+                    rule.and_then(|r| {
+                        if r.status == crate::matcher::ifd::IfdStatus::Active {
+                            match hex::decode(&r.order_b_rs_hex) {
+                                Ok(rs_bytes) => Some(IfdFillContext {
+                                    rule_id: r.id,
+                                    order_b_rs: rs_bytes,
+                                    order_b_p2sh: r.order_b_p2sh.clone(),
+                                    expiry_daa: r.order_b.expiry_daa(),
+                                }),
+                                Err(e) => {
+                                    warn!("[IFD] Failed to decode order B RS hex for rule {}: {}", r.id, e);
+                                    None
+                                }
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                };
+                let payload = ctx.as_ref().map(|c| {
+                    let expiry = if c.expiry_daa > 0 { Some(c.expiry_daa) } else { None };
+                    let kob_payload = kob_core::contract::build_order_payload_full(
+                        &c.order_b_rs, false, expiry,
+                    );
+                    hex::encode(&kob_payload)
+                });
+                (ctx, payload)
+            };
 
             // Plan based on match type
             let plan_result = match best.match_type {
@@ -4712,7 +4742,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
             },
             sell: BookOrder {
                 tx_id: "b".repeat(64),
@@ -4732,7 +4762,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
             },
             seller_kas: 20_000_000,
             buyer_tokens: 10_000_000,
@@ -4774,7 +4804,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
             },
             sell: BookOrder {
                 tx_id: "b".repeat(64),
@@ -4794,7 +4824,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
             },
             seller_kas: 20_000_000,
             buyer_tokens: 20_000_000,
@@ -5015,7 +5045,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         let buy = BookOrder {
             tx_id: "b".repeat(64),
@@ -5035,7 +5065,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
 
         let route = CrossPairRoute {
@@ -5220,7 +5250,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
         let buy = BookOrder {
             tx_id: "b".repeat(64),
@@ -5240,7 +5270,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         };
 
         let route = CrossPairRoute {
@@ -5604,7 +5634,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None,
         });
 
         assert!(ob.contains_outpoint(&outpoint), "should contain outpoint after add");

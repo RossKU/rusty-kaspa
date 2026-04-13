@@ -23,7 +23,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{select_utxos_mass_aware, to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, UtxoEntry};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::MIN_UTXO_VALUE;
 use std::io::{Read, Write};
 use std::net::TcpStream;
@@ -398,9 +398,9 @@ async fn build_signed_buy_tx_json(
     amount: u64,
     fee: u64,
 ) -> anyhow::Result<String> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let owner_hash = blake2b_256(&pubkey);
     let buyer_spk_hash = compute_p2pk_spk_hash(&pubkey);
@@ -520,9 +520,9 @@ async fn build_signed_sell_tx_json(
     amount: u64,
     fee: u64,
 ) -> anyhow::Result<String> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let owner_hash = blake2b_256(&pubkey);
     let seller_spk_hash = compute_p2pk_spk_hash(&pubkey);
@@ -656,8 +656,8 @@ pub async fn run_stop(
             }
 
             let order_type = parse_stop_type(r#type)?;
-            let wallet = WalletFile::load(wallet_path)?;
-            let pubkey = wallet.public_key_bytes()?;
+            let wallet = WalletContext::load(wallet_path)?;
+            let pubkey = wallet.pubkey;
             let owner_id = hex::encode(blake2b_256(&pubkey));
 
             println!("Building signed buy TX for stop order...");
@@ -715,8 +715,8 @@ pub async fn run_stop(
             }
 
             let order_type = parse_stop_type(r#type)?;
-            let wallet = WalletFile::load(wallet_path)?;
-            let pubkey = wallet.public_key_bytes()?;
+            let wallet = WalletContext::load(wallet_path)?;
+            let pubkey = wallet.pubkey;
             let owner_id = hex::encode(blake2b_256(&pubkey));
 
             println!("Building signed sell TX for stop order...");
@@ -758,8 +758,8 @@ pub async fn run_stop(
             let resolved_owner = match owner_id {
                 Some(oid) => oid.clone(),
                 None => {
-                    let wallet = WalletFile::load(wallet_path)?;
-                    let pubkey = wallet.public_key_bytes()?;
+                    let wallet = WalletContext::load(wallet_path)?;
+                    let pubkey = wallet.pubkey;
                     hex::encode(blake2b_256(&pubkey))
                 }
             };
@@ -877,8 +877,8 @@ pub async fn run_trailing_stop(
                 other => anyhow::bail!("Invalid side '{}', expected 'buy' or 'sell'", other),
             };
 
-            let wallet = WalletFile::load(wallet_path)?;
-            let pubkey = wallet.public_key_bytes()?;
+            let wallet = WalletContext::load(wallet_path)?;
+            let pubkey = wallet.pubkey;
             let owner_id = hex::encode(blake2b_256(&pubkey));
 
             println!("Building signed {} TX for trailing stop...", ts_side);
@@ -930,8 +930,8 @@ pub async fn run_trailing_stop(
             let resolved_owner = match owner_id {
                 Some(oid) => oid.clone(),
                 None => {
-                    let wallet = WalletFile::load(wallet_path)?;
-                    let pubkey = wallet.public_key_bytes()?;
+                    let wallet = WalletContext::load(wallet_path)?;
+                    let pubkey = wallet.pubkey;
                     hex::encode(blake2b_256(&pubkey))
                 }
             };

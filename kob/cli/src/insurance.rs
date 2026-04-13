@@ -24,7 +24,7 @@ use kob_core::p2sh::build_p2sh;
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{select_utxos_mass_aware, to_rpc_payload, CoinSelection, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, UtxoEntry};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
@@ -335,9 +335,9 @@ async fn deploy_offer(
         anyhow::bail!("value must be > 0");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let spk_hash = kob_core::blake2b_256(&pubkey);
 
     let redeem_script = build_insurance_offer_redeem_script(
@@ -353,7 +353,7 @@ async fn deploy_offer(
     println!("Max LTV:            {} ({:.2}%)", max_ltv, max_ltv as f64 / 100.0);
     println!("Min Coverage:       {} sompi ({:.8} KAS)", min_coverage, min_coverage as f64 / 1e8);
     println!("Coverage Value:     {} sompi ({:.8} KAS)", value, value as f64 / 1e8);
-    println!("Owner:              {}", wallet.public_key);
+    println!("Owner:              {}", wallet.pubkey_hex());
     println!();
     println!("RedeemScript:       {} bytes", redeem_script.len());
     println!("P2SH SPK:           {}", hex::encode(&p2sh.script()));
@@ -561,8 +561,8 @@ fn resolve_offer_rs(
     let max_ltv = max_ltv.ok_or_else(|| anyhow::anyhow!("--max-ltv required when --rs is omitted"))?;
     let min_coverage = min_coverage.ok_or_else(|| anyhow::anyhow!("--min-coverage required when --rs is omitted"))?;
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
     let spk_hash = kob_core::blake2b_256(&pubkey);
     Ok(build_insurance_offer_redeem_script(
         &spk_hash, premium_bps, max_duration_daa, max_ltv, min_coverage,
@@ -583,10 +583,10 @@ async fn cancel_offer(
     order_value_override: Option<u64>,
     fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let redeem_script = resolve_offer_rs(
         wallet_path, rs_hex, premium_bps, max_duration_daa, max_ltv, min_coverage,
@@ -596,7 +596,7 @@ async fn cancel_offer(
     println!("Cancel Insurance Offer");
     println!("=======================");
     println!("Outpoint:      {}", outpoint);
-    println!("Owner:         {}", wallet.public_key);
+    println!("Owner:         {}", wallet.pubkey_hex());
     println!("RedeemScript:  {} bytes", redeem_script.len());
     println!("P2SH SPK:     {}", hex::encode(&p2sh.script()));
     println!();
@@ -780,10 +780,10 @@ async fn replace_offer(
         anyhow::bail!("new_premium_bps must be > 0");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     let redeem_script = resolve_offer_rs(
         wallet_path, rs_hex, premium_bps, max_duration_daa, max_ltv, min_coverage,
@@ -794,7 +794,7 @@ async fn replace_offer(
     println!("================================");
     println!("Outpoint:          {}", outpoint);
     println!("New Premium:       {} bps ({:.2}%)", new_premium_bps, new_premium_bps as f64 / 100.0);
-    println!("Owner:             {}", wallet.public_key);
+    println!("Owner:             {}", wallet.pubkey_hex());
     println!("RedeemScript:      {} bytes", redeem_script.len());
     println!("P2SH SPK:         {}", hex::encode(&p2sh.script()));
     println!();
@@ -990,17 +990,17 @@ async fn claim_payout(
     lock_time: u64,
     fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
     println!("Insurance Claim Payout (PATH 1)");
     println!("================================");
     println!("Outpoint:      {}", outpoint);
-    println!("Lender:        {}", wallet.public_key);
+    println!("Lender:        {}", wallet.pubkey_hex());
     println!("Lock Time:     {} DAA", lock_time);
     println!("RedeemScript:  {} bytes", redeem_script.len());
     println!("P2SH SPK:     {}", hex::encode(&p2sh.script()));
@@ -1162,17 +1162,17 @@ async fn release(
     insurer_address: &str,
     fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
     println!("Insurance Release (PATH 2)");
     println!("==========================");
     println!("Outpoint:          {}", outpoint);
-    println!("Borrower:          {}", wallet.public_key);
+    println!("Borrower:          {}", wallet.pubkey_hex());
     println!("Insurer Address:   {}", insurer_address);
     println!("RedeemScript:      {} bytes", redeem_script.len());
     println!("P2SH SPK:         {}", hex::encode(&p2sh.script()));
@@ -1360,7 +1360,7 @@ async fn mutual_cancel(
     order_value_override: Option<u64>,
     fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
@@ -1496,7 +1496,7 @@ async fn mutual_cancel(
     let cancel_sigscript = build_insurance_position_cancel_sigscript(
         &insurer_sig, &insurer_pk, &lender_sig, &lender_pk, &redeem_script,
     );
-    let privkey = wallet.secure_key()?;
+    let privkey = wallet.privkey();
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = signing::schnorr_sign_secure(&privkey, &sighash_1)?;
     let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
@@ -1557,17 +1557,17 @@ async fn timeout(
     lock_time: u64,
     fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
     println!("Insurance Timeout Reclaim (PATH 4)");
     println!("===================================");
     println!("Outpoint:      {}", outpoint);
-    println!("Insurer:       {}", wallet.public_key);
+    println!("Insurer:       {}", wallet.pubkey_hex());
     println!("Lock Time:     {} DAA", lock_time);
     println!("RedeemScript:  {} bytes", redeem_script.len());
     println!("P2SH SPK:     {}", hex::encode(&p2sh.script()));

@@ -277,7 +277,7 @@ impl BatchPlan {
         // === Build buy inputs ===
         // Track covenant output count per token_cov_id for coi computation
         let mut cov_out_counter: HashMap<String, u16> = HashMap::new();
-        for (buy_idx, (buy, input_idx)) in self.buys.iter().enumerate() {
+        for (buy_idx, (buy, _input_idx)) in self.buys.iter().enumerate() {
             let token_hex = hex::encode(buy.token_cov_id);
             let tii = self.token_input_map.get(&token_hex)
                 .ok_or_else(|| BatchError::MissingTokenUnit {
@@ -1642,7 +1642,7 @@ mod tests {
         // Sell at input[0]: koi=0, sigscript starts with Op0=0x00
         let sell_ss = &tx.inputs[0].sigscript;
         assert_eq!(sell_ss[0], 0x00, "sell koi=0 -> Op0 (0x00)");
-        assert_eq!(sell_ss[1], 0x51, "sell selector=1 -> Op1 (0x51)");
+        assert_eq!(sell_ss[1], 0x08, "sell IOC: fta push opcode (0x08)");
 
         // Buy v13 at input[1]: toi=1, tii=0 (sell input), coi=0, selector=Op1
         let buy_ss = &tx.inputs[1].sigscript;
@@ -1937,10 +1937,10 @@ mod tests {
 
         let tx = plan.build_tx().expect("build should succeed");
 
-        // Sell v14 fill SS: [Op(koi)] [Op1] [PUSHDATA2(2)] [416B RS]
-        // = 1 + 1 + 3 + 416 = 421 bytes
+        // Sell v14 IOC fill SS: [Op(koi)] [push8(fta)] [Op5] [PUSHDATA2(2)] [416B RS]
+        // = 1 + 9 + 1 + 3 + 416 = 430 bytes (IOC mode: sell excess > 0)
         let sell_ss_len = tx.inputs[0].sigscript.len();
-        assert_eq!(sell_ss_len, 421, "sell_v14 fill SS = 421B");
+        assert_eq!(sell_ss_len, 430, "sell_v14 IOC fill SS = 430B");
 
         // Buy v14 fill SS: [Op(toi)] [Op(tii)] [Op(coi)] [Op1] [PUSHDATA2(2)] [396B RS]
         // = 1 + 1 + 1 + 1 + 3 + 396 = 403 bytes

@@ -61,8 +61,8 @@ pub use compat::{
     covenant_binding_from_hex,
     kob_outpoint_to_kaspa, kaspa_outpoint_to_kob,
 };
-pub use wallet::{SecureKey, WalletFile};
-pub use wallet::{EncryptedWalletFile, encrypt_wallet, decrypt_wallet, save_encrypted, derive_key_public};
+pub use wallet::{SecureKey, WalletContext, LegacyWalletJson};
+pub use wallet::{EncryptedWalletFile, encrypt_wallet, save_encrypted, derive_key_public};
 pub use wallet::{HdWallet, WalletFileV2, AccountEntry, WatchOnlyExport, pubkey_to_address};
 pub use mass::{
     compute_storage_mass, check_storage_mass, check_tx_storage_mass,
@@ -120,12 +120,6 @@ pub use auction::{
 /// executing a trade. It is NOT the miner fee. Miner fees are calculated
 /// from transaction mass via `mass::calc_miner_fee()`.
 pub const DEFAULT_MATCHER_FEE: u64 = 10_000;
-
-/// Legacy alias -- existing code that referenced `FEE` as a flat miner fee
-/// placeholder can still compile. New code should use `mass::calc_miner_fee()`
-/// for miner fees or `DEFAULT_MATCHER_FEE` for matcher fee thresholds.
-#[deprecated(note = "Use DEFAULT_MATCHER_FEE for matcher fee or mass::calc_miner_fee() for miner fee")]
-pub const FEE: u64 = DEFAULT_MATCHER_FEE;
 
 /// Minimum UTXO value to avoid storage mass rejection (~3M sompi).
 pub const MIN_UTXO_VALUE: u64 = 3_000_000;

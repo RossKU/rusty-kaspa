@@ -18,7 +18,7 @@ use kob_core::p2sh::{blake2b_256, build_p2sh};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::estimate_compute_mass;
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
@@ -960,9 +960,9 @@ async fn create_market(
         anyhow::bail!("payout_per_token {} > unit_value {} (creator spread would be negative)", payout_per_token, unit_value);
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let creator_pkh = blake2b_256(&pubkey);
 
     // Connect and get current DAA
@@ -1222,9 +1222,9 @@ async fn vote(
     let redeem_script = hex::decode(ballot_rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     println!("Connecting to {}...", node_url);
     let rpc = NodeClient::connect(node_url).await?;
@@ -1336,9 +1336,9 @@ async fn split(
     let redeem_script = hex::decode(sm_rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     println!("Connecting to {}...", node_url);
     let rpc = NodeClient::connect(node_url).await?;
@@ -1445,9 +1445,9 @@ async fn merge(
     let redeem_script = hex::decode(sm_rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     println!("Connecting to {}...", node_url);
     let rpc = NodeClient::connect(node_url).await?;
@@ -1586,9 +1586,9 @@ async fn settle(
         anyhow::bail!("Tied ballot values ({} == {}) -- no winner can be determined", yes_value, no_value);
     };
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let wallet_spk = build_owner_spk(&pubkey);
 
     println!("Connecting to {}...", node_url);
@@ -1729,9 +1729,9 @@ async fn redeem(
     let no_rs = hex::decode(no_rs_hex)?;
     let no_p2sh = build_p2sh(&no_rs);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let wallet_spk = build_owner_spk(&pubkey);
 
     println!("Connecting to {}...", node_url);
@@ -1840,9 +1840,9 @@ async fn expire_ballot(
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let creator_script = build_owner_spk(&pubkey);
 
     println!("Connecting to {}...", node_url);
@@ -1939,9 +1939,9 @@ async fn refund_pool(
     let redeem_script = hex::decode(rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let creator_script = build_owner_spk(&pubkey);
 
     println!("Connecting to {}...", node_url);

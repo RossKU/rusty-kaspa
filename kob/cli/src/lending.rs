@@ -24,7 +24,7 @@ use kob_core::p2sh::build_p2sh;
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{select_utxos_mass_aware, to_rpc_payload, CoinSelection, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint, UtxoEntry};
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
@@ -70,9 +70,9 @@ pub async fn deploy_offer(
         anyhow::bail!("min_collateral_ratio must be > 0 (e.g. 15000 for 150%)");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     // Parse collateral token covenant ID
     let token_bytes = hex::decode(token)?;
@@ -125,7 +125,7 @@ pub async fn deploy_offer(
     if rate_mode == 1 {
         println!("Rate Floor:         {}", rate_floor_num);
     }
-    println!("Owner:              {}", wallet.public_key);
+    println!("Owner:              {}", wallet.pubkey_hex());
     println!();
     println!(
         "RedeemScript:       {} bytes",
@@ -362,9 +362,9 @@ pub async fn deploy_request(
         anyhow::bail!("duration_daa must be > 0");
     }
 
-    let wallet = WalletFile::load(wallet_path)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     // Parse collateral token covenant ID
     let token_bytes = hex::decode(token)?;
@@ -420,7 +420,7 @@ pub async fn deploy_request(
     if rate_mode >= 1 {
         println!("Rate Cap:           {}", rate_cap_num);
     }
-    println!("Owner:              {}", wallet.public_key);
+    println!("Owner:              {}", wallet.pubkey_hex());
     println!();
     println!(
         "RedeemScript:       {} bytes",
@@ -652,10 +652,10 @@ pub async fn cancel(
     fee: u64,
     fee_utxo_override: Option<&str>,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let spk_hash = kob_core::blake2b_256(&pubkey);
 
     // Parse token covenant ID
@@ -698,7 +698,7 @@ pub async fn cancel(
     println!("======================");
     println!("Outpoint:      {}", outpoint);
     println!("Side:          {}", side);
-    println!("Owner:         {}", wallet.public_key);
+    println!("Owner:         {}", wallet.pubkey_hex());
     println!("RedeemScript:  {} bytes", redeem_script.len());
     println!("P2SH SPK:     {}", hex::encode(&p2sh.script()));
     println!();
@@ -927,10 +927,10 @@ pub async fn repay(
     collateral_override: Option<u64>,
     fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let loan_outpoint = Outpoint::parse(loan_outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
     let borrower_spk_hash = kob_core::blake2b_256(&pubkey);
 
     // Reconstruct the active_loan RS
@@ -1094,7 +1094,7 @@ pub async fn repay(
                 .iter()
                 .find(|u| !u.is_p2sh())
                 .map(|u| u.utxo_entry.script_public_key.script.clone())
-                .unwrap_or_else(|| wallet.public_key.clone()),
+                .unwrap_or_else(|| wallet.pubkey_hex().clone()),
         )?;
         tx.outputs.push(TxOutput::new(tent_borrower_return, 0, spk.clone(), None));
         Some(spk)
@@ -1234,10 +1234,10 @@ pub async fn claim_default(
     collateral_override: Option<u64>,
     fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let loan_outpoint = Outpoint::parse(loan_outpoint_str)?;
-    let pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     // Verify the caller is the lender
     let caller_spk_hash = kob_core::blake2b_256(&pubkey);
@@ -1346,7 +1346,7 @@ pub async fn claim_default(
                 .iter()
                 .find(|u| !u.is_p2sh())
                 .map(|u| u.utxo_entry.script_public_key.script.clone())
-                .unwrap_or_else(|| wallet.public_key.clone()),
+                .unwrap_or_else(|| wallet.pubkey_hex().clone()),
         )?
     };
     let tent_claim = collateral.saturating_sub(estimate_compute_mass(1, 1, 0));
@@ -1472,11 +1472,11 @@ pub async fn liquidate(
     collateral_override: Option<u64>,
     fee: u64,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let loan_outpoint = Outpoint::parse(loan_outpoint_str)?;
     let price_outpoint = Outpoint::parse(price_outpoint_str)?;
-    let _pubkey = wallet.public_key_bytes()?;
-    let privkey = wallet.secure_key()?;
+    let _pubkey = wallet.pubkey;
+    let privkey = wallet.privkey();
 
     // Reconstruct the active_loan RS
     let redeem_script = kob_core::lending::build_active_loan_redeem_script(
@@ -1655,7 +1655,7 @@ pub async fn liquidate(
                 .iter()
                 .find(|u| !u.is_p2sh())
                 .map(|u| u.utxo_entry.script_public_key.script.clone())
-                .unwrap_or_else(|| wallet.public_key.clone()),
+                .unwrap_or_else(|| wallet.pubkey_hex().clone()),
         )?
     };
     if liquidator_bonus >= MIN_UTXO_VALUE {

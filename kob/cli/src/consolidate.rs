@@ -13,7 +13,7 @@ use crate::signing;
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
-use kob_core::wallet::WalletFile;
+use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
 use std::path::Path;
 use tracing::info;
@@ -131,7 +131,7 @@ pub async fn cmd_utxos(
     sort: UtxoSortOrder,
     json_output: bool,
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
+    let wallet = WalletContext::load(wallet_path)?;
     let query_address = address_filter.unwrap_or(&wallet.address);
 
     let rpc = NodeClient::connect(node_url).await?;
@@ -408,8 +408,8 @@ pub async fn cmd_consolidate(
     dry_run: bool,
     exclude_txids: &[String],
 ) -> anyhow::Result<()> {
-    let wallet = WalletFile::load(wallet_path)?;
-    let privkey = wallet.private_key_bytes()?;
+    let wallet = WalletContext::load(wallet_path)?;
+    let privkey = *wallet.privkey_bytes();
 
     println!("UTXO Consolidation{}", if dry_run { " (DRY RUN)" } else { "" });
     println!("==================");
@@ -570,7 +570,7 @@ pub async fn cmd_consolidate(
 /// Uses 2-phase sign + converge_fee for exact mass-based fee.
 async fn submit_consolidation_tx(
     rpc: &NodeClient,
-    _wallet: &WalletFile,
+    _wallet: &WalletContext,
     privkey: &[u8; 32],
     input_utxos: &[&RpcUtxo],
     target_count: usize,

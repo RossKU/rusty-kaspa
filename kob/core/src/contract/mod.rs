@@ -1,6 +1,7 @@
 //! Contract bytecodes and redeemScript/sigscript builders for KOB orders.
 
 mod helpers;
+pub mod dr;
 pub mod opcodes;
 
 pub mod spot;

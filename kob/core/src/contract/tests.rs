@@ -1715,4 +1715,84 @@ mod adversarial_tests {
         );
     }
 
+    /// Byte-exact regression guard for every covenant body.
+    ///
+    /// Each entry pins the Blake2b-256 of the body's opcode sequence. If a
+    /// body changes — accidentally or intentionally — this test fails so the
+    /// reviewer is forced to acknowledge the change. Because the P2SH SPK of
+    /// a deployed UTXO is `Blake2b(version_le || 0xaa || 0x20 || body_hash || 0x87)`,
+    /// any drift strands live funds. Update the pinned hash only when the
+    /// body is deliberately revised AND the corresponding contracts are
+    /// reissued.
+    ///
+    /// The companion D&R builder helpers in `contract/dr.rs` have their own
+    /// byte-exact tests against the DCA reference sequence, so future body
+    /// refactors that compose helpers instead of hand-tabulating opcodes can
+    /// rely on those tests + this hash to confirm bit-identity.
+    #[test]
+    fn bytecode_stable() {
+        use crate::p2sh::blake2b_256;
+        let bodies: &[(&str, &[u8], &str)] = &[
+            ("TOKEN_MINT", TOKEN_MINT_BODY,
+             "27ce3bcda48b1084d84b16b61ca93c2fec28cddf748afeec73585cda3d211211"),
+            ("TOKEN_UNIT", TOKEN_UNIT_BODY,
+             "44a029fde5f5eefd307b64e4189fd375ee1b4f19ffb122fde6b4880565bc4cc5"),
+            ("RECEIPT", RECEIPT_BODY,
+             "a526f6ea62bfc1cc305953a71c029afc334b96b199e1a7edf0ae9d912a904cd3"),
+            ("BUY_ORDER", BUY_ORDER_BODY,
+             "76a8eee18a1ed148f622a82ca1f18eb70bd039d2ecf9a936f5eb9fc1cd6f7e63"),
+            ("SELL_ORDER", SELL_ORDER_BODY,
+             "c485705ed88b5bb851d0ffee7c42390b08ff2b6d1889dbffe9b1a5e4501328be"),
+            ("OCO_SELL", OCO_SELL_BODY,
+             "6ca1f63b8e6ee999da0a4a4d69c6bcaef6ee1d43010906f69337bb8337e20129"),
+            ("DCA_ORDER", DCA_ORDER_BODY,
+             "b355306ea216b42600b756035174701ed6bbd739a4f711d4a44facb0a14b2031"),
+            ("SWAP_ORDER", SWAP_ORDER_BODY,
+             "c9cc62208ad590d7c6e17002ff9870e285bae5f39c3ea837c6da1939c82e19fa"),
+            ("BRACKET_ORDER", BRACKET_ORDER_BODY,
+             "6234a041f56e80d5ed732503eb72868dc12ecbe0f8b0f3b48d2b59b9f00d4324"),
+            ("TOKEN_PAIR_ORDER", TOKEN_PAIR_ORDER_BODY,
+             "efe0b9c0f992088e639b14f6b839756c5abf6c1275001c3001ca6626fee369f3"),
+            ("PERP_DEPLOY", PERP_DEPLOY_BODY,
+             "178f211a9e7a79d789a2b7c357eb92272b065ad9efd823b09f9b7f812951c4ec"),
+            ("PERP_POSITION", PERP_POSITION_BODY,
+             "4daac43be2b69bc7a7350494d7d8524f82c28607ffdaa3174e66dcb19cc7f0fc"),
+            ("LOAN_OFFER", LOAN_OFFER_BODY,
+             "c1625653e06b3ea0606a322ba5e25e95504ab1d9b017520d45445bbf0a828b43"),
+            ("BORROW_REQUEST", BORROW_REQUEST_BODY,
+             "07476fba173e32071c67d7c5aacc7e228b74a766e738dfbd842a5ebfed423290"),
+            ("ACTIVE_LOAN", ACTIVE_LOAN_BODY,
+             "04b7a37fdc67d45f8166fc1a65fd1fdfd64682178bfa2e5e7a178172666a0c1e"),
+            ("BALLOT_BOX", BALLOT_BOX_BODY,
+             "5a94388e99a51b693dd45c87c38d60c133d596635ca270fa91cfadcf17cd26a7"),
+            ("VOTE_RECEIPT", VOTE_RECEIPT_BODY,
+             "7a8ff48ca2f5beb1eddf6eb8d0108f644227528846b5988a5d9d128c798bd04a"),
+            ("REDEMPTION", REDEMPTION_BODY,
+             "76b9365b9a16ffe10d14f60a50faae72051595332b01b51bf953e56584db33b3"),
+            ("SPLIT_MERGE", SPLIT_MERGE_BODY,
+             "00c2ef885a06850844a3e8f18bab3656c43a7375895a15019cbcf22751539d0c"),
+            ("ENGLISH_AUCTION", ENGLISH_AUCTION_BODY,
+             "01b599a964845eb8fca612bec3b69edc83e09d384577f36470dc1647404fe99b"),
+            ("DUTCH_AUCTION", DUTCH_AUCTION_BODY,
+             "a837eea6e5dec22671d30fdba21a88a322b367df2a4e33f8ca07044dc8e44f4c"),
+            ("AUCTION_ESCROW", AUCTION_ESCROW_BODY,
+             "d20f64e9212a00ad26beb92859075f45d3e707f8bbd57e9bd50b2926a118399c"),
+            ("INSURANCE_OFFER", INSURANCE_OFFER_BODY,
+             "73bd1cb2926f025ce3c35d66fdf6263b4c33e53c4ab357892ef2d3ffd8baf859"),
+            ("INSURANCE_POSITION", INSURANCE_POSITION_BODY,
+             "9007186b397af54c5e4893db54ead408698358d520af2c720447b6eb0ce4a78e"),
+            ("CALL_OPTION", CALL_OPTION_BODY,
+             "a891c754cfe12ec55b0f19067086ec851b116ed8fb15987419d8c1d57fa03843"),
+            ("PUT_OPTION", PUT_OPTION_BODY,
+             "7e0ae3ae68f605aefaf949f9c9b2d8c67f50972e89b83bbd517daf7eb8baa7d9"),
+        ];
+        for (name, body, expected_hex) in bodies {
+            let actual = hex::encode(blake2b_256(body));
+            assert_eq!(
+                &actual, expected_hex,
+                "{} body bytecode changed (len={}B): pinned={} actual={}",
+                name, body.len(), expected_hex, actual
+            );
+        }
+    }
 }

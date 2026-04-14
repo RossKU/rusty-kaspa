@@ -490,12 +490,28 @@ async fn deploy(
     }
 
     // Sign all inputs (phase 1)
-    let mut sigscripts: Vec<Vec<u8>> = Vec::new();
-    for i in 0..tx.inputs.len() {
-        let sighash = compute_sighash(&tx, i)?;
-        let signature = signing::schnorr_sign_secure(privkey, &sighash)?;
-        sigscripts.push(signing::build_p2pk_sigscript(&signature));
-    }
+    // Input 0 may be a P2SH token UTXO (mint or unit) — needs covenant sigscript.
+    let sign_all_inputs = |tx: &Transaction, privkey: &kob_core::wallet::SecureKey, pubkey: &[u8; 32], token_input_value: u64| -> anyhow::Result<Vec<Vec<u8>>> {
+        let mut sigscripts: Vec<Vec<u8>> = Vec::new();
+        for i in 0..tx.inputs.len() {
+            let sighash = compute_sighash(tx, i)?;
+            let signature = signing::schnorr_sign_secure(privkey, &sighash)?;
+            if token_input_value > 0 && i == 0 {
+                let mint_rs = kob_core::contract::build_token_mint_redeem_script(pubkey);
+                let unit_rs = kob_core::contract::build_token_unit_redeem_script(pubkey);
+                let is_mint = tx.inputs[0].script_bytes == build_p2sh(&mint_rs).script();
+                if is_mint {
+                    sigscripts.push(contract::build_token_mint_sigscript(&signature, &mint_rs));
+                } else {
+                    sigscripts.push(contract::build_token_unit_sigscript(&signature, &unit_rs));
+                }
+            } else {
+                sigscripts.push(signing::build_p2pk_sigscript(&signature));
+            }
+        }
+        Ok(sigscripts)
+    };
+    let mut sigscripts = sign_all_inputs(&tx, privkey, &pubkey, token_input_value)?;
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
@@ -519,12 +535,7 @@ async fn deploy(
             }
         }
         // Re-sign
-        sigscripts.clear();
-        for i in 0..tx.inputs.len() {
-            let sighash = compute_sighash(&tx, i)?;
-            let signature = signing::schnorr_sign_secure(privkey, &sighash)?;
-            sigscripts.push(signing::build_p2pk_sigscript(&signature));
-        }
+        sigscripts = sign_all_inputs(&tx, privkey, &pubkey, token_input_value)?;
         exact_fee
     } else {
         phase1_fee

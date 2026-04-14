@@ -151,6 +151,8 @@ pub enum BatchError {
     Overflow { index: usize, side: &'static str, detail: &'static str },
     /// Fee bps cap produced no viable matcher fee (all surplus returned to buyers).
     FeeBpsCappedToZero,
+    /// A partially-filled sell does not meet its min_fill requirement.
+    MinFillViolation { index: usize, fill_kas: u64, min_fill: u64 },
 }
 
 impl std::fmt::Display for BatchError {
@@ -186,6 +188,9 @@ impl std::fmt::Display for BatchError {
             }
             BatchError::FeeBpsCappedToZero => {
                 write!(f, "Fee bps cap reduced matcher fee to zero (no profit)")
+            }
+            BatchError::MinFillViolation { index, fill_kas, min_fill } => {
+                write!(f, "Sell[{}] partial fill {} KAS below min_fill {}", index, fill_kas, min_fill)
             }
         }
     }
@@ -285,11 +290,31 @@ impl BatchPlan {
         // === Build sell inputs ===
         for (i, (sell, input_idx)) in self.sells.iter().enumerate() {
             let koi = *input_idx; // seller's KAS output is at output[input_idx]
+
+            // Detect partial fill: sell_fill_amounts[i] < sell.utxo_value means
+            // buyers didn't absorb all tokens.  The full-fill path (Op1) F4 check
+            // requires covenant_output[0].value >= input_value, which fails when
+            // there's a remainder.  Use IOC fill (Op5 + fta) instead — its F4
+            // only checks covenant_output_count >= 1 (existence).
+            let has_remainder = self.sell_fill_amounts.get(i)
+                .map_or(false, |&fta| fta < sell.utxo_value);
+
             let ss = if let Some(oco_path) = sell.oco_path {
-                // OCO sell: use TP (Op1) or SL (Op2) path selector
-                build_oco_sell_fill_sigscript_batch(koi as u16, oco_path, &sell.redeem_script)?
-            } else if self.ioc_mode == Some(IocSide::Sell) && !self.sell_fill_amounts.is_empty() {
-                // Sell IOC: use fta-based sigscript
+                if has_remainder {
+                    // OCO sell with remainder: use IOC fill (Op5 + fta) instead
+                    // of TP/SL full-fill path to avoid F4 value check failure.
+                    let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
+                    if has_v15_buy {
+                        build_sell_ioc_fill_sigscript_v15(koi as u16, fta, &sell.redeem_script)
+                    } else {
+                        build_sell_ioc_fill_sigscript_batch(koi as u16, fta, &sell.redeem_script)?
+                    }
+                } else {
+                    // OCO sell fully filled: use TP (Op1) or SL (Op2) path selector
+                    build_oco_sell_fill_sigscript_batch(koi as u16, oco_path, &sell.redeem_script)?
+                }
+            } else if (self.ioc_mode == Some(IocSide::Sell) || has_remainder) && !self.sell_fill_amounts.is_empty() {
+                // Sell IOC or sell with remainder: use fta-based sigscript
                 let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
                 if has_v15_buy {
                     build_sell_ioc_fill_sigscript_v15(koi as u16, fta, &sell.redeem_script)
@@ -1018,17 +1043,15 @@ pub fn plan_batch_match(
         buy_seller_map.insert(n + j, seller_idx);
     }
 
-    // If sell excess exists, switch to IOC sell mode so each sell uses
-    // the IOC fill path (Op5 + fta) instead of full fill (Op1).
-    // Full fill path F4 requires covenant_output[0].value >= sell_input_value,
-    // which fails when buyers don't absorb all tokens.
-    // IOC fill F4 only checks covenant_output_count >= 1 (existence).
-    let (ioc_mode, sell_fill_amounts) = if sell_excess > 0 {
-        // Use per-sell fill amounts computed above (order-aware allocation).
-        (Some(IocSide::Sell), per_sell_fill.clone())
+    // Always store per-sell fill amounts so build_tx() can detect partial
+    // fills per-sell via has_remainder (fill < utxo_value).
+    // When sell_excess > 0, also switch to IOC sell mode globally.
+    let ioc_mode = if sell_excess > 0 {
+        Some(IocSide::Sell)
     } else {
-        (None, Vec::new())
+        None
     };
+    let sell_fill_amounts = per_sell_fill.clone();
 
     Ok(BatchPlan {
         sells: plan_sells,

@@ -635,8 +635,9 @@ async fn fill(
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
     );
 
-    // Build TX
-    let mut tx = Transaction::new(0);
+    // Build TX — lockTime must satisfy CLTV: next_execution_daa <= tx.lockTime
+    let mut tx = Transaction::new(1);
+    tx.lock_time = next_execution_daa;
 
     // Input 0: DCA UTXO
     tx.inputs.push(TxInput {

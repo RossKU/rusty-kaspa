@@ -2519,7 +2519,7 @@ async fn record_trade(
 
     // Persist M1 candle to SQLite (MT5 style: only M1 stored, higher TFs aggregated on read)
     if let Some(ref history) = state.history {
-        if let Some(candle) = state.candles.latest_candle(&trade.pair_id, super::candle::Interval::M1) {
+        if let Some(candle) = state.candles.latest_candle(&trade.pair_id, crate::matcher::candle::Interval::M1) {
             if let Err(e) = history.upsert_m1(&trade.pair_id, candle) {
                 tracing::warn!("History DB M1 upsert failed: {}", e);
             }

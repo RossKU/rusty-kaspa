@@ -58,7 +58,7 @@ pub struct SharedState {
     /// Shared trailing stop book (used by executor + REST API).
     pub trailing_stop_book: Arc<Mutex<TrailingStopBook>>,
     /// Optional SQLite history store for persistent trade/candle data.
-    pub history: Option<Arc<super::history::HistoryStore>>,
+    pub history: Option<Arc<crate::matcher::history::HistoryStore>>,
     /// Shared IFD/IFO order book (used by executor + REST API).
     pub ifd_book: Arc<Mutex<IfdBook>>,
 
@@ -1059,8 +1059,8 @@ async fn handle_order(
     let ob = s.order_book.lock().await;
     if let Some((pair, order)) = ob.get_order_by_txid(&params.txid) {
         let side = match order.side {
-            super::order_book::OrderSide::Buy => "buy",
-            super::order_book::OrderSide::Sell => "sell",
+            crate::matcher::order_book::OrderSide::Buy => "buy",
+            crate::matcher::order_book::OrderSide::Sell => "sell",
         };
         return Ok(Json(OrderResponse {
             txid: order.tx_id.clone(),

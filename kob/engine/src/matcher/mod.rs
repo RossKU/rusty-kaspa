@@ -1,25 +1,18 @@
-// Chain-layer matcher modules (engine-only).
-//
-// Per-contract books, trackers, executors, matching orchestration, routing,
-// batch, ifd, and trailing_stop live in `kob-domain` and are re-exported
-// below for backward-compat with existing `crate::matcher::X` paths.
+//! Legacy compat façade for the pre-refactor `crate::matcher::X` paths.
+//!
+//! Engine modules were regrouped by concern in Phase 5:
+//!
+//! - chain-layer       → `crate::chain`  (executor, scanner, deploy)
+//! - storage-layer     → `crate::storage` (persistence, history)
+//! - api-layer         → `crate::api`    (REST/WS)
+//! - reporting-layer   → `crate::reporting` (trades, candle)
+//! - domain-layer      → `kob_domain`    (books, trackers, matching, …)
+//!
+//! This file re-exports every module at its original `crate::matcher::X`
+//! path so existing call sites keep resolving. New code should import
+//! from the canonical locations above instead of from `matcher::`.
 
-// Chain-layer (stays in engine)
-#[allow(dead_code)]
-pub mod executor;
-#[allow(dead_code)]
-pub mod scanner;
-pub mod persistence;
-#[allow(dead_code)]
-pub mod api;
-#[allow(dead_code)]
-pub mod trades;
-pub mod candle;
-#[allow(dead_code)]
-pub mod history;
-pub mod deploy;
-
-// Domain-layer (re-exported from kob-domain)
+// Domain re-exports (from Phase 3)
 pub use kob_domain::order_book;
 pub use kob_domain::stop_book;
 pub use kob_domain::dca_book;
@@ -38,3 +31,13 @@ pub use kob_domain::routing;
 pub use kob_domain::batch;
 pub use kob_domain::ifd;
 pub use kob_domain::trailing_stop;
+
+// Engine re-exports (from Phase 5)
+pub use crate::chain::executor;
+pub use crate::chain::scanner;
+pub use crate::chain::deploy;
+pub use crate::storage::persistence;
+pub use crate::storage::history;
+pub use crate::api;
+pub use crate::reporting::trades;
+pub use crate::reporting::candle;

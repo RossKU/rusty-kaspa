@@ -9,6 +9,10 @@
 pub use kob_domain::DEFAULT_MAX_MATCHER_FEE;
 
 pub mod config;
+pub mod chain;
+pub mod storage;
+pub mod api;
+pub mod reporting;
 pub mod matcher;
 pub mod mm;
 pub mod rpc;

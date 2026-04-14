@@ -9,7 +9,7 @@ use rusqlite::{params, Connection};
 use std::sync::{Arc, Mutex};
 use tracing::info;
 
-use super::candle::{Candle, Interval};
+use crate::reporting::candle::{Candle, Interval};
 use crate::config::HistoryConfig;
 
 /// SQLite history store — M1 candles only.

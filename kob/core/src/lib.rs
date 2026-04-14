@@ -41,6 +41,10 @@ pub use contract::{
     DCA_V2_RS_SIZE, DCA_V2_STATE_SIZE, DCA_V2_BODY_SIZE,
     ParsedDcaOrder, parse_dca_order_rs,
     build_dca_order_redeem_script, build_dca_order_fill_sigscript,
+    // Swap
+    SWAP_ORDER_BODY, SWAP_STATE_SIZE, SWAP_BODY_SIZE, SWAP_RS_SIZE,
+    ParsedSwapOrder, parse_swap_order_rs,
+    build_swap_redeem_script, build_swap_fill_sigscript, build_swap_cancel_sigscript,
     build_buy_redeem_script, build_sell_redeem_script,
     build_buy_fill_sigscript, build_sell_fill_sigscript,
     build_buy_partial_fill_sigscript, build_sell_partial_fill_sigscript,

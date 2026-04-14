@@ -7,6 +7,7 @@ pub mod receipt;
 pub mod oco;
 pub mod bracket;
 pub mod dca;
+pub mod swap;
 pub mod token_pair;
 
 pub use order::*;
@@ -15,4 +16,5 @@ pub use receipt::*;
 pub use oco::*;
 pub use bracket::*;
 pub use dca::*;
+pub use swap::*;
 pub use token_pair::*;

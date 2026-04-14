@@ -640,7 +640,7 @@ pub async fn run_deploy_test(
                 info!("    ASK val={} price={}/{} owner={}...", a.value, a.price_num, a.price_den, &a.owner_hash[..a.owner_hash.len().min(16)]);
             }
         }
-        matching::match_book_direct(&ob, true, None)
+        matching::match_book_direct(&ob, true, None, u64::MAX)
     };
 
     if groups.is_empty() {

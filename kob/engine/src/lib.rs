@@ -82,6 +82,7 @@ pub async fn run_engine(
     token_cov_id: Option<String>,
     token_utxo: Option<String>,
 ) -> anyhow::Result<()> {
+    tracing::info!("[ENGINE] allow_self_trade={} cross_pair={}", allow_self_trade, cross_pair);
     // Create shared order book
     let order_book = Arc::new(Mutex::new(OrderBook::new()));
 

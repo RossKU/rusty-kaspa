@@ -23,8 +23,14 @@ use crate::matcher::scanner::{
     BUY_RS_SIZE, SELL_RS_SIZE,
 };
 
-/// Default cooldown for failed outpoints (seconds).
+/// Default cooldown for permanently failed outpoints (seconds).
+/// Script verification failures, mass violations, etc.
 pub const FAILED_OUTPOINT_COOLDOWN_SECS: u64 = 30;
+
+/// Cooldown for transient failures (seconds).
+/// CSV sequence-lock rejections resolve after ~5s (50 DAA at 10 BPS).
+/// Short cooldown prevents submit spam while allowing prompt retry.
+const TRANSIENT_COOLDOWN_SECS: u64 = 6;
 
 /// Maximum number of blocks to retain in the reorg tracker.
 /// Kaspa's finality window is ~4 hours (~14,400 blocks at 10 BPS).
@@ -90,12 +96,24 @@ impl SpentTracker {
         self.spent.insert(outpoint_key.to_string(), Instant::now());
     }
 
-    /// Mark an outpoint as failed (TX submission rejected).
+    /// Mark an outpoint as permanently failed (TX submission rejected).
     /// The outpoint will be excluded from matching for `cooldown_secs` seconds.
     pub fn mark_failed(&mut self, outpoint_key: &str) {
         self.failed.insert(
             outpoint_key.to_string(),
             Instant::now(),
+        );
+    }
+
+    /// Mark an outpoint as transiently failed (e.g. CSV sequence-lock not yet met).
+    /// Uses a short cooldown: the order stays in the book and will retry soon.
+    pub fn mark_transient(&mut self, outpoint_key: &str) {
+        // Backdate the insertion so it expires after TRANSIENT_COOLDOWN_SECS
+        // instead of the full cooldown_secs.
+        let backdate = self.cooldown_secs.saturating_sub(TRANSIENT_COOLDOWN_SECS);
+        self.failed.insert(
+            outpoint_key.to_string(),
+            Instant::now() - std::time::Duration::from_secs(backdate),
         );
     }
 
@@ -608,6 +626,7 @@ pub(crate) fn pair_to_batch_orders(
         utxo_value: pair.sell.value,
         counterparty_spk: seller_spk,
         counterparty_spk_version: seller_spk_ver,
+        min_fill: pair.sell.min_fill,
         oco_path: pair.sell.oco_path,
     };
 
@@ -624,6 +643,7 @@ pub(crate) fn pair_to_batch_orders(
         utxo_value: pair.buy.value,
         counterparty_spk: buyer_spk,
         counterparty_spk_version: buyer_spk_ver,
+        min_fill: pair.buy.min_fill,
         oco_path: None,
     };
 
@@ -694,6 +714,7 @@ pub(crate) fn book_order_to_batch_order(
         utxo_value: order.value,
         counterparty_spk: spk,
         counterparty_spk_version: spk_ver,
+        min_fill: order.min_fill,
         oco_path: order.oco_path,
     })
 }
@@ -1124,33 +1145,50 @@ pub async fn execute_batch_match(
     let result = match rpc.submit_transaction(payload).await {
         Ok(r) => r,
         Err(e) => {
-            error!("[BATCH] Submit failed: {}", e);
-            // Mark all inputs as failed for cooldown
+            let err_str = e.to_string();
+            let is_transient = err_str.contains("sequence locks");
+            if is_transient {
+                warn!("[BATCH] CSV not yet mature (transient): {}", err_str);
+            } else {
+                error!("[BATCH] Submit failed: {}", err_str);
+            }
+            let mark = |key: &str, tracker: &mut SpentTracker| {
+                if is_transient {
+                    tracker.mark_transient(key);
+                } else {
+                    tracker.mark_failed(key);
+                }
+            };
             for (sell, _) in &plan.sells {
-                let key = format!("{}:{}", sell.outpoint.0, sell.outpoint.1);
-                spent_tracker.mark_failed(&key);
+                mark(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1), spent_tracker);
             }
             for (buy, _) in &plan.buys {
-                let key = format!("{}:{}", buy.outpoint.0, buy.outpoint.1);
-                spent_tracker.mark_failed(&key);
+                mark(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1), spent_tracker);
             }
             return None;
         }
     };
 
     if !result.ok {
-        error!(
-            "[BATCH] FAILED: {}",
-            result.error.unwrap_or_else(|| "Unknown error".to_string())
-        );
-        // Mark all order inputs as failed for cooldown
+        let err_str = result.error.unwrap_or_else(|| "Unknown error".to_string());
+        let is_transient = err_str.contains("sequence locks");
+        if is_transient {
+            warn!("[BATCH] CSV not yet mature (transient): {}", err_str);
+        } else {
+            error!("[BATCH] FAILED: {}", err_str);
+        }
+        let mark = |key: &str, tracker: &mut SpentTracker| {
+            if is_transient {
+                tracker.mark_transient(key);
+            } else {
+                tracker.mark_failed(key);
+            }
+        };
         for (sell, _) in &plan.sells {
-            let key = format!("{}:{}", sell.outpoint.0, sell.outpoint.1);
-            spent_tracker.mark_failed(&key);
+            mark(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1), spent_tracker);
         }
         for (buy, _) in &plan.buys {
-            let key = format!("{}:{}", buy.outpoint.0, buy.outpoint.1);
-            spent_tracker.mark_failed(&key);
+            mark(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1), spent_tracker);
         }
         return None;
     }
@@ -2415,6 +2453,12 @@ async fn run_scan_cycle(
     // H-5: Expire cooldown entries from previous failed submissions
     spent_tracker.expire_failed();
 
+    // Fetch current DAA score for CSV maturity checks.
+    // Orders younger than CSV_MATURITY_DAA (50 DAA) are silently skipped
+    // by match_book_direct — they stay in the book and become eligible
+    // once enough DAA scores pass (typically ~5 seconds on mainnet).
+    let current_daa = rpc.get_daa_score().await.unwrap_or(0);
+
     // Phase 1: Same-pair matches via direct book traversal.
     // Combine spent + failed outpoints into a single exclusion set so that
     // match_book_direct() skips orders consumed by prior cycles (deferred
@@ -2428,7 +2472,7 @@ async fn run_scan_cycle(
     }
 
     let opt_groups = matching::match_book_direct(
-        order_book, allow_self_trade, Some(&spent_keys),
+        order_book, allow_self_trade, Some(&spent_keys), current_daa,
     );
 
     if opt_groups.is_empty() {
@@ -2591,6 +2635,13 @@ async fn run_scan_cycle(
 
         let mut plan = match plan_result {
             Ok(p) => p,
+            Err(ref e) if matches!(e, crate::matcher::batch::BatchError::MinFillViolation { .. }) => {
+                // MinFillViolation is a pairing issue, not a permanent order fault.
+                // The orders may match with a different counterparty, so don't
+                // mark them as failed. Just skip this group.
+                info!("[UNIFIED] MinFill violation (skipping, will retry): {}", e);
+                continue;
+            }
             Err(e) => {
                 warn!("[UNIFIED] Plan failed: {}, skipping group", e);
                 for o in group.all_orders() {
@@ -4563,13 +4614,11 @@ pub async fn run_continuous_with_ws(
             }
         }
 
-        // F20: Periodically clear matched_outpoints to prevent unbounded growth.
-        // Every 100 cycles (~5-10 min depending on interval), spent outpoints
-        // from earlier cycles are safely forgotten since they no longer exist
-        // as UTXOs and cannot reappear in future queries.
+        // F20: Prune stale matched_outpoints entries (time-based eviction).
+        // Time-based pruning (10-min TTL) runs every 100 cycles.
         if cycle.is_multiple_of(100) {
             let mut ob = order_book.lock().await;
-            ob.clear_matched_outpoints();
+            ob.prune_matched_outpoints();
         }
 
         let rpc_lock = rpc.lock().await;
@@ -4920,7 +4969,7 @@ pub async fn run_dry_run(
         info!("    {}...: {} bids, {} asks", ps.token_cov_id, ps.bids, ps.asks);
     }
 
-    let all_groups = matching::match_book_direct(&ob, false, None);
+    let all_groups = matching::match_book_direct(&ob, false, None, u64::MAX);
     info!("  Same-pair batch groups: {}", all_groups.len());
 
     for (i, g) in all_groups.iter().enumerate() {

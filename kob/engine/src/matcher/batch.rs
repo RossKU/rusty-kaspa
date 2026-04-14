@@ -84,6 +84,10 @@ pub struct BatchOrder {
     pub counterparty_spk: Vec<u8>,
     /// Counterparty SPK version.
     pub counterparty_spk_version: u16,
+    /// Minimum fill amount (KAS) enforced by the contract bytecode.
+    /// IOC partial fills must produce `fill_kas >= min_fill` or the
+    /// script will reject.
+    pub min_fill: u64,
     /// OCO path: when set, this sell order is part of a single-UTXO OCO
     /// and must use the TP (Op1) or SL (Op2) selector instead of the
     /// standard sell fill selector (Op1).
@@ -990,6 +994,24 @@ pub fn plan_batch_match(
             fill
         }).collect()
     };
+    // IOC min_fill pre-check: when a sell is partially consumed (has remainder),
+    // the IOC fill path computes fill_kas = fta * pnum / pden and checks
+    // fill_kas >= min_fill.  Reject here to avoid submitting a TX that will fail.
+    if sell_excess > 0 {
+        for (i, sell) in sells.iter().enumerate() {
+            let fta = per_sell_fill[i];
+            if fta < sell.utxo_value && fta > 0 && sell.price_den > 0 {
+                let fill_kas = fta as u128 * sell.price_num as u128 / sell.price_den as u128;
+                if (fill_kas as u64) < sell.min_fill {
+                    return Err(BatchError::MinFillViolation {
+                        index: i,
+                        fill_kas: fill_kas as u64,
+                        min_fill: sell.min_fill,
+                    });
+                }
+            }
+        }
+    }
     if sell_excess > 0 {
         for (i, sell) in sells.iter().enumerate() {
             let this_excess = sell.utxo_value.saturating_sub(per_sell_fill[i]);
@@ -1609,6 +1631,7 @@ mod tests {
             utxo_value: amount,
             counterparty_spk: vec![0xDD; 34], // fake seller SPK
             counterparty_spk_version: 0,
+            min_fill: 1_000_000,
             oco_path: None,
         }
     }
@@ -1632,6 +1655,7 @@ mod tests {
             utxo_value: amount,
             counterparty_spk: vec![0xEE; 34], // fake buyer SPK
             counterparty_spk_version: 0,
+            min_fill: 1_000_000,
             oco_path: None,
         }
     }
@@ -2120,6 +2144,7 @@ mod tests {
             utxo_value: 10_000_000,
             counterparty_spk: vec![0xDD; 34],
             counterparty_spk_version: 0,
+            min_fill: 1_000_000,
             oco_path: None,
         };
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
@@ -2154,6 +2179,7 @@ mod tests {
             utxo_value: 10_000_000,
             counterparty_spk: vec![0xEE; 34],
             counterparty_spk_version: 0,
+            min_fill: 1_000_000,
             oco_path: None,
         };
 

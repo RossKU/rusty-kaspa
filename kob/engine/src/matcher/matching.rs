@@ -3,6 +3,10 @@
 use kob_core::MIN_UTXO_VALUE;
 use crate::matcher::order_book::{BookOrder, OrderBook};
 
+/// OP_CSV maturity window: orders must age at least this many DAA scores
+/// before they can be spent. Matches the lockTime embedded in deploy TXs.
+pub const CSV_MATURITY_DAA: u64 = 50;
+
 /// A matched pair ready for execution.
 #[derive(Debug, Clone)]
 pub struct CrossingPair {
@@ -364,6 +368,7 @@ fn find_sweep_groups(
     order_book: &OrderBook,
     allow_self_trade: bool,
     spent_outpoints: Option<&std::collections::HashSet<String>>,
+    current_daa: u64,
 ) -> Vec<SweepGroup> {
     use std::collections::HashSet;
 
@@ -396,6 +401,7 @@ fn find_sweep_groups(
                     && !claimed.contains(&key)
                     && b.price_num > 0
                     && b.price_den > 0
+                    && current_daa.saturating_sub(b.discovered_daa) >= CSV_MATURITY_DAA
             })
             .collect();
 
@@ -409,6 +415,7 @@ fn find_sweep_groups(
                     && !claimed.contains(&key)
                     && s.price_num > 0
                     && s.price_den > 0
+                    && current_daa.saturating_sub(s.discovered_daa) >= CSV_MATURITY_DAA
             })
             .collect();
 
@@ -744,6 +751,7 @@ pub fn match_book_direct(
     order_book: &OrderBook,
     allow_self_trade: bool,
     spent_outpoints: Option<&std::collections::HashSet<String>>,
+    current_daa: u64,
 ) -> Vec<BatchGroup> {
     use std::collections::HashSet;
 
@@ -773,7 +781,7 @@ pub fn match_book_direct(
     // Sweeps must be detected first because they atomically fill large
     // orders that would otherwise be broken into multiple 1:1 pairs.
     // ---------------------------------------------------------------
-    let sweep_groups = find_sweep_groups(order_book, allow_self_trade, spent_outpoints);
+    let sweep_groups = find_sweep_groups(order_book, allow_self_trade, spent_outpoints, current_daa);
 
     for sg in sweep_groups {
         let anchor_key = sg.anchor.outpoint_key();
@@ -833,6 +841,7 @@ pub fn match_book_direct(
                     && !used.contains(&key)
                     && s.price_num > 0
                     && s.price_den > 0
+                    && current_daa.saturating_sub(s.discovered_daa) >= CSV_MATURITY_DAA
             })
             .collect();
 
@@ -846,6 +855,7 @@ pub fn match_book_direct(
                     && !used.contains(&key)
                     && b.price_num > 0
                     && b.price_den > 0
+                    && current_daa.saturating_sub(b.discovered_daa) >= CSV_MATURITY_DAA
             })
             .collect();
 
@@ -1916,7 +1926,7 @@ mod tests {
         sell_b.owner_hash = "dd".repeat(32);
         ob.add_sell_order(sell_b);
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
 
         if groups.len() >= 2 {
             assert!(
@@ -2064,7 +2074,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
 
         let gtc_groups: Vec<_> = groups.iter()
             .filter(|g| g.kind == GroupKind::GtcBuyMultiFill)
@@ -2099,7 +2109,7 @@ mod tests {
         assert!(ob.add_sell_order(sell), "non-post-only sell must be accepted");
 
         // The matcher should find a crossing group.
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(!groups.is_empty(),
             "post-only maker buy + regular taker sell should produce a match group");
     }
@@ -2136,7 +2146,7 @@ mod tests {
         ob.add_buy_order(make_buy(10_000_000, 1, 2, FAKE_TOKEN));
         ob.add_sell_order(make_sell(10_000_000, 1, 2, FAKE_TOKEN));
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(!groups.is_empty(), "Should find at least 1 group");
         assert_eq!(groups[0].kind, GroupKind::Batch);
         assert_eq!(groups[0].sells.len(), 1);
@@ -2150,7 +2160,7 @@ mod tests {
         ob.add_buy_order(make_buy(3_500_000, 1, 10, FAKE_TOKEN));
         ob.add_sell_order(make_sell(3_500_000, 5, 1, FAKE_TOKEN));
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(groups.is_empty(), "Non-overlapping prices should produce no groups");
     }
 
@@ -2168,7 +2178,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         // All 6 orders should be matched. With sweep detection:
         // - Buy sweep: 1 buy sweeps 2 sells (buy has enough KAS for 2 sells)
         // - Sell sweep: remaining 1 sell sweeps 2 remaining buys
@@ -2192,11 +2202,11 @@ mod tests {
         ob.add_sell_order(sell);
 
         // STP on: no groups
-        let groups = match_book_direct(&ob, false, None);
+        let groups = match_book_direct(&ob, false, None, u64::MAX);
         assert!(groups.is_empty(), "STP should block same-owner match");
 
         // STP off: should match
-        let groups2 = match_book_direct(&ob, true, None);
+        let groups2 = match_book_direct(&ob, true, None, u64::MAX);
         assert!(!groups2.is_empty(), "Without STP, should produce group");
     }
 
@@ -2213,12 +2223,12 @@ mod tests {
         sell.owner_hash = "bb".repeat(32);
         ob.add_sell_order(sell);
 
-        let groups_before = match_book_direct(&ob, true, None);
+        let groups_before = match_book_direct(&ob, true, None, u64::MAX);
         assert!(!groups_before.is_empty());
 
         let mut spent = std::collections::HashSet::new();
         spent.insert(buy_key);
-        let groups_after = match_book_direct(&ob, true, Some(&spent));
+        let groups_after = match_book_direct(&ob, true, Some(&spent), u64::MAX);
         assert!(groups_after.is_empty(), "Spent buy should prevent matching");
     }
 
@@ -2237,7 +2247,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         let mut all_outpoints = std::collections::HashSet::new();
         for g in &groups {
             for o in g.all_orders() {
@@ -2267,7 +2277,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         for g in &groups {
             assert!(
                 g.sells.len() <= MAX_BATCH_GROUP_SIZE,
@@ -2294,7 +2304,7 @@ mod tests {
         sell.owner_hash = "bb".repeat(32);
         ob.add_sell_order(sell);
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(!groups.is_empty(), "Should find at least one group");
         let has_partial = groups.iter().any(|g|
             g.kind == GroupKind::PartialBuy || g.kind == GroupKind::PartialSell
@@ -2328,7 +2338,7 @@ mod tests {
         sell.owner_hash = "bb".repeat(32);
         ob.add_sell_order(sell);
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(!groups.is_empty());
 
         // The matched buy should be the older one (daa=100)
@@ -2363,7 +2373,7 @@ mod tests {
         sell_b.owner_hash = "dd".repeat(32);
         ob.add_sell_order(sell_b);
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         let total_sells: usize = groups.iter().map(|g| g.sells.len()).sum();
         assert_eq!(total_sells, 2, "Both token pairs should produce matches");
     }
@@ -2385,7 +2395,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(!groups.is_empty(), "Should find groups");
         // The single buy matching 3 sells should form a group with 1 buy + 3 sells
         let group = &groups[0];
@@ -2401,7 +2411,7 @@ mod tests {
     #[test]
     fn test_direct_empty_book() {
         let ob = OrderBook::new();
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(groups.is_empty());
     }
 
@@ -2415,7 +2425,7 @@ mod tests {
         sell.owner_hash = "bb".repeat(32);
         ob.add_sell_order(sell);
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(groups.is_empty(), "Zero-price orders should be skipped");
     }
 
@@ -2478,7 +2488,7 @@ mod tests {
         sell_regular.discovered_daa = 3;
         ob.add_sell_order(sell_regular);
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
         assert!(!groups.is_empty(), "Should produce at least one group");
 
         // Collect all sell utxo_outpoint_keys across all groups.
@@ -2540,7 +2550,7 @@ mod tests {
         sell_sl.discovered_daa = 3;
         ob.add_sell_order(sell_sl);
 
-        let groups = match_book_direct(&ob, true, None);
+        let groups = match_book_direct(&ob, true, None, u64::MAX);
 
         let mut utxo_keys: Vec<String> = Vec::new();
         for g in &groups {

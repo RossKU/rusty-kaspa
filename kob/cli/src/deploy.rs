@@ -906,8 +906,14 @@ pub async fn deploy_sell(
 
     let total_input = token_input_value + total_p2pk_input;
 
-    // Output 0: P2SH sell order (with covenant binding if token specified)
-    let covenant_binding = token_covenant_id.map(|token_cov_hex| kob_core::tx::CovenantBinding::new(token_input_idx as u16, kob_core::compat::parse_hash(&token_cov_hex.to_string()).unwrap()));
+    // Output 0: P2SH sell order (with covenant binding if token specified AND tx is version 1+)
+    // When no covenant input was found (tx.version == 0), the output must NOT have a
+    // covenant binding — the node rejects covenant fields on version-0 transactions.
+    let covenant_binding = if tx.version >= 1 {
+        token_covenant_id.map(|token_cov_hex| kob_core::tx::CovenantBinding::new(token_input_idx as u16, kob_core::compat::parse_hash(&token_cov_hex.to_string()).unwrap()))
+    } else {
+        None
+    };
 
     tx.outputs.push(TxOutput::new(amount, 0, p2sh.script().to_vec(), covenant_binding));
 

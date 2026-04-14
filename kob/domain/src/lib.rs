@@ -18,51 +18,23 @@
 /// Must match `kob-cli`'s `DEFAULT_MAX_MATCHER_FEE` to avoid P2SH mismatch.
 pub const DEFAULT_MAX_MATCHER_FEE: u64 = 10_000_000;
 
-// Spot books
-#[allow(dead_code)]
-pub mod order_book;
-#[allow(dead_code)]
-pub mod stop_book;
-#[allow(dead_code)]
-pub mod dca_book;
-#[allow(dead_code)]
-pub mod swap_book;
+// Per-contract subdomains. Each subdir groups book + tracker + executor + any
+// spot-only orchestration (matching, routing, batch, ifd, trailing_stop).
+pub mod spot;
+pub mod perp;
+pub mod lending;
+pub mod prediction;
 
-// Perp
-#[allow(dead_code)]
-pub mod perp_book;
-#[allow(dead_code)]
-pub mod perp_tracker;
-#[allow(dead_code)]
-pub mod perp_executor;
-
-// Lending
-#[allow(dead_code)]
-pub mod lending_book;
-#[allow(dead_code)]
-pub mod lending_tracker;
-#[allow(dead_code)]
-pub mod lending_executor;
-
-// Prediction
-#[allow(dead_code)]
-pub mod prediction_book;
-#[allow(dead_code)]
-pub mod prediction_tracker;
-#[allow(dead_code)]
-pub mod prediction_executor;
-
-// Matching / orchestration
-#[allow(dead_code)]
-pub mod matching;
-#[allow(dead_code)]
-pub mod routing;
-#[allow(dead_code)]
-pub mod batch;
-#[allow(dead_code)]
-pub mod ifd;
-#[allow(dead_code)]
-pub mod trailing_stop;
+// Flat re-exports preserve the `kob_domain::<module>::X` paths that kob-engine
+// and intra-domain code use. Relocating a module into a subdir is a storage
+// concern only — the public surface stays flat.
+pub use spot::{
+    order_book, stop_book, dca_book, swap_book,
+    matching, routing, batch, ifd, trailing_stop,
+};
+pub use perp::{perp_book, perp_tracker, perp_executor};
+pub use lending::{lending_book, lending_tracker, lending_executor};
+pub use prediction::{prediction_book, prediction_tracker, prediction_executor};
 
 use std::collections::HashMap;
 use std::hash::Hash;

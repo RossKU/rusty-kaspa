@@ -26,6 +26,13 @@ use crate::matcher::scanner::{
 /// Default cooldown for failed outpoints (seconds).
 pub const FAILED_OUTPOINT_COOLDOWN_SECS: u64 = 30;
 
+/// Maximum number of blocks to retain in the reorg tracker.
+/// Kaspa's finality window is ~4 hours (~14,400 blocks at 10 BPS).
+/// We keep a smaller window (1,000 blocks) since deep reorgs beyond this
+/// depth are extremely unlikely and the startup UTXO validation handles
+/// any edge cases.
+const REORG_TRACKER_MAX_BLOCKS: usize = 1_000;
+
 /// Default matcher fee in basis points (0.30%).
 pub const DEFAULT_FEE_BPS: u16 = 30;
 /// Maximum allowed fee in basis points (1.00%). Prevents misconfiguration.
@@ -146,6 +153,231 @@ impl SpentTracker {
         self.spent.clear();
         self.pending_outputs.clear();
         self.failed.clear();
+    }
+
+    /// Remove all spent entries whose outpoint keys belong to TXs in the given set.
+    ///
+    /// Used during reorg processing: when a block is removed, any outpoints that
+    /// were marked as spent by TXs in that block should be un-spent so they become
+    /// eligible for matching again.
+    pub fn remove_spent_for_txids(&mut self, txids: &HashSet<String>) {
+        let before = self.spent.len();
+        self.spent.retain(|outpoint_key, _| {
+            // Extract txid from "txid:index" format
+            if let Some(colon) = outpoint_key.find(':') {
+                let txid = &outpoint_key[..colon];
+                !txids.contains(txid)
+            } else {
+                true // Keep entries with unexpected format
+            }
+        });
+        let removed = before - self.spent.len();
+        if removed > 0 {
+            info!(
+                "[TRACKER] Removed {} spent entries for reorged TXs ({} txids)",
+                removed, txids.len(),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReorgTracker: block-provenance tracking for chain reorganization handling
+// ---------------------------------------------------------------------------
+
+/// Records which orders were added/removed by each block so that reorgs
+/// (removed blocks) can be rolled back.
+///
+/// For each block hash, we store:
+/// - `orders_added`: BookOrders that were added from transactions in this block.
+///   On reorg, these must be REMOVED from the order book.
+/// - `orders_spent`: outpoint_keys of orders that were spent (filled/cancelled)
+///   by transactions in this block, together with a snapshot of the order at
+///   the time of removal. On reorg, these must be RESTORED to the order book.
+/// - `txids`: all transaction IDs seen in this block, used to clean up the
+///   SpentTracker.
+///
+/// The tracker maintains insertion order via a VecDeque and prunes old entries
+/// when the block count exceeds REORG_TRACKER_MAX_BLOCKS.
+pub struct ReorgTracker {
+    /// Block hash -> provenance data, in insertion order (oldest first).
+    blocks: std::collections::VecDeque<(String, BlockProvenance)>,
+    /// Fast lookup: block_hash -> index in `blocks` VecDeque.
+    index: HashMap<String, usize>,
+}
+
+/// Provenance data for a single block.
+struct BlockProvenance {
+    /// Orders that were added to the book from this block's transactions.
+    /// On reorg, these must be removed.
+    orders_added: Vec<crate::matcher::order_book::BookOrder>,
+    /// Orders that were spent (removed from book) by this block's transactions.
+    /// On reorg, these must be restored. Stored as (outpoint_key, order_snapshot).
+    orders_spent: Vec<(String, crate::matcher::order_book::BookOrder)>,
+    /// All TX IDs seen in this block (for SpentTracker cleanup).
+    txids: HashSet<String>,
+}
+
+impl ReorgTracker {
+    pub fn new() -> Self {
+        Self {
+            blocks: std::collections::VecDeque::new(),
+            index: HashMap::new(),
+        }
+    }
+
+    /// Record provenance for a block.
+    ///
+    /// `block_hash`: the block's hash.
+    /// `orders_added`: orders that were added to the book from this block.
+    /// `orders_spent`: orders that were spent (with snapshots for restoration).
+    /// `txids`: all TX IDs in this block.
+    pub fn record_block(
+        &mut self,
+        block_hash: String,
+        orders_added: Vec<crate::matcher::order_book::BookOrder>,
+        orders_spent: Vec<(String, crate::matcher::order_book::BookOrder)>,
+        txids: HashSet<String>,
+    ) {
+        // Avoid duplicates (same block hash seen twice, e.g. from retransmission)
+        if self.index.contains_key(&block_hash) {
+            return;
+        }
+
+        let idx = self.blocks.len();
+        self.blocks.push_back((block_hash.clone(), BlockProvenance {
+            orders_added,
+            orders_spent,
+            txids,
+        }));
+        self.index.insert(block_hash, idx);
+
+        // Prune oldest blocks if we exceed the limit
+        while self.blocks.len() > REORG_TRACKER_MAX_BLOCKS {
+            if let Some((old_hash, _)) = self.blocks.pop_front() {
+                self.index.remove(&old_hash);
+            }
+            // After popping, all indices shift down by 1. Rebuild index.
+            // This is O(N) but only happens once per block and N is bounded.
+            self.rebuild_index();
+        }
+    }
+
+    /// Process removed blocks during a reorg.
+    ///
+    /// For each removed block hash (in order):
+    /// 1. Remove orders that were added by that block from the order book.
+    /// 2. Restore orders that were spent by that block back to the order book.
+    /// 3. Remove SpentTracker entries for TXs in that block.
+    ///
+    /// Returns `(orders_restored, orders_removed, blocks_handled, blocks_unknown)`.
+    pub fn handle_removed_blocks(
+        &mut self,
+        removed_hashes: &[String],
+        order_book: &mut crate::matcher::order_book::OrderBook,
+        spent_tracker: &mut SpentTracker,
+    ) -> (usize, usize, usize, usize) {
+        let mut total_restored = 0usize;
+        let mut total_removed = 0usize;
+        let mut blocks_handled = 0usize;
+        let mut blocks_unknown = 0usize;
+
+        for block_hash in removed_hashes {
+            // Find and remove the block from our tracker
+            let provenance = if let Some(&idx) = self.index.get(block_hash) {
+                self.index.remove(block_hash);
+                // Remove from deque — we swap_remove for efficiency
+                // but since ordering matters for future pruning,
+                // we mark it as consumed and skip during future lookups.
+                // Actually, for correctness in a reorg scenario the removed
+                // blocks are processed once and then gone. Just extract it.
+                //
+                // Note: VecDeque doesn't have swap_remove. We'll remove by
+                // index which is O(N), but reorgs are rare and N is bounded.
+                let (_, prov) = self.blocks.remove(idx).unwrap();
+                self.rebuild_index();
+                Some(prov)
+            } else {
+                None
+            };
+
+            match provenance {
+                Some(prov) => {
+                    blocks_handled += 1;
+
+                    // Step 1: Remove orders that were ADDED by this block.
+                    // These orders no longer exist on-chain after the reorg.
+                    for order in &prov.orders_added {
+                        let key = order.outpoint_key();
+                        if order_book.contains_outpoint(&key) {
+                            order_book.remove_order(&key);
+                            total_removed += 1;
+                            warn!(
+                                "[REORG] Removed order {} (added by reorged block {}...)",
+                                &key[..key.len().min(20)],
+                                &block_hash[..block_hash.len().min(16)],
+                            );
+                        }
+                    }
+
+                    // Step 2: Restore orders that were SPENT by this block.
+                    // The spending TX is no longer valid, so the original order
+                    // UTXO should reappear in the UTXO set.
+                    for (outpoint_key, order_snapshot) in prov.orders_spent {
+                        // Only restore if the order is not already in the book
+                        // (defensive: another notification path may have re-added it)
+                        if !order_book.contains_outpoint(&outpoint_key) {
+                            // Also remove from matched_outpoints so the order
+                            // is not immediately filtered out by dedup logic
+                            order_book.matched_outpoints.remove(&outpoint_key);
+
+                            match order_snapshot.side {
+                                OrderSide::Buy => {
+                                    order_book.add_buy_order(order_snapshot.clone());
+                                }
+                                OrderSide::Sell => {
+                                    order_book.add_sell_order(order_snapshot.clone());
+                                }
+                            }
+                            total_restored += 1;
+                            warn!(
+                                "[REORG] Restored order {} (spent by reorged block {}...)",
+                                &outpoint_key[..outpoint_key.len().min(20)],
+                                &block_hash[..block_hash.len().min(16)],
+                            );
+                        }
+                    }
+
+                    // Step 3: Clean up SpentTracker entries for TXs in this block.
+                    spent_tracker.remove_spent_for_txids(&prov.txids);
+                }
+                None => {
+                    blocks_unknown += 1;
+                    warn!(
+                        "[REORG] Removed block {}... has no provenance data (too old or not tracked). \
+                         Orders from this block cannot be automatically rolled back. \
+                         A UTXO validation sweep will be needed.",
+                        &block_hash[..block_hash.len().min(16)],
+                    );
+                }
+            }
+        }
+
+        (total_restored, total_removed, blocks_handled, blocks_unknown)
+    }
+
+    /// Number of blocks currently tracked.
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// Rebuild the hash->index lookup after structural changes to the deque.
+    fn rebuild_index(&mut self) {
+        self.index.clear();
+        for (i, (hash, _)) in self.blocks.iter().enumerate() {
+            self.index.insert(hash.clone(), i);
+        }
     }
 }
 
@@ -1113,6 +1345,30 @@ pub struct ScanCounters {
 ///
 /// This is the unified replacement for `process_block_txs_inner` that handles
 /// all four product types in a single pass.
+/// Collects provenance data during block processing for reorg tracking.
+///
+/// When provided to `process_block_txs_all`, this accumulates:
+/// - Orders added to the book (cloned snapshots)
+/// - Orders spent from the book (with pre-removal snapshots)
+/// - All TX IDs seen in the block
+///
+/// After processing, the caller can commit this data to the `ReorgTracker`.
+struct ReorgCollector {
+    orders_added: Vec<crate::matcher::order_book::BookOrder>,
+    orders_spent: Vec<(String, crate::matcher::order_book::BookOrder)>,
+    txids: HashSet<String>,
+}
+
+impl ReorgCollector {
+    fn new() -> Self {
+        Self {
+            orders_added: Vec::new(),
+            orders_spent: Vec::new(),
+            txids: HashSet::new(),
+        }
+    }
+}
+
 fn process_block_txs_all(
     txs: &[TransactionData],
     order_book: &mut OrderBook,
@@ -1124,6 +1380,7 @@ fn process_block_txs_all(
     current_daa: u64,
     mut ifd_book: Option<&mut crate::matcher::ifd::IfdBook>,
     mut dca_book: Option<&mut crate::matcher::dca_book::DcaBook>,
+    mut reorg_collector: Option<&mut ReorgCollector>,
 ) -> ScanCounters {
     let mut counters = ScanCounters::default();
 
@@ -1149,12 +1406,26 @@ fn process_block_txs_all(
         .unwrap_or_default();
 
     for tx in txs {
+        // Reorg tracking: record TX ID
+        if let Some(ref mut rc) = reorg_collector {
+            rc.txids.insert(tx.tx_id.clone());
+        }
+
         // Phase 1: Remove spent orders from ALL books
 
         // Spot book
         let spot_spent = BlockScanner::find_spent_orders(tx, order_book);
         for key in &spot_spent {
             info!("[SCANNER-ALL] Spot order spent: {}", &key[..key.len().min(20)]);
+
+            // Reorg tracking: snapshot the order before removal so it can be
+            // restored if this block is reorged out.
+            if let Some(ref mut rc) = reorg_collector {
+                if let Some(order) = order_book.get_order(key) {
+                    rc.orders_spent.push((key.clone(), order.clone()));
+                }
+            }
+
             if let Some(ws) = ws_tx {
                 if let Some(order) = order_book.get_order(key) {
                     crate::matcher::api::emit_order_cancelled(
@@ -1225,6 +1496,9 @@ fn process_block_txs_all(
                 let mut book_order = BlockScanner::to_book_order_with_tx(
                     &parsed, &tx.tx_id, p2sh_idx, p2sh_value, None, Some(tx),
                 );
+                // FIFO: stamp with the DAA score at which this order was discovered.
+                book_order.discovered_daa = current_daa;
+
                 let outpoint_key = book_order.outpoint_key();
                 if order_book.contains_outpoint(&outpoint_key) {
                     continue; // dedup
@@ -1276,6 +1550,10 @@ fn process_block_txs_all(
                                 book_order.value, &book_order.token_cov_id,
                             );
                         }
+                        // Reorg tracking: snapshot the order before it's moved
+                        if let Some(ref mut rc) = reorg_collector {
+                            rc.orders_added.push(book_order.clone());
+                        }
                         order_book.add_buy_order(book_order);
                     }
                     OrderSide::Sell => {
@@ -1292,6 +1570,10 @@ fn process_block_txs_all(
                                 OrderSide::Sell, book_order.price_num, book_order.price_den,
                                 book_order.value, &book_order.token_cov_id,
                             );
+                        }
+                        // Reorg tracking: snapshot the order before it's moved
+                        if let Some(ref mut rc) = reorg_collector {
+                            rc.orders_added.push(book_order.clone());
                         }
                         order_book.add_sell_order(book_order);
                     }
@@ -1444,9 +1726,13 @@ fn process_block_txs_all(
                     continue;
                 }
 
-                let (tp_order, sl_order) = BlockScanner::oco_sell_to_book_orders(
+                let (mut tp_order, mut sl_order) = BlockScanner::oco_sell_to_book_orders(
                     &parsed, &tx.tx_id, p2sh_idx, p2sh_value, Some(tx),
                 );
+                // FIFO: stamp OCO orders with discovery DAA.
+                tp_order.discovered_daa = current_daa;
+                sl_order.discovered_daa = current_daa;
+
                 let tp_key = tp_order.outpoint_key();
                 let sl_key = sl_order.outpoint_key();
 
@@ -1480,6 +1766,12 @@ fn process_block_txs_all(
                         OrderSide::Sell, sl_order.price_num, sl_order.price_den,
                         sl_order.value, &sl_order.token_cov_id,
                     );
+                }
+
+                // Reorg tracking: snapshot OCO orders before they're moved
+                if let Some(ref mut rc) = reorg_collector {
+                    rc.orders_added.push(tp_order.clone());
+                    rc.orders_added.push(sl_order.clone());
                 }
 
                 order_book.add_sell_order(tp_order);
@@ -1671,6 +1963,7 @@ async fn scan_new_blocks(
                 current_daa,
                 None, // No IFD book in scan_new_blocks (unused path)
                 None, // No DCA book in scan_new_blocks
+                None, // No reorg collector in catchup path
             );
 
             total_counters.spot_added += counters.spot_added;
@@ -3424,15 +3717,29 @@ pub async fn run_continuous_with_ws(
     info!("Interval: {}ms", interval_ms);
     info!("Cross-pair routing: {}", if enable_cross_pair { "ENABLED" } else { "disabled" });
 
-    // Set up graceful shutdown
+    // Set up graceful shutdown with TX drain support.
+    // Phase 1 (first signal): set shutdown flag, finish current scan cycle
+    //   (including any in-flight RPC TX submissions), then persist and exit.
+    // Phase 2 (second signal during drain): force-exit immediately.
     let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let force_exit = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let shutdown_clone = shutdown.clone();
+    let force_exit_clone = force_exit.clone();
 
-    // Handle SIGINT/SIGTERM
     tokio::spawn(async move {
+        // First signal: graceful shutdown
         tokio::signal::ctrl_c().await.ok();
-        info!("[SHUTDOWN] Graceful shutdown requested (Ctrl+C again to force)");
-        shutdown_clone.store(true, std::sync::atomic::Ordering::Relaxed);
+        info!("[SHUTDOWN] Graceful shutdown requested -- draining in-flight TXs...");
+        info!("[SHUTDOWN] Press Ctrl+C again to force immediate exit.");
+        shutdown_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Second signal: force exit
+        tokio::signal::ctrl_c().await.ok();
+        warn!("[SHUTDOWN] Force exit requested -- aborting immediately!");
+        force_exit_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+        // Give a moment for the log to flush, then hard-exit.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        std::process::exit(1);
     });
 
     info!("Scanning for orders... Press Ctrl+C to stop.");
@@ -3447,6 +3754,7 @@ pub async fn run_continuous_with_ws(
 
     let mut cycle = 0u64;
     let mut spent_tracker = SpentTracker::new();
+    let mut reorg_tracker = ReorgTracker::new();
 
     // H2: Track the last seen block hash for catchup after WS reconnection.
     // Initialized from the current sink hash so scan_new_blocks can use
@@ -3465,8 +3773,13 @@ pub async fn run_continuous_with_ws(
         }
     };
 
-    // Subscribe to BlockAdded notifications for event-driven scanning.
-    // This replaces the old getVirtualChainFromBlock polling loop.
+    // Subscribe to BlockAdded and VirtualChainChanged notifications.
+    //
+    // BlockAdded: provides full block data (transactions) for order discovery.
+    // VirtualChainChanged: provides removedChainBlockHashes for reorg detection.
+    //   Without this, the engine would be unaware of chain reorganizations and
+    //   could have phantom orders (from reorged-out blocks) or miss the
+    //   restoration of orders whose spends were reorged out.
     info!("==========================================================");
     info!("  KOB Engine ready — listening for new blocks.");
     info!("  IMPORTANT: Deploy orders AFTER this message appears.");
@@ -3479,11 +3792,18 @@ pub async fn run_continuous_with_ws(
             Ok(_) => info!("[SUBSCRIBE] Subscribed to BlockAdded notifications"),
             Err(e) => warn!("[SUBSCRIBE] Failed to subscribe to BlockAdded: {}. Will retry on reconnect.", e),
         }
+        // Subscribe to VirtualChainChanged for reorg detection.
+        // This notification fires whenever the selected parent chain changes,
+        // providing both added and removed block hashes.
+        match rpc_lock.subscribe("VirtualChainChanged").await {
+            Ok(_) => info!("[SUBSCRIBE] Subscribed to VirtualChainChanged notifications (reorg detection)"),
+            Err(e) => warn!("[SUBSCRIBE] Failed to subscribe to VirtualChainChanged: {}. Reorg detection disabled.", e),
+        }
         rpc_lock.take_notification_receiver().await
             .expect("notification receiver already taken")
     };
 
-    while !shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+    while !shutdown.load(std::sync::atomic::Ordering::SeqCst) {
         // BUG 1 fix: Check RPC connection health at the top of each cycle.
         // If the connection is dead, attempt reconnection before any RPC calls.
         // On reconnect, re-subscribe and take the new notification receiver.
@@ -3501,7 +3821,11 @@ pub async fn run_continuous_with_ws(
                 // Re-subscribe after reconnect
                 match rpc_lock.subscribe("BlockAdded").await {
                     Ok(_) => info!("[SUBSCRIBE] Re-subscribed to BlockAdded notifications"),
-                    Err(e) => warn!("[SUBSCRIBE] Failed to re-subscribe: {}", e),
+                    Err(e) => warn!("[SUBSCRIBE] Failed to re-subscribe to BlockAdded: {}", e),
+                }
+                match rpc_lock.subscribe("VirtualChainChanged").await {
+                    Ok(_) => info!("[SUBSCRIBE] Re-subscribed to VirtualChainChanged notifications"),
+                    Err(e) => warn!("[SUBSCRIBE] Failed to re-subscribe to VirtualChainChanged: {}", e),
                 }
                 if let Some(new_rx) = rpc_lock.take_notification_receiver().await {
                     notif_rx = new_rx;
@@ -3553,9 +3877,15 @@ pub async fn run_continuous_with_ws(
         spent_tracker.expire_failed();
 
         // Phase 0: Process block notifications (event-driven).
-        // Drain all pending blockAddedNotification messages and process
-        // their transactions. This replaces the old getVirtualChainFromBlock
-        // polling approach, reducing latency from 5s+ to sub-second.
+        // Drain all pending notifications and process them.
+        //
+        // Two notification types are handled:
+        //   - blockAddedNotification: new blocks with full TX data (primary path)
+        //   - virtualChainChangedNotification: chain reorg signals with
+        //     removedChainBlockHashes and addedChainBlockHashes
+        //
+        // Reorg handling: when removedChainBlockHashes are received, the
+        // ReorgTracker rolls back orders added/spent by those blocks.
         {
             let scanner = BlockScanner::new();
             let mut blocks_processed = 0u64;
@@ -3563,49 +3893,133 @@ pub async fn run_continuous_with_ws(
 
             // Collect all queued block notifications first, then batch-process.
             // This avoids per-block RPC calls and lock contention.
-            let mut block_txs_batch: Vec<Vec<TransactionData>> = Vec::new();
+            // Each entry is (block_hash, txs) so we can track provenance.
+            let mut block_txs_batch: Vec<(Option<String>, Vec<TransactionData>)> = Vec::new();
+            // Removed block hashes from virtualChainChangedNotification.
+            let mut reorg_removed_hashes: Vec<String> = Vec::new();
             loop {
                 match notif_rx.try_recv() {
                     Ok(notif) => {
                         let method = notif.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                        if method != "blockAddedNotification" {
-                            continue;
-                        }
-                        // Extract block from params.BlockAdded.block
-                        // Kaspa wRPC format: {"params": {"BlockAdded": {"block": {...}}}}
-                        let block = match notif.get("params")
-                            .and_then(|p| p.get("BlockAdded").or_else(|| p.get("block")))
-                            .and_then(|ba| ba.get("block").or(Some(ba)))
-                        {
-                            Some(b) => b,
-                            None => continue,
-                        };
-                        // H2: Extract block hash for catchup tracking.
-                        // Kaspa wRPC: block.verboseData.hash or block.header.hash
-                        if let Some(bh) = block
-                            .get("verboseData").and_then(|vd| vd.get("hash"))
-                            .or_else(|| block.get("header").and_then(|h| h.get("hash")))
-                            .and_then(|v| v.as_str())
-                        {
-                            last_seen_hash = Some(bh.to_string());
-                        }
 
-                        let txs: Vec<TransactionData> = block
-                            .get("transactions")
-                            .and_then(|t| t.as_array())
-                            .map(|arr| arr.iter().filter_map(TransactionData::from_rpc_json).collect())
-                            .unwrap_or_default();
+                        if method == "blockAddedNotification" {
+                            // Extract block from params.BlockAdded.block
+                            // Kaspa wRPC format: {"params": {"BlockAdded": {"block": {...}}}}
+                            let block = match notif.get("params")
+                                .and_then(|p| p.get("BlockAdded").or_else(|| p.get("block")))
+                                .and_then(|ba| ba.get("block").or(Some(ba)))
+                            {
+                                Some(b) => b,
+                                None => continue,
+                            };
+                            // H2: Extract block hash for catchup tracking + reorg provenance.
+                            // Kaspa wRPC: block.verboseData.hash or block.header.hash
+                            let block_hash = block
+                                .get("verboseData").and_then(|vd| vd.get("hash"))
+                                .or_else(|| block.get("header").and_then(|h| h.get("hash")))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
 
-                        if !txs.is_empty() {
-                            block_txs_batch.push(txs);
+                            if let Some(ref bh) = block_hash {
+                                last_seen_hash = Some(bh.clone());
+                            }
+
+                            let txs: Vec<TransactionData> = block
+                                .get("transactions")
+                                .and_then(|t| t.as_array())
+                                .map(|arr| arr.iter().filter_map(TransactionData::from_rpc_json).collect())
+                                .unwrap_or_default();
+
+                            if !txs.is_empty() {
+                                block_txs_batch.push((block_hash, txs));
+                            }
+                            blocks_processed += 1;
+                        } else if method == "virtualChainChangedNotification" {
+                            // Kaspa wRPC format:
+                            // {"params": {"VirtualChainChanged": {
+                            //   "removedChainBlockHashes": ["hash1", ...],
+                            //   "addedChainBlockHashes": ["hash2", ...],
+                            //   "acceptedTransactionIds": [...]
+                            // }}}
+                            let vcc = match notif.get("params")
+                                .and_then(|p| p.get("VirtualChainChanged").or_else(|| p.get("virtualChainChanged")))
+                            {
+                                Some(v) => v,
+                                None => continue,
+                            };
+
+                            // Collect removed block hashes for reorg processing
+                            if let Some(removed) = vcc.get("removedChainBlockHashes")
+                                .and_then(|v| v.as_array())
+                            {
+                                for hash_val in removed {
+                                    if let Some(h) = hash_val.as_str() {
+                                        reorg_removed_hashes.push(h.to_string());
+                                    }
+                                }
+                            }
+
+                            // Update last_seen_hash from added chain blocks
+                            if let Some(added) = vcc.get("addedChainBlockHashes")
+                                .and_then(|v| v.as_array())
+                            {
+                                if let Some(last) = added.last().and_then(|v| v.as_str()) {
+                                    last_seen_hash = Some(last.to_string());
+                                }
+                            }
                         }
-                        blocks_processed += 1;
+                        // Other notification types are silently skipped.
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
                     Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
                         warn!("[NOTIFY] Notification channel disconnected");
                         break;
                     }
+                }
+            }
+
+            // REORG HANDLING: Process removed blocks BEFORE adding new ones.
+            //
+            // When the virtual selected parent chain changes, blocks that were
+            // previously in the chain may be removed. Any orders added by those
+            // blocks must be removed from the book, and any orders spent by
+            // those blocks must be restored.
+            if !reorg_removed_hashes.is_empty() {
+                warn!(
+                    "[REORG] Chain reorganization detected: {} block(s) removed",
+                    reorg_removed_hashes.len(),
+                );
+                for h in &reorg_removed_hashes {
+                    warn!("[REORG]   removed block: {}...", &h[..h.len().min(16)]);
+                }
+
+                let mut ob = order_book.lock().await;
+                let (restored, removed, handled, unknown) = reorg_tracker.handle_removed_blocks(
+                    &reorg_removed_hashes,
+                    &mut ob,
+                    &mut spent_tracker,
+                );
+
+                if restored > 0 || removed > 0 {
+                    warn!(
+                        "[REORG] Rollback complete: {} order(s) restored, {} order(s) removed, \
+                         {}/{} block(s) handled ({} unknown)",
+                        restored, removed, handled, reorg_removed_hashes.len(), unknown,
+                    );
+
+                    // Persist the corrected order book immediately after a reorg
+                    // to prevent data loss if the engine crashes.
+                    if let Err(e) = persistence::save_order_book(orderbook_path, &ob) {
+                        warn!("[REORG] Failed to persist order book after reorg: {}", e);
+                    }
+                }
+
+                if unknown > 0 {
+                    warn!(
+                        "[REORG] {} block(s) had no provenance data. Running UTXO validation \
+                         is recommended (restart the engine to trigger startup pruning).",
+                        unknown,
+                    );
                 }
             }
 
@@ -3622,12 +4036,30 @@ pub async fn run_continuous_with_ws(
                 let mut ib = shared_ifd_book.lock().await;
                 let mut dcab = shared_dca_book.lock().await;
 
-                for txs in &block_txs_batch {
+                for (block_hash, txs) in &block_txs_batch {
+                    // Create a ReorgCollector to track provenance for this block.
+                    // Only collect if we have a block hash to index by.
+                    let mut collector = block_hash.as_ref().map(|_| ReorgCollector::new());
+
                     let counters = process_block_txs_all(
                         txs, &mut ob, &scanner, &mut pb, &mut lb, &mut pred,
                         ws_tx.as_ref(), current_daa, Some(&mut ib),
                         Some(&mut dcab),
+                        collector.as_mut(),
                     );
+
+                    // Commit provenance data to the reorg tracker
+                    if let (Some(bh), Some(rc)) = (block_hash, collector) {
+                        if !rc.orders_added.is_empty() || !rc.orders_spent.is_empty() {
+                            reorg_tracker.record_block(
+                                bh.clone(),
+                                rc.orders_added,
+                                rc.orders_spent,
+                                rc.txids,
+                            );
+                        }
+                    }
+
                     total_counters.spot_added += counters.spot_added;
                     total_counters.spot_removed += counters.spot_removed;
                     total_counters.perp_added += counters.perp_added;
@@ -3889,7 +4321,8 @@ pub async fn run_continuous_with_ws(
             }
         }
 
-        if shutdown.load(std::sync::atomic::Ordering::Relaxed) {
+        if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+            info!("[SHUTDOWN] Scan cycle {} complete -- TX drain finished, persisting state...", cycle);
             break;
         }
 
@@ -4596,7 +5029,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         });
 
         assert!(ob.contains_outpoint(&outpoint), "should contain outpoint after add");
@@ -5074,6 +5507,315 @@ mod tests {
             expiry_daa: found.order_b.expiry_daa(),
         };
         assert_eq!(ctx.order_b_p2sh, "p2sh_buy_b");
+    }
+
+    // ===================================================================
+    // ReorgTracker tests
+    // ===================================================================
+
+    #[test]
+    fn reorg_tracker_basic_record_and_rollback() {
+        use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+
+        let mut tracker = ReorgTracker::new();
+        let mut ob = OrderBook::new();
+        let mut spent = SpentTracker::new();
+
+        // Simulate: block "block_aaa" added order "tx1:0"
+        let order = BookOrder {
+            tx_id: "tx1".to_string(),
+            index: 0,
+            value: 100_000,
+            token_cov_id: "abcd".repeat(16),
+            price_num: 1,
+            price_den: 1,
+            min_fill: 0,
+            owner_hash: "owner".to_string(),
+            spk_hash: "spk".to_string(),
+            counterparty_spk: None,
+            redeem_script_hex: String::new(),
+            p2sh_script_hex: String::new(),
+            p2sh_version: 0,
+            side: OrderSide::Buy,
+            post_only: false,
+            expiry_daa: None,
+            is_freezable: false,
+            max_matcher_fee: u64::MAX,
+            ifd_order_b_rs_hex: None,
+            oco_path: None,
+            oco_partner_key: None,
+        };
+
+        // Add order to book and record provenance
+        ob.add_buy_order(order.clone());
+        assert!(ob.contains_outpoint("tx1:0"));
+
+        let mut txids = HashSet::new();
+        txids.insert("tx1".to_string());
+        tracker.record_block(
+            "block_aaa".to_string(),
+            vec![order.clone()],
+            vec![],
+            txids,
+        );
+
+        // Simulate reorg: block_aaa is removed
+        let (restored, removed, handled, unknown) =
+            tracker.handle_removed_blocks(&["block_aaa".to_string()], &mut ob, &mut spent);
+
+        assert_eq!(removed, 1, "order added by reorged block should be removed");
+        assert_eq!(restored, 0, "no orders to restore");
+        assert_eq!(handled, 1);
+        assert_eq!(unknown, 0);
+        assert!(!ob.contains_outpoint("tx1:0"), "order should be gone after reorg");
+    }
+
+    #[test]
+    fn reorg_tracker_restores_spent_orders() {
+        use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+
+        let mut tracker = ReorgTracker::new();
+        let mut ob = OrderBook::new();
+        let mut spent = SpentTracker::new();
+
+        // Pre-existing order in book
+        let order = BookOrder {
+            tx_id: "tx_preexisting".to_string(),
+            index: 0,
+            value: 50_000,
+            token_cov_id: "abcd".repeat(16),
+            price_num: 2,
+            price_den: 1,
+            min_fill: 0,
+            owner_hash: "owner2".to_string(),
+            spk_hash: "spk2".to_string(),
+            counterparty_spk: None,
+            redeem_script_hex: String::new(),
+            p2sh_script_hex: String::new(),
+            p2sh_version: 0,
+            side: OrderSide::Sell,
+            post_only: false,
+            expiry_daa: None,
+            is_freezable: false,
+            max_matcher_fee: u64::MAX,
+            ifd_order_b_rs_hex: None,
+            oco_path: None,
+            oco_partner_key: None,
+        };
+        ob.add_sell_order(order.clone());
+        assert!(ob.contains_outpoint("tx_preexisting:0"));
+
+        // Simulate: block "block_bbb" spent order "tx_preexisting:0"
+        // (record the snapshot before removal)
+        let spent_snapshot = vec![("tx_preexisting:0".to_string(), order.clone())];
+        ob.remove_order("tx_preexisting:0");
+        assert!(!ob.contains_outpoint("tx_preexisting:0"));
+
+        // Also mark as spent in tracker
+        spent.mark_spent("tx_preexisting:0");
+
+        let mut txids = HashSet::new();
+        txids.insert("tx_spend".to_string());
+        tracker.record_block(
+            "block_bbb".to_string(),
+            vec![],
+            spent_snapshot,
+            txids,
+        );
+
+        // Simulate reorg: block_bbb is removed
+        let (restored, removed, handled, _) =
+            tracker.handle_removed_blocks(&["block_bbb".to_string()], &mut ob, &mut spent);
+
+        assert_eq!(restored, 1, "spent order should be restored");
+        assert_eq!(removed, 0);
+        assert_eq!(handled, 1);
+        assert!(ob.contains_outpoint("tx_preexisting:0"), "order should be back in book");
+    }
+
+    #[test]
+    fn reorg_tracker_unknown_block_is_logged() {
+        let mut tracker = ReorgTracker::new();
+        let mut ob = OrderBook::new();
+        let mut spent = SpentTracker::new();
+
+        let (_, _, handled, unknown) =
+            tracker.handle_removed_blocks(&["unknown_hash".to_string()], &mut ob, &mut spent);
+
+        assert_eq!(handled, 0);
+        assert_eq!(unknown, 1, "unknown block should be counted");
+    }
+
+    #[test]
+    fn reorg_tracker_prunes_old_blocks() {
+        let mut tracker = ReorgTracker::new();
+        let mut ob = OrderBook::new();
+        let mut spent = SpentTracker::new();
+
+        // Fill tracker beyond the limit
+        for i in 0..(REORG_TRACKER_MAX_BLOCKS + 100) {
+            tracker.record_block(
+                format!("block_{}", i),
+                vec![],
+                vec![],
+                HashSet::new(),
+            );
+        }
+
+        assert!(
+            tracker.len() <= REORG_TRACKER_MAX_BLOCKS,
+            "tracker should prune old blocks: {} > {}",
+            tracker.len(), REORG_TRACKER_MAX_BLOCKS,
+        );
+
+        // First block should have been pruned
+        let (_, _, handled, unknown) =
+            tracker.handle_removed_blocks(&["block_0".to_string()], &mut ob, &mut spent);
+        assert_eq!(handled, 0, "block_0 should have been pruned");
+        assert_eq!(unknown, 1);
+    }
+
+    #[test]
+    fn spent_tracker_remove_for_txids() {
+        let mut tracker = SpentTracker::new();
+        tracker.mark_spent("tx_a:0");
+        tracker.mark_spent("tx_a:1");
+        tracker.mark_spent("tx_b:0");
+        tracker.mark_spent("tx_c:2");
+        assert_eq!(tracker.spent.len(), 4);
+
+        let mut txids = HashSet::new();
+        txids.insert("tx_a".to_string());
+        tracker.remove_spent_for_txids(&txids);
+
+        assert_eq!(tracker.spent.len(), 2, "tx_a entries should be removed");
+        assert!(!tracker.is_spent("tx_a:0"));
+        assert!(!tracker.is_spent("tx_a:1"));
+        assert!(tracker.is_spent("tx_b:0"));
+        assert!(tracker.is_spent("tx_c:2"));
+    }
+
+    #[test]
+    fn reorg_tracker_dedup_block_hashes() {
+        let mut tracker = ReorgTracker::new();
+
+        tracker.record_block(
+            "block_dup".to_string(),
+            vec![],
+            vec![],
+            HashSet::new(),
+        );
+        tracker.record_block(
+            "block_dup".to_string(),
+            vec![],
+            vec![],
+            HashSet::new(),
+        );
+
+        assert_eq!(tracker.len(), 1, "duplicate block hash should be deduplicated");
+    }
+
+    #[test]
+    fn reorg_tracker_deep_reorg_multiple_blocks() {
+        use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+
+        let mut tracker = ReorgTracker::new();
+        let mut ob = OrderBook::new();
+        let mut spent = SpentTracker::new();
+
+        // Block 1: adds order A
+        let order_a = BookOrder {
+            tx_id: "txA".to_string(),
+            index: 0,
+            value: 10_000,
+            token_cov_id: "aaaa".repeat(16),
+            price_num: 1,
+            price_den: 1,
+            min_fill: 0,
+            owner_hash: "ownerA".to_string(),
+            spk_hash: "spkA".to_string(),
+            counterparty_spk: None,
+            redeem_script_hex: String::new(),
+            p2sh_script_hex: String::new(),
+            p2sh_version: 0,
+            side: OrderSide::Buy,
+            post_only: false,
+            expiry_daa: None,
+            is_freezable: false,
+            max_matcher_fee: u64::MAX,
+            ifd_order_b_rs_hex: None,
+            oco_path: None,
+            oco_partner_key: None,
+        };
+        ob.add_buy_order(order_a.clone());
+
+        let mut txids1 = HashSet::new();
+        txids1.insert("txA".to_string());
+        tracker.record_block(
+            "block_1".to_string(),
+            vec![order_a.clone()],
+            vec![],
+            txids1,
+        );
+
+        // Block 2: adds order B, spends order A
+        let order_b = BookOrder {
+            tx_id: "txB".to_string(),
+            index: 0,
+            value: 20_000,
+            token_cov_id: "bbbb".repeat(16),
+            price_num: 3,
+            price_den: 1,
+            min_fill: 0,
+            owner_hash: "ownerB".to_string(),
+            spk_hash: "spkB".to_string(),
+            counterparty_spk: None,
+            redeem_script_hex: String::new(),
+            p2sh_script_hex: String::new(),
+            p2sh_version: 0,
+            side: OrderSide::Sell,
+            post_only: false,
+            expiry_daa: None,
+            is_freezable: false,
+            max_matcher_fee: u64::MAX,
+            ifd_order_b_rs_hex: None,
+            oco_path: None,
+            oco_partner_key: None,
+        };
+        ob.add_sell_order(order_b.clone());
+
+        // Snapshot order A before removal
+        let a_snapshot = vec![("txA:0".to_string(), order_a.clone())];
+        ob.remove_order("txA:0");
+
+        let mut txids2 = HashSet::new();
+        txids2.insert("txB".to_string());
+        txids2.insert("tx_spend_a".to_string());
+        tracker.record_block(
+            "block_2".to_string(),
+            vec![order_b.clone()],
+            a_snapshot,
+            txids2,
+        );
+
+        // At this point: book has only order B
+        assert!(!ob.contains_outpoint("txA:0"));
+        assert!(ob.contains_outpoint("txB:0"));
+
+        // Deep reorg: both blocks removed (in order)
+        let (restored, removed, handled, _) = tracker.handle_removed_blocks(
+            &["block_2".to_string(), "block_1".to_string()],
+            &mut ob,
+            &mut spent,
+        );
+
+        // Block 2 rollback: remove B (added), restore A (spent)
+        // Block 1 rollback: remove A (added, but A was just restored — it gets removed)
+        assert_eq!(handled, 2);
+        // Net effect: both orders removed from book
+        assert!(!ob.contains_outpoint("txB:0"), "B should be removed (added by block_2)");
+        // A was restored by block_2 rollback, then removed by block_1 rollback
+        assert!(!ob.contains_outpoint("txA:0"), "A should be removed (added by block_1)");
     }
 
 }

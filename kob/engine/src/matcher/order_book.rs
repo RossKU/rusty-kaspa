@@ -7,15 +7,18 @@ use std::time::Instant;
 
 /// Order key for BTreeMap sorting.
 ///
-/// For bids: sort by price DESC, then by value DESC (tiebreaker).
-/// For asks: sort by price ASC, then by value ASC (tiebreaker).
+/// For bids: sort by price DESC, then by DAA ASC (FIFO), then by value DESC.
+/// For asks: sort by price ASC, then by DAA ASC (FIFO), then by value ASC.
 /// The outpoint key is included for uniqueness.
 #[derive(Debug, Clone)]
 pub struct OrderKey {
     /// Price as rational number (num/den), stored for comparison
     pub price_num: u64,
     pub price_den: u64,
-    /// Order value in sompi (for tiebreaking)
+    /// DAA score when the order was discovered (FIFO tiebreaker).
+    /// Lower value = older order = higher priority at equal price.
+    pub discovered_daa: u64,
+    /// Order value in sompi (secondary tiebreaker)
     pub value: u64,
     /// Outpoint key for uniqueness (txId:index)
     pub outpoint_key: String,
@@ -56,7 +59,12 @@ impl Ord for BidKey {
         if price_ord != Ordering::Equal {
             return price_ord;
         }
-        // Tiebreak: higher value first
+        // FIFO tiebreak: older order first (lower DAA = earlier discovery)
+        let daa_ord = self.0.discovered_daa.cmp(&other.0.discovered_daa);
+        if daa_ord != Ordering::Equal {
+            return daa_ord;
+        }
+        // Secondary tiebreak: higher value first
         let val_ord = other.0.value.cmp(&self.0.value);
         if val_ord != Ordering::Equal {
             return val_ord;
@@ -91,7 +99,12 @@ impl Ord for AskKey {
         if price_ord != Ordering::Equal {
             return price_ord;
         }
-        // Tiebreak: lower value first
+        // FIFO tiebreak: older order first (lower DAA = earlier discovery)
+        let daa_ord = self.0.discovered_daa.cmp(&other.0.discovered_daa);
+        if daa_ord != Ordering::Equal {
+            return daa_ord;
+        }
+        // Secondary tiebreak: lower value first
         let val_ord = self.0.value.cmp(&other.0.value);
         if val_ord != Ordering::Equal {
             return val_ord;
@@ -174,6 +187,12 @@ pub struct BookOrder {
     /// (the UTXO is shared, spending it cancels both paths).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oco_partner_key: Option<String>,
+    /// DAA score at which the scanner discovered this order on-chain.
+    /// Used for FIFO tiebreaking: at equal price, older orders (lower DAA)
+    /// are matched first, ensuring first-come-first-served fairness.
+    /// Defaults to 0 for backward compatibility with pre-FIFO persisted orders.
+    #[serde(default)]
+    pub discovered_daa: u64,
 }
 
 fn default_max_matcher_fee() -> u64 {
@@ -290,6 +309,7 @@ impl PairBook {
         let key = BidKey(OrderKey {
             price_num: order.price_num,
             price_den: order.price_den,
+            discovered_daa: order.discovered_daa,
             value: order.value,
             outpoint_key: order.outpoint_key(),
         });
@@ -302,6 +322,7 @@ impl PairBook {
         let key = AskKey(OrderKey {
             price_num: order.price_num,
             price_den: order.price_den,
+            discovered_daa: order.discovered_daa,
             value: order.value,
             outpoint_key: order.outpoint_key(),
         });
@@ -851,7 +872,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         }
     }
 
@@ -1037,7 +1058,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         };
         ob.add_buy_order(buy);
         let buy_key = format!("{}:1", "b".repeat(64));
@@ -1144,7 +1165,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         }
     }
 
@@ -1342,7 +1363,7 @@ mod tests {
             post_only,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         }
     }
 
@@ -1365,7 +1386,7 @@ mod tests {
             post_only,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         }
     }
 
@@ -1582,7 +1603,7 @@ mod tests {
             post_only: false,
             expiry_daa: expiry,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         }
     }
 

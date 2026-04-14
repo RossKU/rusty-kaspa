@@ -178,6 +178,7 @@ pub fn create_book_order(
         max_matcher_fee: 0, ifd_order_b_rs_hex: None,
         oco_path: None,
         oco_partner_key: None,
+        discovered_daa: 0,
     }
 }
 

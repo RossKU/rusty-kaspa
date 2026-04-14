@@ -41,6 +41,7 @@ use kob_core::contract::spot::order::{
     BUY_ORDER_V15_RS_EXPECTED_LEN,
     build_buy_v15_fill_sigscript,
     build_buy_v15_ioc_fill_sigscript,
+    build_buy_v15_partial_fill_sigscript,
     build_sell_fill_sigscript_v15,
     build_sell_ioc_fill_sigscript_v15,
 };
@@ -250,6 +251,15 @@ pub struct BatchPlan {
     /// Per-sell fill token amounts for sell IOC (index matches sells vec).
     /// Only populated when ioc_mode == Some(IocSide::Sell).
     pub sell_fill_amounts: Vec<u64>,
+    /// Per-buy partial fill parameters.
+    ///
+    /// Key: index into the `buys` vec.
+    /// Value: `(fill_kas, residual_output_idx, token_output_idx)`.
+    ///
+    /// When present for a buy, `build_tx()` emits an Op2 (partial fill) sigscript
+    /// instead of Op1 (full fill) or Op5 (IOC fill).  The buy contract's D&R path
+    /// creates a continuation UTXO at `residual_output_idx` with the residual KAS.
+    pub buy_partial_fills: HashMap<usize, (u64, u16, u16)>,
 }
 
 /// Which side of the IOC is the sweeper.
@@ -319,7 +329,27 @@ impl BatchPlan {
             // Indices >16 are handled by data-push encoding (no OpN limit).
             let is_v15 = buy.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN;
 
-            let ss = if self.ioc_mode == Some(IocSide::Buy) {
+            let ss = if let Some(&(fill_kas, residual_idx, token_idx)) = self.buy_partial_fills.get(&buy_idx) {
+                // Partial fill (Op2 selector): buy D&R with residual continuation.
+                if is_v15 {
+                    // V15: [sii] [ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]
+                    build_buy_v15_partial_fill_sigscript(
+                        *tii as u16,
+                        &buy.redeem_script,
+                        fill_kas,
+                        residual_idx,
+                        token_idx,
+                    )
+                } else {
+                    // V14: [ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]
+                    kob_core::build_buy_partial_fill_sigscript(
+                        &buy.redeem_script,
+                        fill_kas,
+                        residual_idx,
+                        token_idx,
+                    )
+                }
+            } else if self.ioc_mode == Some(IocSide::Buy) {
                 if is_v15 {
                     // V15 buy IOC: [sii] [toi] [tii] [coi] [Op5] [pushData(RS)]
                     // sii = sell input index (= tii, the sell carrying this buy's token covenant)
@@ -1013,6 +1043,7 @@ pub fn plan_batch_match(
         total_seller_kas,
         ioc_mode,
         sell_fill_amounts,
+        buy_partial_fills: HashMap::new(),
     })
 }
 
@@ -1219,6 +1250,7 @@ pub fn plan_ioc_match(
         total_seller_kas,
         ioc_mode: Some(IocSide::Buy),
         sell_fill_amounts: Vec::new(),
+        buy_partial_fills: HashMap::new(),
     })
 }
 
@@ -1400,6 +1432,7 @@ pub fn plan_sell_ioc_match(
         total_seller_kas,
         ioc_mode: Some(IocSide::Sell),
         sell_fill_amounts,
+        buy_partial_fills: HashMap::new(),
     })
 }
 

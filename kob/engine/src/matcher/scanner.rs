@@ -350,6 +350,8 @@ impl BlockScanner {
             ifd_order_b_rs_hex,
             oco_path: None,
             oco_partner_key: None,
+            // Caller sets discovered_daa after construction when DAA context is available.
+            discovered_daa: 0,
         }
     }
 
@@ -411,6 +413,8 @@ impl BlockScanner {
                 ifd_order_b_rs_hex: None,
                 oco_path: Some(path),
                 oco_partner_key: Some(partner.to_string()),
+                // Caller sets discovered_daa after construction.
+                discovered_daa: 0,
             }
         };
 
@@ -937,7 +941,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         };
         let buy_key = buy.outpoint_key();
         ob.add_buy_order(buy);
@@ -964,7 +968,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         };
         let sell_key = sell.outpoint_key();
         ob.add_sell_order(sell);
@@ -1091,7 +1095,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         };
         ob.add_buy_order(buy);
         assert_eq!(ob.stats().total_bids, 1);
@@ -2144,7 +2148,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         };
         ob.add_buy_order(gtc_order);
 
@@ -2167,7 +2171,7 @@ mod tests {
             post_only: false,
             expiry_daa: Some(1000),
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         };
         ob.add_buy_order(gtd_order);
 
@@ -2190,7 +2194,7 @@ mod tests {
             post_only: false,
             expiry_daa: Some(2000),
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
         };
         ob.add_sell_order(gtd_sell);
 

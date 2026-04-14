@@ -67,6 +67,10 @@ struct PersistOrder {
     /// Backward-compatible: absent in old JSON deserializes as None.
     #[serde(rename = "ocoPartnerKey", default, skip_serializing_if = "Option::is_none")]
     oco_partner_key: Option<String>,
+    /// DAA score at discovery time (FIFO tiebreaker).
+    /// Backward-compatible: absent in old JSON deserializes as 0.
+    #[serde(rename = "discoveredDaa", default)]
+    discovered_daa: u64,
 }
 
 fn persist_default_mmfee() -> u64 {
@@ -109,6 +113,7 @@ pub fn save_order_book(path: &str, order_book: &OrderBook) -> Result<(), String>
                     ifd_order_b_rs_hex: order.ifd_order_b_rs_hex.clone(),
                     oco_path: order.oco_path,
                     oco_partner_key: order.oco_partner_key.clone(),
+                    discovered_daa: order.discovered_daa,
                 },
             );
         }
@@ -137,6 +142,7 @@ pub fn save_order_book(path: &str, order_book: &OrderBook) -> Result<(), String>
                     ifd_order_b_rs_hex: order.ifd_order_b_rs_hex.clone(),
                     oco_path: order.oco_path,
                     oco_partner_key: order.oco_partner_key.clone(),
+                    discovered_daa: order.discovered_daa,
                 },
             );
         }
@@ -208,6 +214,7 @@ pub async fn load_order_book(
                 ifd_order_b_rs_hex: order.ifd_order_b_rs_hex,
                 oco_path: order.oco_path,
                 oco_partner_key: order.oco_partner_key,
+                discovered_daa: order.discovered_daa,
             });
             loaded += 1;
         }
@@ -242,6 +249,7 @@ pub async fn load_order_book(
                 ifd_order_b_rs_hex: order.ifd_order_b_rs_hex,
                 oco_path: order.oco_path,
                 oco_partner_key: order.oco_partner_key,
+                discovered_daa: order.discovered_daa,
             });
             loaded += 1;
         }

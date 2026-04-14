@@ -758,17 +758,18 @@ async fn fill(
         value: order_value,
     });
 
-    // Input 1: filler's token UTXO (P2PK, signed)
-    // We use the fee UTXO's SPK version for the token input since the filler
-    // owns both. The actual token UTXO SPK is the filler's P2PK.
-    let filler_spk_bytes = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
+    // Input 1: filler's token UTXO (P2SH token_unit covenant)
+    // Token UTXOs from `token mint` are P2SH, not P2PK.
+    // Build the token_unit redeem script for the filler's pubkey, then derive P2SH.
+    let token_unit_rs = contract::build_token_unit_redeem_script(&wallet.pubkey);
+    let token_p2sh = build_p2sh(&token_unit_rs);
     tx.inputs.push(TxInput {
         prev_tx_id: token_outpoint.transaction_id.clone(),
         prev_index: token_outpoint.index,
         sequence: 0,
         sig_op_count: 1,
-        script_version: fee_utxo.utxo_entry.script_public_key.version,
-        script_bytes: filler_spk_bytes.clone(),
+        script_version: token_p2sh.version,
+        script_bytes: token_p2sh.script().to_vec(),
         value: token_value,
     });
 
@@ -921,10 +922,10 @@ async fn fill(
         &old_rs,
     );
 
-    // Sign input 1 (token UTXO, P2PK)
+    // Sign input 1 (token UTXO, P2SH token_unit)
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
-    let token_ss = signing::build_p2pk_sigscript(&sig_1);
+    let token_ss = contract::build_token_unit_sigscript(&sig_1, &token_unit_rs);
 
     // Sign input 2 (fee UTXO, P2PK)
     let sighash_2 = compute_sighash(&tx, 2)?;
@@ -958,7 +959,7 @@ async fn fill(
         );
         let sighash_1b = compute_sighash(&tx, 1)?;
         let sig_1b = signing::schnorr_sign(&privkey, &sighash_1b)?;
-        let token_ss2 = signing::build_p2pk_sigscript(&sig_1b);
+        let token_ss2 = contract::build_token_unit_sigscript(&sig_1b, &token_unit_rs);
         let sighash_2b = compute_sighash(&tx, 2)?;
         let sig_2b = signing::schnorr_sign(&privkey, &sighash_2b)?;
         let fee_ss2 = signing::build_p2pk_sigscript(&sig_2b);

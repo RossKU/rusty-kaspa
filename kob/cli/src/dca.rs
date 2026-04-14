@@ -1,7 +1,7 @@
 //! `kob-cli dca` -- Deploy, fill, and cancel DCA (Dollar-Cost Averaging) orders.
 //!
 //! Subcommands:
-//!   deploy  -- Deploy a DCA schedule (dca_order_v2: 315B RS)
+//!   deploy  -- Deploy a DCA schedule (dca_order_v2: 373B RS)
 //!   fill    -- Fill one period (permissionless, anyone can call)
 //!   cancel  -- Owner cancels remaining schedule
 //!
@@ -11,7 +11,7 @@
 //! Each period, a permissionless filler executes one tranche at the specified
 //! price, purchasing tokens on behalf of the owner.
 //!
-//! RS = 315B (120B state + 195B body)
+//! RS = 373B (153B state + 220B body)
 //! State: [owner_hash 32B][target_cov_id 32B][price_num 8B][price_den 8B]
 //!        [amount_per_period 8B][interval_daa 8B][next_execution_daa 8B][periods_remaining 8B]
 //!

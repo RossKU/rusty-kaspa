@@ -322,7 +322,7 @@ pub const ACTIVE_LOAN_BODY: &[u8] = &[
     // --- D&R Step 1: Verify old_rs authenticity ---
     0x60, 0x79,                   // Op16 OpPick -> old_rs copy (d16)                   [2B]
     0xaa,                         // OpBlake2b -> rs_hash                                [1B]
-    0x02, 0xaa, 0x20,             // push [0xaa, 0x20]                                  [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]                    [5B]
     0x7c,                         // OpSwap                                              [1B]
     0x7e,                         // OpCat -> [0xaa,0x20]||hash                          [1B]
     0x01, 0x87,                   // push [0x87]                                        [2B]
@@ -382,7 +382,7 @@ pub const ACTIVE_LOAN_BODY: &[u8] = &[
     // --- D&R Step 5: Verify output SPK ---
     0x01, 0x11, 0x79,             // push(17) OpPick -> new_rs copy (d17)               [3B]
     0xaa,                         // OpBlake2b                                           [1B]
-    0x02, 0xaa, 0x20,             // push [0xaa, 0x20]                                  [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]                    [5B]
     0x7c,                         // OpSwap                                              [1B]
     0x7e,                         // OpCat                                               [1B]
     0x01, 0x87,                   // push [0x87]                                        [2B]
@@ -470,7 +470,7 @@ pub const ACTIVE_LOAN_BODY: &[u8] = &[
     // --- D&R Step 1: Verify old_rs authenticity ---
     0x60, 0x79,                   // Op16 OpPick -> old_rs copy (d16)                   [2B]
     0xaa,                         // OpBlake2b                                           [1B]
-    0x02, 0xaa, 0x20,             // push [0xaa, 0x20]                                  [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]                    [5B]
     0x7c,                         // OpSwap                                              [1B]
     0x7e,                         // OpCat                                               [1B]
     0x01, 0x87,                   // push [0x87]                                        [2B]
@@ -514,7 +514,7 @@ pub const ACTIVE_LOAN_BODY: &[u8] = &[
     // --- D&R Step 5: Verify output SPK ---
     0x01, 0x11, 0x79,             // push(17) OpPick -> new_rs copy (d17)               [3B]
     0xaa,                         // OpBlake2b                                           [1B]
-    0x02, 0xaa, 0x20,             // push [0xaa, 0x20]                                  [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]                    [5B]
     0x7c,                         // OpSwap                                              [1B]
     0x7e,                         // OpCat                                               [1B]
     0x01, 0x87,                   // push [0x87]                                        [2B]
@@ -562,7 +562,7 @@ pub const ACTIVE_LOAN_BODY: &[u8] = &[
     // --- D&R Step 1: Verify old_rs authenticity ---
     0x01, 0x11, 0x79,             // push(17) OpPick -> old_rs copy (d17)               [3B]
     0xaa,                         // OpBlake2b                                           [1B]
-    0x02, 0xaa, 0x20,             // push [0xaa, 0x20]                                  [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]                    [5B]
     0x7c,                         // OpSwap                                              [1B]
     0x7e,                         // OpCat                                               [1B]
     0x01, 0x87,                   // push [0x87]                                        [2B]
@@ -607,7 +607,7 @@ pub const ACTIVE_LOAN_BODY: &[u8] = &[
     // --- D&R Step 5: Verify output SPK (output[ci]) ---
     0x01, 0x12, 0x79,             // push(18) OpPick -> new_rs copy (d18)               [3B]
     0xaa,                         // OpBlake2b                                           [1B]
-    0x02, 0xaa, 0x20,             // push [0xaa, 0x20]                                  [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]                    [5B]
     0x7c,                         // OpSwap                                              [1B]
     0x7e,                         // OpCat                                               [1B]
     0x01, 0x87,                   // push [0x87]                                        [2B]
@@ -710,7 +710,7 @@ pub const ACTIVE_LOAN_BODY: &[u8] = &[
     // --- D&R Step 1: Verify old_rs authenticity ---
     0x60, 0x79,                   // Op16 OpPick -> old_rs copy (d16)                   [2B]
     0xaa,                         // OpBlake2b                                           [1B]
-    0x02, 0xaa, 0x20,             // push [0xaa, 0x20]                                  [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]                    [5B]
     0x7c,                         // OpSwap                                              [1B]
     0x7e,                         // OpCat                                               [1B]
     0x01, 0x87,                   // push [0x87]                                        [2B]
@@ -754,7 +754,7 @@ pub const ACTIVE_LOAN_BODY: &[u8] = &[
     // --- D&R Step 5: Verify output SPK (output[ci]) ---
     0x01, 0x11, 0x79,             // push(17) OpPick -> new_rs copy (d17)               [3B]
     0xaa,                         // OpBlake2b                                           [1B]
-    0x02, 0xaa, 0x20,             // push [0xaa, 0x20]                                  [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]                    [5B]
     0x7c,                         // OpSwap                                              [1B]
     0x7e,                         // OpCat                                               [1B]
     0x01, 0x87,                   // push [0x87]                                        [2B]

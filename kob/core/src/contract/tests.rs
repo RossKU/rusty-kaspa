@@ -1072,8 +1072,8 @@ mod tests {
     fn dca_order_body_length() {
         assert_eq!(
             DCA_ORDER_BODY.len(),
-            216,
-            "dca_order body must be 216 bytes"
+            220,
+            "dca_order body must be 220 bytes"
         );
     }
 
@@ -1085,7 +1085,7 @@ mod tests {
         // Verify CLTV presence
         assert!(hex.contains("b0"), "fill path must contain OpCheckLockTimeVerify");
         // Verify D&R Blake2b authenticity pattern
-        assert!(hex.contains("aa02aa207c7e01877e"), "D&R must contain Blake2b+P2SH SPK pattern");
+        assert!(hex.contains("aa040000aa207c7e01877e"), "D&R must contain Blake2b+P2SH SPK pattern (with version prefix)");
         // Verify ends with OpEndIf Op1
         assert!(hex.ends_with("6851"), "must end with OpEndIf Op1");
     }
@@ -1098,7 +1098,7 @@ mod tests {
         let rs = build_dca_order_redeem_script(
             &oh, &tcid, &bspkh, 100, 200, 50000, 100, 1000, 10,
         ).unwrap();
-        assert_eq!(rs.len(), 369, "dca_order RS must be 369 bytes (153 state + 216 body)");
+        assert_eq!(rs.len(), 373, "dca_order RS must be 373 bytes (153 state + 220 body)");
     }
 
     #[test]
@@ -1395,8 +1395,8 @@ mod tests {
         let ss = build_dca_order_fill_sigscript(0, &[], &[], &rs);
         // Should be valid: pushData(empty) + pushData(empty) + Op0 + Op1 + pushData(RS)
         // pushData(empty) = [0x00] (1 byte each)
-        // Total = 1 + 1 + 1 + 1 + pushData(369) = 4 + 372 = 376B
-        assert!(ss.len() < 380, "final fill sigscript should be compact, got {}", ss.len());
+        // Total = 1 + 1 + 1 + 1 + pushData(373) = 4 + 376 = 380B
+        assert!(ss.len() < 384, "final fill sigscript should be compact, got {}", ss.len());
     }
 
 }

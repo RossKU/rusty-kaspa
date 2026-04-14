@@ -1452,7 +1452,7 @@ fn borrow_request_body_exact_length() {
 
 #[test]
 fn active_loan_body_exact_length() {
-    assert_eq!(ACTIVE_LOAN_BODY.len(), 766); // D&R pattern + insurer branch
+    assert_eq!(ACTIVE_LOAN_BODY.len(), 782); // D&R pattern + insurer branch (+16B for 8x SPK version prefix)
 }
 
 // Total RS size tests
@@ -1472,7 +1472,7 @@ fn borrow_request_total_rs_size() {
 #[test]
 fn active_loan_total_rs_size() {
     let rs = default_active_loan_rs();
-    assert_eq!(rs.len(), 222 + 766); // 988 (D&R pattern + insurer)
+    assert_eq!(rs.len(), 222 + 782); // 1004 (D&R pattern + insurer, +16B for 8x SPK version prefix)
 }
 
 // BorrowRequest v3 replace path tests

@@ -48,14 +48,14 @@ use crate::contract::helpers::opn;
 ///   For final fill (periods==1): new_rs and old_rs can be Op0 (empty/dummy).
 /// Cancel sigscript: [pushData(sig+type 65B)][pushData(pk 32B)][Op0][pushData(RS)]
 ///
-/// Body = 216B, RS = 153 + 216 = 369 bytes.
+/// Body = 220B, RS = 153 + 220 = 373 bytes.
 /// DCA order V2 state size (153 bytes).
 pub const DCA_V2_STATE_SIZE: usize = 153;
 
-/// DCA order V2 body size (216 bytes).
-pub const DCA_V2_BODY_SIZE: usize = 216;
+/// DCA order V2 body size (220 bytes).
+pub const DCA_V2_BODY_SIZE: usize = 220;
 
-/// DCA order V2 redeemScript size (153 + 216 = 369 bytes).
+/// DCA order V2 redeemScript size (153 + 220 = 373 bytes).
 pub const DCA_V2_RS_SIZE: usize = DCA_V2_STATE_SIZE + DCA_V2_BODY_SIZE;
 
 /// Parsed DCA order V2 state fields.
@@ -172,14 +172,15 @@ pub const DCA_ORDER_BODY: &[u8] = &[
     // Stack (11): next_exec(0), interval(1), amt_pp(2), pden(3), pnum(4),
     //             bspkh(5), tcid(6), ohash(7), ci(8), old_rs(9), new_rs(10)
 
-    // --- D&R Step 1: Verify old_rs authenticity (15B) ---
+    // --- D&R Step 1: Verify old_rs authenticity (17B) ---
+    // OpTxInputSpk returns version(2B) + script, so we must include version prefix.
     0x59, 0x79,       // Op9 OpPick -> old_rs copy (d9)
     0xaa,             // OpBlake2b -> rs_hash
-    0x02, 0xaa, 0x20, // push [0xaa, 0x20]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]
     0x7c,             // OpSwap
-    0x7e,             // OpCat -> [0xaa,0x20]||hash
+    0x7e,             // OpCat -> [0x00,0x00,0xaa,0x20]||hash
     0x01, 0x87,       // push [0x87]
-    0x7e,             // OpCat -> expected P2SH SPK
+    0x7e,             // OpCat -> expected P2SH SPK (37B, with version)
     0xb9, 0xbf,       // OpTxInputIndex OpTxInputSpk
     0x87, 0x69,       // OpEqual OpVerify
     // Stack: [11] (back to base)
@@ -260,14 +261,15 @@ pub const DCA_ORDER_BODY: &[u8] = &[
     0x9c, 0x69,       // OpNumEqual OpVerify (== new_periods)              [2B]
     // Stack: [11]
 
-    // --- D&R Step 7: Verify output[ci].spk == P2SH(new_rs) (16B) ---
+    // --- D&R Step 7: Verify output[ci].spk == P2SH(new_rs) (18B) ---
+    // OpTxOutputSpk returns version(2B) + script, so include version prefix.
     0x5a, 0x79,       // Op10 OpPick -> new_rs copy (d10)                  [2B]
     0xaa,             // OpBlake2b                                          [1B]
-    0x02, 0xaa, 0x20, // push [0xaa, 0x20]                                 [3B]
+    0x04, 0x00, 0x00, 0xaa, 0x20, // push [version_0(2B), 0xaa, 0x20]     [5B]
     0x7c,             // OpSwap                                             [1B]
     0x7e,             // OpCat                                              [1B]
     0x01, 0x87,       // push [0x87]                                        [2B]
-    0x7e,             // OpCat -> expected output SPK                       [1B]
+    0x7e,             // OpCat -> expected output SPK (37B, with version)   [1B]
     // Stack (12): expected_spk(0), ...ci(9)...
     0x59, 0x79,       // Op9 OpPick -> ci (d8+1=d9)                        [2B]
     0xc3,             // OpTxOutputSpk -> output[ci].spk                   [1B]

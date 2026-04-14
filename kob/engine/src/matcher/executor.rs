@@ -1785,6 +1785,16 @@ fn process_block_txs_all(
                         continue; // dedup
                     }
                     let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
+                    // Extract buyer SPK from the deploy TX outputs.
+                    // The DCA contract stores buyer_spk_hash = blake2b(buyer_spk).
+                    // We scan TX outputs for a non-P2SH output whose SPK hash matches.
+                    let buyer_spk = crate::matcher::scanner::extract_owner_spk(tx, &parsed.buyer_spk_hash);
+                    if buyer_spk.is_none() {
+                        debug!(
+                            "[DCA] buyer_spk not found in deploy TX for {}:{} — fill will be deferred",
+                            &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                        );
+                    }
                     let entry = crate::matcher::dca_book::DcaEntry {
                         tx_id: tx.tx_id.clone(),
                         index: p2sh_idx,
@@ -1801,6 +1811,7 @@ fn process_block_txs_all(
                         p2sh_script_hex: hex::encode(&p2sh_spk.script()),
                         p2sh_version: p2sh_spk.version,
                         discovered_daa: current_daa,
+                        buyer_spk,
                     };
                     info!(
                         "[SCANNER-ALL] Discovered DCA order: {} periods={} next_exec={} amt/period={}",
@@ -3630,52 +3641,496 @@ async fn run_scan_cycle(
         }
     }
 
-    // DCA auto-fill: check for executable DCA orders
+    // DCA auto-fill: check for executable DCA orders and build fill TXs.
+    //
+    // A DCA fill TX spends the DCA UTXO + a matching sell order + a wallet UTXO,
+    // producing: (0) token output to buyer, (1) KAS output to seller,
+    // (2) DCA continuation UTXO if periods > 1, (3+) wallet change.
+    //
+    // The DCA UTXO uses CLTV (lock_time = next_execution_daa) while the sell
+    // uses OP_CSV (sequence=50).  These are orthogonal per-input checks.
     {
-        let dcab = dca_book.lock().await;
-        if !dcab.is_empty() {
-            let current_daa = rpc.get_daa_score().await.unwrap_or(0);
-            let executable = dcab.executable_entries(current_daa);
-            if !executable.is_empty() {
-                info!(
-                    "[DCA] {} executable DCA order(s) at DAA {} (of {} tracked)",
-                    executable.len(), current_daa, dcab.len(),
-                );
-                for entry in &executable {
-                    info!(
-                        "[DCA] Executable: {} token={} periods={} amt/period={} next_exec={}",
+        let current_daa = rpc.get_daa_score().await.unwrap_or(0);
+        let executable = {
+            let dcab = dca_book.lock().await;
+            if dcab.is_empty() {
+                Vec::new()
+            } else {
+                dcab.executable_entries(current_daa)
+            }
+        };
+        if !executable.is_empty() {
+            info!(
+                "[DCA] {} executable DCA order(s) at DAA {}",
+                executable.len(), current_daa,
+            );
+        }
+        for entry in &executable {
+            info!(
+                "[DCA] Executable: {} token={} periods={} amt/period={} next_exec={}",
+                &entry.outpoint_key()[..entry.outpoint_key().len().min(20)],
+                &entry.target_cov_id[..entry.target_cov_id.len().min(12)],
+                entry.periods_remaining,
+                entry.amount_per_period,
+                entry.next_execution_daa,
+            );
+
+            // Gate: buyer_spk must be known to construct the token output.
+            let buyer_spk_hex = match entry.buyer_spk.as_ref() {
+                Some(spk) if spk.len() >= 6 => spk, // version(4 hex) + min script
+                _ => {
+                    debug!(
+                        "[DCA] buyer_spk unavailable for {} — cannot build fill TX",
                         &entry.outpoint_key()[..entry.outpoint_key().len().min(20)],
-                        &entry.target_cov_id[..entry.target_cov_id.len().min(12)],
-                        entry.periods_remaining,
-                        entry.amount_per_period,
-                        entry.next_execution_daa,
                     );
-                    // Check if there is a matching sell order in the spot order book
-                    // for the target token. DCA buys tokens at the specified limit price.
-                    let target_token = &entry.target_cov_id;
-                    let has_matching_sell = order_book.pair_books.get(target_token)
-                        .map(|pb| !pb.asks.is_empty())
-                        .unwrap_or(false);
-                    if has_matching_sell {
-                        info!(
-                            "[DCA] Sell orders available for token {}... -- DCA fill candidate",
-                            &target_token[..target_token.len().min(12)],
-                        );
-                        // Full DCA auto-fill TX construction:
-                        // 1. Select best sell order from asks
-                        // 2. Verify sell price <= DCA limit price (price_num/price_den)
-                        // 3. Build fill TX with lock_time = next_execution_daa (CLTV)
-                        // 4. Build continuation RS (D&R) if periods > 1
-                        // 5. Submit TX
-                        // Note: This requires the batch TX builder to support CLTV lock_time
-                        // instead of the usual OP_CSV lock_time=50. Implementation deferred
-                        // to a follow-up PR once the batch builder supports per-TX lock_time.
-                    } else {
-                        debug!(
-                            "[DCA] No sell orders for token {}... -- DCA fill deferred",
-                            &target_token[..target_token.len().min(12)],
-                        );
+                    continue;
+                }
+            };
+            let buyer_spk_raw = match hex::decode(buyer_spk_hex) {
+                Ok(v) if v.len() > 2 => v,
+                _ => {
+                    warn!("[DCA] Invalid buyer_spk hex for {}", entry.outpoint_key());
+                    continue;
+                }
+            };
+            let buyer_spk_version = u16::from_le_bytes([buyer_spk_raw[0], buyer_spk_raw[1]]);
+            let buyer_spk_script = &buyer_spk_raw[2..];
+
+            // 1. Select best-priced sell order for the target token.
+            let target_token = &entry.target_cov_id;
+            let best_sell = order_book.pair_books.get(target_token).and_then(|pb| {
+                // asks are sorted by price ASC (cheapest first).
+                pb.asks.values().find(|sell| {
+                    if sell.price_den == 0 || sell.price_num == 0 {
+                        return false;
                     }
+                    // Skip if the sell lacks counterparty_spk (matcher cannot route KAS).
+                    if sell.counterparty_spk.is_none() {
+                        return false;
+                    }
+                    // Skip expired sells (expiry_daa > 0 && expiry_daa <= lock_time would
+                    // fail the sell contract's time gate: `expiry > lockTime`).
+                    if let Some(exp) = sell.expiry_daa {
+                        if exp > 0 && exp <= entry.next_execution_daa {
+                            return false;
+                        }
+                    }
+                    // Price match: sell price <= DCA limit price (both expressed as KAS/token).
+                    // sell: price_num/price_den KAS per token
+                    // DCA limit: price_den/price_num KAS per token (inverted from token/KAS)
+                    // Condition: sell.pnum * dca.pnum <= dca.pden * sell.pden
+                    let lhs = (sell.price_num as u128) * (entry.price_num as u128);
+                    let rhs = (entry.price_den as u128) * (sell.price_den as u128);
+                    lhs <= rhs
+                })
+            });
+
+            let sell = match best_sell {
+                Some(s) => s,
+                None => {
+                    debug!(
+                        "[DCA] No price-compatible sell for token {}... — deferred",
+                        &target_token[..target_token.len().min(12)],
+                    );
+                    continue;
+                }
+            };
+
+            // Skip if sell is already spent or under cooldown.
+            let sell_key = sell.outpoint_key();
+            if spent_tracker.is_spent(&sell_key) {
+                debug!("[DCA] Sell {} already spent, skipping", &sell_key[..sell_key.len().min(20)]);
+                continue;
+            }
+
+            // Resolve seller SPK.
+            let (seller_spk_ver, seller_spk_script) = match sell.resolve_counterparty_spk() {
+                Some(x) => x,
+                None => {
+                    warn!("[DCA] Sell {} missing counterparty_spk", &sell_key[..sell_key.len().min(20)]);
+                    continue;
+                }
+            };
+
+            // 2. Compute expected token amount and seller KAS.
+            //
+            // The DCA contract checks output[0].value >= expected_tokens.
+            // The sell contract's F4 checks covenant_output[0].value >= sell.value.
+            // Therefore we must give ALL of the sell's tokens to the buyer:
+            //   output[0].value = sell.value   (satisfies both if sell.value >= expected_tokens)
+            //
+            // Seller KAS is computed from the FULL sell amount at the sell's price.
+            let expected_tokens = match entry.amount_per_period.checked_mul(entry.price_num) {
+                Some(v) => v / entry.price_den,
+                None => {
+                    warn!("[DCA] u64 overflow in expected_tokens for {}", entry.outpoint_key());
+                    continue;
+                }
+            };
+            if expected_tokens < kob_core::MIN_UTXO_VALUE {
+                debug!("[DCA] expected_tokens {} < MIN_UTXO_VALUE, skipping", expected_tokens);
+                continue;
+            }
+            // Check that the sell has enough tokens for the DCA's expected minimum.
+            if sell.value < expected_tokens {
+                debug!(
+                    "[DCA] Sell has {} tokens but DCA needs {} — skipping",
+                    sell.value, expected_tokens,
+                );
+                continue;
+            }
+            // Token output value = sell.value (all tokens from the sell).
+            // This satisfies sell F4 (covenant conservation) and DCA F3 (>= expected).
+            let token_output_value = sell.value;
+
+            // KAS that the seller expects for ALL their tokens at their price.
+            let seller_kas = match sell.value.checked_mul(sell.price_num) {
+                Some(v) => v / sell.price_den,
+                None => {
+                    warn!("[DCA] u64 overflow in seller_kas for {}", entry.outpoint_key());
+                    continue;
+                }
+            };
+            if seller_kas < kob_core::MIN_UTXO_VALUE {
+                debug!("[DCA] seller_kas {} < MIN_UTXO_VALUE, skipping", seller_kas);
+                continue;
+            }
+            // Ensure the DCA's amount_per_period covers the seller's KAS.
+            // This can fail when sell.value > expected_tokens and the extra tokens
+            // push seller_kas beyond the DCA's per-period budget.
+            if entry.amount_per_period < seller_kas {
+                debug!(
+                    "[DCA] amt_per_period {} < seller_kas {} — sell too large",
+                    entry.amount_per_period, seller_kas,
+                );
+                continue;
+            }
+
+            // 3. Acquire wallet UTXO for miner fee.
+            let (utxos, wallet_spk_version, wallet_spk_script, _wallet_spk_hex) =
+                match fetch_wallet_utxos(rpc, &config.address, "DCA").await {
+                    Some(x) => x,
+                    None => continue,
+                };
+            let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
+            let token_p2sh_hex = hex::encode(&token_p2sh.script());
+            let wallet_utxo = utxos.iter()
+                .filter(|u| {
+                    let (_, script) = u.parse_spk();
+                    hex::encode(&script) != token_p2sh_hex
+                        && !spent_tracker.is_spent(&u.outpoint_key())
+                })
+                .max_by_key(|u| u.utxo_entry.amount);
+            let wallet_utxo = match wallet_utxo {
+                Some(u) => u,
+                None => {
+                    warn!("[DCA] No suitable wallet UTXO for fee — skipping");
+                    continue;
+                }
+            };
+
+            // 4. Parse DCA RS and build continuation RS (D&R) if periods > 1.
+            let dca_rs = match hex::decode(&entry.redeem_script_hex) {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!("[DCA] Failed to decode DCA RS hex");
+                    continue;
+                }
+            };
+            let sell_rs = match hex::decode(&sell.redeem_script_hex) {
+                Ok(v) => v,
+                Err(_) => {
+                    warn!("[DCA] Failed to decode sell RS hex");
+                    continue;
+                }
+            };
+
+            let is_final_fill = entry.periods_remaining == 1;
+            let (new_rs, continuation_output_idx) = if is_final_fill {
+                // Final period: no continuation UTXO needed.
+                (Vec::new(), 0u8)
+            } else {
+                // Build continuation RS with updated next_exec and periods.
+                let parsed = match kob_core::parse_dca_order_rs(&dca_rs) {
+                    Some(p) => p,
+                    None => {
+                        warn!("[DCA] Failed to parse DCA RS for {}", entry.outpoint_key());
+                        continue;
+                    }
+                };
+                let new_next_exec = parsed.next_execution_daa + parsed.interval_daa;
+                let new_periods = parsed.periods_remaining - 1;
+                match kob_core::build_dca_order_redeem_script(
+                    &parsed.owner_hash,
+                    &parsed.target_cov_id,
+                    &parsed.buyer_spk_hash,
+                    parsed.price_num,
+                    parsed.price_den,
+                    parsed.amount_per_period,
+                    parsed.interval_daa,
+                    new_next_exec,
+                    new_periods,
+                ) {
+                    Ok(rs) => (rs, 2u8), // continuation at output[2]
+                    Err(e) => {
+                        warn!("[DCA] Failed to build continuation RS: {}", e);
+                        continue;
+                    }
+                }
+            };
+
+            // 5. Build the fill TX.
+            //
+            // Input layout:
+            //   [0] sell order  (sequence=50 for OP_CSV)
+            //   [1] DCA order   (sequence=0, CLTV via lock_time)
+            //   [2] wallet UTXO (sequence=0, P2PK signed)
+            //
+            // Output layout:
+            //   [0] tokens to DCA buyer (DCA contract checks output[0])
+            //   [1] KAS to seller (sell contract's koi=1)
+            //   [2] DCA continuation (if periods > 1), P2SH(new_rs)
+            //   [2/3] wallet change (remaining KAS)
+
+            // Sell fill sigscript: [koi_opN][Op1][pushData(RS)]
+            // koi=1 (seller KAS output is at index 1)
+            let sell_fill_ss = kob_core::build_sell_fill_sigscript(1u16, &sell_rs);
+
+            // DCA fill sigscript.
+            // For non-final fills: old_rs and new_rs are the current and updated RS.
+            // For final fill (periods==1): old_rs and new_rs are empty (the D&R
+            // block is skipped, so they are pushed but never verified).
+            let (fill_old_rs, fill_new_rs): (&[u8], &[u8]) = if is_final_fill {
+                (&[], &[])
+            } else {
+                (&dca_rs, &new_rs)
+            };
+            let dca_fill_ss = kob_core::build_dca_order_fill_sigscript(
+                continuation_output_idx,
+                fill_old_rs,
+                fill_new_rs,
+                &dca_rs,  // redeem_script of the input being spent
+            );
+
+            // Fee estimate: 3 inputs, 3-4 outputs, 1 sig_op (wallet)
+            let num_outputs = if is_final_fill { 3 } else { 4 }; // with or without continuation
+            let est_fee = kob_core::mass::estimate_compute_mass(3, num_outputs, 0);
+
+            // Continuation UTXO value: DCA value minus amount_per_period.
+            let continuation_value = if is_final_fill {
+                0
+            } else {
+                entry.value.saturating_sub(entry.amount_per_period)
+            };
+            if !is_final_fill && continuation_value < kob_core::MIN_UTXO_VALUE {
+                warn!(
+                    "[DCA] Continuation value {} < MIN_UTXO_VALUE — cannot fill",
+                    continuation_value,
+                );
+                continue;
+            }
+
+            // Total KAS in: sell.value (tokens, part of covenant) + DCA.value + wallet.value
+            // Total KAS out: expected_tokens (output[0]) + seller_kas (output[1])
+            //                + continuation (output[2] if !final) + wallet_change + miner_fee
+            let total_kas_in = entry.value + wallet_utxo.utxo_entry.amount;
+            let kas_needed = seller_kas + continuation_value + est_fee;
+            if total_kas_in < kas_needed {
+                warn!(
+                    "[DCA] Insufficient KAS: have {} (dca={} + wallet={}) need {} (seller={} + cont={} + fee={})",
+                    total_kas_in, entry.value, wallet_utxo.utxo_entry.amount,
+                    kas_needed, seller_kas, continuation_value, est_fee,
+                );
+                continue;
+            }
+            let wallet_change = total_kas_in - kas_needed;
+
+            // Build sighash TX for wallet input signing.
+            let sell_p2sh = kob_core::build_p2sh(&sell_rs);
+            let dca_p2sh = kob_core::build_p2sh(&dca_rs);
+
+            let mut sighash_tx = kob_core::tx::Transaction::new(1);
+            sighash_tx.lock_time = entry.next_execution_daa;
+
+            // Input[0]: sell order (sequence=50 for CSV)
+            sighash_tx.inputs.push(kob_core::tx::TxInput {
+                prev_tx_id: sell.tx_id.clone(),
+                prev_index: sell.index,
+                sequence: 50,
+                sig_op_count: 0,
+                script_version: sell_p2sh.version,
+                script_bytes: sell_p2sh.script().to_vec(),
+                value: sell.value,
+            });
+            // Input[1]: DCA order (sequence=0, CLTV)
+            sighash_tx.inputs.push(kob_core::tx::TxInput {
+                prev_tx_id: entry.tx_id.clone(),
+                prev_index: entry.index,
+                sequence: 0,
+                sig_op_count: 0,
+                script_version: dca_p2sh.version,
+                script_bytes: dca_p2sh.script().to_vec(),
+                value: entry.value,
+            });
+            // Input[2]: wallet UTXO (P2PK, sigOpCount=1)
+            let (w_spk_version, w_spk_script) = wallet_utxo.parse_spk();
+            sighash_tx.inputs.push(kob_core::tx::TxInput {
+                prev_tx_id: wallet_utxo.outpoint.transaction_id.clone(),
+                prev_index: wallet_utxo.outpoint.index,
+                sequence: 0,
+                sig_op_count: 1,
+                script_version: w_spk_version,
+                script_bytes: w_spk_script.clone(),
+                value: wallet_utxo.utxo_entry.amount,
+            });
+
+            // Output[0]: tokens to DCA buyer (covenant binding from sell input[0])
+            let sell_token_hex = &sell.token_cov_id;
+            let sell_cov_hash = match kob_core::compat::parse_hash(sell_token_hex) {
+                Ok(h) => h,
+                Err(_) => {
+                    warn!("[DCA] Invalid sell token_cov_id hex");
+                    continue;
+                }
+            };
+            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                token_output_value,
+                buyer_spk_version,
+                buyer_spk_script.to_vec(),
+                Some(kob_core::tx::CovenantBinding::new(0, sell_cov_hash)),
+            ));
+            // Output[1]: KAS to seller
+            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                seller_kas,
+                seller_spk_ver,
+                seller_spk_script.clone(),
+                None,
+            ));
+            // Output[2]: DCA continuation (if periods > 1)
+            if !is_final_fill {
+                let cont_p2sh = kob_core::build_p2sh(&new_rs);
+                sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                    continuation_value,
+                    cont_p2sh.version,
+                    cont_p2sh.script().to_vec(),
+                    None,
+                ));
+            }
+            // Wallet change output
+            if wallet_change >= kob_core::MIN_UTXO_VALUE {
+                sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                    wallet_change,
+                    wallet_spk_version,
+                    wallet_spk_script.clone(),
+                    None,
+                ));
+            }
+
+            // Sign wallet input (input[2]) — P2PK: sigscript = [sig 65B]
+            let wallet_input_idx = 2usize;
+            let sighash = match kob_core::compute_sighash(&sighash_tx, wallet_input_idx) {
+                Ok(h) => h,
+                Err(e) => {
+                    error!("[DCA] Sighash computation failed: {}", e);
+                    continue;
+                }
+            };
+            let mut privkey = config.private_key_bytes();
+            let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
+                Ok(s) => s,
+                Err(e) => {
+                    privkey.zeroize();
+                    error!("[DCA] Wallet signing failed: {}", e);
+                    continue;
+                }
+            };
+            privkey.zeroize();
+            let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
+
+            // Build RPC inputs
+            let rpc_inputs = vec![
+                deploy::build_rpc_input_with_sequence(
+                    &sell.tx_id, sell.index,
+                    &hex::encode(&sell_fill_ss), 0, 50,
+                ),
+                deploy::build_rpc_input_with_sequence(
+                    &entry.tx_id, entry.index,
+                    &hex::encode(&dca_fill_ss), 0, 0,
+                ),
+                deploy::build_rpc_input_with_sequence(
+                    &wallet_utxo.outpoint.transaction_id, wallet_utxo.outpoint.index,
+                    &hex::encode(&wallet_ss), 1, 0,
+                ),
+            ];
+
+            // Build RPC outputs
+            let mut rpc_outputs = vec![
+                // Output[0]: tokens to buyer (with covenant binding to sell input[0])
+                deploy::build_rpc_output_with_covenant(
+                    token_output_value,
+                    buyer_spk_version,
+                    &hex::encode(buyer_spk_script),
+                    0, // auth input = sell at index 0
+                    sell_token_hex,
+                ),
+                // Output[1]: KAS to seller
+                deploy::build_rpc_output(seller_kas, seller_spk_ver, &hex::encode(&seller_spk_script)),
+            ];
+            if !is_final_fill {
+                let cont_p2sh = kob_core::build_p2sh(&new_rs);
+                rpc_outputs.push(deploy::build_rpc_output(
+                    continuation_value,
+                    cont_p2sh.version,
+                    &hex::encode(cont_p2sh.script()),
+                ));
+            }
+            if wallet_change >= kob_core::MIN_UTXO_VALUE {
+                rpc_outputs.push(deploy::build_rpc_output(
+                    wallet_change,
+                    wallet_spk_version,
+                    &hex::encode(&wallet_spk_script),
+                ));
+            }
+
+            // 6. Submit TX (lock_time = next_execution_daa for CLTV).
+            let payload = deploy::build_submit_payload_with_lock_time(
+                1, rpc_inputs, rpc_outputs, entry.next_execution_daa,
+            );
+            match rpc.submit_transaction(payload).await {
+                Ok(result) if result.ok => {
+                    let tx_id = result.tx_id.unwrap_or_default();
+                    info!(
+                        "[DCA] FILL SUCCESS: {} -> TX {} (tokens={}, seller_kas={}, periods_left={})",
+                        &entry.outpoint_key()[..entry.outpoint_key().len().min(20)],
+                        &tx_id[..tx_id.len().min(16)],
+                        token_output_value, seller_kas,
+                        if is_final_fill { 0 } else { entry.periods_remaining - 1 },
+                    );
+                    // Mark inputs as spent.
+                    spent_tracker.mark_spent(&entry.outpoint_key());
+                    spent_tracker.mark_spent(&sell_key);
+                    spent_tracker.mark_spent(&wallet_utxo.outpoint_key());
+
+                    // Remove the consumed DCA entry.  The continuation UTXO (if any)
+                    // will be rediscovered by the scanner in a subsequent block and
+                    // re-added to the DCA book with updated next_exec/periods.
+                    {
+                        let mut dcab = dca_book.lock().await;
+                        dcab.remove(&entry.outpoint_key());
+                    }
+                }
+                Ok(result) => {
+                    let err_str = result.error.unwrap_or_else(|| "Unknown".to_string());
+                    warn!(
+                        "[DCA] FILL FAILED: {} — {}",
+                        &entry.outpoint_key()[..entry.outpoint_key().len().min(20)],
+                        err_str,
+                    );
+                    spent_tracker.mark_failed(&entry.outpoint_key());
+                }
+                Err(e) => {
+                    error!("[DCA] RPC error for {}: {}", entry.outpoint_key(), e);
+                    spent_tracker.mark_failed(&entry.outpoint_key());
                 }
             }
         }
@@ -5544,6 +5999,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
+            discovered_daa: 0,
         };
 
         // Add order to book and record provenance
@@ -5601,6 +6057,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
+            discovered_daa: 0,
         };
         ob.add_sell_order(order.clone());
         assert!(ob.contains_outpoint("tx_preexisting:0"));
@@ -5746,6 +6203,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
+            discovered_daa: 0,
         };
         ob.add_buy_order(order_a.clone());
 
@@ -5781,6 +6239,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
+            discovered_daa: 0,
         };
         ob.add_sell_order(order_b.clone());
 

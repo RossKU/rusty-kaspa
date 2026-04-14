@@ -43,6 +43,13 @@ pub struct DcaEntry {
     pub p2sh_version: u16,
     /// DAA score when this entry was discovered.
     pub discovered_daa: u64,
+    /// Buyer's actual scriptPublicKey (hex: 2B version LE + script bytes).
+    ///
+    /// Extracted from the DCA deploy TX outputs by matching
+    /// `compute_spk_hash(spk) == buyer_spk_hash`.  Required for building
+    /// the token output in the DCA fill TX.  `None` means the SPK was not
+    /// found in the deploy TX and the DCA fill cannot be executed.
+    pub buyer_spk: Option<String>,
 }
 
 impl DcaEntry {
@@ -148,6 +155,7 @@ mod tests {
             p2sh_script_hex: "00".repeat(35),
             p2sh_version: 0,
             discovered_daa: 4000,
+            buyer_spk: None,
         }
     }
 

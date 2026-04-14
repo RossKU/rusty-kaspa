@@ -2767,6 +2767,31 @@ async fn run_scan_cycle(
         );
     }
 
+    // H4 hoist: wallet UTXOs and token P2SH hex are cycle-level constants.
+    // Fetching once per cycle and filtering via spent_tracker inside the loop
+    // cuts RPC roundtrips from N (per group) to 1 (per cycle). Same wallet
+    // address, same SPK; spent_tracker auto-marks consumed UTXOs on submit
+    // so the per-iteration filter still picks fresh UTXOs between groups.
+    let wallet_ctx: Option<(Vec<RpcUtxo>, u16, Vec<u8>)> = match rpc
+        .get_spendable_utxos(&config.address, Some(0))
+        .await
+    {
+        Ok(u) if !u.is_empty() => {
+            let (v, s) = u[0].parse_spk();
+            Some((u, v, s))
+        }
+        Ok(_) => {
+            warn!("[UNIFIED] No wallet UTXOs available (cycle)");
+            None
+        }
+        Err(e) => {
+            warn!("[UNIFIED] Failed to get wallet UTXOs: {} (cycle)", e);
+            None
+        }
+    };
+    let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
+    let token_p2sh_hex = hex::encode(&token_p2sh.script());
+
     for group in &opt_groups {
         info!(
             "[UNIFIED] Group kind={:?} sells={} buys={} surplus={}",
@@ -2831,24 +2856,13 @@ async fn run_scan_cycle(
             continue;
         }
 
-        // Acquire wallet UTXOs
-        let utxos = match rpc
-            .get_spendable_utxos(&config.address, Some(0))
-            .await
-        {
-            Ok(u) if !u.is_empty() => u,
-            Ok(_) => {
-                warn!("[UNIFIED] No wallet UTXOs available, skipping group");
-                continue;
-            }
-            Err(e) => {
-                warn!("[UNIFIED] Failed to get wallet UTXOs: {}, skipping", e);
-                continue;
-            }
+        // Pull wallet UTXOs + SPK from the cycle-level cache (hoisted above).
+        // `token_p2sh_hex` is also hoisted — it's a compile-time constant built
+        // from `kob_core::TOKEN_RS`, so no point recomputing per group.
+        let (utxos, wallet_spk_version, wallet_spk_script) = match &wallet_ctx {
+            Some((u, v, s)) => (u.as_slice(), *v, s.clone()),
+            None => continue,
         };
-        let (wallet_spk_version, wallet_spk_script) = utxos[0].parse_spk();
-        let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
-        let token_p2sh_hex = hex::encode(&token_p2sh.script());
         let wallet_utxo = utxos.iter()
             .filter(|u| {
                 let (_, script) = u.parse_spk();

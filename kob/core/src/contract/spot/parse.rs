@@ -7,9 +7,12 @@ use crate::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN;
 /// OpZkPrecompile opcode byte (0xa6).
 pub const OP_ZK_PRECOMPILE: u8 = 0xa6;
 
-/// Check whether a redeemScript contains the ZK precompile opcode.
-pub fn has_zk_opcode(redeem_script: &[u8]) -> bool {
-    redeem_script.contains(&OP_ZK_PRECOMPILE)
+/// Check whether the *body* section of a redeemScript contains the ZK
+/// precompile opcode.  The state section (push-data at the front) is
+/// skipped because arbitrary data bytes there (e.g. owner_hash) can
+/// coincidentally equal `0xa6`, causing false positives.
+pub fn has_zk_opcode(redeem_script: &[u8], body_start: usize) -> bool {
+    redeem_script.get(body_start..).map_or(false, |body| body.contains(&OP_ZK_PRECOMPILE))
 }
 
 /// Parsed order parameters from a redeemScript.
@@ -176,7 +179,7 @@ fn parse_buy_state(rs: &[u8]) -> Option<ParsedOrder> {
         spk_hash: bspkh,
         _max_matcher_fee: mmfee,
         cpend,
-        requires_zk: has_zk_opcode(rs),
+        requires_zk: has_zk_opcode(rs, BUY_STATE_SIZE),
         redeem_script: rs.to_vec(),
         post_only: false,
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
@@ -240,7 +243,7 @@ fn parse_sell_state(rs: &[u8]) -> Option<ParsedOrder> {
         spk_hash: sspkh,
         _max_matcher_fee: mmfee,
         cpend,
-        requires_zk: has_zk_opcode(rs),
+        requires_zk: has_zk_opcode(rs, SELL_STATE_SIZE),
         redeem_script: rs.to_vec(),
         post_only: false,
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
@@ -409,12 +412,19 @@ mod tests {
 
     #[test]
     fn has_zk_opcode_positive() {
-        assert!(has_zk_opcode(&[0x51, 0xa6, 0x87]));
+        // 0xa6 in body (after body_start=1)
+        assert!(has_zk_opcode(&[0x51, 0xa6, 0x87], 1));
     }
 
     #[test]
     fn has_zk_opcode_negative() {
-        assert!(!has_zk_opcode(&[0x51, 0x52, 0x87]));
+        assert!(!has_zk_opcode(&[0x51, 0x52, 0x87], 1));
+    }
+
+    #[test]
+    fn has_zk_opcode_ignores_state_section() {
+        // 0xa6 appears in state (offset 1) but NOT in body (offset 3 onward)
+        assert!(!has_zk_opcode(&[0x51, 0xa6, 0x52, 0x87, 0x69], 3));
     }
 
     #[test]

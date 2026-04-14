@@ -48,14 +48,14 @@ use crate::contract::helpers::opn;
 ///   For final fill (periods==1): new_rs and old_rs can be Op0 (empty/dummy).
 /// Cancel sigscript: [pushData(sig+type 65B)][pushData(pk 32B)][Op0][pushData(RS)]
 ///
-/// Body = 220B, RS = 153 + 220 = 373 bytes.
+/// Body = 221B, RS = 153 + 221 = 374 bytes.
 /// DCA order V2 state size (153 bytes).
 pub const DCA_V2_STATE_SIZE: usize = 153;
 
-/// DCA order V2 body size (220 bytes).
-pub const DCA_V2_BODY_SIZE: usize = 220;
+/// DCA order V2 body size (221 bytes).
+pub const DCA_V2_BODY_SIZE: usize = 221;
 
-/// DCA order V2 redeemScript size (153 + 220 = 373 bytes).
+/// DCA order V2 redeemScript size (153 + 221 = 374 bytes).
 pub const DCA_V2_RS_SIZE: usize = DCA_V2_STATE_SIZE + DCA_V2_BODY_SIZE;
 
 /// Parsed DCA order V2 state fields.
@@ -85,7 +85,7 @@ pub struct ParsedDcaOrder {
 
 /// Parse a DCA order V2 redeemScript.
 ///
-/// Returns `None` if the RS length doesn't match 369B or the push-prefix
+/// Returns `None` if the RS length doesn't match 374B or the push-prefix
 /// bytes are inconsistent.
 pub fn parse_dca_order_rs(rs: &[u8]) -> Option<ParsedDcaOrder> {
     if rs.len() != DCA_V2_RS_SIZE {
@@ -198,44 +198,43 @@ pub const DCA_ORDER_BODY: &[u8] = &[
     0x87, 0x69,       // OpEqual OpVerify                                   [2B]
     // Stack: [11]
 
-    // --- D&R Step 3: Verify unchanged suffix [153..end) (26B) ---
+    // --- D&R Step 3: Verify unchanged suffix [153..end) (18B) ---
+    // OpSubstr(data, begin, end): use OpSize as end directly
     0x59, 0x79,       // Op9 OpPick -> old_rs copy (d9)                    [2B]
     0x82,             // OpSize -> len (no pop)                             [1B]
-    0x02, 0x99, 0x00, // push 153                                          [3B]
-    0x94,             // OpSub -> suffix_len                                [1B]
     0x02, 0x99, 0x00, // push 153 (begin)                                  [3B]
-    0x7c,             // OpSwap                                             [1B]
-    0x7f,             // OpSubstr -> old_suffix                             [1B]
+    0x7c,             // OpSwap -> (data, 153, len)                         [1B]
+    0x7f,             // OpSubstr -> old_suffix = data[153..len]            [1B]
     0x5b, 0x79,       // Op11 OpPick -> new_rs copy (d10+1=d11)            [2B]
     0x82,             // OpSize                                             [1B]
     0x02, 0x99, 0x00, // push 153                                          [3B]
-    0x94,             // OpSub                                              [1B]
-    0x02, 0x99, 0x00, // push 153                                          [3B]
     0x7c,             // OpSwap                                             [1B]
-    0x7f,             // OpSubstr -> new_suffix                             [1B]
+    0x7f,             // OpSubstr -> new_suffix = data[153..len]            [1B]
     0x87, 0x69,       // OpEqual OpVerify                                   [2B]
     // Stack: [11]
 
-    // --- D&R Step 4: Verify push prefix at new_rs[144] == 0x08 (11B) ---
+    // --- D&R Step 4: Verify push prefix at new_rs[144] == 0x08 (12B) ---
+    // OpSubstr(data, 144, 145) -> data[144..145] = 1 byte
     0x5a, 0x79,       // Op10 OpPick -> new_rs copy (d10)                  [2B]
-    0x02, 0x90, 0x00, // push 144                                          [3B]
-    0x51,             // Op1 (size=1)                                       [1B]
-    0x7f,             // OpSubstr -> 1-byte at offset 144                   [1B]
-    0x01, 0x08,       // push [0x08]                                        [2B]
+    0x02, 0x90, 0x00, // push 144 (begin)                                  [3B]
+    0x02, 0x91, 0x00, // push 145 (end)                                    [3B]
+    0x7f,             // OpSubstr -> 1-byte at [144..145)                   [1B]
+    0x58,             // Op8 -> push number 8 (minimal encoding)            [1B]
     0x87, 0x69,       // OpEqual OpVerify                                   [2B]
     // Stack: [11]
 
-    // --- D&R Step 5: Verify new_next_exec == old_next_exec + interval (19B) ---
+    // --- D&R Step 5: Verify new_next_exec == old_next_exec + interval (23B) ---
+    // OpSubstr(data, 136, 144) -> data[136..144) = 8 bytes
     // Extract new_next_exec from new_rs[136..144)
     0x5a, 0x79,       // Op10 OpPick -> new_rs copy (d10)                  [2B]
-    0x02, 0x88, 0x00, // push 136                                          [3B]
-    0x58,             // Op8 (size=8)                                       [1B]
+    0x02, 0x88, 0x00, // push 136 (begin)                                  [3B]
+    0x02, 0x90, 0x00, // push 144 (end)                                    [3B]
     0x7f,             // OpSubstr -> new_next_exec                          [1B]
     // Stack (12): new_nex(0), next_exec(1), interval(2), ... old_rs(10), new_rs(11)
     // Extract old_next_exec from old_rs[136..144)
     0x5a, 0x79,       // Op10 OpPick -> old_rs (d9+1=d10)                  [2B]
-    0x02, 0x88, 0x00, // push 136                                          [3B]
-    0x58,             // Op8                                                [1B]
+    0x02, 0x88, 0x00, // push 136 (begin)                                  [3B]
+    0x02, 0x90, 0x00, // push 144 (end)                                    [3B]
     0x7f,             // OpSubstr -> old_next_exec                          [1B]
     // Stack (13): old_nex(0), new_nex(1), next_exec(2), interval(3), ...
     // Get interval from state stack (d3)
@@ -244,17 +243,18 @@ pub const DCA_ORDER_BODY: &[u8] = &[
     0x9c, 0x69,       // OpNumEqual OpVerify (== new_next_exec)            [2B]
     // Stack: [11]
 
-    // --- D&R Step 6: Verify new_periods == old_periods - 1 (18B) ---
+    // --- D&R Step 6: Verify new_periods == old_periods - 1 (22B) ---
+    // OpSubstr(data, 145, 153) -> data[145..153) = 8 bytes
     // Extract new_periods from new_rs[145..153)
     0x5a, 0x79,       // Op10 OpPick -> new_rs copy (d10)                  [2B]
-    0x02, 0x91, 0x00, // push 145                                          [3B]
-    0x58,             // Op8 (size=8)                                       [1B]
+    0x02, 0x91, 0x00, // push 145 (begin)                                  [3B]
+    0x02, 0x99, 0x00, // push 153 (end)                                    [3B]
     0x7f,             // OpSubstr -> new_periods                            [1B]
     // Stack (12)
     // Extract old_periods from old_rs[145..153)
     0x5a, 0x79,       // Op10 OpPick -> old_rs (d9+1=d10)                  [2B]
-    0x02, 0x91, 0x00, // push 145                                          [3B]
-    0x58,             // Op8                                                [1B]
+    0x02, 0x91, 0x00, // push 145 (begin)                                  [3B]
+    0x02, 0x99, 0x00, // push 153 (end)                                    [3B]
     0x7f,             // OpSubstr -> old_periods                            [1B]
     // Stack (13): old_per(0), new_per(1), ...
     0x51, 0x94,       // Op1 OpSub -> old_periods - 1                      [2B]
@@ -324,7 +324,7 @@ pub const DCA_ORDER_BODY: &[u8] = &[
     0x51,             // Op1 (TRUE)
 ];
 
-/// Build dca_order redeemScript (369 bytes).
+/// Build dca_order redeemScript (374 bytes).
 ///
 /// State (153B):
 ///   [0x20][owner_hash 32B][0x20][target_cov_id 32B][0x20][buyer_spk_hash 32B]

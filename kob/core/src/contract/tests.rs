@@ -1072,8 +1072,8 @@ mod tests {
     fn dca_order_body_length() {
         assert_eq!(
             DCA_ORDER_BODY.len(),
-            220,
-            "dca_order body must be 220 bytes"
+            221,
+            "dca_order body must be 221 bytes"
         );
     }
 
@@ -1098,7 +1098,7 @@ mod tests {
         let rs = build_dca_order_redeem_script(
             &oh, &tcid, &bspkh, 100, 200, 50000, 100, 1000, 10,
         ).unwrap();
-        assert_eq!(rs.len(), 373, "dca_order RS must be 373 bytes (153 state + 220 body)");
+        assert_eq!(rs.len(), 374, "dca_order RS must be 374 bytes (153 state + 221 body)");
     }
 
     #[test]
@@ -1290,8 +1290,8 @@ mod tests {
 
         let ss = build_dca_order_fill_sigscript(0, &old_rs, &new_rs, &old_rs);
         // sigscript contains: pushData(new_rs) + pushData(old_rs) + ci + Op1 + pushData(RS)
-        // new_rs and old_rs are 369B each, pushData(369) = 4d + 2B len + 369B = 372B
-        // ci = Op0 (1B), selector Op1 (1B), pushData(RS=369B) = 372B
+        // new_rs and old_rs are 374B each, pushData(374) = 4d + 2B len + 374B = 377B
+        // ci = Op0 (1B), selector Op1 (1B), pushData(RS=374B) = 377B
         // Total ≈ 372 + 372 + 1 + 1 + 372 = 1118B
         assert!(ss.len() > 1100, "fill sigscript should be >1100B, got {}", ss.len());
         // Last bytes should be pushData(RS)
@@ -1395,7 +1395,7 @@ mod tests {
         let ss = build_dca_order_fill_sigscript(0, &[], &[], &rs);
         // Should be valid: pushData(empty) + pushData(empty) + Op0 + Op1 + pushData(RS)
         // pushData(empty) = [0x00] (1 byte each)
-        // Total = 1 + 1 + 1 + 1 + pushData(373) = 4 + 376 = 380B
+        // Total = 1 + 1 + 1 + 1 + pushData(374) = 4 + 377 = 381B
         assert!(ss.len() < 384, "final fill sigscript should be compact, got {}", ss.len());
     }
 

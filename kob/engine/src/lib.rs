@@ -227,7 +227,24 @@ pub async fn run_engine(
             };
             let shared_market_tracker = Arc::new(Mutex::new(matcher::prediction_tracker::MarketTracker::new()));
             let shared_dca_book = Arc::new(Mutex::new(matcher::dca_book::DcaBook::new()));
-            let shared_swap_book = Arc::new(Mutex::new(matcher::swap_book::SwapBook::new()));
+
+            // Load swap book
+            let swap_book_path = format!("{}.swap.json", orderbook_path);
+            let shared_swap_book = {
+                let book = match matcher::persistence::load_swap_book(&swap_book_path) {
+                    Ok(b) => {
+                        if b.len() > 0 {
+                            info!("[SWAP BOOK] Loaded {} swap order(s)", b.len());
+                        }
+                        b
+                    }
+                    Err(_) => {
+                        info!("[SWAP BOOK] No persisted file at {}, starting empty", swap_book_path);
+                        matcher::swap_book::SwapBook::new()
+                    }
+                };
+                Arc::new(Mutex::new(book))
+            };
 
             // Start API server if port > 0
             let (ws_broadcaster, shared_state_for_executor) = if api_port > 0 {

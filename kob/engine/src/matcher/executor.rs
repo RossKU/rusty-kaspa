@@ -1230,6 +1230,281 @@ pub async fn execute_batch_match(
     })
 }
 
+/// Execute a cross-pair swap fill: build and submit the atomic TX.
+///
+/// TX layout (defined by swap covenant in `swap.rs`):
+///   Inputs:  [0] swap UTXO, [1] sell_target, [2] buy_source, [3] wallet
+///   Outputs: [0] Token A → buyer, [1] Token B → swap owner, [2] KAS → seller, [3] change
+///
+/// The swap UTXO (input 0) carries the source token covenant binding.
+/// The sell_target (input 1) carries the target token covenant binding.
+/// Output[0] gets Token A covenant from input 0, output[1] gets Token B covenant from input 1.
+pub async fn execute_swap_fill(
+    rpc: &RpcClient,
+    sg: &crate::matcher::matching::CrossSwapGroup,
+    sell_target: &crate::matcher::batch::BatchOrder,
+    buy_source: &crate::matcher::batch::BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    wallet_spk: &[u8],
+    wallet_spk_version: u16,
+    config: &AppConfig,
+) -> Option<BatchMatchResult> {
+    // --- Parse swap entry ---
+    let swap_rs = match hex::decode(&sg.swap.redeem_script_hex) {
+        Ok(rs) if !rs.is_empty() => rs,
+        _ => {
+            warn!("[SWAP-FILL] Failed to decode swap RS");
+            return None;
+        }
+    };
+    let swap_p2sh = kob_core::build_p2sh(&swap_rs);
+
+    // Owner SPK (hex: 2B version LE + script bytes) for target token output
+    let owner_spk_raw = match &sg.swap.owner_spk {
+        Some(h) => match hex::decode(h) {
+            Ok(v) if v.len() > 2 => v,
+            _ => { warn!("[SWAP-FILL] Invalid owner_spk hex"); return None; }
+        },
+        None => { warn!("[SWAP-FILL] Missing owner_spk — cannot build fill"); return None; }
+    };
+    let owner_spk_version = u16::from_le_bytes([owner_spk_raw[0], owner_spk_raw[1]]);
+    let owner_spk_script = &owner_spk_raw[2..];
+
+    // --- Receipt input index (rii) ---
+    // Swap covenant F1 checks: input[rii].covenant_id == receipt_cov_id.
+    // Source cov_id lives on input 0 (swap UTXO), target on input 1 (sell_target).
+    let rii: u16 = if sg.swap.receipt_cov_id == sg.swap.source_cov_id {
+        0
+    } else if sg.swap.receipt_cov_id == sg.sell_target.token_cov_id {
+        1
+    } else {
+        warn!(
+            "[SWAP-FILL] receipt_cov_id {} matches neither source {} nor target {} — skip",
+            &sg.swap.receipt_cov_id[..16.min(sg.swap.receipt_cov_id.len())],
+            &sg.swap.source_cov_id[..16.min(sg.swap.source_cov_id.len())],
+            &sg.sell_target.token_cov_id[..16.min(sg.sell_target.token_cov_id.len())],
+        );
+        return None;
+    };
+
+    // V15 buy not supported in cross-pair swap (reads sell sigscript at sii)
+    if buy_source.redeem_script.len()
+        == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN
+    {
+        warn!("[SWAP-FILL] v15 buy not supported in cross-pair swap — skip");
+        return None;
+    }
+
+    // --- Sigscripts ---
+    // Input[0] swap:        [rii] [toi=1] [Op1] [pushData(RS)]
+    let swap_ss = kob_core::contract::spot::swap::build_swap_fill_sigscript(rii, 1, &swap_rs);
+    // Input[1] sell_target: [koi=2] [Op1] [pushData(RS)]
+    let sell_ss = kob_core::contract::spot::order::build_sell_fill_sigscript(2, &sell_target.redeem_script);
+    // Input[2] buy_source:  [toi=0] [tii=0] [coi=0] [Op1] [pushData(RS)]
+    let buy_ss = kob_core::contract::spot::order::build_buy_fill_sigscript(0, 0, 0, &buy_source.redeem_script);
+
+    // --- Wallet ---
+    let wallet = match wallet_utxo {
+        Some(w) => w,
+        None => { warn!("[SWAP-FILL] No wallet UTXO"); return None; }
+    };
+
+    // --- Output values ---
+    let source_token_amount = sg.swap.value;       // Token A → buyer
+    let target_token_amount = sg.sell_target.value; // Token B → swap owner
+    let kas_to_seller = sg.kas_flow;
+
+    // Fee estimation: 4 inputs, 4 outputs, 1 sig_op (wallet)
+    let estimated_fee = kob_core::mass::estimate_compute_mass(4, 4, 1);
+
+    // Matcher change = surplus + wallet - fee
+    // (token values cancel: swap.value → output[0], sell.value → output[1])
+    let matcher_change = (sg.surplus + wallet.2).saturating_sub(estimated_fee);
+
+    // Minimum value checks
+    if kas_to_seller < MIN_UTXO_VALUE {
+        warn!("[SWAP-FILL] KAS to seller {} below min {}", kas_to_seller, MIN_UTXO_VALUE);
+        return None;
+    }
+    if matcher_change < MIN_UTXO_VALUE {
+        warn!("[SWAP-FILL] Matcher change {} below min {}", matcher_change, MIN_UTXO_VALUE);
+        return None;
+    }
+
+    // --- Build sighash TX ---
+    let mut sighash_tx = kob_core::tx::Transaction::new(1);
+    sighash_tx.lock_time = 50;
+
+    // Input[0]: swap UTXO (covenant, CSV=50, sigOp=0)
+    sighash_tx.inputs.push(kob_core::tx::TxInput {
+        prev_tx_id: sg.swap.tx_id.clone(),
+        prev_index: sg.swap.index,
+        sequence: 50, sig_op_count: 0,
+        script_version: swap_p2sh.version,
+        script_bytes: swap_p2sh.script().to_vec(),
+        value: sg.swap.value,
+    });
+    // Input[1]: sell_target (covenant, CSV=50, sigOp=0)
+    let sell_p2sh = kob_core::build_p2sh(&sell_target.redeem_script);
+    sighash_tx.inputs.push(kob_core::tx::TxInput {
+        prev_tx_id: sell_target.outpoint.0.clone(),
+        prev_index: sell_target.outpoint.1,
+        sequence: 50, sig_op_count: 0,
+        script_version: sell_p2sh.version,
+        script_bytes: sell_p2sh.script().to_vec(),
+        value: sell_target.utxo_value,
+    });
+    // Input[2]: buy_source (covenant, CSV=50, sigOp=0)
+    let buy_p2sh = kob_core::build_p2sh(&buy_source.redeem_script);
+    sighash_tx.inputs.push(kob_core::tx::TxInput {
+        prev_tx_id: buy_source.outpoint.0.clone(),
+        prev_index: buy_source.outpoint.1,
+        sequence: 50, sig_op_count: 0,
+        script_version: buy_p2sh.version,
+        script_bytes: buy_p2sh.script().to_vec(),
+        value: buy_source.utxo_value,
+    });
+    // Input[3]: wallet (P2PK, seq=0, sigOp=1)
+    let wallet_input_idx: usize = 3;
+    sighash_tx.inputs.push(kob_core::tx::TxInput {
+        prev_tx_id: wallet.0.clone(),
+        prev_index: wallet.1,
+        sequence: 0, sig_op_count: 1,
+        script_version: wallet_spk_version,
+        script_bytes: wallet_spk.to_vec(),
+        value: wallet.2,
+    });
+
+    // --- Outputs ---
+    let source_cov_id = &sg.swap.source_cov_id;
+    let target_cov_id = &sg.swap.target_cov_id;
+    let source_hash = kob_core::compat::parse_hash(source_cov_id).unwrap();
+    let target_hash = kob_core::compat::parse_hash(target_cov_id).unwrap();
+
+    // Output[0]: Token A → buyer (covenant: source token, auth input 0)
+    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+        source_token_amount, buy_source.counterparty_spk_version,
+        buy_source.counterparty_spk.clone(),
+        Some(kob_core::tx::CovenantBinding::new(0, source_hash)),
+    ));
+    // Output[1]: Token B → swap owner (covenant: target token, auth input 1)
+    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+        target_token_amount, owner_spk_version,
+        owner_spk_script.to_vec(),
+        Some(kob_core::tx::CovenantBinding::new(1, target_hash)),
+    ));
+    // Output[2]: KAS → seller
+    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+        kas_to_seller, sell_target.counterparty_spk_version,
+        sell_target.counterparty_spk.clone(), None,
+    ));
+    // Output[3]: matcher change
+    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+        matcher_change, wallet_spk_version,
+        wallet_spk.to_vec(), None,
+    ));
+
+    // --- RPC outputs ---
+    let buyer_spk_hex = hex::encode(&buy_source.counterparty_spk);
+    let owner_spk_hex = hex::encode(owner_spk_script);
+    let seller_spk_hex = hex::encode(&sell_target.counterparty_spk);
+    let matcher_spk_hex = hex::encode(wallet_spk);
+
+    let rpc_outputs = vec![
+        deploy::build_rpc_output_with_covenant(
+            source_token_amount, buy_source.counterparty_spk_version,
+            &buyer_spk_hex, 0, source_cov_id,
+        ),
+        deploy::build_rpc_output_with_covenant(
+            target_token_amount, owner_spk_version,
+            &owner_spk_hex, 1, target_cov_id,
+        ),
+        deploy::build_rpc_output(
+            kas_to_seller, sell_target.counterparty_spk_version, &seller_spk_hex,
+        ),
+        deploy::build_rpc_output(
+            matcher_change, wallet_spk_version, &matcher_spk_hex,
+        ),
+    ];
+
+    // --- RPC inputs (covenant inputs first, wallet last) ---
+    let mut rpc_inputs = vec![
+        deploy::build_rpc_input_with_sequence(
+            &sg.swap.tx_id, sg.swap.index, &hex::encode(&swap_ss), 0, 50,
+        ),
+        deploy::build_rpc_input_with_sequence(
+            &sell_target.outpoint.0, sell_target.outpoint.1,
+            &hex::encode(&sell_ss), 0, 50,
+        ),
+        deploy::build_rpc_input_with_sequence(
+            &buy_source.outpoint.0, buy_source.outpoint.1,
+            &hex::encode(&buy_ss), 0, 50,
+        ),
+    ];
+
+    // --- Sign wallet input ---
+    let mut privkey = config.private_key_bytes();
+    let sighash = match kob_core::compute_sighash(&sighash_tx, wallet_input_idx) {
+        Ok(sh) => sh,
+        Err(e) => { privkey.zeroize(); error!("[SWAP-FILL] Sighash failed: {}", e); return None; }
+    };
+    let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
+        Ok(s) => s,
+        Err(e) => { privkey.zeroize(); error!("[SWAP-FILL] Signing failed: {}", e); return None; }
+    };
+    privkey.zeroize();
+    let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
+    rpc_inputs.push(deploy::build_rpc_input(
+        &wallet.0, wallet.1, &hex::encode(&wallet_ss), 1,
+    ));
+
+    // --- Mass pre-check ---
+    let in_vals = vec![sg.swap.value, sell_target.utxo_value, buy_source.utxo_value, wallet.2];
+    let out_vals = vec![source_token_amount, target_token_amount, kas_to_seller, matcher_change];
+    if check_mass_presubmit(&in_vals, &out_vals, "SWAP-FILL").is_none() {
+        return None;
+    }
+
+    // --- Debug dump ---
+    info!("======================================================================");
+    info!("EXECUTING SWAP FILL: swap → buy_source(Token A) + sell_target(Token B)");
+    info!("======================================================================");
+    info!("  swap={}:{} (src_tok={})", &sg.swap.tx_id[..16.min(sg.swap.tx_id.len())], sg.swap.index, sg.swap.value);
+    info!("  sell_target={}:{} (tgt_tok={})", &sell_target.outpoint.0[..16.min(sell_target.outpoint.0.len())], sell_target.outpoint.1, sell_target.utxo_value);
+    info!("  buy_source={}:{} (kas={})", &buy_source.outpoint.0[..16.min(buy_source.outpoint.0.len())], buy_source.outpoint.1, buy_source.utxo_value);
+    info!("  kas_flow={} surplus={} fee={} matcher_change={} rii={}", kas_to_seller, sg.surplus, estimated_fee, matcher_change, rii);
+
+    // --- Submit ---
+    let payload = deploy::build_submit_payload_with_lock_time(1, rpc_inputs, rpc_outputs, 50);
+    let result = match rpc.submit_transaction(payload).await {
+        Ok(r) => r,
+        Err(e) => {
+            let err_str = e.to_string();
+            if err_str.contains("sequence locks") {
+                warn!("[SWAP-FILL] CSV not yet mature (transient): {}", err_str);
+            } else {
+                error!("[SWAP-FILL] Submit failed: {}", err_str);
+            }
+            return None;
+        }
+    };
+    if !result.ok {
+        error!("[SWAP-FILL] TX rejected: {}", result.error.as_deref().unwrap_or("unknown"));
+        return None;
+    }
+
+    let tx_id = result.tx_id.unwrap_or_default();
+    info!("[SWAP-FILL] SUCCESS! TXID: {}", tx_id);
+
+    Some(BatchMatchResult {
+        tx_id,
+        sell_count: 1,
+        buy_count: 1,
+        total_seller_kas: kas_to_seller,
+        matcher_surplus: sg.surplus,
+    })
+}
+
 // L1 Block Scanning — Order Discovery
 
 /// Process a batch of transactions from a block notification.
@@ -2939,25 +3214,12 @@ async fn run_scan_cycle(
                     .max_by_key(|u| u.utxo_entry.amount)
                     .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-                // Plan: Use plan_batch_match with the buy-source and sell-target
-                // as the buy and sell legs. The swap UTXO is handled specially.
-                let plan_result = crate::matcher::batch::plan_batch_match(
-                    &[sell_target_batch], &[buy_source_batch], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                );
-
-                let mut plan = match plan_result {
-                    Ok(p) => p,
-                    Err(e) => {
-                        warn!("[SWAP-ROUTE] Plan failed: {}, skipping", e);
-                        spent_tracker.mark_failed(&sg.swap.outpoint_key());
-                        spent_tracker.mark_failed(&sg.buy_source.outpoint_key());
-                        spent_tracker.mark_failed(&sg.sell_target.outpoint_key());
-                        continue;
-                    }
-                };
-
-                match execute_batch_match(rpc, &mut plan, config, spent_tracker, None).await {
+                // Build and submit the swap atomic TX directly (not via plan_batch_match,
+                // which can't handle cross-pair token routing).
+                match execute_swap_fill(
+                    rpc, sg, &sell_target_batch, &buy_source_batch,
+                    wallet_utxo.clone(), &wallet_spk_script, wallet_spk_version, config,
+                ).await {
                     Some(batch_result) => {
                         info!(
                             "[SWAP-ROUTE] SUCCESS: tx={} kas_flow={} surplus={}",
@@ -3010,7 +3272,7 @@ async fn run_scan_cycle(
                         ).await;
 
                         // Mark wallet outpoint as spent
-                        if let Some(ref wu) = plan.wallet_input {
+                        if let Some(ref wu) = wallet_utxo {
                             let wk = format!("{}:{}", wu.0, wu.1);
                             spent_tracker.mark_spent(&wk);
                         }

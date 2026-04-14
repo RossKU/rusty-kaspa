@@ -2190,7 +2190,7 @@ mod tests {
         // Phase 2: exact mass
         let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
         assert!(exact_fee <= est_fee, "exact fee must be <= estimated fee");
-        assert!(delta >= 0, "delta must be non-negative");
+        // delta is u64, always non-negative by type.
         assert_eq!(exact_fee + delta, est_fee, "exact + delta = estimated");
 
         // Apply and verify (no bps cap — delta goes to matcher)
@@ -2219,13 +2219,13 @@ mod tests {
         assert_eq!(plan.matcher_surplus, max_fee_bps,
             "Phase 1 surplus should be exactly bps cap");
 
-        let est_fee = plan.total_fee;
+        let _est_fee = plan.total_fee;
         let tx = plan.to_transaction();
         let batch_tx = plan.build_tx().unwrap();
         let mut sigscripts: Vec<Vec<u8>> = batch_tx.inputs.iter()
             .map(|i| i.sigscript.clone()).collect();
         let fake_wallet_ss = vec![0x41; 66];
-        fake_wallet_ss.last(); // suppress unused warning
+        let _ = fake_wallet_ss.last(); // suppress unused warning
         *sigscripts.last_mut().unwrap() = vec![0x41; 66];
 
         let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
@@ -2930,7 +2930,7 @@ mod tests {
         // Price 1/1 => each buy wants buy.utxo_value tokens.
         let token = TOKEN_A;
         let per_buy = 10_000_000_000u64; // 100 KAS per buy
-        let max_n = 800; // upper bound to search
+        let _max_n = 800; // upper bound to search
 
         let mut last_ok_n = 0u64;
         let mut results: Vec<(usize, u64, u64, u64)> = Vec::new(); // (n, compute, storage, sigscript_total)

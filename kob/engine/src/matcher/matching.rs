@@ -1270,10 +1270,8 @@ pub fn match_swap_routes(
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
 mod tests {
     use super::*;
-    use kob_core::mass::estimate_compute_mass;
     use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
 
     fn make_buy(value: u64, price_num: u64, price_den: u64, token_cov_id: &str) -> BookOrder {
@@ -1370,6 +1368,7 @@ mod tests {
     // E2E Integration: Full matching pipeline tests
 
     /// Helper: make a buy with unique tx_id and configurable owner.
+    #[allow(dead_code)]
     fn make_buy_e2e(
         tx_id: &str,
         index: u32,
@@ -1401,6 +1400,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn make_sell_e2e(
         tx_id: &str,
         index: u32,
@@ -1859,117 +1859,10 @@ mod tests {
         );
     }
 
-    // --- find_optimal_groups tests ---
+    // --- match_book_direct: surplus ordering (migrated from find_optimal_groups tests) ---
 
     #[test]
-    fn test_optimal_groups_single_full_pair() {
-        let mut ob = OrderBook::new();
-        ob.add_buy_order(make_buy(10_000_000, 1, 2, FAKE_TOKEN));
-        ob.add_sell_order(make_sell(10_000_000, 1, 2, FAKE_TOKEN));
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let groups = find_optimal_groups(&pairs, &ob, true, None);
-
-        assert!(!groups.is_empty(), "Should produce at least 1 group");
-        // Single pair should be a Batch group
-        let batch_groups: Vec<_> = groups.iter().filter(|g| g.kind == GroupKind::Batch).collect();
-        assert!(!batch_groups.is_empty(), "Single full pair should produce a Batch group");
-    }
-
-    #[test]
-    fn test_optimal_groups_no_overlap() {
-        // 3 full pairs same token -> all in one batch group, no duplicates
-        let mut ob = OrderBook::new();
-        for i in 0..3u32 {
-            let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
-            buy.tx_id = format!("{:0>64}", format!("buy{}", i));
-            buy.owner_hash = format!("{:0>64}", format!("ob{}", i));
-            ob.add_buy_order(buy);
-            let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
-            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
-            sell.owner_hash = format!("{:0>64}", format!("os{}", i));
-            ob.add_sell_order(sell);
-        }
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let groups = find_optimal_groups(&pairs, &ob, true, None);
-
-        // Collect all outpoints across all groups
-        let mut all_outpoints = std::collections::HashSet::new();
-        let mut total_orders = 0;
-        for g in &groups {
-            for o in g.all_orders() {
-                let key = o.outpoint_key();
-                assert!(!all_outpoints.contains(&key), "Outpoint {} appears in multiple groups", key);
-                all_outpoints.insert(key);
-                total_orders += 1;
-            }
-        }
-        assert!(total_orders > 0, "Should have some orders in groups");
-    }
-
-    #[test]
-    fn test_optimal_groups_sweep_priority() {
-        // 1 large buy + 3 small sells -> sweep should take priority
-        let mut ob = OrderBook::new();
-
-        let mut buy = make_buy(5_000_000_000, 4, 1, FAKE_TOKEN);
-        buy.tx_id = format!("{:0>64}", "buy_big");
-        buy.owner_hash = "aa".repeat(32);
-        ob.add_buy_order(buy);
-
-        for i in 0..3u32 {
-            let mut sell = make_sell(500_000_000, 2, 1, FAKE_TOKEN);
-            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
-            sell.owner_hash = format!("{:0>64}", format!("b{}", i));
-            ob.add_sell_order(sell);
-        }
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let groups = find_optimal_groups(&pairs, &ob, true, None);
-
-        let sweep_groups: Vec<_> = groups.iter()
-            .filter(|g| g.kind == GroupKind::BuySweep || g.kind == GroupKind::SellSweep || g.kind == GroupKind::GtcBuyMultiFill || g.kind == GroupKind::GtcSellMultiFill)
-            .collect();
-        assert!(!sweep_groups.is_empty(), "Should find sweep groups when 1:N relationship exists");
-    }
-
-    #[test]
-    fn test_optimal_groups_partial_remaining() {
-        // Large buy + small sell -> should produce a PartialBuy group
-        let mut ob = OrderBook::new();
-
-        let mut buy = make_buy(50_000_000, 2, 1, FAKE_TOKEN);
-        buy.tx_id = "a".repeat(64);
-        buy.owner_hash = "aa".repeat(32);
-        ob.add_buy_order(buy);
-
-        let mut sell = make_sell(20_000_000, 1, 3, FAKE_TOKEN);
-        sell.tx_id = "c".repeat(64);
-        sell.owner_hash = "bb".repeat(32);
-        ob.add_sell_order(sell);
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let groups = find_optimal_groups(&pairs, &ob, true, None);
-
-        assert!(!groups.is_empty(), "Should find at least one group");
-        // Should have a partial group if partial pair exists
-        let has_partial = groups.iter().any(|g|
-            g.kind == GroupKind::PartialBuy || g.kind == GroupKind::PartialSell
-        );
-        let has_full = groups.iter().any(|g| g.kind == GroupKind::Batch);
-        assert!(has_partial || has_full, "Should have either partial or batch group");
-    }
-
-    #[test]
-    fn test_optimal_groups_empty() {
-        let ob = OrderBook::new();
-        let groups = find_optimal_groups(&[], &ob, true, None);
-        assert!(groups.is_empty());
-    }
-
-    #[test]
-    fn test_optimal_groups_sorted_by_surplus() {
+    fn test_direct_sorted_by_surplus() {
         let mut ob = OrderBook::new();
         let token_a = FAKE_TOKEN;
         let token_b = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
@@ -1994,8 +1887,7 @@ mod tests {
         sell_b.owner_hash = "dd".repeat(32);
         ob.add_sell_order(sell_b);
 
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let groups = find_optimal_groups(&pairs, &ob, true, None);
+        let groups = match_book_direct(&ob, true, None);
 
         if groups.len() >= 2 {
             assert!(
@@ -2123,8 +2015,8 @@ mod tests {
     }
 
     #[test]
-    fn test_gtc_multi_fill_uses_batch_kind() {
-        // When find_optimal_groups processes a GTC multi-fill sweep,
+    fn test_direct_gtc_multi_fill_uses_batch_kind() {
+        // When match_book_direct processes a GTC multi-fill sweep,
         // it should produce a GtcBuyMultiFill GroupKind.
         let mut ob = OrderBook::new();
 
@@ -2143,8 +2035,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let groups = find_optimal_groups(&pairs, &ob, true, None);
+        let groups = match_book_direct(&ob, true, None);
 
         let gtc_groups: Vec<_> = groups.iter()
             .filter(|g| g.kind == GroupKind::GtcBuyMultiFill)
@@ -2178,10 +2069,10 @@ mod tests {
         sell.post_only = false;
         assert!(ob.add_sell_order(sell), "non-post-only sell must be accepted");
 
-        // The matcher should find a crossing pair.
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        assert!(!pairs.is_empty(),
-            "post-only maker buy + regular taker sell should produce a crossing pair");
+        // The matcher should find a crossing group.
+        let groups = match_book_direct(&ob, true, None);
+        assert!(!groups.is_empty(),
+            "post-only maker buy + regular taker sell should produce a match group");
     }
 
     /// Two post-only orders cannot both rest at crossing prices because

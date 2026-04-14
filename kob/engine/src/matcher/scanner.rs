@@ -1502,15 +1502,15 @@ mod tests {
         ob.add_sell_order(sell_order);
         assert_eq!(ob.stats().total_asks, 1);
 
-        // Matching engine should find crossing pairs (allow self trade since owners differ)
-        let pairs = matching::find_all_crossing_pairs_with_stp(&ob, true);
+        // Matching engine should find crossing groups (allow self trade since owners differ)
+        let groups = matching::match_book_direct(&ob, true, None);
         // Whether they cross depends on price: buy pnum=3/pden=2 sell pnum=5/pden=3
         // buy price = 3/2 tokens per KAS, sell price = 5/3 tokens per KAS
         // Buy expects 10M * 3/2 = 15M tokens. Sell expects 10M * 5/3 = 16.66M KAS.
         // These may or may not cross depending on surplus arithmetic.
         // The key test is the pipeline works end-to-end without panics.
         // At minimum we verify the engine ran and produced a result vector.
-        assert!(pairs.len() <= 2, "Should produce 0-2 crossing/partial pairs");
+        assert!(groups.len() <= 2, "Should produce 0-2 match groups");
     }
 
     /// E2E: Scanner dedup — same TX scanned twice should not create duplicate orders.
@@ -2398,7 +2398,7 @@ mod tests {
     fn test_parse_prediction_rs_redemption() {
         let market_id = [0xDD; 32];
         let yes_box = [0x44; 32];
-        let no_box = [0x55; 32];
+        let _no_box = [0x55; 32];
         let yes_tok = [0x66; 32];
         let no_tok = [0x77; 32];
         let creator = [0x88; 32];

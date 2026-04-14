@@ -417,7 +417,7 @@ pub fn find_triangular_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kob_core::DEFAULT_MATCHER_FEE;
+
 
     fn make_buy(
         tx_id_char: char,

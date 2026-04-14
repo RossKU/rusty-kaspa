@@ -6227,7 +6227,7 @@ mod tests {
         assert!(ob.contains_outpoint("txB:0"));
 
         // Deep reorg: both blocks removed (in order)
-        let (restored, removed, handled, _) = tracker.handle_removed_blocks(
+        let (_restored, _removed, handled, _) = tracker.handle_removed_blocks(
             &["block_2".to_string(), "block_1".to_string()],
             &mut ob,
             &mut spent,

@@ -41,6 +41,11 @@ pub enum MatchType {
 ///
 /// Returns crossing pairs sorted by surplus (highest first).
 /// Self-trade pairs (same owner_hash on both sides) are excluded by default.
+///
+/// **Deprecated**: Use `match_book_direct()` instead, which avoids the O(N x M)
+/// enumeration and produces `BatchGroup`s directly with FIFO ordering.
+#[deprecated(note = "Use match_book_direct() for O(N+M) FIFO-ordered matching")]
+#[allow(deprecated)]
 pub fn find_all_crossing_pairs(order_book: &OrderBook) -> Vec<CrossingPair> {
     find_all_crossing_pairs_with_stp(order_book, false)
 }
@@ -52,6 +57,9 @@ pub fn find_all_crossing_pairs(order_book: &OrderBook) -> Vec<CrossingPair> {
 ///
 /// Orders whose outpoint keys appear in `spent_outpoints` are excluded from
 /// matching. Pass `None` when no SpentTracker context is available (e.g. tests).
+///
+/// **Deprecated**: Use `match_book_direct()` instead.
+#[deprecated(note = "Use match_book_direct() for O(N+M) FIFO-ordered matching")]
 pub fn find_all_crossing_pairs_with_stp(order_book: &OrderBook, allow_self_trade: bool) -> Vec<CrossingPair> {
     find_all_crossing_pairs_full(order_book, allow_self_trade, None, None)
 }
@@ -59,6 +67,9 @@ pub fn find_all_crossing_pairs_with_stp(order_book: &OrderBook, allow_self_trade
 /// Find all crossing pairs, filtering out orders that are tracked as locally
 /// spent by the SpentTracker. This prevents Phase 1a-consumed orders from
 /// being re-matched in Phase 1b.
+///
+/// **Deprecated**: Use `match_book_direct()` instead.
+#[deprecated(note = "Use match_book_direct() for O(N+M) FIFO-ordered matching")]
 pub fn find_all_crossing_pairs_with_spent(
     order_book: &OrderBook,
     allow_self_trade: bool,
@@ -632,6 +643,11 @@ pub struct SweepGroup {
 /// * `order_book` - The order book to scan.
 /// * `allow_self_trade` - If true, allow same-owner matches (testing only).
 /// * `spent_outpoints` - Outpoints already claimed by prior phases.
+///
+/// **Deprecated**: Sweep detection is now integrated into `match_book_direct()`.
+/// When one bid crosses multiple asks (or vice versa), the direct traversal
+/// naturally accumulates them into a BuySweep/SellSweep group.
+#[deprecated(note = "Sweep detection is built into match_book_direct()")]
 pub fn find_sweep_groups(
     order_book: &OrderBook,
     allow_self_trade: bool,
@@ -911,6 +927,7 @@ pub struct CrossPairBatchGroup {
 /// # Returns
 /// A vec of `CrossPairBatchGroup`s, sorted by total surplus descending.
 /// Each group contains crossings from >= 2 different token pairs.
+#[allow(deprecated)]
 pub fn find_cross_pair_batch_groups(
     order_book: &OrderBook,
     _max_routes: usize,
@@ -1116,6 +1133,11 @@ impl BatchGroup {
 /// 4. Return all groups sorted by surplus descending.
 ///
 /// The returned groups are non-overlapping: no outpoint appears in more than one group.
+///
+/// **Deprecated**: Use `match_book_direct()` instead, which produces the same
+/// `BatchGroup` output without the intermediate `CrossingPair` stage.
+#[deprecated(note = "Use match_book_direct() for O(N+M) FIFO-ordered matching")]
+#[allow(deprecated)]
 pub fn find_optimal_groups(
     all_pairs: &[CrossingPair],
     order_book: &OrderBook,
@@ -1299,7 +1321,445 @@ pub fn find_optimal_groups(
     groups
 }
 
+// ===================================================================
+// Direct book traversal matcher (replaces CrossingPair enumeration)
+// ===================================================================
+
+/// Cross-book swap order: a user wants to sell token A and receive token B
+/// in a single atomic transaction.
+///
+/// # Future use
+/// In the matching loop, after processing same-token crossings, swap orders
+/// can be satisfied by cross-referencing the output of one token book with
+/// the input of another. This replaces the TRI-BATCH mechanism with a
+/// cleaner first-class data model.
+#[derive(Debug, Clone)]
+pub struct SwapOrder {
+    /// The order selling token A for KAS (first leg).
+    pub sell: BookOrder,
+    /// The desired token to buy (token B covenant id).
+    pub target_token_cov_id: String,
+    /// Maximum price the user is willing to pay for the target token
+    /// (expressed as target_price_num / target_price_den KAS per token).
+    pub target_price_num: u64,
+    pub target_price_den: u64,
+}
+
+/// Per-token swap order queue, keyed by sell-side token_cov_id.
+///
+/// TODO: After swap routing is implemented, the executor will:
+/// 1. Match same-token orders via `match_book_direct()`.
+/// 2. For each unmatched SwapOrder, check if the target token book has
+///    crossing asks at <= target_price. If so, combine the sell-leg
+///    (token A -> KAS) and buy-leg (KAS -> token B) into a single
+///    CrossPairBatchGroup for atomic execution.
+pub type SwapBook = std::collections::HashMap<String, Vec<SwapOrder>>;
+
+/// Walk the order book directly, producing `BatchGroup`s without
+/// intermediate `CrossingPair` enumeration.
+///
+/// This replaces the O(N x M) `find_all_crossing_pairs` +
+/// `find_optimal_groups` pipeline with a single O(N + M) traversal
+/// per token pair, preserving BTreeMap FIFO ordering.
+///
+/// # Algorithm (per token book)
+///
+/// 1. Iterate asks (ascending price, FIFO within level) and bids
+///    (descending price, FIFO within level).
+/// 2. While best_ask.price <= best_bid.price (prices cross):
+///    a. Compute full/partial fill parameters.
+///    b. Accumulate into the current batch group.
+///    c. Advance the consumed side (or both if exact match).
+/// 3. When the group reaches `MAX_BATCH_GROUP_SIZE` or prices stop
+///    crossing, emit the group and start a new one.
+///
+/// The emitted groups are non-overlapping and FIFO-ordered. OCO partner
+/// exclusion (H1 fix) is respected: filling one OCO path excludes the
+/// partner from subsequent groups.
+///
+/// # Arguments
+/// * `order_book` — The multi-pair order book.
+/// * `allow_self_trade` — If true, same-owner matches are allowed (testing).
+/// * `spent_outpoints` — Outpoints already consumed by prior phases.
+pub fn match_book_direct(
+    order_book: &OrderBook,
+    allow_self_trade: bool,
+    spent_outpoints: Option<&std::collections::HashSet<String>>,
+) -> Vec<BatchGroup> {
+    use std::collections::HashSet;
+
+    let empty_set = HashSet::new();
+    let spent = spent_outpoints.unwrap_or(&empty_set);
+
+    let mut all_groups: Vec<BatchGroup> = Vec::new();
+
+    // Track used outpoints globally (across all token books) so an order
+    // consumed in one token pair is not re-matched in another (shouldn't
+    // happen for same-token, but guards against edge cases with OCO).
+    let mut used: HashSet<String> = HashSet::new();
+
+    // H1-fix helper: mark order + OCO partner as used.
+    let use_order = |used: &mut HashSet<String>, order: &BookOrder| {
+        let key = order.outpoint_key();
+        used.insert(key);
+        if let Some(ref partner) = order.oco_partner_key {
+            used.insert(partner.clone());
+        }
+    };
+
+    // ---------------------------------------------------------------
+    // Step 1: Sweep groups (1:N) — highest priority.
+    // Uses the existing BTreeMap-ordered sweep detection, which is
+    // already O(B * A) but with early termination on sorted asks.
+    // Sweeps must be detected first because they atomically fill large
+    // orders that would otherwise be broken into multiple 1:1 pairs.
+    // ---------------------------------------------------------------
+    #[allow(deprecated)]
+    let sweep_groups = find_sweep_groups(order_book, allow_self_trade, spent_outpoints);
+
+    for sg in sweep_groups {
+        let anchor_key = sg.anchor.outpoint_key();
+        if used.contains(&anchor_key) {
+            continue;
+        }
+        if sg.fills.iter().any(|f| used.contains(&f.outpoint_key())) {
+            continue;
+        }
+        // Claim all outpoints (+ OCO partners via H1-fix).
+        use_order(&mut used, &sg.anchor);
+        for f in &sg.fills {
+            use_order(&mut used, f);
+        }
+
+        let total_surplus = sg.total_fill_cost; // approximate
+        let (sells, buys, kind) = if sg.is_buy_sweep {
+            let k = if sg.is_gtc_multi_fill {
+                GroupKind::GtcBuyMultiFill
+            } else {
+                GroupKind::BuySweep
+            };
+            (sg.fills.clone(), vec![sg.anchor.clone()], k)
+        } else {
+            let k = if sg.is_gtc_multi_fill {
+                GroupKind::GtcSellMultiFill
+            } else {
+                GroupKind::SellSweep
+            };
+            (vec![sg.anchor.clone()], sg.fills.clone(), k)
+        };
+
+        all_groups.push(BatchGroup {
+            sells,
+            buys,
+            total_surplus,
+            kind,
+            source_pairs: Vec::new(),
+        });
+    }
+
+    // ---------------------------------------------------------------
+    // Step 2: Direct book traversal for 1:1 full fills and partials.
+    // O(N + M) per token pair, preserving FIFO ordering from BTreeMap.
+    // ---------------------------------------------------------------
+    for (token_cov_id, book) in &order_book.pair_books {
+        // Collect active, filtered asks and bids in BTreeMap iteration order.
+        // BTreeMap guarantees: asks = price ASC, FIFO within level;
+        //                      bids = price DESC, FIFO within level.
+        let asks: Vec<&BookOrder> = book
+            .asks
+            .values()
+            .filter(|s| {
+                let key = s.outpoint_key();
+                !order_book.matched_outpoints.contains_key(&key)
+                    && !spent.contains(&key)
+                    && !used.contains(&key)
+                    && s.price_num > 0
+                    && s.price_den > 0
+            })
+            .collect();
+
+        let bids: Vec<&BookOrder> = book
+            .bids
+            .values()
+            .filter(|b| {
+                let key = b.outpoint_key();
+                !order_book.matched_outpoints.contains_key(&key)
+                    && !spent.contains(&key)
+                    && !used.contains(&key)
+                    && b.price_num > 0
+                    && b.price_den > 0
+            })
+            .collect();
+
+        if asks.is_empty() || bids.is_empty() {
+            continue;
+        }
+
+        // Simultaneous walk of both sides.
+        //
+        // Both `ask_idx` and `bid_idx` advance only when the respective
+        // order is consumed:
+        //
+        //   Full fill (1:1): both the bid UTXO and ask UTXO are entirely
+        //     consumed by one match pair. Advance both.
+        //
+        //   Partial fill: both UTXOs are consumed by the TX (the residual
+        //     becomes a new UTXO after confirmation). Advance both.
+        //
+        // This produces N:M batch groups where each bid pairs with one ask
+        // in FIFO order. 1:N sweeps are handled by Step 1 above.
+        let mut ask_idx = 0usize;
+        let mut bid_idx = 0usize;
+
+        // Accumulator for the current group.
+        let mut group_sells: Vec<BookOrder> = Vec::new();
+        let mut group_buys: Vec<BookOrder> = Vec::new();
+        let mut group_surplus: u64 = 0;
+        let mut group_source_pairs: Vec<CrossingPair> = Vec::new();
+
+        while ask_idx < asks.len() && bid_idx < bids.len() {
+            let ask = asks[ask_idx];
+            let bid = bids[bid_idx];
+
+            // Skip used orders (may have been excluded via OCO partner or sweep).
+            if used.contains(&ask.outpoint_key()) {
+                ask_idx += 1;
+                continue;
+            }
+            if used.contains(&bid.outpoint_key()) {
+                bid_idx += 1;
+                continue;
+            }
+
+            // STP: skip same owner. Advance ask to try next counterpart.
+            if !allow_self_trade && ask.owner_hash == bid.owner_hash {
+                ask_idx += 1;
+                continue;
+            }
+
+            // Check crossing: ask.price <= bid.price
+            let lhs = ask.price_num as u128 * bid.price_den as u128;
+            let rhs = bid.price_num as u128 * ask.price_den as u128;
+            if lhs > rhs {
+                // Best ask doesn't cross best bid. No more crossings possible.
+                break;
+            }
+
+            // --- Compute fill parameters ---
+            let buy_kas = bid.value;
+            let sell_tokens = ask.value;
+
+            let expected_tokens = match buy_kas.checked_mul(bid.price_num) {
+                Some(v) => v / bid.price_den,
+                None => {
+                    tracing::warn!(
+                        "[DIRECT] u64 overflow: buy_kas={} * price_num={}, skipping bid",
+                        buy_kas, bid.price_num
+                    );
+                    bid_idx += 1;
+                    continue;
+                }
+            };
+            let expected_kas = match sell_tokens.checked_mul(ask.price_num) {
+                Some(v) => v / ask.price_den,
+                None => {
+                    tracing::warn!(
+                        "[DIRECT] u64 overflow: sell_tokens={} * price_num={}, skipping ask",
+                        sell_tokens, ask.price_num
+                    );
+                    ask_idx += 1;
+                    continue;
+                }
+            };
+
+            // Try full fill.
+            let mmfee_floor = buy_kas.saturating_sub(bid.max_matcher_fee);
+            let seller_kas = std::cmp::max(expected_kas, mmfee_floor);
+            let buyer_tokens = sell_tokens;
+            let total_in = match buy_kas.checked_add(sell_tokens) {
+                Some(v) => v,
+                None => {
+                    tracing::warn!(
+                        "[DIRECT] u64 overflow in total_in, skipping pair"
+                    );
+                    ask_idx += 1;
+                    bid_idx += 1;
+                    continue;
+                }
+            };
+
+            let full_fill_ok = seller_kas.checked_add(buyer_tokens)
+                .is_some_and(|sum| sum <= total_in)
+                && seller_kas >= MIN_UTXO_VALUE
+                && buyer_tokens >= MIN_UTXO_VALUE;
+
+            if full_fill_ok {
+                let raw_surplus = total_in - seller_kas - buyer_tokens;
+                let surplus = raw_surplus
+                    .min(bid.max_matcher_fee)
+                    .min(ask.max_matcher_fee);
+
+                group_sells.push(ask.clone());
+                group_buys.push(bid.clone());
+                group_surplus += surplus;
+                group_source_pairs.push(CrossingPair {
+                    token_cov_id: token_cov_id.clone(),
+                    buy: bid.clone(),
+                    sell: ask.clone(),
+                    seller_kas,
+                    buyer_tokens,
+                    surplus,
+                    expected_tokens,
+                    expected_kas,
+                    match_type: MatchType::Full,
+                    fill_kas: None,
+                    residual_kas: None,
+                    fill_token_amount: None,
+                    residual_tokens: None,
+                });
+
+                use_order(&mut used, ask);
+                use_order(&mut used, bid);
+                ask_idx += 1;
+                bid_idx += 1;
+
+                // Check if group is full.
+                if group_sells.len() >= MAX_BATCH_GROUP_SIZE {
+                    emit_group(
+                        &mut all_groups,
+                        &mut group_sells,
+                        &mut group_buys,
+                        &mut group_surplus,
+                        &mut group_source_pairs,
+                    );
+                }
+            } else {
+                // Try partial fill.
+                if let Some(partial) = compute_partial_fill_match(token_cov_id, bid, ask) {
+                    // Emit accumulated full fills first.
+                    if !group_sells.is_empty() || !group_buys.is_empty() {
+                        emit_group(
+                            &mut all_groups,
+                            &mut group_sells,
+                            &mut group_buys,
+                            &mut group_surplus,
+                            &mut group_source_pairs,
+                        );
+                    }
+
+                    let kind = match partial.match_type {
+                        MatchType::PartialBuy => GroupKind::PartialBuy,
+                        MatchType::PartialSell => GroupKind::PartialSell,
+                        MatchType::Full => GroupKind::Batch,
+                    };
+
+                    use_order(&mut used, ask);
+                    use_order(&mut used, bid);
+
+                    all_groups.push(BatchGroup {
+                        sells: vec![partial.sell.clone()],
+                        buys: vec![partial.buy.clone()],
+                        total_surplus: partial.surplus,
+                        kind,
+                        source_pairs: vec![partial],
+                    });
+
+                    ask_idx += 1;
+                    bid_idx += 1;
+                } else {
+                    // Neither full nor partial fill viable.
+                    // Advance ask to try a different one with this bid.
+                    ask_idx += 1;
+                }
+            }
+        } // end while
+
+        // Emit any remaining accumulated group.
+        if !group_sells.is_empty() || !group_buys.is_empty() {
+            emit_group(
+                &mut all_groups,
+                &mut group_sells,
+                &mut group_buys,
+                &mut group_surplus,
+                &mut group_source_pairs,
+            );
+        }
+    }
+
+    // Sort all groups by surplus descending (most profitable first).
+    all_groups.sort_by(|a, b| b.total_surplus.cmp(&a.total_surplus));
+
+    all_groups
+}
+
+/// Helper: flush the accumulator into a `BatchGroup` and reset.
+fn emit_group(
+    all_groups: &mut Vec<BatchGroup>,
+    sells: &mut Vec<BookOrder>,
+    buys: &mut Vec<BookOrder>,
+    surplus: &mut u64,
+    source_pairs: &mut Vec<CrossingPair>,
+) {
+    if sells.is_empty() && buys.is_empty() {
+        return;
+    }
+
+    let kind = classify_group_kind(sells, buys);
+
+    all_groups.push(BatchGroup {
+        sells: std::mem::take(sells),
+        buys: std::mem::take(buys),
+        total_surplus: *surplus,
+        kind,
+        source_pairs: std::mem::take(source_pairs),
+    });
+    *surplus = 0;
+}
+
+/// Classify a group into the correct `GroupKind` based on sell/buy counts.
+///
+/// This replaces the old separate sweep-detection pass. The group shape
+/// naturally determines the kind:
+/// - 1 buy + N sells (N >= 2) = BuySweep
+/// - 1 sell + N buys (N >= 2) = SellSweep
+/// - N sells + N buys = Batch
+/// - 1:1 handled by caller for partials
+fn classify_group_kind(sells: &[BookOrder], buys: &[BookOrder]) -> GroupKind {
+    let ns = sells.len();
+    let nb = buys.len();
+
+    if nb == 1 && ns >= 2 {
+        // Check if the single buy is GTC (non-IOC): if so, use GtcBuyMultiFill
+        // so the executor uses plan_batch_match (Op1) instead of plan_ioc_match.
+        if !buys[0].is_ioc_eligible() {
+            // Verify total sell tokens >= buy expected_tokens for GTC satisfaction.
+            let total_tokens: u64 = sells.iter().map(|s| s.value).sum();
+            let expected = buys[0].expected_output();
+            if total_tokens >= expected && expected > 0 {
+                return GroupKind::GtcBuyMultiFill;
+            }
+        }
+        GroupKind::BuySweep
+    } else if ns == 1 && nb >= 2 {
+        if !sells[0].is_ioc_eligible() {
+            let total_kas: u64 = buys.iter().map(|b| {
+                let kas_128 = b.value as u128 * b.price_num as u128
+                    / b.price_den.max(1) as u128;
+                kas_128.min(u64::MAX as u128) as u64
+            }).sum();
+            let expected = sells[0].expected_output();
+            if total_kas >= expected && expected > 0 {
+                return GroupKind::GtcSellMultiFill;
+            }
+        }
+        GroupKind::SellSweep
+    } else {
+        GroupKind::Batch
+    }
+}
+
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use kob_core::mass::estimate_compute_mass;
@@ -3215,6 +3675,299 @@ mod tests {
         sell.post_only = true;
         assert!(!ob.add_sell_order(sell),
             "post-only sell that would cross existing bid must be rejected");
+    }
+
+    // ================================================================
+    // match_book_direct tests
+    // ================================================================
+
+    #[test]
+    fn test_direct_single_full_pair() {
+        let mut ob = OrderBook::new();
+        ob.add_buy_order(make_buy(10_000_000, 1, 2, FAKE_TOKEN));
+        ob.add_sell_order(make_sell(10_000_000, 1, 2, FAKE_TOKEN));
+
+        let groups = match_book_direct(&ob, true, None);
+        assert!(!groups.is_empty(), "Should find at least 1 group");
+        assert_eq!(groups[0].kind, GroupKind::Batch);
+        assert_eq!(groups[0].sells.len(), 1);
+        assert_eq!(groups[0].buys.len(), 1);
+    }
+
+    #[test]
+    fn test_direct_no_crossing() {
+        let mut ob = OrderBook::new();
+        // Buy at 1/10 (low bid), sell at 5/1 (high ask)
+        ob.add_buy_order(make_buy(3_500_000, 1, 10, FAKE_TOKEN));
+        ob.add_sell_order(make_sell(3_500_000, 5, 1, FAKE_TOKEN));
+
+        let groups = match_book_direct(&ob, true, None);
+        assert!(groups.is_empty(), "Non-overlapping prices should produce no groups");
+    }
+
+    #[test]
+    fn test_direct_multiple_full_pairs_same_token() {
+        let mut ob = OrderBook::new();
+        for i in 0..3u32 {
+            let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
+            buy.tx_id = format!("{:0>64}", format!("buy{}", i));
+            buy.owner_hash = format!("{:0>64}", format!("ob{}", i));
+            ob.add_buy_order(buy);
+            let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("os{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let groups = match_book_direct(&ob, true, None);
+        // All 6 orders should be matched. With sweep detection:
+        // - Buy sweep: 1 buy sweeps 2 sells (buy has enough KAS for 2 sells)
+        // - Sell sweep: remaining 1 sell sweeps 2 remaining buys
+        // Result: all 3 sells and all 3 buys matched across 2 groups.
+        let total_sells: usize = groups.iter().map(|g| g.sells.len()).sum();
+        let total_buys: usize = groups.iter().map(|g| g.buys.len()).sum();
+        assert_eq!(total_sells, 3, "All 3 sells should be matched");
+        assert_eq!(total_buys, 3, "All 3 buys should be matched");
+        assert!(groups.len() >= 2, "Should have multiple groups");
+    }
+
+    #[test]
+    fn test_direct_stp_blocks_same_owner() {
+        let mut ob = OrderBook::new();
+        let owner = "aa".repeat(32);
+        let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
+        buy.owner_hash = owner.clone();
+        ob.add_buy_order(buy);
+        let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
+        sell.owner_hash = owner;
+        ob.add_sell_order(sell);
+
+        // STP on: no groups
+        let groups = match_book_direct(&ob, false, None);
+        assert!(groups.is_empty(), "STP should block same-owner match");
+
+        // STP off: should match
+        let groups2 = match_book_direct(&ob, true, None);
+        assert!(!groups2.is_empty(), "Without STP, should produce group");
+    }
+
+    #[test]
+    fn test_direct_spent_outpoints_excluded() {
+        let mut ob = OrderBook::new();
+        let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
+        buy.tx_id = "a".repeat(64);
+        buy.owner_hash = "aa".repeat(32);
+        let buy_key = buy.outpoint_key();
+        ob.add_buy_order(buy);
+        let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
+        sell.tx_id = "c".repeat(64);
+        sell.owner_hash = "bb".repeat(32);
+        ob.add_sell_order(sell);
+
+        let groups_before = match_book_direct(&ob, true, None);
+        assert!(!groups_before.is_empty());
+
+        let mut spent = std::collections::HashSet::new();
+        spent.insert(buy_key);
+        let groups_after = match_book_direct(&ob, true, Some(&spent));
+        assert!(groups_after.is_empty(), "Spent buy should prevent matching");
+    }
+
+    #[test]
+    fn test_direct_no_outpoint_overlap() {
+        // Verify no outpoint appears in more than one group.
+        let mut ob = OrderBook::new();
+        for i in 0..6u32 {
+            let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
+            buy.tx_id = format!("{:0>64}", format!("buy{}", i));
+            buy.owner_hash = format!("{:0>64}", format!("ob{}", i));
+            ob.add_buy_order(buy);
+            let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("os{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let groups = match_book_direct(&ob, true, None);
+        let mut all_outpoints = std::collections::HashSet::new();
+        for g in &groups {
+            for o in g.all_orders() {
+                let key = o.outpoint_key();
+                assert!(
+                    !all_outpoints.contains(&key),
+                    "Outpoint {} appears in multiple groups",
+                    key
+                );
+                all_outpoints.insert(key);
+            }
+        }
+    }
+
+    #[test]
+    fn test_direct_max_batch_group_size_cap() {
+        // 20 pairs -> should be split at MAX_BATCH_GROUP_SIZE
+        let mut ob = OrderBook::new();
+        for i in 0..20u32 {
+            let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
+            buy.tx_id = format!("{:0>64}", format!("buy{:02}", i));
+            buy.owner_hash = format!("{:0>64}", format!("ob{:02}", i));
+            ob.add_buy_order(buy);
+            let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{:02}", i));
+            sell.owner_hash = format!("{:0>64}", format!("os{:02}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let groups = match_book_direct(&ob, true, None);
+        for g in &groups {
+            assert!(
+                g.sells.len() <= MAX_BATCH_GROUP_SIZE,
+                "Group sells {} > MAX_BATCH_GROUP_SIZE {}",
+                g.sells.len(),
+                MAX_BATCH_GROUP_SIZE,
+            );
+        }
+        let total: usize = groups.iter().map(|g| g.sells.len()).sum();
+        assert_eq!(total, 20, "All 20 pairs should be matched");
+    }
+
+    #[test]
+    fn test_direct_partial_fill() {
+        let mut ob = OrderBook::new();
+        // Large buy: 50M KAS at 2/1 (expects 100M tokens)
+        let mut buy = make_buy(50_000_000, 2, 1, FAKE_TOKEN);
+        buy.tx_id = "a".repeat(64);
+        buy.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy);
+        // Small sell: 20M tokens at 1/3 (expects ~6.67M KAS)
+        let mut sell = make_sell(20_000_000, 1, 3, FAKE_TOKEN);
+        sell.tx_id = "c".repeat(64);
+        sell.owner_hash = "bb".repeat(32);
+        ob.add_sell_order(sell);
+
+        let groups = match_book_direct(&ob, true, None);
+        assert!(!groups.is_empty(), "Should find at least one group");
+        let has_partial = groups.iter().any(|g|
+            g.kind == GroupKind::PartialBuy || g.kind == GroupKind::PartialSell
+        );
+        let has_batch = groups.iter().any(|g| g.kind == GroupKind::Batch);
+        assert!(has_partial || has_batch, "Should have partial or batch group");
+    }
+
+    #[test]
+    fn test_direct_fifo_ordering() {
+        // Verify that FIFO ordering is preserved: at equal price, older
+        // orders (lower discovered_daa) should be matched first.
+        let mut ob = OrderBook::new();
+
+        // Two buys at the same price, different DAA
+        let mut buy_old = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
+        buy_old.tx_id = format!("{:0>64}", "buy_old");
+        buy_old.owner_hash = "aa".repeat(32);
+        buy_old.discovered_daa = 100; // older
+        ob.add_buy_order(buy_old);
+
+        let mut buy_new = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
+        buy_new.tx_id = format!("{:0>64}", "buy_new");
+        buy_new.owner_hash = "cc".repeat(32);
+        buy_new.discovered_daa = 200; // newer
+        ob.add_buy_order(buy_new);
+
+        // Only one sell (will match the older buy first)
+        let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
+        sell.tx_id = format!("{:0>64}", "sell_one");
+        sell.owner_hash = "bb".repeat(32);
+        ob.add_sell_order(sell);
+
+        let groups = match_book_direct(&ob, true, None);
+        assert!(!groups.is_empty());
+
+        // The matched buy should be the older one (daa=100)
+        let matched_buy = &groups[0].buys[0];
+        assert_eq!(
+            matched_buy.discovered_daa, 100,
+            "FIFO: older order (daa=100) should be matched before newer (daa=200)"
+        );
+    }
+
+    #[test]
+    fn test_direct_multi_token() {
+        let token_a = FAKE_TOKEN;
+        let token_b = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
+
+        let mut ob = OrderBook::new();
+        let mut buy_a = make_buy(10_000_000, 1, 2, token_a);
+        buy_a.tx_id = "a".repeat(64);
+        buy_a.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy_a);
+        let mut sell_a = make_sell(10_000_000, 1, 2, token_a);
+        sell_a.tx_id = "b".repeat(64);
+        sell_a.owner_hash = "bb".repeat(32);
+        ob.add_sell_order(sell_a);
+
+        let mut buy_b = make_buy(20_000_000, 1, 3, token_b);
+        buy_b.tx_id = "c".repeat(64);
+        buy_b.owner_hash = "cc".repeat(32);
+        ob.add_buy_order(buy_b);
+        let mut sell_b = make_sell(20_000_000, 1, 3, token_b);
+        sell_b.tx_id = "d".repeat(64);
+        sell_b.owner_hash = "dd".repeat(32);
+        ob.add_sell_order(sell_b);
+
+        let groups = match_book_direct(&ob, true, None);
+        let total_sells: usize = groups.iter().map(|g| g.sells.len()).sum();
+        assert_eq!(total_sells, 2, "Both token pairs should produce matches");
+    }
+
+    #[test]
+    fn test_direct_sweep_detection() {
+        // 1 large buy + 3 small sells -> should produce BuySweep or GtcBuyMultiFill
+        let mut ob = OrderBook::new();
+
+        let mut buy = make_buy(5_000_000_000, 4, 1, FAKE_TOKEN);
+        buy.tx_id = format!("{:0>64}", "buy_big");
+        buy.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy);
+
+        for i in 0..3u32 {
+            let mut sell = make_sell(500_000_000, 2, 1, FAKE_TOKEN);
+            sell.tx_id = format!("{:0>64}", format!("sell{}", i));
+            sell.owner_hash = format!("{:0>64}", format!("b{}", i));
+            ob.add_sell_order(sell);
+        }
+
+        let groups = match_book_direct(&ob, true, None);
+        assert!(!groups.is_empty(), "Should find groups");
+        // The single buy matching 3 sells should form a group with 1 buy + 3 sells
+        let group = &groups[0];
+        assert_eq!(group.buys.len(), 1, "Should have 1 buy");
+        assert!(group.sells.len() >= 2, "Should have multiple sells");
+        let sweep_kind = matches!(
+            group.kind,
+            GroupKind::BuySweep | GroupKind::GtcBuyMultiFill | GroupKind::Batch
+        );
+        assert!(sweep_kind, "Kind should be BuySweep, GtcBuyMultiFill, or Batch");
+    }
+
+    #[test]
+    fn test_direct_empty_book() {
+        let ob = OrderBook::new();
+        let groups = match_book_direct(&ob, true, None);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn test_direct_zero_price_skipped() {
+        let mut ob = OrderBook::new();
+        let mut buy = make_buy(10_000_000, 0, 1, FAKE_TOKEN);
+        buy.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy);
+        let mut sell = make_sell(10_000_000, 0, 1, FAKE_TOKEN);
+        sell.owner_hash = "bb".repeat(32);
+        ob.add_sell_order(sell);
+
+        let groups = match_book_direct(&ob, true, None);
+        assert!(groups.is_empty(), "Zero-price orders should be skipped");
     }
 
 }

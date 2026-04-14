@@ -640,6 +640,7 @@ pub async fn run_deploy_test(
                 info!("    ASK val={} price={}/{} owner={}...", a.value, a.price_num, a.price_den, &a.owner_hash[..a.owner_hash.len().min(16)]);
             }
         }
+        #[allow(deprecated)]
         matching::find_all_crossing_pairs_with_stp(&ob, true)
     };
 

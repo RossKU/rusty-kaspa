@@ -2306,33 +2306,25 @@ async fn run_scan_cycle(
     // H-5: Expire cooldown entries from previous failed submissions
     spent_tracker.expire_failed();
 
-    // Phase 1: Same-pair matches
-    // Pass spent_tracker keys so orders consumed by earlier cycles (deferred
-    // removal) are excluded at the source, preventing Phase 1a/1b stale
-    // crossing race (commit 2a346a5b).
-    let spent_keys = spent_tracker.spent_keys();
-    let all_pairs_raw = matching::find_all_crossing_pairs_with_spent(order_book, allow_self_trade, &spent_keys);
-    // H-5: Filter out pairs whose outpoints are under failure cooldown
-    let all_pairs: Vec<_> = all_pairs_raw
-        .into_iter()
-        .filter(|p| {
-            let bk = p.buy.outpoint_key();
-            let sk = p.sell.outpoint_key();
-            if spent_tracker.is_failed(&bk) || spent_tracker.is_failed(&sk) {
-                info!(
-                    "[SCAN] Skipping pair (outpoint under cooldown): buy={}... sell={}...",
-                    &bk[..bk.len().min(20)],
-                    &sk[..sk.len().min(20)],
-                );
-                return false;
-            }
-            true
-        })
-        .collect();
+    // Phase 1: Same-pair matches via direct book traversal.
+    // Combine spent + failed outpoints into a single exclusion set so that
+    // match_book_direct() skips orders consumed by prior cycles (deferred
+    // removal, commit 2a346a5b) and orders under failure cooldown (H-5).
+    let mut spent_keys = spent_tracker.spent_keys();
+    // H-5: also exclude outpoints under failure cooldown
+    for (key, when) in &spent_tracker.failed {
+        if when.elapsed().as_secs() < spent_tracker.cooldown_secs {
+            spent_keys.insert(key.clone());
+        }
+    }
 
-    if all_pairs.is_empty() {
+    let opt_groups = matching::match_book_direct(
+        order_book, allow_self_trade, Some(&spent_keys),
+    );
+
+    if opt_groups.is_empty() {
         let stats = order_book.stats();
-        info!("[SCAN] No same-pair crossing pairs found");
+        info!("[SCAN] No crossing orders found (direct traversal)");
         info!(
             "  Pairs tracked: {}, Bids: {}, Asks: {}",
             stats.pairs, stats.total_bids, stats.total_asks
@@ -2342,29 +2334,7 @@ async fn run_scan_cycle(
         }
     } else {
         info!(
-            "[SCAN] Found {} same-pair crossing pair(s) across {} token(s)",
-            all_pairs.len(),
-            {
-                let mut tokens = HashSet::new();
-                for p in &all_pairs {
-                    tokens.insert(&p.token_cov_id);
-                }
-                tokens.len()
-            }
-        );
-    }
-
-    // Unified spot matching: find_optimal_groups replaces Phase 0/0.5/1a/1b
-    let opt_groups = matching::find_optimal_groups(
-        &all_pairs, order_book, allow_self_trade,
-        Some(&spent_keys),
-    );
-
-    if opt_groups.is_empty() {
-        info!("[SCAN] No optimal groups to execute");
-    } else {
-        info!(
-            "[SCAN] Executing {} optimal group(s) (sweep/batch/remaining unified)",
+            "[SCAN] Executing {} group(s) via direct book traversal (FIFO-ordered)",
             opt_groups.len(),
         );
     }
@@ -4836,6 +4806,7 @@ pub async fn run_continuous_with_ws(
 
 // Dry-run Mode
 
+#[allow(deprecated)]
 pub async fn run_dry_run(
     rpc: Arc<Mutex<RpcClient>>,
     order_book: Arc<Mutex<OrderBook>>,
@@ -4947,6 +4918,7 @@ pub async fn run_dry_run(
 }
 
 #[cfg(test)]
+#[allow(deprecated)]
 mod tests {
     use super::*;
     use kob_core::RECEIPT_VALUE;

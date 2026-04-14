@@ -3,24 +3,27 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod contract;
+pub mod crypto;
 pub mod error;
 pub mod listing;
 pub mod mass;
-pub mod p2sh;
 pub mod primitives;
-pub mod sighash;
-pub mod signing;
 pub mod tx;
 pub mod types;
 pub mod wallet;
+pub mod compat;
+pub mod rpc_types;
+
+// Flat re-exports preserve the original `kob_core::{bech32,p2sh,sighash,signing}`
+// paths used throughout the workspace. Relocating into `crypto/` is a storage
+// concern only — the public surface stays flat.
+pub use crypto::{bech32, p2sh, sighash, signing};
+
 pub use contract::perp;
 pub use contract::prediction;
 pub use contract::lending;
 pub use contract::insurance;
 pub use contract::auction;
-pub mod bech32;
-pub mod compat;
-pub mod rpc_types;
 
 pub use error::KobError;
 pub type Result<T> = std::result::Result<T, KobError>;

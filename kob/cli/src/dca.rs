@@ -26,7 +26,7 @@ use kob_core::contract;
 use kob_core::contract::build_order_payload;
 use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
-use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
+use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_mass_with_sigscripts, converge_fee, estimate_compute_mass};
@@ -80,6 +80,11 @@ pub enum DcaCommand {
     /// Reads the current RS, parses state, builds the continuation RS
     /// (next_exec += interval, periods -= 1) for D&R enforcement.
     /// If periods == 1, this is the final fill with no continuation output.
+    ///
+    /// The filler must provide a token UTXO (--token-outpoint, --token-value)
+    /// that carries the target covenant_id. Output[0] delivers tokens to the
+    /// buyer's address, so the buyer's public key (--buyer-pubkey) is required
+    /// to construct the P2PK SPK that matches the buyer_spk_hash in the RS.
     Fill {
         /// DCA order outpoint (txid:index).
         #[arg(long)]
@@ -89,8 +94,22 @@ pub enum DcaCommand {
         #[arg(long)]
         rs: String,
 
-        /// Continuation output index for D&R (default: 0).
-        #[arg(long, default_value_t = 0)]
+        /// Filler's token UTXO outpoint (txid:index). Must carry target covenant_id.
+        #[arg(long)]
+        token_outpoint: String,
+
+        /// Value of the token UTXO in sompi.
+        #[arg(long)]
+        token_value: u64,
+
+        /// Buyer's Schnorr public key (hex, 64 chars).
+        /// Used to build the P2PK SPK for the token delivery output.
+        #[arg(long)]
+        buyer_pubkey: String,
+
+        /// Continuation output index for D&R (default: 1).
+        /// Output[0] is always the token delivery to the buyer.
+        #[arg(long, default_value_t = 1)]
         continuation_output_idx: u8,
 
         /// DCA UTXO value in sompi (queried from chain if omitted).
@@ -150,6 +169,9 @@ pub async fn run(
         DcaCommand::Fill {
             outpoint,
             rs,
+            token_outpoint,
+            token_value,
+            buyer_pubkey,
             continuation_output_idx,
             order_value,
         } => {
@@ -159,6 +181,9 @@ pub async fn run(
                 network,
                 outpoint,
                 rs,
+                token_outpoint,
+                *token_value,
+                buyer_pubkey,
                 *continuation_output_idx,
                 *order_value,
             )
@@ -530,13 +555,33 @@ async fn fill(
     network: Network,
     outpoint_str: &str,
     rs_hex: &str,
+    token_outpoint_str: &str,
+    token_value: u64,
+    buyer_pubkey_hex: &str,
     continuation_output_idx: u8,
     order_value_override: Option<u64>,
 ) -> anyhow::Result<()> {
     let outpoint = Outpoint::parse(outpoint_str)?;
     let old_rs = hex::decode(rs_hex)?;
+    let token_outpoint = Outpoint::parse(token_outpoint_str)?;
 
-    // Validate RS length: 120B state + body
+    // Parse buyer pubkey
+    let buyer_pk_bytes = hex::decode(buyer_pubkey_hex)?;
+    if buyer_pk_bytes.len() != 32 {
+        anyhow::bail!("--buyer-pubkey must be 64 hex characters (32 bytes)");
+    }
+    let mut buyer_pubkey = [0u8; 32];
+    buyer_pubkey.copy_from_slice(&buyer_pk_bytes);
+
+    // Validate continuation_output_idx > 0 (output[0] is always token delivery)
+    if continuation_output_idx == 0 {
+        anyhow::bail!(
+            "continuation_output_idx must be > 0: output[0] is reserved for \
+             token delivery to the buyer (hardcoded in DCA bytecode)"
+        );
+    }
+
+    // Validate RS length
     if old_rs.len() < DCA_V2_STATE_LEN {
         anyhow::bail!(
             "Invalid DCA RS: expected at least {} bytes (state), got {}",
@@ -556,7 +601,37 @@ async fn fill(
     let next_execution_daa = parse_next_execution_daa(&old_rs);
     let periods_remaining = parse_periods_remaining(&old_rs);
 
+    // Verify buyer_pubkey matches the buyer_spk_hash in the RS
+    let computed_bspkh = compute_p2pk_spk_hash(&buyer_pubkey);
+    if computed_bspkh != buyer_spk_hash {
+        anyhow::bail!(
+            "buyer_pubkey does not match buyer_spk_hash in RS.\n\
+             Computed: {}\n\
+             Expected: {}",
+            hex::encode(computed_bspkh),
+            hex::encode(buyer_spk_hash),
+        );
+    }
+
     let is_final_fill = periods_remaining == 1;
+
+    // Calculate expected token amount
+    let expected_tokens = amount_per_period
+        .checked_mul(price_num)
+        .ok_or_else(|| anyhow::anyhow!("overflow: amount_per_period * price_num"))?
+        / price_den;
+
+    if token_value < expected_tokens {
+        anyhow::bail!(
+            "Token UTXO value {} sompi is less than expected_tokens {} sompi \
+             (amount_per_period={} * price_num={} / price_den={})",
+            token_value,
+            expected_tokens,
+            amount_per_period,
+            price_num,
+            price_den,
+        );
+    }
 
     println!("Fill dca_order_v2 (period {})", if is_final_fill { "FINAL" } else { "continuation" });
     println!("==============================");
@@ -572,6 +647,9 @@ async fn fill(
     println!("Interval:            {} DAA", interval_daa);
     println!("Next Execution DAA:  {}", next_execution_daa);
     println!("Periods Remaining:   {}", periods_remaining);
+    println!("Expected Tokens:     {} sompi", expected_tokens);
+    println!("Token UTXO:          {} ({} sompi)", token_outpoint, token_value);
+    println!("Buyer Pubkey:        {}", buyer_pubkey_hex);
     println!();
 
     let p2sh = build_p2sh(&old_rs);
@@ -583,6 +661,7 @@ async fn fill(
         outpoint = %outpoint,
         periods_remaining = periods_remaining,
         is_final = is_final_fill,
+        expected_tokens = expected_tokens,
         "filling DCA period"
     );
     println!("Connecting to {}...", node_url);
@@ -617,12 +696,18 @@ async fn fill(
         )?
     };
 
-    // Need a fee UTXO (estimate: 2-in, 2-out TX)
-    let fill_est_fee = estimate_compute_mass(2, 2, 0);
+    // Need a fee UTXO (estimate: 3-in, 3-out TX)
+    let fill_est_fee = estimate_compute_mass(3, 3, 0);
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let fee_utxo = wallet_utxos
         .iter()
-        .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= fill_est_fee + MIN_UTXO_VALUE)
+        .find(|u| {
+            !u.is_p2sh()
+                && u.utxo_entry.amount >= fill_est_fee + MIN_UTXO_VALUE
+                // Exclude the token UTXO if it happens to be in the same wallet
+                && !(u.outpoint.transaction_id == token_outpoint.transaction_id
+                     && u.outpoint.index == token_outpoint.index)
+        })
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "No P2PK UTXO with >= {} sompi for fee payment",
@@ -635,7 +720,30 @@ async fn fill(
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
     );
 
-    // Build TX — lockTime must satisfy CLTV: next_execution_daa <= tx.lockTime
+    // Build buyer's P2PK SPK: [0x20][pubkey 32B][0xac] (34 bytes, version 0)
+    let mut buyer_spk = Vec::with_capacity(34);
+    buyer_spk.push(0x20);
+    buyer_spk.extend_from_slice(&buyer_pubkey);
+    buyer_spk.push(0xac);
+
+    // Covenant binding for token delivery output -- authorized by token input (index 1).
+    let token_cov_id_hex = hex::encode(target_cov_id);
+    let token_covenant_binding = CovenantBinding::new(
+        1, // authorizing_input = input[1] (token UTXO)
+        kob_core::compat::parse_hash(&token_cov_id_hex)?,
+    );
+
+    // Build TX -- lockTime must satisfy CLTV: next_execution_daa <= tx.lockTime
+    // TX version = 1 for covenant bindings.
+    //
+    // TX layout:
+    //   input[0]: DCA UTXO (P2SH covenant, fill sigscript)
+    //   input[1]: filler's token UTXO (carries target covenant_id, signed P2PK)
+    //   input[2]: fee UTXO (P2PK, signed)
+    //
+    //   output[0]: token delivery to buyer (P2PK, CovenantBinding from input[1])
+    //   output[ci]: continuation P2SH (D&R, when periods > 1)
+    //   output[N]: filler KAS change (adjustable)
     let mut tx = Transaction::new(1);
     tx.lock_time = next_execution_daa;
 
@@ -650,7 +758,21 @@ async fn fill(
         value: order_value,
     });
 
-    // Input 1: fee UTXO
+    // Input 1: filler's token UTXO (P2PK, signed)
+    // We use the fee UTXO's SPK version for the token input since the filler
+    // owns both. The actual token UTXO SPK is the filler's P2PK.
+    let filler_spk_bytes = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
+    tx.inputs.push(TxInput {
+        prev_tx_id: token_outpoint.transaction_id.clone(),
+        prev_index: token_outpoint.index,
+        sequence: 0,
+        sig_op_count: 1,
+        script_version: fee_utxo.utxo_entry.script_public_key.version,
+        script_bytes: filler_spk_bytes.clone(),
+        value: token_value,
+    });
+
+    // Input 2: fee UTXO
     let fee_spk_bytes = fee_utxo.script_bytes();
     tx.inputs.push(TxInput {
         prev_tx_id: fee_utxo.outpoint.transaction_id.clone(),
@@ -662,18 +784,36 @@ async fn fill(
         value: fee_utxo.utxo_entry.amount,
     });
 
-    let total_in = order_value + fee_utxo.utxo_entry.amount;
+    // Total KAS input = order_value + token_value + fee_utxo
+    let total_in = order_value + token_value + fee_utxo.utxo_entry.amount;
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
 
-    // Determine filler output index for converge_fee
-    let filler_output_idx: usize;
+    // Output 0: token delivery to buyer (with covenant binding)
+    // The bytecode checks output[0].value >= expected_tokens and
+    // blake2b(output[0].spk) == buyer_spk_hash.
+    tx.outputs.push(TxOutput::new(
+        expected_tokens,
+        0, // P2PK version
+        buyer_spk.clone(),
+        Some(token_covenant_binding),
+    ));
+
+    // Fixed outputs sum so far
+    let mut fixed_sum = expected_tokens;
+
+    // Determine change output index for converge_fee
+    let change_output_idx: usize;
 
     if is_final_fill {
-        // Final fill: no continuation. All funds to filler (minus fee).
-        // Use tentative value; converge_fee will adjust.
-        let tentative_value = total_in.saturating_sub(fill_est_fee);
-        tx.outputs.push(TxOutput::new(tentative_value, fee_utxo.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
-        filler_output_idx = 0;
+        // Final fill: no continuation. Filler gets remaining KAS (minus fee).
+        let tentative_change = total_in.saturating_sub(expected_tokens + fill_est_fee);
+        tx.outputs.push(TxOutput::new(
+            tentative_change,
+            fee_utxo.utxo_entry.script_public_key.version,
+            wallet_spk.clone(),
+            None,
+        ));
+        change_output_idx = 1;
     } else {
         // Continuation: D&R pattern
         let new_p2sh = build_p2sh(&new_rs);
@@ -687,39 +827,68 @@ async fn fill(
             );
         }
 
-        // Tentative filler value (adjusted by converge_fee)
-        let tentative_filler = total_in.saturating_sub(continuation_value + fill_est_fee);
+        fixed_sum += continuation_value;
 
-        if continuation_output_idx == 0 {
-            // Output 0: continuation (fixed)
-            tx.outputs.push(TxOutput::new(continuation_value, 0, new_p2sh.script().to_vec(), None));
-            // Output 1: filler payment (adjustable)
-            if tentative_filler >= MIN_UTXO_VALUE {
-                tx.outputs.push(TxOutput::new(tentative_filler, fee_utxo.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
-                filler_output_idx = 1;
+        // Build outputs: output[0] = token (already added above)
+        // We need output[ci] = continuation, and a change output.
+        // ci defaults to 1. If ci=1, continuation is output[1], change is output[2].
+        // If ci=2, we put change at output[1] and continuation at output[2].
+        let tentative_change = total_in.saturating_sub(fixed_sum + fill_est_fee);
+
+        if continuation_output_idx == 1 {
+            // Output 1: continuation (fixed)
+            tx.outputs.push(TxOutput::new(
+                continuation_value,
+                0,
+                new_p2sh.script().to_vec(),
+                None,
+            ));
+            // Output 2: filler KAS change (adjustable)
+            if tentative_change >= MIN_UTXO_VALUE {
+                tx.outputs.push(TxOutput::new(
+                    tentative_change,
+                    fee_utxo.utxo_entry.script_public_key.version,
+                    wallet_spk.clone(),
+                    None,
+                ));
+                change_output_idx = 2;
             } else {
-                filler_output_idx = 0; // no filler output, fee absorbs all
+                // No change output; fee absorbs remainder
+                change_output_idx = usize::MAX;
             }
         } else {
-            // Output 0: filler payment (adjustable)
-            if tentative_filler >= MIN_UTXO_VALUE {
-                tx.outputs.push(TxOutput::new(tentative_filler, fee_utxo.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+            // ci > 1: put change at output[1], continuation at output[ci]
+            if tentative_change >= MIN_UTXO_VALUE {
+                tx.outputs.push(TxOutput::new(
+                    tentative_change,
+                    fee_utxo.utxo_entry.script_public_key.version,
+                    wallet_spk.clone(),
+                    None,
+                ));
+                change_output_idx = 1;
             } else {
+                change_output_idx = usize::MAX;
+            }
+            // Pad with empty outputs if needed to reach continuation_output_idx
+            while tx.outputs.len() < continuation_output_idx as usize {
+                // Should not normally happen; ci=1 or ci=2 covers typical cases
                 anyhow::bail!(
-                    "Filler value {} sompi below dust threshold {}. \
-                     Use continuation_output_idx=0 or increase fee UTXO.",
-                    tentative_filler, MIN_UTXO_VALUE
+                    "continuation_output_idx {} requires intermediate outputs. Use 1 or 2.",
+                    continuation_output_idx
                 );
             }
-            // Output at continuation_output_idx: continuation (fixed)
-            tx.outputs.push(TxOutput::new(continuation_value, 0, new_p2sh.script().to_vec(), None));
-            filler_output_idx = 0;
+            tx.outputs.push(TxOutput::new(
+                continuation_value,
+                0,
+                new_p2sh.script().to_vec(),
+                None,
+            ));
         }
     }
 
-    // Phase 1: converge fee on filler output
-    let (phase1_fee, _) = if filler_output_idx < tx.outputs.len() {
-        converge_fee(&mut tx, total_in, filler_output_idx, 0)
+    // Phase 1: converge fee on change output
+    let (phase1_fee, _) = if change_output_idx < tx.outputs.len() {
+        converge_fee(&mut tx, total_in, change_output_idx, 0)
     } else {
         let f = kob_core::mass::calc_miner_fee(&tx);
         (f, 0)
@@ -727,22 +896,24 @@ async fn fill(
 
     if !is_final_fill {
         let continuation_value = order_value - amount_per_period;
-        let filler_value = if filler_output_idx < tx.outputs.len() {
-            tx.outputs[filler_output_idx].value
+        let change_value = if change_output_idx < tx.outputs.len() {
+            tx.outputs[change_output_idx].value
         } else {
             0
         };
-        println!("Continuation value: {} sompi", continuation_value);
-        println!("Filler value:       {} sompi", filler_value);
+        println!("Token delivery:     {} sompi (output[0])", expected_tokens);
+        println!("Continuation value: {} sompi (output[{}])", continuation_value, continuation_output_idx);
+        println!("Filler change:      {} sompi", change_value);
         println!("New next_exec DAA:  {}", next_execution_daa + interval_daa);
         println!("New periods:        {}", periods_remaining - 1);
         println!("New RS:             {}", hex::encode(&new_rs));
     } else {
-        println!("Final fill output:  {} sompi", tx.outputs[0].value);
+        println!("Token delivery:     {} sompi (output[0])", expected_tokens);
+        println!("Filler change:      {} sompi (output[1])", tx.outputs[1].value);
     }
     println!();
 
-    // Build fill sigscript for input 0
+    // Build fill sigscript for input 0 (DCA covenant)
     let fill_ss = contract::build_dca_order_fill_sigscript(
         continuation_output_idx,
         &old_rs,
@@ -750,28 +921,33 @@ async fn fill(
         &old_rs,
     );
 
-    // Sign input 1 (fee UTXO, P2PK)
+    // Sign input 1 (token UTXO, P2PK)
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
-    let fee_ss = signing::build_p2pk_sigscript(&sig_1);
+    let token_ss = signing::build_p2pk_sigscript(&sig_1);
+
+    // Sign input 2 (fee UTXO, P2PK)
+    let sighash_2 = compute_sighash(&tx, 2)?;
+    let sig_2 = signing::schnorr_sign(&privkey, &sighash_2)?;
+    let fee_ss = signing::build_p2pk_sigscript(&sig_2);
 
     // Phase 2: exact mass check with real sigscripts
-    let sigscripts_check = vec![fill_ss.clone(), fee_ss.clone()];
+    let sigscripts_check = vec![fill_ss.clone(), token_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_check);
     let exact_fee = exact_mass;
 
-    let (fill_ss_final, fee_ss_final) = if exact_fee != phase1_fee && filler_output_idx < tx.outputs.len() {
-        // Re-adjust filler output
-        let fixed_sum: u64 = tx.outputs.iter().enumerate()
-            .filter(|(i, _)| *i != filler_output_idx)
+    let (fill_ss_final, token_ss_final, fee_ss_final) = if exact_fee != phase1_fee && change_output_idx < tx.outputs.len() {
+        // Re-adjust change output
+        let fixed_out_sum: u64 = tx.outputs.iter().enumerate()
+            .filter(|(i, _)| *i != change_output_idx)
             .map(|(_, o)| o.value)
             .sum();
-        let new_filler = total_in.saturating_sub(fixed_sum + exact_fee);
-        if new_filler >= MIN_UTXO_VALUE {
-            tx.outputs[filler_output_idx].value = new_filler;
-        } else if new_filler > 0 {
-            println!("Filler value {} sompi below dust after fee adjustment, donated as fee.", new_filler);
-            tx.outputs[filler_output_idx].value = 0;
+        let new_change = total_in.saturating_sub(fixed_out_sum + exact_fee);
+        if new_change >= MIN_UTXO_VALUE {
+            tx.outputs[change_output_idx].value = new_change;
+        } else if new_change > 0 {
+            println!("Change value {} sompi below dust after fee adjustment, donated as fee.", new_change);
+            tx.outputs[change_output_idx].value = 0;
         }
         // Re-build sigscripts (sighash changed)
         let fill_ss2 = contract::build_dca_order_fill_sigscript(
@@ -782,21 +958,28 @@ async fn fill(
         );
         let sighash_1b = compute_sighash(&tx, 1)?;
         let sig_1b = signing::schnorr_sign(&privkey, &sighash_1b)?;
-        let fee_ss2 = signing::build_p2pk_sigscript(&sig_1b);
-        (fill_ss2, fee_ss2)
+        let token_ss2 = signing::build_p2pk_sigscript(&sig_1b);
+        let sighash_2b = compute_sighash(&tx, 2)?;
+        let sig_2b = signing::schnorr_sign(&privkey, &sighash_2b)?;
+        let fee_ss2 = signing::build_p2pk_sigscript(&sig_2b);
+        (fill_ss2, token_ss2, fee_ss2)
     } else {
-        (fill_ss, fee_ss)
+        (fill_ss, token_ss, fee_ss)
     };
 
-    let fill_exact_compute = calc_mass_with_sigscripts(&tx, &[fill_ss_final.clone(), fee_ss_final.clone()]);
+    let fill_exact_compute = calc_mass_with_sigscripts(
+        &tx,
+        &[fill_ss_final.clone(), token_ss_final.clone(), fee_ss_final.clone()],
+    );
     println!("Compute mass:     {:>9} (exact, post-sign)", fill_exact_compute);
     println!("Miner fee:        {:>9} sompi", exact_fee);
-    println!("Fill SS:  {} bytes", fill_ss_final.len());
-    println!("Fee SS:   {} bytes", fee_ss_final.len());
+    println!("Fill SS:   {} bytes", fill_ss_final.len());
+    println!("Token SS:  {} bytes", token_ss_final.len());
+    println!("Fee SS:    {} bytes", fee_ss_final.len());
     println!();
 
     // Submit
-    let payload = to_rpc_payload(&tx, &[fill_ss_final, fee_ss_final]);
+    let payload = to_rpc_payload(&tx, &[fill_ss_final, token_ss_final, fee_ss_final]);
     println!("Submitting DCA fill transaction...");
     let tx_id = rpc.submit_transaction(payload).await?;
 
@@ -811,10 +994,11 @@ async fn fill(
         println!();
         println!("Next fill command:");
         println!(
-            "  kob-cli dca fill --outpoint {}:{} --rs {}",
+            "  kob-cli dca fill --outpoint {}:{} --rs {} --token-outpoint <txid:idx> --token-value <sompi> --buyer-pubkey {}",
             tx_id,
             continuation_output_idx,
             hex::encode(&new_rs),
+            buyer_pubkey_hex,
         );
     }
 

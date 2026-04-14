@@ -375,6 +375,15 @@ fn find_sweep_groups(
     // to avoid double-spending across groups.
     let mut claimed: HashSet<String> = HashSet::new();
 
+    // OCO-aware claim helper: mark both the order's key and its partner key
+    // so that the other OCO path (same underlying UTXO) is excluded.
+    let claim_order = |claimed: &mut HashSet<String>, order: &BookOrder| {
+        claimed.insert(order.outpoint_key());
+        if let Some(ref partner) = order.oco_partner_key {
+            claimed.insert(partner.clone());
+        }
+    };
+
     for (_token_cov_id, book) in &order_book.pair_books {
         // Collect active bids and asks
         let bids: Vec<&BookOrder> = book
@@ -426,12 +435,21 @@ fn find_sweep_groups(
             let mut kas_remaining = buy_kas;
             let mut sweep_sells: Vec<BookOrder> = Vec::new();
             let mut total_fill_cost: u64 = 0;
+            // Track UTXO outpoints within this sweep to prevent OCO
+            // duplicate inputs (TP + SL share the same UTXO).
+            let mut sweep_utxo_keys: HashSet<String> = HashSet::new();
 
             for sell in &asks {
                 if sweep_sells.len() >= MAX_BATCH_GROUP_SIZE {
                     break;
                 }
                 if claimed.contains(&sell.outpoint_key()) {
+                    continue;
+                }
+                // OCO: skip if another path of the same UTXO is already
+                // in this sweep (prevents duplicate inputs in the TX).
+                let utxo_key = sell.utxo_outpoint_key();
+                if sweep_utxo_keys.contains(&utxo_key) {
                     continue;
                 }
                 // STP
@@ -463,6 +481,7 @@ fn find_sweep_groups(
                 if kas_remaining >= sell_kas {
                     kas_remaining -= sell_kas;
                     total_fill_cost += sell_kas;
+                    sweep_utxo_keys.insert(utxo_key);
                     sweep_sells.push((*sell).clone());
                 }
                 // If can't afford, skip this sell and try the next
@@ -484,10 +503,9 @@ fn find_sweep_groups(
                 };
 
                 if emit {
-                    let buy_key = buy.outpoint_key();
-                    claimed.insert(buy_key);
+                    claim_order(&mut claimed, buy);
                     for s in &sweep_sells {
-                        claimed.insert(s.outpoint_key());
+                        claim_order(&mut claimed, s);
                     }
                     groups.push(SweepGroup {
                         anchor: (*buy).clone(),
@@ -521,12 +539,21 @@ fn find_sweep_groups(
             let mut tokens_remaining = sell_tokens;
             let mut sweep_buys: Vec<BookOrder> = Vec::new();
             let mut total_fill_cost: u64 = 0;
+            // Track UTXO outpoints within this sweep to prevent OCO
+            // duplicate inputs (TP + SL share the same UTXO).
+            let mut sweep_utxo_keys: HashSet<String> = HashSet::new();
 
             for buy in &sorted_bids_for_sell_sweep {
                 if sweep_buys.len() >= MAX_BATCH_GROUP_SIZE {
                     break;
                 }
                 if claimed.contains(&buy.outpoint_key()) {
+                    continue;
+                }
+                // OCO: skip if another path of the same UTXO is already
+                // in this sweep (prevents duplicate inputs in the TX).
+                let utxo_key = buy.utxo_outpoint_key();
+                if sweep_utxo_keys.contains(&utxo_key) {
                     continue;
                 }
                 // STP
@@ -554,6 +581,7 @@ fn find_sweep_groups(
                 if tokens_remaining >= buy_tokens {
                     tokens_remaining -= buy_tokens;
                     total_fill_cost += buy_tokens;
+                    sweep_utxo_keys.insert(utxo_key);
                     sweep_buys.push((*buy).clone());
                 }
             }
@@ -578,10 +606,9 @@ fn find_sweep_groups(
                 };
 
                 if emit {
-                    let sell_key = sell.outpoint_key();
-                    claimed.insert(sell_key);
+                    claim_order(&mut claimed, sell);
                     for b in &sweep_buys {
-                        claimed.insert(b.outpoint_key());
+                        claim_order(&mut claimed, b);
                     }
                     groups.push(SweepGroup {
                         anchor: (*sell).clone(),
@@ -2390,6 +2417,146 @@ mod tests {
 
         let groups = match_book_direct(&ob, true, None);
         assert!(groups.is_empty(), "Zero-price orders should be skipped");
+    }
+
+    /// OCO duplicate-input prevention: when TP and SL paths of the same
+    /// UTXO are both in the order book, only one may appear in any batch
+    /// group. Both paths share the same tx_id:index, so including both
+    /// would create a TX with duplicate inputs that kaspad rejects.
+    #[test]
+    fn test_oco_duplicate_input_excluded_from_sweep() {
+        let mut ob = OrderBook::new();
+
+        // Large buy that can sweep multiple sells.
+        let mut buy = make_buy_e2e(
+            &"aa".repeat(32), 0,
+            100_000_000,  // 100M sompi
+            1, 1,         // price 1/1: 1 KAS per token
+            FAKE_TOKEN,
+            &"b1".repeat(32),
+        );
+        buy.discovered_daa = 1;
+        ob.add_buy_order(buy);
+
+        // OCO sell: TP path (price 1/1, 10M tokens).
+        // tx_id = "cc..cc", index = 0 → utxo_outpoint_key = "cc..cc:0"
+        let oco_tx_id = "cc".repeat(32);
+        let mut sell_tp = make_sell_e2e(
+            &oco_tx_id, 0,
+            10_000_000,   // 10M tokens
+            1, 1,         // price 1/1
+            FAKE_TOKEN,
+            &"s1".repeat(32),
+        );
+        sell_tp.oco_path = Some(kob_core::OcoPath::TakeProfit);
+        // Partner key points to the SL virtual order.
+        sell_tp.oco_partner_key = Some(format!("{}:0:sl", oco_tx_id));
+        sell_tp.discovered_daa = 2;
+        ob.add_sell_order(sell_tp);
+
+        // OCO sell: SL path (price 1/2, same UTXO).
+        let mut sell_sl = make_sell_e2e(
+            &oco_tx_id, 0,
+            10_000_000,   // same 10M tokens
+            1, 2,         // price 1/2 (cheaper for buyer)
+            FAKE_TOKEN,
+            &"s1".repeat(32),
+        );
+        sell_sl.oco_path = Some(kob_core::OcoPath::StopLoss);
+        sell_sl.oco_partner_key = Some(format!("{}:0:tp", oco_tx_id));
+        sell_sl.discovered_daa = 2;
+        ob.add_sell_order(sell_sl);
+
+        // A second regular sell at a crossing price (different UTXO).
+        let mut sell_regular = make_sell_e2e(
+            &"dd".repeat(32), 0,
+            10_000_000,
+            1, 1,
+            FAKE_TOKEN,
+            &"s2".repeat(32),
+        );
+        sell_regular.discovered_daa = 3;
+        ob.add_sell_order(sell_regular);
+
+        let groups = match_book_direct(&ob, true, None);
+        assert!(!groups.is_empty(), "Should produce at least one group");
+
+        // Collect all sell utxo_outpoint_keys across all groups.
+        let mut utxo_keys: Vec<String> = Vec::new();
+        for g in &groups {
+            for s in &g.sells {
+                utxo_keys.push(s.utxo_outpoint_key());
+            }
+        }
+
+        // The OCO UTXO must appear at most once across all groups.
+        let oco_utxo = format!("{}:0", oco_tx_id);
+        let oco_count = utxo_keys.iter().filter(|k| **k == oco_utxo).count();
+        assert!(
+            oco_count <= 1,
+            "OCO UTXO {} appears {} times in batch groups (expected <= 1). \
+             Duplicate inputs would cause TX rejection.",
+            oco_utxo, oco_count,
+        );
+    }
+
+    /// Same as above but for the 1:1 direct walk path (not sweep).
+    #[test]
+    fn test_oco_duplicate_input_excluded_from_direct_walk() {
+        let mut ob = OrderBook::new();
+
+        let oco_tx_id = "cc".repeat(32);
+
+        // Two separate buys, each big enough for a 1:1 match.
+        let mut buy1 = make_buy_e2e(
+            &"a1".repeat(32), 0,
+            10_000_000, 1, 1, FAKE_TOKEN, &"b1".repeat(32),
+        );
+        buy1.discovered_daa = 1;
+        ob.add_buy_order(buy1);
+
+        let mut buy2 = make_buy_e2e(
+            &"a2".repeat(32), 0,
+            10_000_000, 1, 2, FAKE_TOKEN, &"b2".repeat(32),
+        );
+        buy2.discovered_daa = 2;
+        ob.add_buy_order(buy2);
+
+        // OCO TP sell
+        let mut sell_tp = make_sell_e2e(
+            &oco_tx_id, 0, 10_000_000, 1, 1, FAKE_TOKEN, &"s1".repeat(32),
+        );
+        sell_tp.oco_path = Some(kob_core::OcoPath::TakeProfit);
+        sell_tp.oco_partner_key = Some(format!("{}:0:sl", oco_tx_id));
+        sell_tp.discovered_daa = 3;
+        ob.add_sell_order(sell_tp);
+
+        // OCO SL sell (same UTXO, lower price)
+        let mut sell_sl = make_sell_e2e(
+            &oco_tx_id, 0, 10_000_000, 1, 2, FAKE_TOKEN, &"s1".repeat(32),
+        );
+        sell_sl.oco_path = Some(kob_core::OcoPath::StopLoss);
+        sell_sl.oco_partner_key = Some(format!("{}:0:tp", oco_tx_id));
+        sell_sl.discovered_daa = 3;
+        ob.add_sell_order(sell_sl);
+
+        let groups = match_book_direct(&ob, true, None);
+
+        let mut utxo_keys: Vec<String> = Vec::new();
+        for g in &groups {
+            for s in &g.sells {
+                utxo_keys.push(s.utxo_outpoint_key());
+            }
+        }
+
+        let oco_utxo = format!("{}:0", oco_tx_id);
+        let oco_count = utxo_keys.iter().filter(|k| **k == oco_utxo).count();
+        assert!(
+            oco_count <= 1,
+            "OCO UTXO {} appears {} times across groups (expected <= 1). \
+             Both TP and SL paths were matched, causing duplicate inputs.",
+            oco_utxo, oco_count,
+        );
     }
 
 }

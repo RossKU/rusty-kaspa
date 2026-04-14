@@ -47,9 +47,9 @@ pub struct ParsedOrder {
 }
 
 /// Buy state size: 145B.
-const BUY_STATE_SIZE: usize = 145;
+pub const BUY_STATE_SIZE: usize = 145;
 /// Sell state size: 112B.
-const SELL_STATE_SIZE: usize = 112;
+pub const SELL_STATE_SIZE: usize = 112;
 
 /// Buy body size (v14: IOC path added, +9B).
 const BUY_BODY_SIZE: usize = 251;
@@ -425,6 +425,47 @@ mod tests {
     fn has_zk_opcode_ignores_state_section() {
         // 0xa6 appears in state (offset 1) but NOT in body (offset 3 onward)
         assert!(!has_zk_opcode(&[0x51, 0xa6, 0x52, 0x87, 0x69], 3));
+    }
+
+    #[test]
+    fn has_zk_opcode_false_for_standard_buy() {
+        use crate::contract::spot::order::{build_buy_redeem_script, BUY_ORDER_BODY};
+        // Use owner_hash / spk_hash that contain 0xa6 in arbitrary positions
+        // to ensure state bytes don't leak past body_start
+        let mut ohash = [0xa6; 32]; // worst case: all 0xa6
+        let bspkh = [0xa6; 32];
+        let rs = build_buy_redeem_script(
+            &[0xa6; 32], 1, 20, 1_000_000, &ohash, &bspkh, 50_000, 0, 0,
+        ).unwrap();
+        assert_eq!(rs.len(), BUY_STATE_SIZE + BUY_ORDER_BODY.len(),
+            "RS length mismatch: {} vs expected {}", rs.len(), BUY_STATE_SIZE + BUY_ORDER_BODY.len());
+        let result = has_zk_opcode(&rs, BUY_STATE_SIZE);
+        if result {
+            let body = &rs[BUY_STATE_SIZE..];
+            let positions: Vec<usize> = body.iter().enumerate()
+                .filter(|(_, &b)| b == OP_ZK_PRECOMPILE)
+                .map(|(i, _)| i)
+                .collect();
+            panic!("has_zk_opcode returned true! 0xa6 found at body offsets: {:?} (body len={})", positions, body.len());
+        }
+    }
+
+    #[test]
+    fn has_zk_opcode_false_for_standard_sell() {
+        use crate::contract::spot::order::{build_sell_redeem_script, SELL_ORDER_BODY};
+        let rs = build_sell_redeem_script(
+            1, 20, 1_000_000, &[0xa6; 32], &[0xa6; 32], 50_000, 0, 0,
+        ).unwrap();
+        assert_eq!(rs.len(), SELL_STATE_SIZE + SELL_ORDER_BODY.len());
+        let result = has_zk_opcode(&rs, SELL_STATE_SIZE);
+        if result {
+            let body = &rs[SELL_STATE_SIZE..];
+            let positions: Vec<usize> = body.iter().enumerate()
+                .filter(|(_, &b)| b == OP_ZK_PRECOMPILE)
+                .map(|(i, _)| i)
+                .collect();
+            panic!("has_zk_opcode returned true! 0xa6 found at body offsets: {:?}", positions);
+        }
     }
 
     #[test]

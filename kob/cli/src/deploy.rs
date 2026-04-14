@@ -335,11 +335,10 @@ pub async fn deploy_buy(
     println!("RedeemScript: {} bytes (v{})", redeem_script.len(), version);
     println!("RS hex:     {}", hex::encode(&redeem_script));
     println!("P2SH SPK:   {}", hex::encode(&p2sh.script()));
-    // ZK-GATE: Warn if the redeemScript contains OpZkPrecompile (0xa6).
-    // Current KOB contracts do not use 0xa6, but future versions or
-    // freezable tokens (e.g. USDC) may require the matcher to have a
-    // ZK prover configured.
-    if redeem_script.contains(&0xa6) {
+    // ZK-GATE: Warn if the body section contains OpZkPrecompile (0xa6).
+    // Only check body (skip state push-data to avoid false positives from
+    // arbitrary bytes like owner_hash that can coincidentally equal 0xa6).
+    if kob_core::contract::spot::parse::has_zk_opcode(&redeem_script, kob_core::contract::spot::parse::BUY_STATE_SIZE) {
         println!();
         println!("WARNING: This order's redeemScript contains OpZkPrecompile (0xa6).");
         println!("         The matcher must have --zk-prover enabled to fill this order.");
@@ -695,8 +694,8 @@ pub async fn deploy_sell(
     println!("RedeemScript: {} bytes (v{})", redeem_script.len(), version);
     println!("RS hex:     {}", hex::encode(&redeem_script));
     println!("P2SH SPK:   {}", hex::encode(&p2sh.script()));
-    // ZK-GATE: Warn if the redeemScript contains OpZkPrecompile (0xa6).
-    if redeem_script.contains(&0xa6) {
+    // ZK-GATE: Warn if the body section contains OpZkPrecompile (0xa6).
+    if kob_core::contract::spot::parse::has_zk_opcode(&redeem_script, kob_core::contract::spot::parse::SELL_STATE_SIZE) {
         println!();
         println!("WARNING: This order's redeemScript contains OpZkPrecompile (0xa6).");
         println!("         The matcher must have --zk-prover enabled to fill this order.");

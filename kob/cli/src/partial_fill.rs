@@ -28,7 +28,7 @@ use crate::signing;
 use kob_core::contract;
 use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
-use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
+use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletContext;
 use kob_core::mass::{compute_storage_mass, MAX_TX_MASS};
@@ -418,14 +418,22 @@ async fn run_buy_partial_fill(
     println!("  fee:                       {} sompi", fee);
     println!();
 
-    // Build transaction
-    let mut tx = Transaction::new(0);
+    // Build transaction.
+    // version=1 required for covenant output bindings.
+    // lock_time=50 required for OP_CSV(50) in covenant inputs.
+    let mut tx = Transaction::new(1);
+    tx.lock_time = 50;
+
+    // Covenant binding for token conservation outputs.
+    // authorizing_input=1 (token UTXO input), covenant_id=token.
+    let cov_hash = kob_core::compat::parse_hash(token_cov_id_hex)?;
+    let cov_binding = || Some(CovenantBinding::new(1, cov_hash));
 
     // Input 0: buy_order (P2SH, partial fill, sigOpCount=0)
     tx.inputs.push(TxInput {
         prev_tx_id: outpoint.transaction_id.clone(),
         prev_index: outpoint.index,
-        sequence: 0,
+        sequence: 50, // OP_CSV(50) relative locktime
         sig_op_count: 0,
         script_version: p2sh.version,
         script_bytes: p2sh.script().to_vec(),
@@ -454,11 +462,11 @@ async fn run_buy_partial_fill(
         value: fee_value,
     });
 
-    // Output 0: residual order (same P2SH address)
+    // Output 0: residual order (same P2SH address) -- no covenant (buy order is KAS)
     tx.outputs.push(TxOutput::new(residual_value, p2sh.version, p2sh.script().to_vec(), None));
 
-    // Output 1: buyer tokens
-    tx.outputs.push(TxOutput::new(final_buyer_tokens, wallet_spk_version, wallet_spk.to_vec(), None));
+    // Output 1: buyer tokens -- covenant-bound for F4
+    tx.outputs.push(TxOutput::new(final_buyer_tokens, wallet_spk_version, wallet_spk.to_vec(), cov_binding()));
 
     // Output 2: trade receipt
     tx.outputs.push(TxOutput::new(receipt_value, receipt_p2sh.version, receipt_p2sh.script().to_vec(), None));
@@ -676,14 +684,22 @@ async fn run_sell_partial_fill(
     println!("  fee:                       {} sompi", fee);
     println!();
 
-    // Build transaction
-    let mut tx = Transaction::new(0);
+    // Build transaction.
+    // version=1 required for covenant output bindings.
+    // lock_time=50 required for OP_CSV(50) in covenant inputs.
+    let mut tx = Transaction::new(1);
+    tx.lock_time = 50;
+
+    // Covenant binding for token conservation outputs.
+    // authorizing_input=0 (sell order input), covenant_id=token.
+    let cov_hash = kob_core::compat::parse_hash(token_cov_id_hex)?;
+    let cov_binding = || Some(CovenantBinding::new(0, cov_hash));
 
     // Input 0: sell_order (P2SH, partial fill, sigOpCount=0)
     tx.inputs.push(TxInput {
         prev_tx_id: outpoint.transaction_id.clone(),
         prev_index: outpoint.index,
-        sequence: 0,
+        sequence: 50, // OP_CSV(50) relative locktime
         sig_op_count: 0,
         script_version: p2sh.version,
         script_bytes: p2sh.script().to_vec(),
@@ -704,11 +720,11 @@ async fn run_sell_partial_fill(
     // Output 0: seller KAS
     tx.outputs.push(TxOutput::new(final_seller_kas, wallet_spk_version, wallet_spk.to_vec(), None));
 
-    // Output 1: residual order (same P2SH address)
-    tx.outputs.push(TxOutput::new(residual_value, p2sh.version, p2sh.script().to_vec(), None));
+    // Output 1: residual order (same P2SH address) -- covenant-bound for F4
+    tx.outputs.push(TxOutput::new(residual_value, p2sh.version, p2sh.script().to_vec(), cov_binding()));
 
-    // Output 2: trade receipt
-    tx.outputs.push(TxOutput::new(receipt_value, receipt_p2sh.version, receipt_p2sh.script().to_vec(), None));
+    // Output 2: trade receipt -- covenant-bound for F4 (CovOutCount >= 2)
+    tx.outputs.push(TxOutput::new(receipt_value, receipt_p2sh.version, receipt_p2sh.script().to_vec(), cov_binding()));
 
     // Output 3: matcher change (optional)
     if matcher_change >= MIN_UTXO_VALUE {

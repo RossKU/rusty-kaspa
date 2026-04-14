@@ -37,12 +37,20 @@
 use std::collections::{HashMap, HashSet};
 
 use kob_core::MIN_UTXO_VALUE;
+use kob_core::contract::spot::oco::{
+    build_oco_sell_sl_fill_sigscript,
+    build_oco_sell_tp_fill_sigscript,
+};
 use kob_core::contract::spot::order::{
     BUY_ORDER_V15_RS_EXPECTED_LEN,
+    build_buy_fill_sigscript,
+    build_buy_ioc_fill_sigscript,
     build_buy_v15_fill_sigscript,
     build_buy_v15_ioc_fill_sigscript,
     build_buy_v15_partial_fill_sigscript,
+    build_sell_fill_sigscript,
     build_sell_fill_sigscript_v15,
+    build_sell_ioc_fill_sigscript,
     build_sell_ioc_fill_sigscript_v15,
 };
 
@@ -311,11 +319,18 @@ impl BatchPlan {
                     if has_v15_buy {
                         build_sell_ioc_fill_sigscript_v15(koi as u16, fta, &sell.redeem_script)
                     } else {
-                        build_sell_ioc_fill_sigscript_batch(koi as u16, fta, &sell.redeem_script)?
+                        build_sell_ioc_fill_sigscript(koi as u16, fta, &sell.redeem_script)
                     }
                 } else {
                     // OCO sell fully filled: use TP (Op1) or SL (Op2) path selector
-                    build_oco_sell_fill_sigscript_batch(koi as u16, oco_path, &sell.redeem_script)?
+                    match oco_path {
+                        kob_core::OcoPath::TakeProfit => {
+                            build_oco_sell_tp_fill_sigscript(koi as u16, &sell.redeem_script)
+                        }
+                        kob_core::OcoPath::StopLoss => {
+                            build_oco_sell_sl_fill_sigscript(koi as u16, &sell.redeem_script)
+                        }
+                    }
                 }
             } else if (self.ioc_mode == Some(IocSide::Sell) || has_remainder) && !self.sell_fill_amounts.is_empty() {
                 // Sell IOC or sell with remainder: use fta-based sigscript
@@ -323,12 +338,12 @@ impl BatchPlan {
                 if has_v15_buy {
                     build_sell_ioc_fill_sigscript_v15(koi as u16, fta, &sell.redeem_script)
                 } else {
-                    build_sell_ioc_fill_sigscript_batch(koi as u16, fta, &sell.redeem_script)?
+                    build_sell_ioc_fill_sigscript(koi as u16, fta, &sell.redeem_script)
                 }
             } else if has_v15_buy {
                 build_sell_fill_sigscript_v15(koi as u16, &sell.redeem_script)
             } else {
-                build_sell_fill_sigscript_batch(koi as u16, &sell.redeem_script)?
+                build_sell_fill_sigscript(koi as u16, &sell.redeem_script)
             };
             inputs.push(BatchTxInput {
                 tx_id: sell.outpoint.0.clone(),
@@ -391,12 +406,12 @@ impl BatchPlan {
                     )
                 } else {
                     // V14 buy IOC: use Op5 selector
-                    build_buy_ioc_fill_sigscript_batch(
+                    build_buy_ioc_fill_sigscript(
                         toi as u16,
                         *tii as u16,
                         coi,
                         &buy.redeem_script,
-                    )?
+                    )
                 }
             } else if is_v15 {
                 // V15 buy fill: [sii] [toi] [tii] [coi] [Op1] [pushData(RS)]
@@ -409,12 +424,12 @@ impl BatchPlan {
                     &buy.redeem_script,
                 )
             } else {
-                build_buy_fill_sigscript_batch(
+                build_buy_fill_sigscript(
                     toi as u16,
                     *tii as u16,
                     coi,
                     &buy.redeem_script,
-                )?
+                )
             };
             inputs.push(BatchTxInput {
                 tx_id: buy.outpoint.0.clone(),
@@ -1481,130 +1496,10 @@ pub fn plan_sell_ioc_match(
     })
 }
 
-// Sigscript Builders (batch-specific)
-
-/// Push a script integer onto a sigscript buffer.
-///
-/// Encoding:
-///   0        -> `[0x00]`             (Op0, 1 byte)
-///   1..=16   -> `[0x50+n]`           (OpN, 1 byte)
-///   17..=127 -> `[0x01, n]`          (data-push, 2 bytes)
-///   128..=255-> `[0x02, n, 0x00]`    (data-push, 3 bytes; zero-pad high byte for sign)
-///   256+     -> `[0x02, lo, hi]`     (data-push, 3 bytes, little-endian)
-fn push_index(ss: &mut Vec<u8>, n: u16) {
-    match n {
-        0 => ss.push(0x00),
-        1..=16 => ss.push(0x50 + n as u8),
-        17..=127 => {
-            ss.push(0x01); // OpData1: push next 1 byte
-            ss.push(n as u8);
-        }
-        128..=255 => {
-            // Values 128-255: MSB of low byte is set, so a 1-byte push would
-            // be interpreted as negative by the script engine.  Push 2 bytes
-            // with a zero high byte to keep the value positive.
-            ss.push(0x02); // OpData2: push next 2 bytes
-            ss.push(n as u8);
-            ss.push(0x00);
-        }
-        _ => {
-            // 256+: 2-byte little-endian
-            ss.push(0x02);
-            ss.push(n as u8);         // low byte
-            ss.push((n >> 8) as u8);  // high byte
-        }
-    }
-}
-
-/// Build OCO sell fill sigscript for batch: `[koi] [selector] [pushData(RS)]`
-///
-/// * `kas_output_idx`: which output receives the seller's KAS
-/// * `path`: TakeProfit uses Op1, StopLoss uses Op2
-fn build_oco_sell_fill_sigscript_batch(
-    kas_output_idx: u16,
-    path: kob_core::OcoPath,
-    redeem_script: &[u8],
-) -> Result<Vec<u8>, BatchError> {
-    let mut ss = Vec::with_capacity(3 + redeem_script.len() + 3);
-    push_index(&mut ss, kas_output_idx);
-    match path {
-        kob_core::OcoPath::TakeProfit => ss.push(0x51), // Op1
-        kob_core::OcoPath::StopLoss => ss.push(0x52),   // Op2
-    }
-    ss.extend_from_slice(&kob_core::push_data(redeem_script));
-    Ok(ss)
-}
-
-/// Build sell fill sigscript for batch: `[koi] [Op1] [pushData(RS)]`
-///
-/// * `kas_output_idx`: which output receives the seller's KAS
-fn build_sell_fill_sigscript_batch(kas_output_idx: u16, redeem_script: &[u8]) -> Result<Vec<u8>, BatchError> {
-    let mut ss = Vec::with_capacity(3 + redeem_script.len() + 3);
-    push_index(&mut ss, kas_output_idx);
-    ss.push(0x51); // Op1 (selector = fill)
-    ss.extend_from_slice(&kob_core::push_data(redeem_script));
-    Ok(ss)
-}
-
-/// Build buy fill sigscript for batch: `[toi] [tii] [coi] [Op1] [pushData(RS)]`
-///
-/// * `token_output_idx`: which output receives the buyer's tokens (toi)
-/// * `token_input_idx`: which input carries the token covenant (tii)
-/// * `cov_output_idx`: which covenant output index for OpCovOutputIdx lookup (coi)
-fn build_buy_fill_sigscript_batch(
-    token_output_idx: u16,
-    token_input_idx: u16,
-    cov_output_idx: u16,
-    redeem_script: &[u8],
-) -> Result<Vec<u8>, BatchError> {
-    let mut ss = Vec::with_capacity(7 + redeem_script.len() + 3);
-    push_index(&mut ss, token_output_idx);
-    push_index(&mut ss, token_input_idx);
-    push_index(&mut ss, cov_output_idx);
-    ss.push(0x51); // Op1 (selector = fill)
-    ss.extend_from_slice(&kob_core::push_data(redeem_script));
-    Ok(ss)
-}
-
-/// Build buy IOC fill sigscript for batch: `[toi] [tii] [coi] [Op5] [pushData(RS)]`
-///
-/// Same as normal fill but with Op5 selector to trigger IOC sub-dispatch.
-fn build_buy_ioc_fill_sigscript_batch(
-    token_output_idx: u16,
-    token_input_idx: u16,
-    cov_output_idx: u16,
-    redeem_script: &[u8],
-) -> Result<Vec<u8>, BatchError> {
-    let mut ss = Vec::with_capacity(7 + redeem_script.len() + 3);
-    push_index(&mut ss, token_output_idx);
-    push_index(&mut ss, token_input_idx);
-    push_index(&mut ss, cov_output_idx);
-    ss.push(0x55); // Op5 (selector = IOC fill)
-    ss.extend_from_slice(&kob_core::push_data(redeem_script));
-    Ok(ss)
-}
-
-/// Build sell IOC fill sigscript for batch: `[koi] [pushData(fta 8B)] [Op5] [pushData(RS)]`
-///
-/// * `kas_output_idx`: which output receives the seller's KAS
-/// * `fill_token_amount`: how many tokens are being filled (fta)
-fn build_sell_ioc_fill_sigscript_batch(
-    kas_output_idx: u16,
-    fill_token_amount: u64,
-    redeem_script: &[u8],
-) -> Result<Vec<u8>, BatchError> {
-    let fta = kob_core::u64_le(fill_token_amount);
-    let mut ss = Vec::with_capacity(14 + redeem_script.len() + 3);
-    push_index(&mut ss, kas_output_idx);
-    ss.extend_from_slice(&kob_core::push_data(&fta));
-    ss.push(0x55); // Op5 (selector = IOC fill)
-    ss.extend_from_slice(&kob_core::push_data(redeem_script));
-    Ok(ss)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kob_core::contract::helpers::push_index;
 
     // Test token covenant IDs
     const TOKEN_A: [u8; 32] = [0x01; 32];

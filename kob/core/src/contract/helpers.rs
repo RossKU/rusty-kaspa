@@ -30,7 +30,7 @@ pub(crate) fn opn(n: u8) -> u8 {
 ///
 /// This enables batch transactions with more than 17 inputs/outputs,
 /// where output indices can exceed the OpN range.
-pub(crate) fn push_index(ss: &mut Vec<u8>, n: u16) {
+pub fn push_index(ss: &mut Vec<u8>, n: u16) {
     match n {
         0 => ss.push(0x00),
         1..=16 => ss.push(0x50 + n as u8),

@@ -65,6 +65,7 @@ members = [
     "kob/core",
     "kob/cli",
     "kob/engine",
+    "kob/lab",
 ]
 
 [workspace.package]

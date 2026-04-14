@@ -15,7 +15,7 @@
 //! - index_basket v1 (multi-token basket)
 //! - futures_dated v1 (dated futures with DAA expiry)
 
-use crate::primitives::{push_data, u64_le};
+use kob_core::primitives::{push_data, u64_le};
 
 /// crowdfund_pool v2 body bytecode (37 bytes).
 ///
@@ -80,12 +80,12 @@ pub fn build_crowdfund_pool_v2_redeem_script(
     creator_pk: &[u8; 32],
     goal_amount: u64,
     min_contribution: u64,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if goal_amount <= 0 {
-        return Err(crate::KobError::Contract("goal_amount must be > 0".into()));
+        return Err(kob_core::KobError::Contract("goal_amount must be > 0".into()));
     }
     if min_contribution <= 0 {
-        return Err(crate::KobError::Contract("min_contribution must be > 0 (zero allows dust griefing, F12)".into()));
+        return Err(kob_core::KobError::Contract("min_contribution must be > 0 (zero allows dust griefing, F12)".into()));
     }
     let mut rs = Vec::with_capacity(89);
     // State header (51 bytes)
@@ -249,15 +249,15 @@ pub fn build_amm_pool_v1_redeem_script(
     fee_num: u64,
     fee_den: u64,
     lp_supply: u64,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if fee_den <= 0 {
-        return Err(crate::KobError::Contract("fee_den must be > 0".into()));
+        return Err(kob_core::KobError::Contract("fee_den must be > 0".into()));
     }
     if reserve_kas <= 0 {
-        return Err(crate::KobError::Contract("reserve_kas must be > 0".into()));
+        return Err(kob_core::KobError::Contract("reserve_kas must be > 0".into()));
     }
     if reserve_token <= 0 {
-        return Err(crate::KobError::Contract("reserve_token must be > 0".into()));
+        return Err(kob_core::KobError::Contract("reserve_token must be > 0".into()));
     }
     let mut rs = Vec::with_capacity(256);
     // State header (144 bytes)
@@ -406,15 +406,15 @@ pub fn build_cdp_v1_redeem_script(
     liq_ratio_num: u64,
     liq_ratio_den: u64,
     min_collateral: u64,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if liq_ratio_den <= 0 {
-        return Err(crate::KobError::Contract("liq_ratio_den must be > 0".into()));
+        return Err(kob_core::KobError::Contract("liq_ratio_den must be > 0".into()));
     }
     if liq_ratio_num <= 0 {
-        return Err(crate::KobError::Contract("liq_ratio_num must be > 0".into()));
+        return Err(kob_core::KobError::Contract("liq_ratio_num must be > 0".into()));
     }
     if min_collateral <= 0 {
-        return Err(crate::KobError::Contract("min_collateral must be > 0".into()));
+        return Err(kob_core::KobError::Contract("min_collateral must be > 0".into()));
     }
     let mut rs = Vec::with_capacity(229);
     // State header (111 bytes)
@@ -530,12 +530,12 @@ pub fn build_streaming_payment_v1_redeem_script(
     claimed_amount: u64,
     start_daa: u64,
     end_daa: u64,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if total_amount <= 0 {
-        return Err(crate::KobError::Contract("total_amount must be > 0".into()));
+        return Err(kob_core::KobError::Contract("total_amount must be > 0".into()));
     }
     if end_daa <= start_daa {
-        return Err(crate::KobError::Contract("end_daa must be > start_daa".into()));
+        return Err(kob_core::KobError::Contract("end_daa must be > start_daa".into()));
     }
     let mut rs = Vec::with_capacity(163);
     // State header (102 bytes)
@@ -649,9 +649,9 @@ pub fn build_bridge_vault_v1_redeem_script(
     guardian_hash_3: &[u8; 32],
     threshold: u64,
     balance: u64,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if threshold <= 0 || threshold > 3 {
-        return Err(crate::KobError::Contract("threshold must be 1..=3".into()));
+        return Err(kob_core::KobError::Contract("threshold must be 1..=3".into()));
     }
 
     let mut rs = Vec::with_capacity(212);
@@ -817,12 +817,12 @@ pub fn build_bridge_receipt_v1_redeem_script(
     amount: u64,
     nonce: u64,
     status: u8,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if amount <= 0 {
-        return Err(crate::KobError::Contract("amount must be > 0".into()));
+        return Err(kob_core::KobError::Contract("amount must be > 0".into()));
     }
     if status > 2 {
-        return Err(crate::KobError::Contract("status must be 0 (pending), 1 (confirmed), or 2 (completed)".into()));
+        return Err(kob_core::KobError::Contract("status must be 0 (pending), 1 (confirmed), or 2 (completed)".into()));
     }
 
     let mut rs = Vec::with_capacity(175);
@@ -987,12 +987,12 @@ pub fn build_nft_royalty_v1_redeem_script(
     royalty_num: u64,
     royalty_den: u64,
     floor_price: u64,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if royalty_den <= 0 {
-        return Err(crate::KobError::Contract("royalty_den must be > 0".into()));
+        return Err(kob_core::KobError::Contract("royalty_den must be > 0".into()));
     }
     if floor_price <= 0 {
-        return Err(crate::KobError::Contract("floor_price must be > 0".into()));
+        return Err(kob_core::KobError::Contract("floor_price must be > 0".into()));
     }
 
     let mut rs = Vec::with_capacity(177);
@@ -1168,12 +1168,12 @@ pub fn build_index_basket_v1_redeem_script(
     weight_1: u64,
     weight_2: u64,
     total_baskets: u64,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if weight_1 <= 0 {
-        return Err(crate::KobError::Contract("weight_1 must be > 0".into()));
+        return Err(kob_core::KobError::Contract("weight_1 must be > 0".into()));
     }
     if weight_2 <= 0 {
-        return Err(crate::KobError::Contract("weight_2 must be > 0".into()));
+        return Err(kob_core::KobError::Contract("weight_2 must be > 0".into()));
     }
 
     let mut rs = Vec::with_capacity(223);
@@ -1362,15 +1362,15 @@ pub fn build_futures_dated_v1_redeem_script(
     maturity_daa: u64,
     margin_long: u64,
     margin_short: u64,
-) -> crate::Result<Vec<u8>> {
+) -> kob_core::Result<Vec<u8>> {
     if strike_price_den <= 0 {
-        return Err(crate::KobError::Contract("strike_price_den must be > 0".into()));
+        return Err(kob_core::KobError::Contract("strike_price_den must be > 0".into()));
     }
     if notional <= 0 {
-        return Err(crate::KobError::Contract("notional must be > 0".into()));
+        return Err(kob_core::KobError::Contract("notional must be > 0".into()));
     }
     if maturity_daa <= 0 {
-        return Err(crate::KobError::Contract("maturity_daa must be > 0".into()));
+        return Err(kob_core::KobError::Contract("maturity_daa must be > 0".into()));
     }
     let state_size = 33 + 33 + 33 + 33 + 9 + 9 + 9 + 9 + 9 + 9; // 186B
     let body_len = FUTURES_DATED_BODY_V1.len(); // 96B

@@ -4,7 +4,6 @@
 
 pub mod contract;
 pub mod error;
-pub mod lab;
 pub mod listing;
 pub mod mass;
 pub mod p2sh;

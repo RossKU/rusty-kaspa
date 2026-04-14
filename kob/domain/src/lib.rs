@@ -13,10 +13,56 @@
 //! - `kob-engine` adds chain I/O, orchestration, and REST API on top.
 //! - Standalone tools (MM bots, simulators) can depend on this crate
 //!   directly to reuse matching logic without pulling in chain dependencies.
-//!
-//! Phase 2 of the 4-crate refactor: this file defines the common traits
-//! and shared primitives. Phase 3 will move per-contract book/executor/
-//! tracker implementations under this crate's `src/`.
+
+/// Default maximum matcher fee (in sompi) embedded in deploy redeemScripts.
+/// Must match `kob-cli`'s `DEFAULT_MAX_MATCHER_FEE` to avoid P2SH mismatch.
+pub const DEFAULT_MAX_MATCHER_FEE: u64 = 10_000_000;
+
+// Spot books
+#[allow(dead_code)]
+pub mod order_book;
+#[allow(dead_code)]
+pub mod stop_book;
+#[allow(dead_code)]
+pub mod dca_book;
+#[allow(dead_code)]
+pub mod swap_book;
+
+// Perp
+#[allow(dead_code)]
+pub mod perp_book;
+#[allow(dead_code)]
+pub mod perp_tracker;
+#[allow(dead_code)]
+pub mod perp_executor;
+
+// Lending
+#[allow(dead_code)]
+pub mod lending_book;
+#[allow(dead_code)]
+pub mod lending_tracker;
+#[allow(dead_code)]
+pub mod lending_executor;
+
+// Prediction
+#[allow(dead_code)]
+pub mod prediction_book;
+#[allow(dead_code)]
+pub mod prediction_tracker;
+#[allow(dead_code)]
+pub mod prediction_executor;
+
+// Matching / orchestration
+#[allow(dead_code)]
+pub mod matching;
+#[allow(dead_code)]
+pub mod routing;
+#[allow(dead_code)]
+pub mod batch;
+#[allow(dead_code)]
+pub mod ifd;
+#[allow(dead_code)]
+pub mod trailing_stop;
 
 use std::collections::HashMap;
 use std::hash::Hash;

@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::matcher::prediction_book::BallotSide;
+use crate::prediction_book::BallotSide;
 
 /// A tracked prediction market with aggregated state.
 #[derive(Debug, Clone)]

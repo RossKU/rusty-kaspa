@@ -1,7 +1,7 @@
 //! Prediction market transaction construction (create, vote, split, merge, settle, redeem).
 #![allow(deprecated)]
 
-use crate::matcher::prediction_book::{
+use crate::prediction_book::{
     BallotBoxEntry, BallotSide, RedemptionEntry, SplitMergeEntry,
 };
 

@@ -4,7 +4,9 @@
 
 /// Default maximum matcher fee (in sompi) embedded in deploy redeemScripts.
 /// Must match `kob-cli`'s `DEFAULT_MAX_MATCHER_FEE` to avoid P2SH mismatch.
-pub const DEFAULT_MAX_MATCHER_FEE: u64 = 10_000_000;
+///
+/// Re-exported from `kob-domain` for backward compatibility.
+pub use kob_domain::DEFAULT_MAX_MATCHER_FEE;
 
 pub mod config;
 pub mod matcher;

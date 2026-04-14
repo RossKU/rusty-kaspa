@@ -1,7 +1,7 @@
 //! Crossing pair detection and match output computation.
 
 use kob_core::MIN_UTXO_VALUE;
-use crate::matcher::order_book::{BookOrder, OrderBook};
+use crate::order_book::{BookOrder, OrderBook};
 
 /// OP_CSV maturity window: orders must age at least this many DAA scores
 /// before they can be spent. Matches the lockTime embedded in deploy TXs.
@@ -1144,7 +1144,7 @@ fn classify_group_kind(sells: &[BookOrder], buys: &[BookOrder]) -> GroupKind {
 #[derive(Debug, Clone)]
 pub struct CrossSwapGroup {
     /// The swap entry from the swap book.
-    pub swap: crate::matcher::swap_book::SwapEntry,
+    pub swap: crate::swap_book::SwapEntry,
     /// Buy-source: counterparty on SOURCE/KAS book who wants to buy source tokens.
     /// This order provides KAS in exchange for the swap user's source tokens.
     pub buy_source: BookOrder,
@@ -1176,7 +1176,7 @@ pub struct CrossSwapGroup {
 /// * `used_outpoints` — Outpoints consumed by same-token matching in this cycle.
 pub fn match_swap_routes(
     order_book: &OrderBook,
-    swap_book: &crate::matcher::swap_book::SwapBook,
+    swap_book: &crate::swap_book::SwapBook,
     spent_outpoints: Option<&std::collections::HashSet<String>>,
     used_outpoints: &std::collections::HashSet<String>,
 ) -> Vec<CrossSwapGroup> {
@@ -1311,7 +1311,7 @@ pub fn match_swap_routes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+    use crate::order_book::{BookOrder, OrderBook, OrderSide};
 
     fn make_buy(value: u64, price_num: u64, price_den: u64, token_cov_id: &str) -> BookOrder {
         BookOrder {
@@ -1674,7 +1674,7 @@ mod tests {
         sell3.owner_hash = "b3".repeat(32);
         ob.add_sell_order(sell3);
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         assert!(!groups.is_empty(), "Should find at least 1 sweep group");
 
         let g = &groups[0];
@@ -1725,7 +1725,7 @@ mod tests {
         sell3.owner_hash = "b3".repeat(32);
         ob.add_sell_order(sell3);
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         // Buy has 2B. sell1=1B, sell2=0.4B -> total 1.4B, remaining 0.6B.
         // sell3 needs 2B -> skip. So sweep = 2 sells.
         assert!(!groups.is_empty(), "Should find sweep group");
@@ -1749,7 +1749,7 @@ mod tests {
         sell1.owner_hash = "bb".repeat(32);
         ob.add_sell_order(sell1);
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         assert!(groups.is_empty(), "Single sell should not form a sweep group");
     }
 
@@ -1777,7 +1777,7 @@ mod tests {
         buy2.owner_hash = "d2".repeat(32);
         ob.add_buy_order(buy2);
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         // Sell has 2B tokens. buy1 wants 2.5B but sell only has 2B -> buy1 can't be fully filled.
         // Actually: sell sweep checks buy_tokens <= tokens_remaining.
         // buy1 wants 2.5B tokens but sell only has 2B -> skip buy1.
@@ -1806,7 +1806,7 @@ mod tests {
             ob.add_buy_order(buy);
         }
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         // Each buy at price 1/1 wants 400M tokens.
         // Sell has 1B tokens. buy0: 400M (rem 600M), buy1: 400M (rem 200M), buy2: 400M (rem -200M, skip).
         // So 2 buys fit -> valid sell sweep.
@@ -1835,11 +1835,11 @@ mod tests {
         }
 
         // With STP enabled (allow_self_trade=false), no sweep should form
-        let groups = find_sweep_groups(&ob, false, None);
+        let groups = find_sweep_groups(&ob, false, None, CSV_MATURITY_DAA);
         assert!(groups.is_empty(), "STP should prevent self-trade sweep");
 
         // With STP disabled, sweep should form
-        let groups2 = find_sweep_groups(&ob, true, None);
+        let groups2 = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         assert!(!groups2.is_empty(), "Self-trade sweep should work when STP disabled");
     }
 
@@ -1865,7 +1865,7 @@ mod tests {
         spent.insert(format!("{}:2", format!("{:0>64}", "sell0")));
         spent.insert(format!("{}:2", format!("{:0>64}", "sell1")));
 
-        let groups = find_sweep_groups(&ob, true, Some(&spent));
+        let groups = find_sweep_groups(&ob, true, Some(&spent), CSV_MATURITY_DAA);
         // Only 1 sell available (sell2) -> no sweep (needs >= 2)
         assert!(groups.is_empty(), "Spent sells should not form sweep group");
     }
@@ -1888,7 +1888,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         assert!(!groups.is_empty(), "Should find sweep group");
         assert!(
             groups[0].fills.len() <= MAX_BATCH_GROUP_SIZE,
@@ -1980,7 +1980,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         // GTC buy cannot be partially filled, so no sweep group should exist
         let buy_sweeps: Vec<_> = groups.iter()
             .filter(|g| g.is_buy_sweep)
@@ -2013,7 +2013,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         let buy_groups: Vec<_> = groups.iter()
             .filter(|g| g.is_buy_sweep)
             .collect();
@@ -2043,7 +2043,7 @@ mod tests {
             ob.add_sell_order(sell);
         }
 
-        let groups = find_sweep_groups(&ob, true, None);
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
         let buy_sweeps: Vec<_> = groups.iter()
             .filter(|g| g.is_buy_sweep)
             .collect();

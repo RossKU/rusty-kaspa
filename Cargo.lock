@@ -4463,10 +4463,13 @@ dependencies = [
 name = "kob-domain"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "kaspa-consensus-core",
  "kob-core",
  "serde",
+ "serde_json",
  "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]
@@ -4480,6 +4483,7 @@ dependencies = [
  "hex",
  "k256",
  "kob-core",
+ "kob-domain",
  "rand 0.8.5",
  "reqwest",
  "rusqlite",

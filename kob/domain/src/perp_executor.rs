@@ -1,10 +1,10 @@
 //! Perpetual position transaction construction (open, close, liquidate, settle).
 
-use crate::matcher::perp_book::{PerpCrossingPair, PerpOrder};
-use crate::matcher::perp_tracker::{LiquidatablePosition, PerpPosition};
+use crate::perp_book::{PerpCrossingPair, PerpOrder};
+use crate::perp_tracker::{LiquidatablePosition, PerpPosition};
 
 #[cfg(test)]
-use crate::matcher::perp_tracker::LiquidatedSide;
+use crate::perp_tracker::LiquidatedSide;
 
 use kob_core::MIN_UTXO_VALUE;
 
@@ -1070,7 +1070,7 @@ pub fn build_partial_close_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::perp_book::PerpSide;
+    use crate::perp_book::PerpSide;
 
     fn make_long_order(margin: u64, value: u64) -> PerpOrder {
         PerpOrder {
@@ -1402,7 +1402,7 @@ mod tests {
     #[test]
     fn liquidation_long_underwater() {
         let position = make_position();
-        let mtm = crate::matcher::perp_tracker::PositionTracker::mark_to_market(&position, 50)
+        let mtm = crate::perp_tracker::PositionTracker::mark_to_market(&position, 50)
             .unwrap();
 
         let params = LiquidationParams {
@@ -1450,7 +1450,7 @@ mod tests {
         let mut position = make_position();
         position.keeper_fee = 1000; // Below MIN_UTXO_VALUE
 
-        let mtm = crate::matcher::perp_tracker::PositionTracker::mark_to_market(&position, 50)
+        let mtm = crate::perp_tracker::PositionTracker::mark_to_market(&position, 50)
             .unwrap();
 
         let params = LiquidationParams {
@@ -1475,7 +1475,7 @@ mod tests {
     #[test]
     fn liquidation_empty_payload() {
         let position = make_position();
-        let mtm = crate::matcher::perp_tracker::PositionTracker::mark_to_market(&position, 50)
+        let mtm = crate::perp_tracker::PositionTracker::mark_to_market(&position, 50)
             .unwrap();
 
         let params = LiquidationParams {

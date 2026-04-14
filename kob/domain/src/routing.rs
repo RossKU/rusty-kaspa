@@ -24,9 +24,9 @@
 use std::collections::HashMap;
 
 use kob_core::MIN_UTXO_VALUE;
-use crate::matcher::order_book::{BookOrder, OrderBook};
+use crate::order_book::{BookOrder, OrderBook};
 #[cfg(test)]
-use crate::matcher::order_book::OrderSide;
+use crate::order_book::OrderSide;
 
 /// A cross-pair route matching a sell in one pair with a buy in another.
 ///

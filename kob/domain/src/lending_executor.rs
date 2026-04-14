@@ -1,7 +1,7 @@
 //! P2P lending transaction construction (match, repay, liquidate, extend).
 
-use crate::matcher::lending_book::{BorrowRequest, LendingMatch, LendingOffer};
-use crate::matcher::lending_tracker::LoanPosition;
+use crate::lending_book::{BorrowRequest, LendingMatch, LendingOffer};
+use crate::lending_tracker::LoanPosition;
 
 use kob_core::mass::estimate_compute_mass;
 use kob_core::MIN_UTXO_VALUE;
@@ -1440,7 +1440,7 @@ pub fn build_loan_transfer_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::lending_book::LendingOffer;
+    use crate::lending_book::LendingOffer;
 
     fn make_offer(value: u64) -> LendingOffer {
         LendingOffer {

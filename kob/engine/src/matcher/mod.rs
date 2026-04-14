@@ -1,47 +1,40 @@
-#[allow(dead_code)] // Items used in tests
-pub mod order_book;
-pub mod matching;
-#[allow(dead_code)] // Items used in tests
+// Chain-layer matcher modules (engine-only).
+//
+// Per-contract books, trackers, executors, matching orchestration, routing,
+// batch, ifd, and trailing_stop live in `kob-domain` and are re-exported
+// below for backward-compat with existing `crate::matcher::X` paths.
+
+// Chain-layer (stays in engine)
+#[allow(dead_code)]
 pub mod executor;
-#[allow(dead_code)] // Items used in tests
+#[allow(dead_code)]
 pub mod scanner;
 pub mod persistence;
-#[allow(dead_code)] // Items used in tests
+#[allow(dead_code)]
 pub mod api;
-pub mod stop_book;
-pub mod trailing_stop;
-#[allow(dead_code)] // Items used in tests
+#[allow(dead_code)]
 pub mod trades;
 pub mod candle;
-#[allow(dead_code)] // Items used in tests
+#[allow(dead_code)]
 pub mod history;
-#[allow(dead_code)] // Items used in tests
-pub mod routing;
-#[allow(dead_code)] // Items used in tests
-pub mod batch;
 pub mod deploy;
-#[allow(dead_code)] // Items used in tests
-pub mod ifd;
-#[allow(dead_code)] // Items used in tests
-pub mod perp_book;
-#[allow(dead_code)] // Items used in tests
-pub mod perp_tracker;
-#[allow(dead_code)] // Items used in tests
-pub mod perp_executor;
-#[allow(dead_code)] // Items used in tests
-pub mod lending_book;
-#[allow(dead_code)] // Items used in tests
-pub mod lending_tracker;
-#[allow(dead_code)] // Items used in tests
-pub mod lending_executor;
-#[allow(dead_code)] // Items used in tests
-pub mod prediction_book;
-#[allow(dead_code)] // Items used in tests
-pub mod prediction_executor;
-#[allow(dead_code)] // Items used in tests
-pub mod prediction_tracker;
-#[allow(dead_code)] // Items used in tests
-pub mod dca_book;
-#[allow(dead_code)] // Items used in tests
-pub mod swap_book;
 
+// Domain-layer (re-exported from kob-domain)
+pub use kob_domain::order_book;
+pub use kob_domain::stop_book;
+pub use kob_domain::dca_book;
+pub use kob_domain::swap_book;
+pub use kob_domain::perp_book;
+pub use kob_domain::perp_tracker;
+pub use kob_domain::perp_executor;
+pub use kob_domain::lending_book;
+pub use kob_domain::lending_tracker;
+pub use kob_domain::lending_executor;
+pub use kob_domain::prediction_book;
+pub use kob_domain::prediction_tracker;
+pub use kob_domain::prediction_executor;
+pub use kob_domain::matching;
+pub use kob_domain::routing;
+pub use kob_domain::batch;
+pub use kob_domain::ifd;
+pub use kob_domain::trailing_stop;

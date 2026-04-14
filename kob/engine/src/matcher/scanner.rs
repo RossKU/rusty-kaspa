@@ -1516,7 +1516,7 @@ mod tests {
         assert_eq!(ob.stats().total_asks, 1);
 
         // Matching engine should find crossing groups (allow self trade since owners differ)
-        let groups = matching::match_book_direct(&ob, true, None);
+        let groups = matching::match_book_direct(&ob, true, None, u64::MAX);
         // Whether they cross depends on price: buy pnum=3/pden=2 sell pnum=5/pden=3
         // buy price = 3/2 tokens per KAS, sell price = 5/3 tokens per KAS
         // Buy expects 10M * 3/2 = 15M tokens. Sell expects 10M * 5/3 = 16.66M KAS.

@@ -10,4 +10,7 @@ path = "src/lib.rs"
 kob-core = { path = "../core" }
 kaspa-consensus-core = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = "0.1"
+hex = { workspace = true }
 thiserror = "2"

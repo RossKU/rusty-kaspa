@@ -1071,11 +1071,56 @@ pub async fn execute_batch_match(
     // Bytecode trace: disassemble all input sigscripts at debug level
     trace_batch_inputs(&batch_tx, plan);
 
+    // === DEBUG: Dump full TX structure before submit ===
+    info!("=== BATCH TX DEBUG DUMP ===");
+    info!("  version=1, lockTime=50, inputs={}, outputs={}", rpc_inputs.len(), rpc_outputs.len());
+    for (i, inp) in rpc_inputs.iter().enumerate() {
+        let sig_hex = inp["signatureScript"].as_str().unwrap_or("");
+        let seq = inp["sequence"].as_u64().unwrap_or(0);
+        let soc = inp["sigOpCount"].as_u64().unwrap_or(0);
+        let tx = inp["previousOutpoint"]["transactionId"].as_str().unwrap_or("?");
+        let idx = inp["previousOutpoint"]["index"].as_u64().unwrap_or(0);
+        info!("  INPUT[{}]: {}:{} seq={} sigOp={} ssLen={}", i, &tx[..8.min(tx.len())], idx, seq, soc, sig_hex.len()/2);
+    }
+    for (i, out) in rpc_outputs.iter().enumerate() {
+        let val = out["value"].as_u64().unwrap_or(0);
+        let spk = out["scriptPublicKey"]["script"].as_str().unwrap_or("?");
+        let has_cov = out.get("covenant").is_some();
+        let cov_info = if has_cov {
+            let ai = out["covenant"]["authorizingInput"].as_u64().unwrap_or(999);
+            let cid = out["covenant"]["covenantId"].as_str().unwrap_or("?");
+            format!(" COV(ai={}, cid={}..)", ai, &cid[..16.min(cid.len())])
+        } else {
+            String::new()
+        };
+        info!("  OUTPUT[{}]: value={} spk={}..{}{}", i, val, &spk[..8.min(spk.len())], if spk.len() > 8 { &spk[spk.len()-4..] } else { "" }, cov_info);
+    }
+    // Also dump plan output purposes for cross-reference
+    for (i, po) in plan.outputs.iter().enumerate() {
+        info!("  PLAN_OUT[{}]: purpose={:?} value={}", i, po.purpose, po.value);
+    }
+    // Dump sigscript indices used
+    for (i, (sell, input_idx)) in plan.sells.iter().enumerate() {
+        info!("  SELL[{}]: input_idx={} outpoint={}:{} amount={} price={}/{}", i, input_idx, &sell.outpoint.0[..8], sell.outpoint.1, sell.amount, sell.price_num, sell.price_den);
+    }
+    for (i, (buy, input_idx)) in plan.buys.iter().enumerate() {
+        let token_hex = hex::encode(buy.token_cov_id);
+        let tii = plan.token_input_map.get(&token_hex).copied().unwrap_or(999);
+        let toi = plan.sells.len() + i;
+        info!("  BUY[{}]: input_idx={} toi={} tii={} outpoint={}:{} amount={} price={}/{}", i, input_idx, toi, tii, &buy.outpoint.0[..8], buy.outpoint.1, buy.amount, buy.price_num, buy.price_den);
+    }
+    info!("=== END DEBUG DUMP ===");
+
     // Submit via RPC (version=1 for covenant output bindings, lockTime=50 for OP_CSV)
     let payload = match ifd_payload {
         Some(ref hex) => deploy::build_submit_payload_with_tx_payload(1, rpc_inputs, rpc_outputs, hex, 50),
         None => deploy::build_submit_payload_with_lock_time(1, rpc_inputs, rpc_outputs, 50),
     };
+    // Dump full payload JSON at debug level for manual replay
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        info!("[BATCH] Full RPC payload (for manual replay):");
+        info!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
+    }
     let result = match rpc.submit_transaction(payload).await {
         Ok(r) => r,
         Err(e) => {

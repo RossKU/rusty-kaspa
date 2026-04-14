@@ -864,6 +864,7 @@ pub fn match_book_direct(
 
             // STP: skip same owner. Advance ask to try next counterpart.
             if !allow_self_trade && ask.owner_hash == bid.owner_hash {
+                tracing::debug!("[DIRECT] STP skip: ask={} bid={} same owner_hash={}", ask.outpoint_key(), bid.outpoint_key(), &ask.owner_hash[..16]);
                 ask_idx += 1;
                 continue;
             }
@@ -871,6 +872,7 @@ pub fn match_book_direct(
             // Check crossing: ask.price <= bid.price
             let lhs = ask.price_num as u128 * bid.price_den as u128;
             let rhs = bid.price_num as u128 * ask.price_den as u128;
+            tracing::debug!("[DIRECT] Crossing check: ask {}/{} vs bid {}/{} → lhs={} rhs={} cross={}", ask.price_num, ask.price_den, bid.price_num, bid.price_den, lhs, rhs, lhs <= rhs);
             if lhs > rhs {
                 // Best ask doesn't cross best bid. No more crossings possible.
                 break;

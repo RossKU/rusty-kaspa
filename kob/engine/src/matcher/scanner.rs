@@ -340,7 +340,20 @@ impl BlockScanner {
             side: parsed.order_type,
             post_only: parsed.post_only,
             expiry_daa: parsed.expiry_daa,
-            is_freezable: parsed.requires_zk,
+            is_freezable: {
+                let zk = parsed.requires_zk;
+                if zk {
+                    let body_start = if parsed.order_type == kob_core::OrderSide::Buy { 145 } else { 112 };
+                    tracing::warn!(
+                        "[ZK-DEBUG] requires_zk=true for {} RS len={} body_start={} body_bytes={:02x?}",
+                        if parsed.order_type == kob_core::OrderSide::Buy { "BUY" } else { "SELL" },
+                        parsed.redeem_script.len(),
+                        body_start,
+                        &parsed.redeem_script[body_start..body_start.min(parsed.redeem_script.len()) + 20.min(parsed.redeem_script.len().saturating_sub(body_start))]
+                    );
+                }
+                zk
+            },
             // V15 buy orders store max_matcher_fee as BPS (basis points of trade value).
             // Convert to absolute sompi so the matching engine can use it uniformly.
             // For v15 buys: mmfee_sompi = value * bps / 10000.

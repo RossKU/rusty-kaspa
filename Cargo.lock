@@ -4460,6 +4460,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kob-domain"
+version = "0.1.0"
+dependencies = [
+ "kaspa-consensus-core",
+ "kob-core",
+ "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "kob-engine"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "kob-domain"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kob-core = { path = "../core" }
+kaspa-consensus-core = { workspace = true }
+serde = { workspace = true }
+thiserror = "2"

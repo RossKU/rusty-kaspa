@@ -63,6 +63,7 @@ members = [
     "metrics/perf_monitor",
     "utils/alloc",
     "kob/core",
+    "kob/domain",
     "kob/cli",
     "kob/engine",
     "kob/lab",

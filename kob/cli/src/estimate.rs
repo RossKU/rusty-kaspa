@@ -58,6 +58,12 @@ const OCO_RS_SIZE: u64 = 333;
 const CALL_OPTION_RS_SIZE: u64 = 159;
 /// put_option v4 redeemScript: 159B state + 46B body = 205B.
 const PUT_OPTION_RS_SIZE: u64 = 205;
+/// swap_order redeemScript: 174B state + 69B body = 243B.
+const SWAP_RS_SIZE: u64 = 243;
+
+/// swap_order cancel sigscript: pushData(sig 65B) + pushData(pk 32B) + Op0 + pushData(243B RS)
+///   = 66 + 33 + 1 + 3 + 243 = 346.
+const SWAP_CANCEL_SS_SIZE: u64 = 346;
 
 
 /// buy_v13 fill sigscript: 4 opcodes + pushData(387) = 4 + 3 + 387 = 394.
@@ -167,6 +173,18 @@ pub enum EstimateCommand {
         /// Amount to lock as collateral (in sompi).
         #[arg(long)]
         amount: u64,
+    },
+    /// Estimate fee for deploying a swap order (swap_order, 243B RS).
+    DeploySwap {
+        /// Amount of source tokens to lock (in sompi).
+        #[arg(long)]
+        amount: u64,
+    },
+    /// Estimate fee for cancelling a swap order.
+    CancelSwap {
+        /// Swap order UTXO value in sompi.
+        #[arg(long)]
+        order_value: u64,
     },
 }
 
@@ -687,6 +705,73 @@ fn estimate_option(option_type: &str, amount: u64) -> FeeEstimate {
     build_estimate(&label, inputs, outputs)
 }
 
+fn estimate_deploy_swap(amount: u64) -> FeeEstimate {
+    let _rs_size = SWAP_RS_SIZE;
+    let label = "deploy-swap (swap_order)".to_string();
+
+    // Swap deploy: 1 token input (covenant lineage) + 1 wallet input for fee
+    let wallet_value = amount + 10_000;
+    let inputs = vec![
+        InputEstimate {
+            label: "token P2PK/P2SH".to_string(),
+            sigscript_size: WALLET_INPUT_SS_SIZE,
+            sig_ops: 1,
+            value: wallet_value,
+        },
+        InputEstimate {
+            label: "fee P2PK".to_string(),
+            sigscript_size: WALLET_INPUT_SS_SIZE,
+            sig_ops: 1,
+            value: 10_000,
+        },
+    ];
+
+    let outputs = vec![
+        OutputEstimate {
+            label: "swap_order P2SH".to_string(),
+            spk_size: P2SH_SPK_SIZE,
+            value: amount,
+        },
+        OutputEstimate {
+            label: "change P2PK".to_string(),
+            spk_size: P2PK_SPK_SIZE,
+            value: wallet_value - amount,
+        },
+    ];
+
+    build_estimate(&label, inputs, outputs)
+}
+
+fn estimate_cancel_swap(order_value: u64) -> FeeEstimate {
+    let label = "cancel-swap (swap_order)".to_string();
+
+    let inputs = vec![
+        InputEstimate {
+            label: "swap_order P2SH".to_string(),
+            sigscript_size: SWAP_CANCEL_SS_SIZE,
+            sig_ops: 1, // cancel path has CheckSigVerify
+            value: order_value,
+        },
+        InputEstimate {
+            label: "fee P2PK".to_string(),
+            sigscript_size: WALLET_INPUT_SS_SIZE,
+            sig_ops: 1,
+            value: 10_000,
+        },
+    ];
+
+    let return_value = order_value.saturating_sub(10_000);
+    let outputs = vec![
+        OutputEstimate {
+            label: "owner P2PK".to_string(),
+            spk_size: P2PK_SPK_SIZE,
+            value: return_value,
+        },
+    ];
+
+    build_estimate(&label, inputs, outputs)
+}
+
 // Public Entry Point
 
 /// Run the estimate-fee command (no network/wallet needed).
@@ -749,6 +834,20 @@ pub fn run(cmd: &EstimateCommand) {
                 std::process::exit(1);
             }
             estimate_option(option_type, *amount)
+        }
+        EstimateCommand::DeploySwap { amount } => {
+            if *amount == 0 {
+                error!("amount must be > 0");
+                std::process::exit(1);
+            }
+            estimate_deploy_swap(*amount)
+        }
+        EstimateCommand::CancelSwap { order_value } => {
+            if *order_value == 0 {
+                error!("order_value must be > 0");
+                std::process::exit(1);
+            }
+            estimate_cancel_swap(*order_value)
         }
     };
 

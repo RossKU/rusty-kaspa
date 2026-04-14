@@ -40,6 +40,7 @@ pub mod wallet;
 pub mod wallet_send;
 pub mod prediction;
 pub mod insurance;
+pub mod swap;
 pub mod watch;
 
 use clap::Subcommand;
@@ -813,6 +814,16 @@ pub enum Commands {
     Insurance {
         #[command(subcommand)]
         action: insurance::InsuranceCommand,
+    },
+
+    /// Cross-token swap: deploy, cancel, info.
+    ///
+    /// Lock source tokens and specify a target token + minimum receive amount.
+    /// A matcher routes through KAS-denominated order books to deliver target
+    /// tokens in a single atomic TX.
+    Swap {
+        #[command(subcommand)]
+        action: swap::SwapCommand,
     },
 }
 
@@ -3006,6 +3017,9 @@ pub async fn dispatch(
         },
         Commands::Insurance { action } => {
             insurance::run(wallet_path, node, network, fee, &action).await?;
+        }
+        Commands::Swap { action } => {
+            swap::run(wallet_path, node, network, &action).await?;
         }
     }
 

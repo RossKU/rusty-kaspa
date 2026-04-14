@@ -226,6 +226,7 @@ pub async fn run_engine(
             };
             let shared_market_tracker = Arc::new(Mutex::new(matcher::prediction_tracker::MarketTracker::new()));
             let shared_dca_book = Arc::new(Mutex::new(matcher::dca_book::DcaBook::new()));
+            let shared_swap_book = Arc::new(Mutex::new(matcher::swap_book::SwapBook::new()));
 
             // Start API server if port > 0
             let (ws_broadcaster, shared_state_for_executor) = if api_port > 0 {
@@ -373,6 +374,7 @@ pub async fn run_engine(
                 shared_prediction_book,
                 shared_market_tracker,
                 shared_dca_book,
+                shared_swap_book,
             )
             .await;
         }

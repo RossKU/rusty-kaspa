@@ -1335,6 +1335,8 @@ pub struct ScanCounters {
     pub prediction_removed: usize,
     pub dca_added: usize,
     pub dca_removed: usize,
+    pub swap_added: usize,
+    pub swap_removed: usize,
 }
 
 /// Process a batch of transactions using the multi-product scanner.
@@ -1380,11 +1382,12 @@ fn process_block_txs_all(
     current_daa: u64,
     mut ifd_book: Option<&mut crate::matcher::ifd::IfdBook>,
     mut dca_book: Option<&mut crate::matcher::dca_book::DcaBook>,
+    mut swap_book: Option<&mut crate::matcher::swap_book::SwapBook>,
     mut reorg_collector: Option<&mut ReorgCollector>,
 ) -> ScanCounters {
     let mut counters = ScanCounters::default();
 
-    // Collect perp/lending/prediction outpoints for spent detection.
+    // Collect perp/lending/prediction/swap outpoints for spent detection.
     let perp_outpoints: HashSet<String> = {
         let mut set = HashSet::new();
         for key in perp_book.all_outpoint_keys() {
@@ -1403,6 +1406,10 @@ fn process_block_txs_all(
     let dca_outpoints: HashSet<String> = dca_book
         .as_ref()
         .map(|db| db.all_outpoint_keys())
+        .unwrap_or_default();
+    let swap_outpoints: HashSet<String> = swap_book
+        .as_ref()
+        .map(|sb| sb.all_outpoint_keys())
         .unwrap_or_default();
 
     for tx in txs {
@@ -1473,6 +1480,16 @@ fn process_block_txs_all(
                 db.remove(key);
             }
             counters.dca_removed += 1;
+        }
+
+        // Swap book
+        let swap_spent = BlockScanner::find_spent_in_keys(tx, &swap_outpoints);
+        for key in &swap_spent {
+            info!("[SCANNER-ALL] Swap order spent: {}", &key[..key.len().min(20)]);
+            if let Some(ref mut sb) = swap_book {
+                sb.remove(key);
+            }
+            counters.swap_removed += 1;
         }
 
         // Phase 2: Detect new deploys (all products)
@@ -1824,6 +1841,48 @@ fn process_block_txs_all(
                     counters.dca_added += 1;
                 }
             }
+            ScanResult::Swap(parsed, p2sh_idx, p2sh_value) => {
+                let outpoint_key = format!("{}:{}", tx.tx_id, p2sh_idx);
+                if let Some(ref mut sb) = swap_book {
+                    if sb.contains(&outpoint_key) {
+                        continue; // dedup
+                    }
+                    let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
+                    // Extract owner SPK from the deploy TX outputs.
+                    let owner_spk = crate::matcher::scanner::extract_owner_spk(tx, &parsed.owner_spk_hash);
+                    if owner_spk.is_none() {
+                        debug!(
+                            "[SWAP] owner_spk not found in deploy TX for {}:{} — fill will be deferred",
+                            &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                        );
+                    }
+                    let entry = crate::matcher::swap_book::SwapEntry {
+                        tx_id: tx.tx_id.clone(),
+                        index: p2sh_idx,
+                        value: p2sh_value,
+                        source_cov_id: hex::encode(parsed.source_token_cov_id),
+                        target_cov_id: hex::encode(parsed.target_token_cov_id),
+                        min_target_amount: parsed.min_target_amount,
+                        owner_hash: hex::encode(parsed.owner_hash),
+                        owner_spk_hash: hex::encode(parsed.owner_spk_hash),
+                        receipt_cov_id: hex::encode(parsed.receipt_cov_id),
+                        redeem_script_hex: hex::encode(&parsed.redeem_script),
+                        p2sh_script_hex: hex::encode(&p2sh_spk.script()),
+                        p2sh_version: p2sh_spk.version,
+                        discovered_daa: current_daa,
+                        owner_spk,
+                    };
+                    info!(
+                        "[SCANNER-ALL] Discovered swap order: {} source={} target={} min_ta={}",
+                        &outpoint_key[..outpoint_key.len().min(20)],
+                        &entry.source_cov_id[..entry.source_cov_id.len().min(12)],
+                        &entry.target_cov_id[..entry.target_cov_id.len().min(12)],
+                        parsed.min_target_amount,
+                    );
+                    sb.add(entry);
+                    counters.swap_added += 1;
+                }
+            }
         }
     }
 
@@ -1974,6 +2033,7 @@ async fn scan_new_blocks(
                 current_daa,
                 None, // No IFD book in scan_new_blocks (unused path)
                 None, // No DCA book in scan_new_blocks
+                None, // No swap book in scan_new_blocks
                 None, // No reorg collector in catchup path
             );
 
@@ -1987,13 +2047,16 @@ async fn scan_new_blocks(
             total_counters.prediction_removed += counters.prediction_removed;
             total_counters.dca_added += counters.dca_added;
             total_counters.dca_removed += counters.dca_removed;
+            total_counters.swap_added += counters.swap_added;
+            total_counters.swap_removed += counters.swap_removed;
         }
     }
 
     let any_found = total_counters.spot_added > 0
         || total_counters.perp_added > 0
         || total_counters.lending_added > 0
-        || total_counters.prediction_added > 0;
+        || total_counters.prediction_added > 0
+        || total_counters.swap_added > 0;
     let any_removed = total_counters.spot_removed > 0
         || total_counters.perp_removed > 0
         || total_counters.lending_removed > 0
@@ -2288,7 +2351,7 @@ async fn run_scan_cycle(
     order_book: &mut OrderBook,
     config: &AppConfig,
     spent_tracker: &mut SpentTracker,
-    enable_cross_pair: bool,
+    _enable_cross_pair: bool,
     allow_self_trade: bool,
     ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
     shared_state: Option<&AppState>,
@@ -2300,6 +2363,7 @@ async fn run_scan_cycle(
     prediction_book: &Arc<Mutex<crate::matcher::prediction_book::PredictionBook>>,
     market_tracker: &Arc<Mutex<crate::matcher::prediction_tracker::MarketTracker>>,
     dca_book: &Arc<Mutex<crate::matcher::dca_book::DcaBook>>,
+    swap_book: &Arc<Mutex<crate::matcher::swap_book::SwapBook>>,
 ) -> Vec<MatchResult> {
     let mut results = Vec::new();
 
@@ -2472,6 +2536,11 @@ async fn run_scan_cycle(
                     &sells, &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
+            }
+            matching::GroupKind::CrossSwap => {
+                // Cross-swap groups are handled in Phase 3, not here.
+                warn!("[UNIFIED] Unexpected CrossSwap group in Phase 1, skipping");
+                continue;
             }
         };
 
@@ -2696,158 +2765,76 @@ async fn run_scan_cycle(
     }
 
 
-    // Phase 2: Triangular (3-hop) arbitrage via batch engine
-    // (Cross-pair batch moved to Phase 0 above to avoid order starvation.)
-    if enable_cross_pair {
-        let tri_groups = matching::find_triangular_batch_groups(order_book, 5, allow_self_trade);
+    // Phase 2: Cross-book swap routing (replaces old TRI-BATCH)
 
-        if tri_groups.is_empty() {
-            info!("[SCAN] No triangular arbitrage routes found");
-        } else {
-            info!(
-                "[SCAN] Found {} triangular batch group(s)",
-                tri_groups.len(),
+
+    // Phase 3: Cross-book swap routing
+    //
+    // For each swap order in the swap book, find counterparties on BOTH
+    // the source TOKEN/KAS book and the target TOKEN/KAS book, then build
+    // an atomic TX with all 3 orders + matcher wallet.
+    {
+        let swab = swap_book.lock().await;
+        if !swab.is_empty() {
+            // Collect currently spent/used outpoints for exclusion.
+            let swap_spent_keys = spent_tracker.spent_keys();
+            let swap_groups = matching::match_swap_routes(
+                order_book, &swab, Some(&swap_spent_keys), &std::collections::HashSet::new(),
             );
+            drop(swab);
 
-            for group in &tri_groups {
+            if !swap_groups.is_empty() {
                 info!(
-                    "[TRI-BATCH] Planning batch: {} sells + {} buys, surplus={}",
-                    group.sells.len(),
-                    group.buys.len(),
-                    group.total_surplus,
+                    "[SCAN] Found {} cross-book swap route(s)",
+                    swap_groups.len(),
+                );
+            }
+
+            for sg in &swap_groups {
+                info!(
+                    "[SWAP-ROUTE] swap={} buy_source={} sell_target={} kas_flow={} surplus={}",
+                    &sg.swap.outpoint_key()[..sg.swap.outpoint_key().len().min(20)],
+                    &sg.buy_source.outpoint_key()[..sg.buy_source.outpoint_key().len().min(20)],
+                    &sg.sell_target.outpoint_key()[..sg.sell_target.outpoint_key().len().min(20)],
+                    sg.kas_flow,
+                    sg.surplus,
                 );
 
-                // Convert BookOrders to BatchOrders (same logic as Phase 2)
-                let mut sells = Vec::new();
-                let mut buys = Vec::new();
-                let mut skip_group = false;
-
-                for sell in &group.sells {
-                    let sell_rs = hex::decode(&sell.redeem_script_hex).unwrap_or_default();
-                    let token_bytes: [u8; 32] = match hex::decode(&sell.token_cov_id) {
-                        Ok(v) if v.len() == 32 => {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&v);
-                            arr
-                        }
-                        _ => {
-                            warn!("[TRI-BATCH] Invalid sell token_cov_id hex, skipping group");
-                            skip_group = true;
-                            break;
-                        }
-                    };
-                    if sell_rs.len() != SELL_RS_SIZE && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
-                        warn!("[TRI-BATCH] Unsupported sell RS size {}, skipping group (v14={}, oco={})", sell_rs.len(), SELL_RS_SIZE, kob_core::OCO_SELL_RS_SIZE);
-                        skip_group = true;
-                        break;
+                // Convert counterparty orders to BatchOrders
+                let buy_source_batch = match book_order_to_batch_order(&sg.buy_source, "SWAP-BUY") {
+                    Some(o) => o,
+                    None => {
+                        spent_tracker.mark_failed(&sg.buy_source.outpoint_key());
+                        continue;
                     }
-                    let sell_version = 14u8;
-                    let (seller_spk_ver, seller_spk) = match sell.resolve_counterparty_spk() {
-                        Some(x) => x,
-                        None => {
-                            warn!("[TRI-BATCH] Sell order {} missing counterparty_spk, skipping group", sell.outpoint_key());
-                            skip_group = true;
-                            break;
-                        }
-                    };
-                    sells.push(crate::matcher::batch::BatchOrder {
-                        outpoint: (sell.tx_id.clone(), sell.index),
-                        order_type: crate::matcher::batch::OrderType::Sell,
-                        version: sell_version,
-                        token_cov_id: token_bytes,
-                        price_num: sell.price_num,
-                        price_den: sell.price_den,
-                        amount: sell.value,
-                        redeem_script: sell_rs,
-                        utxo_value: sell.value,
-                        counterparty_spk: seller_spk,
-                        counterparty_spk_version: seller_spk_ver,
-                        oco_path: sell.oco_path,
-                    });
-                }
-
-                if skip_group {
-                    for sell in &group.sells {
-                        spent_tracker.mark_failed(&sell.outpoint_key());
+                };
+                let sell_target_batch = match book_order_to_batch_order(&sg.sell_target, "SWAP-SELL") {
+                    Some(o) => o,
+                    None => {
+                        spent_tracker.mark_failed(&sg.sell_target.outpoint_key());
+                        continue;
                     }
-                    continue;
-                }
+                };
 
-                for buy in &group.buys {
-                    let buy_rs = hex::decode(&buy.redeem_script_hex).unwrap_or_default();
-                    let token_bytes: [u8; 32] = match hex::decode(&buy.token_cov_id) {
-                        Ok(v) if v.len() == 32 => {
-                            let mut arr = [0u8; 32];
-                            arr.copy_from_slice(&v);
-                            arr
-                        }
-                        _ => {
-                            warn!("[TRI-BATCH] Invalid buy token_cov_id hex, skipping group");
-                            skip_group = true;
-                            break;
-                        }
-                    };
-                    if buy_rs.len() != BUY_RS_SIZE && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
-                        warn!("[TRI-BATCH] Unsupported buy RS size {}, skipping group (v14={}, v15={})", buy_rs.len(), BUY_RS_SIZE, kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN);
-                        skip_group = true;
-                        break;
-                    }
-                    let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN { 15u8 } else { 14u8 };
-                    let (buyer_spk_ver, buyer_spk) = match buy.resolve_counterparty_spk() {
-                        Some(x) => x,
-                        None => {
-                            warn!("[TRI-BATCH] Buy order {} missing counterparty_spk, skipping group", buy.outpoint_key());
-                            skip_group = true;
-                            break;
-                        }
-                    };
-                    buys.push(crate::matcher::batch::BatchOrder {
-                        outpoint: (buy.tx_id.clone(), buy.index),
-                        order_type: crate::matcher::batch::OrderType::Buy,
-                        version: buy_version,
-                        token_cov_id: token_bytes,
-                        price_num: buy.price_num,
-                        price_den: buy.price_den,
-                        amount: buy.value,
-                        redeem_script: buy_rs,
-                        utxo_value: buy.value,
-                        counterparty_spk: buyer_spk,
-                        counterparty_spk_version: buyer_spk_ver,
-                        oco_path: None,
-                    });
-                }
-
-                if skip_group || sells.is_empty() || buys.is_empty() {
-                    for sell in &group.sells {
-                        spent_tracker.mark_failed(&sell.outpoint_key());
-                    }
-                    for buy in &group.buys {
-                        spent_tracker.mark_failed(&buy.outpoint_key());
-                    }
-                    continue;
-                }
-
-                // Acquire wallet UTXOs for fee payment and token unit search
-                let tri_utxos = match rpc
+                // Acquire wallet UTXOs
+                let utxos = match rpc
                     .get_spendable_utxos(&config.address, Some(0))
                     .await
                 {
                     Ok(u) if !u.is_empty() => u,
                     Ok(_) => {
-                        warn!("[TRI-BATCH] No wallet UTXOs available, skipping");
+                        warn!("[SWAP-ROUTE] No wallet UTXOs available, skipping");
                         continue;
                     }
                     Err(e) => {
-                        warn!("[TRI-BATCH] Failed to get wallet UTXOs: {}, skipping", e);
+                        warn!("[SWAP-ROUTE] Failed to get wallet UTXOs: {}, skipping", e);
                         continue;
                     }
                 };
-                let (wallet_spk_version, wallet_spk_script) = tri_utxos[0].parse_spk();
-
-                // Find the best wallet UTXO for fee payment
+                let (wallet_spk_version, wallet_spk_script) = utxos[0].parse_spk();
                 let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
                 let token_p2sh_hex = hex::encode(&token_p2sh.script());
-                let wallet_utxo = tri_utxos.iter()
+                let wallet_utxo = utxos.iter()
                     .filter(|u| {
                         let (_, script) = u.parse_spk();
                         hex::encode(&script) != token_p2sh_hex
@@ -2856,15 +2843,20 @@ async fn run_scan_cycle(
                     .max_by_key(|u| u.utxo_entry.amount)
                     .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-                // Plan and execute via batch engine (sell inputs provide covenant lineage)
-                let mut plan = match crate::matcher::batch::plan_batch_match(
-                    &sells, &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version,
-                    Some(config.fee_bps),
-                ) {
+                // Plan: Use plan_batch_match with the buy-source and sell-target
+                // as the buy and sell legs. The swap UTXO is handled specially.
+                let plan_result = crate::matcher::batch::plan_batch_match(
+                    &[sell_target_batch], &[buy_source_batch], wallet_utxo,
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                );
+
+                let mut plan = match plan_result {
                     Ok(p) => p,
                     Err(e) => {
-                        warn!("[TRI-BATCH] Plan failed: {}, skipping group", e);
+                        warn!("[SWAP-ROUTE] Plan failed: {}, skipping", e);
+                        spent_tracker.mark_failed(&sg.swap.outpoint_key());
+                        spent_tracker.mark_failed(&sg.buy_source.outpoint_key());
+                        spent_tracker.mark_failed(&sg.sell_target.outpoint_key());
                         continue;
                     }
                 };
@@ -2872,86 +2864,87 @@ async fn run_scan_cycle(
                 match execute_batch_match(rpc, &mut plan, config, spent_tracker, None).await {
                     Some(batch_result) => {
                         info!(
-                            "[TRI-BATCH] SUCCESS: tx={} sells={} buys={} surplus={}",
+                            "[SWAP-ROUTE] SUCCESS: tx={} kas_flow={} surplus={}",
                             &batch_result.tx_id[..batch_result.tx_id.len().min(16)],
-                            batch_result.sell_count,
-                            batch_result.buy_count,
-                            batch_result.matcher_surplus,
+                            sg.kas_flow,
+                            sg.surplus,
                         );
-                        for sell in &group.sells {
-                            let sk = sell.outpoint_key();
-                            if let Some(ws) = ws_tx {
-                                crate::matcher::api::emit_order_filled(
-                                    ws, &sell.owner_hash, &sk,
-                                    &batch_result.tx_id,
-                                    sell.price_num, sell.price_den,
-                                    sell.value, OrderSide::Sell,
-                                    &sell.token_cov_id,
-                                );
-                            }
-                            // Record triangular sell leg trade
-                            record_trade(
-                                shared_state,
+
+                        // Mark all 3 orders as spent
+                        spent_tracker.mark_spent(&sg.swap.outpoint_key());
+                        spent_tracker.mark_spent(&sg.buy_source.outpoint_key());
+                        spent_tracker.mark_spent(&sg.sell_target.outpoint_key());
+
+                        // Emit events for counterparty orders
+                        if let Some(ws) = ws_tx {
+                            crate::matcher::api::emit_order_filled(
+                                ws, &sg.buy_source.owner_hash, &sg.buy_source.outpoint_key(),
                                 &batch_result.tx_id,
-                                &sell.token_cov_id,
-                                sell.price_num, sell.price_den,
-                                sell.value,
-                                Side::Sell,
-                                None,
-                            ).await;
-                            // Use BookOrder clone partner key directly (C5 fix).
-                            let sell_oco_partner = sell.oco_partner_key.clone();
-                            // Mark as spent; scanner removes on confirmation
-                            spent_tracker.mark_spent(&sk);
-                            // Mark OCO partner as spent so it cannot match while pending
-                            if let Some(ref partner_key) = sell_oco_partner {
-                                spent_tracker.mark_spent(partner_key);
-                                info!("[OCO] Marked partner spent (pending): {}", partner_key);
-                            }
-                        }
-                        for buy in &group.buys {
-                            let bk = buy.outpoint_key();
-                            if let Some(ws) = ws_tx {
-                                crate::matcher::api::emit_order_filled(
-                                    ws, &buy.owner_hash, &bk,
-                                    &batch_result.tx_id,
-                                    buy.price_num, buy.price_den,
-                                    buy.value, OrderSide::Buy,
-                                    &buy.token_cov_id,
-                                );
-                            }
-                            // Record triangular buy leg trade
-                            record_trade(
-                                shared_state,
+                                sg.buy_source.price_num, sg.buy_source.price_den,
+                                sg.buy_source.value, OrderSide::Buy,
+                                &sg.buy_source.token_cov_id,
+                            );
+                            crate::matcher::api::emit_order_filled(
+                                ws, &sg.sell_target.owner_hash, &sg.sell_target.outpoint_key(),
                                 &batch_result.tx_id,
-                                &buy.token_cov_id,
-                                buy.price_num, buy.price_den,
-                                buy.value,
-                                Side::Buy,
-                                None,
-                            ).await;
-                            // Mark as spent; scanner removes on confirmation
-                            spent_tracker.mark_spent(&bk);
+                                sg.sell_target.price_num, sg.sell_target.price_den,
+                                sg.sell_target.value, OrderSide::Sell,
+                                &sg.sell_target.token_cov_id,
+                            );
                         }
+
+                        // Record trades for both legs
+                        record_trade(
+                            shared_state,
+                            &batch_result.tx_id,
+                            &sg.buy_source.token_cov_id,
+                            sg.buy_source.price_num, sg.buy_source.price_den,
+                            sg.buy_source.value,
+                            Side::Buy,
+                            None,
+                        ).await;
+                        record_trade(
+                            shared_state,
+                            &batch_result.tx_id,
+                            &sg.sell_target.token_cov_id,
+                            sg.sell_target.price_num, sg.sell_target.price_den,
+                            sg.sell_target.value,
+                            Side::Sell,
+                            None,
+                        ).await;
+
+                        // Mark wallet outpoint as spent
                         if let Some(ref wu) = plan.wallet_input {
                             let wk = format!("{}:{}", wu.0, wu.1);
                             spent_tracker.mark_spent(&wk);
                         }
+
+                        // Push MatchResult for stop/trailing stop triggers
+                        results.push(MatchResult {
+                            match_tx_id: batch_result.tx_id.clone(),
+                            match_type: MatchType::Full,
+                            seller_kas: sg.kas_flow,
+                            buyer_tokens: sg.sell_target.value,
+                            receipt_tx_id: batch_result.tx_id.clone(),
+                            receipt_idx: 0,
+                            receipt_value: 0,
+                            token_cov_id: sg.sell_target.token_cov_id.clone(),
+                            price_num: sg.sell_target.price_num,
+                            price_den: sg.sell_target.price_den,
+                        });
                     }
                     None => {
-                        warn!("[TRI-BATCH] Batch execution failed");
-                        for sell in &group.sells {
-                            spent_tracker.mark_failed(&sell.outpoint_key());
-                        }
-                        for buy in &group.buys {
-                            spent_tracker.mark_failed(&buy.outpoint_key());
-                        }
+                        warn!("[SWAP-ROUTE] Execution failed for swap group");
+                        spent_tracker.mark_failed(&sg.swap.outpoint_key());
+                        spent_tracker.mark_failed(&sg.buy_source.outpoint_key());
+                        spent_tracker.mark_failed(&sg.sell_target.outpoint_key());
                     }
                 }
             }
+        } else {
+            drop(swab);
         }
     }
-
 
     // Phase 4: Perp matching
     {
@@ -4133,6 +4126,7 @@ pub async fn run_continuous_with_ws(
     shared_prediction_book: Arc<Mutex<crate::matcher::prediction_book::PredictionBook>>,
     shared_market_tracker: Arc<Mutex<crate::matcher::prediction_tracker::MarketTracker>>,
     shared_dca_book: Arc<Mutex<crate::matcher::dca_book::DcaBook>>,
+    shared_swap_book: Arc<Mutex<crate::matcher::swap_book::SwapBook>>,
 ) {
     info!("======================================================================");
     info!("KOB MATCHER BOT -- CONTINUOUS MODE (HARDENED)");
@@ -4176,6 +4170,7 @@ pub async fn run_continuous_with_ws(
     let perp_book_path = format!("{}.perp.json", orderbook_path);
     let lending_book_path = format!("{}.lending.json", orderbook_path);
     let prediction_book_path = format!("{}.prediction.json", orderbook_path);
+    let swap_book_path = format!("{}.swap.json", orderbook_path);
 
     let mut cycle = 0u64;
     let mut spent_tracker = SpentTracker::new();
@@ -4460,6 +4455,7 @@ pub async fn run_continuous_with_ws(
                 let mut pred = shared_prediction_book.lock().await;
                 let mut ib = shared_ifd_book.lock().await;
                 let mut dcab = shared_dca_book.lock().await;
+                let mut swab = shared_swap_book.lock().await;
 
                 for (block_hash, txs) in &block_txs_batch {
                     // Create a ReorgCollector to track provenance for this block.
@@ -4470,6 +4466,7 @@ pub async fn run_continuous_with_ws(
                         txs, &mut ob, &scanner, &mut pb, &mut lb, &mut pred,
                         ws_tx.as_ref(), current_daa, Some(&mut ib),
                         Some(&mut dcab),
+                        Some(&mut swab),
                         collector.as_mut(),
                     );
 
@@ -4495,6 +4492,8 @@ pub async fn run_continuous_with_ws(
                     total_counters.prediction_removed += counters.prediction_removed;
                     total_counters.dca_added += counters.dca_added;
                     total_counters.dca_removed += counters.dca_removed;
+                    total_counters.swap_added += counters.swap_added;
+                    total_counters.swap_removed += counters.swap_removed;
                 }
             }
 
@@ -4503,14 +4502,15 @@ pub async fn run_continuous_with_ws(
                     || total_counters.perp_added > 0
                     || total_counters.lending_added > 0
                     || total_counters.prediction_added > 0
-                    || total_counters.dca_added > 0;
+                    || total_counters.dca_added > 0
+                    || total_counters.swap_added > 0;
                 if any_found {
                     info!(
-                        "[NOTIFY] Processed {} block(s): spot(+{}), perp(+{}), lending(+{}), prediction(+{}), dca(+{})",
+                        "[NOTIFY] Processed {} block(s): spot(+{}), perp(+{}), lending(+{}), prediction(+{}), dca(+{}), swap(+{})",
                         blocks_processed,
                         total_counters.spot_added, total_counters.perp_added,
                         total_counters.lending_added, total_counters.prediction_added,
-                        total_counters.dca_added,
+                        total_counters.dca_added, total_counters.swap_added,
                     );
                 } else {
                     debug!("[NOTIFY] Processed {} block(s), no new orders", blocks_processed);
@@ -4530,7 +4530,7 @@ pub async fn run_continuous_with_ws(
         let rpc_lock = rpc.lock().await;
         let scan_result = {
             let mut ob = order_book.lock().await;
-            run_scan_cycle(&rpc_lock, &mut ob, config, &mut spent_tracker, enable_cross_pair, allow_self_trade, ws_tx.as_ref(), shared_state.as_ref(), &shared_ifd_book, &shared_perp_book, &shared_perp_tracker, &shared_lending_book, &shared_loan_tracker, &shared_prediction_book, &shared_market_tracker, &shared_dca_book).await
+            run_scan_cycle(&rpc_lock, &mut ob, config, &mut spent_tracker, enable_cross_pair, allow_self_trade, ws_tx.as_ref(), shared_state.as_ref(), &shared_ifd_book, &shared_perp_book, &shared_perp_tracker, &shared_lending_book, &shared_loan_tracker, &shared_prediction_book, &shared_market_tracker, &shared_dca_book, &shared_swap_book).await
         };
 
         // Receipt chaining: the receipt from the last successful match
@@ -4744,6 +4744,12 @@ pub async fn run_continuous_with_ws(
                     warn!("Failed to save prediction book: {}", e);
                 }
             }
+            {
+                let swab = shared_swap_book.lock().await;
+                if let Err(e) = persistence::save_swap_book(&swap_book_path, &swab) {
+                    warn!("Failed to save swap book: {}", e);
+                }
+            }
         }
 
         if shutdown.load(std::sync::atomic::Ordering::SeqCst) {
@@ -4801,7 +4807,13 @@ pub async fn run_continuous_with_ws(
             warn!("Failed to save prediction book on shutdown: {}", e);
         }
     }
-    info!("[SHUTDOWN] Complete. All books saved (spot, perp, lending, prediction).");
+    {
+        let swab = shared_swap_book.lock().await;
+        if let Err(e) = persistence::save_swap_book(&swap_book_path, &swab) {
+            warn!("Failed to save swap book on shutdown: {}", e);
+        }
+    }
+    info!("[SHUTDOWN] Complete. All books saved (spot, perp, lending, prediction, swap).");
 }
 
 // Dry-run Mode
@@ -4863,33 +4875,14 @@ pub async fn run_dry_run(
         info!("    {}...: {} bids, {} asks", ps.token_cov_id, ps.bids, ps.asks);
     }
 
-    let all_pairs = matching::find_all_crossing_pairs(&ob);
-    info!("  Same-pair crossing pairs: {}", all_pairs.len());
+    let all_groups = matching::match_book_direct(&ob, false, None);
+    info!("  Same-pair batch groups: {}", all_groups.len());
 
-    for (i, p) in all_pairs.iter().enumerate() {
+    for (i, g) in all_groups.iter().enumerate() {
         info!(
-            "  [{}] [{}...] BUY {} @ {}/{} x SELL {} @ {}/{} -> surplus {} ({:?})",
+            "  [{}] kind={:?} sells={} buys={} surplus={}",
             i,
-            &p.token_cov_id[..p.token_cov_id.len().min(12)],
-            p.buy.value,
-            p.buy.price_num,
-            p.buy.price_den,
-            p.sell.value,
-            p.sell.price_num,
-            p.sell.price_den,
-            p.surplus,
-            p.match_type,
-        );
-    }
-
-    // Cross-pair batch groups (unified through batch engine)
-    let cross_groups = matching::find_cross_pair_batch_groups(&ob, 20, false, None);
-    info!("  Cross-pair batch groups: {}", cross_groups.len());
-
-    for (i, g) in cross_groups.iter().enumerate() {
-        info!(
-            "  [X{}] {} sells + {} buys, total_surplus={}",
-            i,
+            g.kind,
             g.sells.len(),
             g.buys.len(),
             g.total_surplus,

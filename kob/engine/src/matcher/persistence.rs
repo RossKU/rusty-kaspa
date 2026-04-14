@@ -457,6 +457,38 @@ pub fn load_prediction_book(path: &str) -> Result<crate::matcher::prediction_boo
     info!("[PREDICTION BOOK] Loaded from {} ({} markets)", path, book.market_count());
     Ok(book)
 }
+
+// Swap book persistence
+
+/// Save the swap book to a JSON file (atomic write).
+pub fn save_swap_book(path: &str, book: &crate::matcher::swap_book::SwapBook) -> Result<(), String> {
+    let json = serde_json::to_string_pretty(&book.to_json()).map_err(|e| e.to_string())?;
+    let tmp_path = format!("{}.tmp", path);
+    std::fs::write(&tmp_path, &json)
+        .map_err(|e| format!("Failed to write {}: {}", tmp_path, e))?;
+    std::fs::rename(&tmp_path, path)
+        .map_err(|e| format!("Failed to rename {} -> {}: {}", tmp_path, path, e))?;
+    info!("[SWAP BOOK] Saved to disk ({})", path);
+    Ok(())
+}
+
+/// Load the swap book from a JSON file.
+pub fn load_swap_book(path: &str) -> Result<crate::matcher::swap_book::SwapBook, String> {
+    let path_ref = std::path::Path::new(path);
+    if !path_ref.exists() {
+        info!("[SWAP BOOK] No persisted file found at {}", path);
+        return Ok(crate::matcher::swap_book::SwapBook::new());
+    }
+    let data = std::fs::read_to_string(path)
+        .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+    let json: serde_json::Value = serde_json::from_str(&data)
+        .map_err(|e| format!("Failed to parse {}: {}", path, e))?;
+    let book = crate::matcher::swap_book::SwapBook::from_json(&json)
+        .ok_or_else(|| format!("Invalid swap book JSON structure in {}", path))?;
+    info!("[SWAP BOOK] Loaded from {} ({} entries)", path, book.len());
+    Ok(book)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

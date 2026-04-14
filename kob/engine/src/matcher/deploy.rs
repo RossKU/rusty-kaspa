@@ -623,7 +623,7 @@ pub async fn run_deploy_test(
     info!("Waiting 55s for deploy TX propagation + OP_CSV maturity...");
     tokio::time::sleep(std::time::Duration::from_secs(55)).await;
 
-    let crossing = {
+    let groups = {
         let ob = order_book.lock().await;
         info!("  Order book state: {} pairs, {} total bids, {} total asks",
             ob.pair_books.len(),
@@ -640,27 +640,33 @@ pub async fn run_deploy_test(
                 info!("    ASK val={} price={}/{} owner={}...", a.value, a.price_num, a.price_den, &a.owner_hash[..a.owner_hash.len().min(16)]);
             }
         }
-        #[allow(deprecated)]
-        matching::find_all_crossing_pairs_with_stp(&ob, true)
+        matching::match_book_direct(&ob, true, None)
     };
 
-    if crossing.is_empty() {
-        warn!("No crossing pairs found after deploy. (debug: allow_self_trade=true)");
+    if groups.is_empty() {
+        warn!("No matching groups found after deploy. (debug: allow_self_trade=true)");
         return;
     }
 
-    info!("Found {} crossing pair(s)", crossing.len());
-    let best = &crossing[0];
+    info!("Found {} matching group(s)", groups.len());
+    let best = &groups[0];
     info!(
-        "  Best: {:?} surplus={} seller_kas={} buyer_tokens={}",
-        best.match_type, best.surplus, best.seller_kas, best.buyer_tokens
+        "  Best: kind={:?} sells={} buys={} surplus={}",
+        best.kind, best.sells.len(), best.buys.len(), best.total_surplus
     );
 
     // Convert to batch orders and execute via batch engine
-    let (sell_order, buy_order) = match executor::pair_to_batch_orders(best, "DEPLOY-TEST") {
-        Some(orders) => orders,
+    let sell_order = match executor::book_order_to_batch_order(&best.sells[0], "DEPLOY-TEST") {
+        Some(o) => o,
         None => {
-            warn!("Failed to convert crossing pair to batch orders");
+            warn!("Failed to convert sell to batch order");
+            return;
+        }
+    };
+    let buy_order = match executor::book_order_to_batch_order(&best.buys[0], "DEPLOY-TEST") {
+        Some(o) => o,
+        None => {
+            warn!("Failed to convert buy to batch order");
             return;
         }
     };
@@ -716,8 +722,12 @@ pub async fn run_deploy_test(
             // Remove matched orders
             {
                 let mut ob = order_book.lock().await;
-                ob.remove_order(&best.buy.outpoint_key());
-                ob.remove_order(&best.sell.outpoint_key());
+                for buy in &best.buys {
+                    ob.remove_order(&buy.outpoint_key());
+                }
+                for sell in &best.sells {
+                    ob.remove_order(&sell.outpoint_key());
+                }
             }
 
             info!("======================================================================");

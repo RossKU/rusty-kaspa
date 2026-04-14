@@ -2,11 +2,6 @@
 
 use kob_core::MIN_UTXO_VALUE;
 use crate::matcher::order_book::{BookOrder, OrderBook};
-use crate::matcher::routing;
-
-/// Maximum number of bid x ask iterations per token pair before bailing out.
-/// Prevents O(n*m) explosion when both sides have many orders.
-pub const MAX_MATCH_ITERATIONS: usize = 50_000;
 
 /// A matched pair ready for execution.
 #[derive(Debug, Clone)]
@@ -37,221 +32,6 @@ pub enum MatchType {
     PartialSell,
 }
 
-/// Find all crossing pairs across all token pairs in the order book.
-///
-/// Returns crossing pairs sorted by surplus (highest first).
-/// Self-trade pairs (same owner_hash on both sides) are excluded by default.
-///
-/// **Deprecated**: Use `match_book_direct()` instead, which avoids the O(N x M)
-/// enumeration and produces `BatchGroup`s directly with FIFO ordering.
-#[deprecated(note = "Use match_book_direct() for O(N+M) FIFO-ordered matching")]
-#[allow(deprecated)]
-pub fn find_all_crossing_pairs(order_book: &OrderBook) -> Vec<CrossingPair> {
-    find_all_crossing_pairs_with_stp(order_book, false)
-}
-
-/// Find all crossing pairs with configurable self-trade prevention.
-///
-/// When `allow_self_trade` is false (default), pairs where buy.owner_hash == sell.owner_hash
-/// are skipped. Set to true only for testing.
-///
-/// Orders whose outpoint keys appear in `spent_outpoints` are excluded from
-/// matching. Pass `None` when no SpentTracker context is available (e.g. tests).
-///
-/// **Deprecated**: Use `match_book_direct()` instead.
-#[deprecated(note = "Use match_book_direct() for O(N+M) FIFO-ordered matching")]
-pub fn find_all_crossing_pairs_with_stp(order_book: &OrderBook, allow_self_trade: bool) -> Vec<CrossingPair> {
-    find_all_crossing_pairs_full(order_book, allow_self_trade, None, None)
-}
-
-/// Find all crossing pairs, filtering out orders that are tracked as locally
-/// spent by the SpentTracker. This prevents Phase 1a-consumed orders from
-/// being re-matched in Phase 1b.
-///
-/// **Deprecated**: Use `match_book_direct()` instead.
-#[deprecated(note = "Use match_book_direct() for O(N+M) FIFO-ordered matching")]
-pub fn find_all_crossing_pairs_with_spent(
-    order_book: &OrderBook,
-    allow_self_trade: bool,
-    spent_outpoints: &std::collections::HashSet<String>,
-) -> Vec<CrossingPair> {
-    find_all_crossing_pairs_full(order_book, allow_self_trade, None, Some(spent_outpoints))
-}
-
-/// Internal: find crossing pairs with optional DAA-based expiry filtering
-/// and optional SpentTracker-based exclusion.
-fn find_all_crossing_pairs_full(
-    order_book: &OrderBook,
-    allow_self_trade: bool,
-    current_daa: Option<u64>,
-    spent_outpoints: Option<&std::collections::HashSet<String>>,
-) -> Vec<CrossingPair> {
-    let mut all_pairs = Vec::new();
-
-    for (token_cov_id, book) in &order_book.pair_books {
-        let pairs = find_crossing_pairs_for_token(
-            token_cov_id,
-            book,
-            &order_book.matched_outpoints,
-            allow_self_trade,
-            current_daa,
-            spent_outpoints,
-        );
-        all_pairs.extend(pairs);
-    }
-
-    // Sort by surplus descending (best match first)
-    all_pairs.sort_by(|a, b| b.surplus.cmp(&a.surplus));
-    all_pairs
-}
-
-/// Find crossing pairs for a specific token pair.
-///
-/// Orders whose outpoint keys appear in `spent_outpoints` are excluded.
-/// This prevents orders consumed by Phase 1a batch from being re-matched
-/// in Phase 1b remaining (deferred-removal race, commit 2a346a5b).
-fn find_crossing_pairs_for_token(
-    token_cov_id: &str,
-    book: &crate::matcher::order_book::PairBook,
-    matched: &std::collections::HashMap<String, std::time::Instant>,
-    allow_self_trade: bool,
-    current_daa: Option<u64>,
-    spent_outpoints: Option<&std::collections::HashSet<String>>,
-) -> Vec<CrossingPair> {
-    let empty_set = std::collections::HashSet::new();
-    let spent = spent_outpoints.unwrap_or(&empty_set);
-    let mut pairs = Vec::new();
-
-    // Collect active bids and asks (filtered by matched set, spent tracker, and expiry)
-    let bids: Vec<&BookOrder> = book
-        .bids
-        .values()
-        .filter(|b| {
-            let key = b.outpoint_key();
-            !matched.contains_key(&key)
-                && !spent.contains(&key)
-                && !current_daa.is_some_and(|daa| b.is_expired(daa))
-        })
-        .collect();
-
-    let asks: Vec<&BookOrder> = book
-        .asks
-        .values()
-        .filter(|s| {
-            let key = s.outpoint_key();
-            !matched.contains_key(&key)
-                && !spent.contains(&key)
-                && !current_daa.is_some_and(|daa| s.is_expired(daa))
-        })
-        .collect();
-
-    if bids.is_empty() || asks.is_empty() {
-        return pairs;
-    }
-
-    let mut iterations: usize = 0;
-
-    'outer: for buy in &bids {
-        for sell in &asks {
-            iterations += 1;
-            if iterations > MAX_MATCH_ITERATIONS {
-                tracing::warn!(
-                    "[MATCHING] Iteration cap ({}) hit for pair [{}...], {} bids x {} asks. Breaking early.",
-                    MAX_MATCH_ITERATIONS,
-                    &token_cov_id[..token_cov_id.len().min(12)],
-                    bids.len(),
-                    asks.len(),
-                );
-                break 'outer;
-            }
-            // STP: skip if same owner
-            if !allow_self_trade && buy.owner_hash == sell.owner_hash {
-                continue;
-            }
-            // M-3: skip orders with zero price fields (corrupted JSON / bad state)
-            if buy.price_num == 0 || buy.price_den == 0 || sell.price_num == 0 || sell.price_den == 0 {
-                continue;
-            }
-            // Full fill computation (multiply-first arithmetic, F3 fix)
-            let buy_kas = buy.value;
-            let sell_tokens = sell.value;
-            let expected_tokens = match buy_kas.checked_mul(buy.price_num) {
-                Some(v) => v / buy.price_den,
-                None => {
-                    tracing::warn!(
-                        "u64 overflow in full fill: buy_kas={} * price_num={}, skipping pair",
-                        buy_kas, buy.price_num
-                    );
-                    continue;
-                }
-            };
-            let expected_kas = match sell_tokens.checked_mul(sell.price_num) {
-                Some(v) => v / sell.price_den,
-                None => {
-                    tracing::warn!(
-                        "u64 overflow in full fill: sell_tokens={} * price_num={}, skipping pair",
-                        sell_tokens, sell.price_num
-                    );
-                    continue;
-                }
-            };
-            // Respect buy order's max_matcher_fee: the buy contract enforces
-            // kas_in - out[0].value <= mmfee, so seller_kas >= kas_in - mmfee.
-            let mmfee_floor = buy_kas.saturating_sub(buy.max_matcher_fee);
-            let seller_kas = std::cmp::max(expected_kas, mmfee_floor);
-            let buyer_tokens = sell_tokens;
-            let total_in = match buy_kas.checked_add(sell_tokens) {
-                Some(v) => v,
-                None => {
-                    tracing::warn!(
-                        "u64 overflow in total_in: buy_kas={} + sell_tokens={}, skipping pair",
-                        buy_kas, sell_tokens
-                    );
-                    continue;
-                }
-            };
-
-            // Check for overflow: if seller_kas + buyer_tokens > total_in, skip
-            if seller_kas.checked_add(buyer_tokens).is_none_or(|sum| sum > total_in) {
-                // Prices don't cross for full fill, or overflow
-            } else {
-                let raw_surplus = total_in - seller_kas - buyer_tokens;
-                // C4 fix: cap surplus at both orders max_matcher_fee
-                let surplus = raw_surplus
-                    .min(buy.max_matcher_fee)
-                    .min(sell.max_matcher_fee);
-
-                // surplus=0 is valid when mmfee=0 (matcher pays miner fee from fee UTXOs).
-                if seller_kas >= MIN_UTXO_VALUE
-                    && buyer_tokens >= MIN_UTXO_VALUE
-                {
-                    pairs.push(CrossingPair {
-                        token_cov_id: token_cov_id.to_string(),
-                        buy: (*buy).clone(),
-                        sell: (*sell).clone(),
-                        seller_kas,
-                        buyer_tokens,
-                        surplus,
-                        expected_tokens,
-                        expected_kas,
-                        match_type: MatchType::Full,
-                        fill_kas: None,
-                        residual_kas: None,
-                        fill_token_amount: None,
-                        residual_tokens: None,
-                    });
-                }
-            }
-
-            // Check partial fill possibilities
-            if let Some(partial) = compute_partial_fill_match(token_cov_id, buy, sell) {
-                pairs.push(partial);
-            }
-        }
-    }
-
-    pairs
-}
 
 /// Minimum partial fill size to produce at least 1 unit of output after
 /// integer-division truncation (OpDiv floors).
@@ -529,71 +309,6 @@ fn compute_partial_fill_match(
 /// N=15 balances throughput with reliability.
 pub const MAX_BATCH_GROUP_SIZE: usize = 15;
 
-/// Group crossing pairs into batch-eligible groups.
-///
-/// Only **full-fill** pairs are eligible for batching (partial fills have
-/// residual outputs that complicate TX layout). Groups are partitioned by
-/// `token_cov_id` and each group contains at least 2 pairs (a single pair
-/// is handled by the remaining-pair path as a single-pair batch). Groups are capped at
-/// [`MAX_BATCH_GROUP_SIZE`] pairs due to OpN index limits.
-///
-/// Returns a vec of groups, where each group is a vec of crossing pairs
-/// that share the same token and are all full fills.
-pub fn find_batch_groups(pairs: &[CrossingPair]) -> Vec<Vec<&CrossingPair>> {
-    use std::collections::{HashMap, HashSet};
-
-    // Partition full-fill pairs by token
-    let mut by_token: HashMap<&str, Vec<&CrossingPair>> = HashMap::new();
-    for p in pairs {
-        if p.match_type != MatchType::Full {
-            continue;
-        }
-        by_token.entry(&p.token_cov_id).or_default().push(p);
-    }
-
-    let mut groups = Vec::new();
-    for (_token, token_pairs) in by_token {
-        if token_pairs.is_empty() {
-            continue;
-        }
-
-        // Sort by surplus descending so we greedily pick the most profitable pairs first
-        let mut sorted = token_pairs;
-        sorted.sort_by(|a, b| b.surplus.cmp(&a.surplus));
-
-        // Deduplicate: each outpoint (sell or buy) can appear in at most one pair.
-        // Greedy selection: pick pairs in surplus order, skip if either outpoint is already used.
-        // Split into groups of MAX_BATCH_GROUP_SIZE.
-        let mut used_outpoints = HashSet::new();
-        let mut deduped = Vec::new();
-
-        for p in &sorted {
-            let sell_key = p.sell.outpoint_key();
-            let buy_key = p.buy.outpoint_key();
-            if used_outpoints.contains(&sell_key) || used_outpoints.contains(&buy_key) {
-                continue;
-            }
-            used_outpoints.insert(sell_key);
-            used_outpoints.insert(buy_key);
-            deduped.push(*p);
-        }
-
-        for chunk in deduped.chunks(MAX_BATCH_GROUP_SIZE) {
-            if !chunk.is_empty() {
-                groups.push(chunk.to_vec());
-            }
-        }
-    }
-
-    // Sort by total surplus descending (most profitable batch first)
-    groups.sort_by(|a, b| {
-        let surplus_a: u64 = a.iter().map(|p| p.surplus).sum();
-        let surplus_b: u64 = b.iter().map(|p| p.surplus).sum();
-        surplus_b.cmp(&surplus_a)
-    });
-
-    groups
-}
 
 /// A 1:N sweep group: one large anchor order sweeps multiple fills.
 ///
@@ -644,11 +359,8 @@ pub struct SweepGroup {
 /// * `allow_self_trade` - If true, allow same-owner matches (testing only).
 /// * `spent_outpoints` - Outpoints already claimed by prior phases.
 ///
-/// **Deprecated**: Sweep detection is now integrated into `match_book_direct()`.
-/// When one bid crosses multiple asks (or vice versa), the direct traversal
-/// naturally accumulates them into a BuySweep/SellSweep group.
-#[deprecated(note = "Sweep detection is built into match_book_direct()")]
-pub fn find_sweep_groups(
+/// Sweep detection helper used internally by `match_book_direct()`.
+fn find_sweep_groups(
     order_book: &OrderBook,
     allow_self_trade: bool,
     spent_outpoints: Option<&std::collections::HashSet<String>>,
@@ -888,192 +600,6 @@ pub fn find_sweep_groups(
     groups
 }
 
-/// A cross-pair batch group containing sells and buys from different token
-/// pairs that can be matched atomically through the batch engine.
-///
-/// Each group represents one atomic batch TX: the sell orders produce KAS,
-/// and the buy orders consume KAS to acquire different tokens.
-#[derive(Debug, Clone)]
-pub struct CrossPairBatchGroup {
-    /// Sell-side orders (each sells tokens for KAS, from various pairs).
-    pub sells: Vec<BookOrder>,
-    /// Buy-side orders (each buys tokens with KAS, from various pairs).
-    pub buys: Vec<BookOrder>,
-    /// Total KAS surplus across all route legs in this group.
-    pub total_surplus: u64,
-}
-
-/// Combine same-pair crossings from different tokens into multi-pair batch groups.
-///
-/// Algorithm:
-/// 1. Find all same-pair crossings via `find_all_crossing_pairs_with_stp`.
-/// 2. Filter out orders already claimed by the BATCH path (`spent_outpoints`).
-/// 3. Keep only full-fill pairs (partials handled by REMAINING path).
-/// 4. Group by token, pick the best (highest surplus) crossing per token.
-/// 5. Combine crossings from 2+ different tokens into one `CrossPairBatchGroup`.
-///
-/// Each crossing pair adds 1 sell + 1 buy to the TX. With `MAX_BATCH_GROUP_SIZE`
-/// as the per-group cap on crossing pairs, we can fit that many token pairs plus
-/// 1 wallet input. The batch engine's `token_input_map` routes each buy's `tii`
-/// to the correct sell (same `token_cov_id`), so multi-token batches work natively.
-///
-/// # Arguments
-/// * `order_book` - The order book to scan.
-/// * `_max_routes` - Reserved for future use (capped by `MAX_BATCH_GROUP_SIZE`).
-/// * `allow_self_trade` - If true, allow same-owner matches (testing only).
-/// * `spent_outpoints` - Outpoints already claimed by BATCH or spent_tracker.
-///   Pass `None` when no prior phase has run (e.g. diagnostics, tests).
-///
-/// # Returns
-/// A vec of `CrossPairBatchGroup`s, sorted by total surplus descending.
-/// Each group contains crossings from >= 2 different token pairs.
-#[allow(deprecated)]
-pub fn find_cross_pair_batch_groups(
-    order_book: &OrderBook,
-    _max_routes: usize,
-    allow_self_trade: bool,
-    spent_outpoints: Option<&std::collections::HashSet<String>>,
-) -> Vec<CrossPairBatchGroup> {
-    use std::collections::{HashMap, HashSet};
-
-    let all_pairs = find_all_crossing_pairs_with_stp(order_book, allow_self_trade);
-    if all_pairs.is_empty() {
-        return Vec::new();
-    }
-
-    let empty_set = HashSet::new();
-    let spent = spent_outpoints.unwrap_or(&empty_set);
-
-    // Step 1: Filter to full-fill pairs not already claimed.
-    // Step 2: Group by token, keeping best (highest surplus) per token.
-    // Each outpoint may appear in multiple CrossingPair candidates; we
-    // track used outpoints to avoid double-spending across tokens.
-    let mut best_by_token: HashMap<&str, &CrossingPair> = HashMap::new();
-
-    for p in &all_pairs {
-        if p.match_type != MatchType::Full {
-            continue;
-        }
-        let bk = p.buy.outpoint_key();
-        let sk = p.sell.outpoint_key();
-        if spent.contains(&bk) || spent.contains(&sk) {
-            continue;
-        }
-        let entry = best_by_token
-            .entry(&p.token_cov_id)
-            .or_insert(p);
-        if p.surplus > entry.surplus {
-            *entry = p;
-        }
-    }
-
-    // Need crossings from at least 2 different tokens to form a cross-pair group.
-    if best_by_token.len() < 2 {
-        return Vec::new();
-    }
-
-    // Step 3: Sort candidates by surplus descending, then deduplicate outpoints.
-    let mut candidates: Vec<&CrossingPair> = best_by_token.values().copied().collect();
-    candidates.sort_by(|a, b| b.surplus.cmp(&a.surplus));
-
-    let mut used_outpoints = HashSet::new();
-    let mut deduped: Vec<&CrossingPair> = Vec::new();
-
-    for p in &candidates {
-        let bk = p.buy.outpoint_key();
-        let sk = p.sell.outpoint_key();
-        if used_outpoints.contains(&bk) || used_outpoints.contains(&sk) {
-            continue;
-        }
-        used_outpoints.insert(bk);
-        used_outpoints.insert(sk);
-        deduped.push(p);
-    }
-
-    // After dedup, still need >= 2 different tokens.
-    if deduped.len() < 2 {
-        return Vec::new();
-    }
-
-    // Step 4: Chunk into groups of MAX_BATCH_GROUP_SIZE crossing pairs.
-    // Each crossing pair = 1 sell + 1 buy = 2 order inputs + 2 outputs.
-    // TX layout: (2 * N_pairs) order inputs + 1 wallet = total inputs,
-    // (2 * N_pairs) outputs + receipt + change = total outputs.
-    // push_index() handles indices >16, so the OpN range is not a limit.
-    // Bounded by MAX_TX_MASS (500k); N=15 uses ~14k mass.
-    let mut groups = Vec::new();
-
-    for chunk in deduped.chunks(MAX_BATCH_GROUP_SIZE) {
-        // Each chunk must contain crossings from >= 2 tokens to be a cross-pair group.
-        let mut token_set = HashSet::new();
-        for p in chunk {
-            token_set.insert(&p.token_cov_id);
-        }
-        if token_set.len() < 2 {
-            continue;
-        }
-
-        let mut sells = Vec::new();
-        let mut buys = Vec::new();
-        let mut total_surplus = 0u64;
-
-        for p in chunk {
-            sells.push(p.sell.clone());
-            buys.push(p.buy.clone());
-            total_surplus = total_surplus.saturating_add(p.surplus);
-        }
-
-        groups.push(CrossPairBatchGroup {
-            sells,
-            buys,
-            total_surplus,
-        });
-    }
-
-    // Sort by total surplus descending
-    groups.sort_by(|a, b| b.total_surplus.cmp(&a.total_surplus));
-
-    groups
-}
-
-/// Find triangular (3-hop) arbitrage routes and package them as batch groups.
-///
-/// Each `TriangularRoute` has 3 legs (each a 2-hop CrossPairRoute), totalling
-/// 6 orders (3 sells + 3 buys). These are converted into `CrossPairBatchGroup`s
-/// that the batch engine processes identically to 2-hop groups.
-///
-/// Input count per triangular group: 3 sells + 3 buys + up to 3 token units + 1 wallet = 10,
-/// well within the OpN limit of 16.
-pub fn find_triangular_batch_groups(
-    order_book: &OrderBook,
-    max_routes: usize,
-    allow_self_trade: bool,
-) -> Vec<CrossPairBatchGroup> {
-    let tri_routes = routing::find_triangular_routes(order_book, max_routes, allow_self_trade);
-    if tri_routes.is_empty() {
-        return Vec::new();
-    }
-
-    let mut groups = Vec::new();
-
-    for route in &tri_routes {
-        let mut sells = Vec::new();
-        let mut buys = Vec::new();
-
-        for leg in &route.legs {
-            sells.push(leg.sell_leg.clone());
-            buys.push(leg.buy_leg.clone());
-        }
-
-        groups.push(CrossPairBatchGroup {
-            sells,
-            buys,
-            total_surplus: route.total_surplus,
-        });
-    }
-
-    groups
-}
 
 /// Planner hint: which plan function to call for this group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1096,6 +622,9 @@ pub enum GroupKind {
     /// Total buy KAS >= sell expected_kas, so the sell uses Op1 (full fill).
     /// Uses `plan_batch_match` (not IOC).
     GtcSellMultiFill,
+    /// Cross-book swap: swap covenant + buy-source + sell-target in one atomic TX.
+    /// Uses custom swap planner (not the standard batch planners).
+    CrossSwap,
 }
 
 /// A unified batch group that the executor processes in one loop.
@@ -1123,203 +652,6 @@ impl BatchGroup {
     }
 }
 
-/// Unified grouper: replaces `find_batch_groups`, `find_sweep_groups`, and
-/// the Phase 1b remaining-pair selection with a single pass.
-///
-/// Algorithm:
-/// 1. Collect sweep groups from the order book (1:N relationships).
-/// 2. Collect N:N batch groups from the crossing pairs.
-/// 3. Collect remaining 1:1 pairs (full, partial buy, partial sell) not yet claimed.
-/// 4. Return all groups sorted by surplus descending.
-///
-/// The returned groups are non-overlapping: no outpoint appears in more than one group.
-///
-/// **Deprecated**: Use `match_book_direct()` instead, which produces the same
-/// `BatchGroup` output without the intermediate `CrossingPair` stage.
-#[deprecated(note = "Use match_book_direct() for O(N+M) FIFO-ordered matching")]
-#[allow(deprecated)]
-pub fn find_optimal_groups(
-    all_pairs: &[CrossingPair],
-    order_book: &OrderBook,
-    allow_self_trade: bool,
-    spent_outpoints: Option<&std::collections::HashSet<String>>,
-) -> Vec<BatchGroup> {
-    use std::collections::HashSet;
-
-    let mut groups: Vec<BatchGroup> = Vec::new();
-    let mut used: HashSet<String> = HashSet::new();
-
-    // H1-fix: helper to mark an order key as used AND also exclude its
-    // OCO partner.  OCO orders (TP + SL) share a single UTXO; if one
-    // path is selected for a group the other must be excluded from all
-    // subsequent groups to prevent a double-spend within the same cycle.
-    let use_order = |used: &mut HashSet<String>, order: &BookOrder| {
-        let key = order.outpoint_key();
-        used.insert(key);
-        if let Some(ref partner) = order.oco_partner_key {
-            used.insert(partner.clone());
-        }
-    };
-
-    // ---------------------------------------------------------------
-    // Step 1: Sweep groups (1:N)  -- highest priority because they
-    // atomically fill large orders that would otherwise be broken into
-    // multiple 1:1 pairs across cycles.
-    // ---------------------------------------------------------------
-    let sweep_spent: HashSet<String> = spent_outpoints
-        .map(|s| s.iter().cloned().collect())
-        .unwrap_or_default();
-    let sweep_groups = find_sweep_groups(order_book, allow_self_trade, Some(&sweep_spent));
-
-    for sg in sweep_groups {
-        let anchor_key = sg.anchor.outpoint_key();
-        if used.contains(&anchor_key) {
-            continue;
-        }
-        // Skip if any fill already used
-        if sg.fills.iter().any(|f| used.contains(&f.outpoint_key())) {
-            continue;
-        }
-        // Claim all outpoints (+ OCO partners via H1-fix)
-        use_order(&mut used, &sg.anchor);
-        for f in &sg.fills {
-            use_order(&mut used, f);
-        }
-
-        let total_surplus = sg.total_fill_cost; // approximate
-        let (sells, buys, kind) = if sg.is_buy_sweep {
-            let k = if sg.is_gtc_multi_fill {
-                GroupKind::GtcBuyMultiFill
-            } else {
-                GroupKind::BuySweep
-            };
-            (sg.fills.clone(), vec![sg.anchor.clone()], k)
-        } else {
-            let k = if sg.is_gtc_multi_fill {
-                GroupKind::GtcSellMultiFill
-            } else {
-                GroupKind::SellSweep
-            };
-            (vec![sg.anchor.clone()], sg.fills.clone(), k)
-        };
-
-        groups.push(BatchGroup {
-            sells,
-            buys,
-            total_surplus,
-            kind,
-            source_pairs: Vec::new(), // sweep groups don't map 1:1 to CrossingPairs
-        });
-    }
-
-    // ---------------------------------------------------------------
-    // Step 2: N:N batch groups from full-fill crossing pairs.
-    // Greedy: sort all full-fill pairs by surplus desc, deduplicate
-    // outpoints, then chunk by token into groups of MAX_BATCH_GROUP_SIZE.
-    // ---------------------------------------------------------------
-    {
-        let mut full_pairs: Vec<&CrossingPair> = all_pairs
-            .iter()
-            .filter(|p| {
-                p.match_type == MatchType::Full
-                    && !used.contains(&p.buy.outpoint_key())
-                    && !used.contains(&p.sell.outpoint_key())
-            })
-            .collect();
-        full_pairs.sort_by(|a, b| b.surplus.cmp(&a.surplus));
-
-        // Greedy deduplicate
-        let mut deduped: Vec<&CrossingPair> = Vec::new();
-        for p in &full_pairs {
-            let bk = p.buy.outpoint_key();
-            let sk = p.sell.outpoint_key();
-            if used.contains(&bk) || used.contains(&sk) {
-                continue;
-            }
-            use_order(&mut used, &p.buy);
-            use_order(&mut used, &p.sell);
-            deduped.push(p);
-        }
-
-        // Group by token
-        let mut by_token: std::collections::HashMap<&str, Vec<&CrossingPair>> =
-            std::collections::HashMap::new();
-        for p in &deduped {
-            by_token.entry(&p.token_cov_id).or_default().push(p);
-        }
-
-        for (_token, token_pairs) in by_token {
-            for chunk in token_pairs.chunks(MAX_BATCH_GROUP_SIZE) {
-                if chunk.is_empty() {
-                    continue;
-                }
-                let sells: Vec<BookOrder> = chunk.iter().map(|p| p.sell.clone()).collect();
-                let buys: Vec<BookOrder> = chunk.iter().map(|p| p.buy.clone()).collect();
-                let total_surplus: u64 = chunk.iter().map(|p| p.surplus).sum();
-                let source_pairs: Vec<CrossingPair> = chunk.iter().map(|p| (*p).clone()).collect();
-
-                groups.push(BatchGroup {
-                    sells,
-                    buys,
-                    total_surplus,
-                    kind: GroupKind::Batch,
-                    source_pairs,
-                });
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------
-    // Step 3: Remaining 1:1 pairs (partial buy, partial sell, or
-    // full-fill pairs that didn't make it into a batch group).
-    // Pick the best remaining pair per token.
-    // ---------------------------------------------------------------
-    {
-        let mut best_by_token: std::collections::HashMap<&str, &CrossingPair> =
-            std::collections::HashMap::new();
-
-        for p in all_pairs {
-            let bk = p.buy.outpoint_key();
-            let sk = p.sell.outpoint_key();
-            if used.contains(&bk) || used.contains(&sk) {
-                continue;
-            }
-            let entry = best_by_token.entry(&p.token_cov_id).or_insert(p);
-            if p.surplus > entry.surplus {
-                *entry = p;
-            }
-        }
-
-        for (_token, best) in best_by_token {
-            let bk = best.buy.outpoint_key();
-            let sk = best.sell.outpoint_key();
-            if used.contains(&bk) || used.contains(&sk) {
-                continue;
-            }
-            use_order(&mut used, &best.buy);
-            use_order(&mut used, &best.sell);
-
-            let kind = match best.match_type {
-                MatchType::Full => GroupKind::Batch,
-                MatchType::PartialBuy => GroupKind::PartialBuy,
-                MatchType::PartialSell => GroupKind::PartialSell,
-            };
-
-            groups.push(BatchGroup {
-                sells: vec![best.sell.clone()],
-                buys: vec![best.buy.clone()],
-                total_surplus: best.surplus,
-                kind,
-                source_pairs: vec![best.clone()],
-            });
-        }
-    }
-
-    // Sort all groups by surplus descending (most profitable first)
-    groups.sort_by(|a, b| b.total_surplus.cmp(&a.total_surplus));
-
-    groups
-}
 
 // ===================================================================
 // Direct book traversal matcher (replaces CrossingPair enumeration)
@@ -1414,7 +746,6 @@ pub fn match_book_direct(
     // Sweeps must be detected first because they atomically fill large
     // orders that would otherwise be broken into multiple 1:1 pairs.
     // ---------------------------------------------------------------
-    #[allow(deprecated)]
     let sweep_groups = find_sweep_groups(order_book, allow_self_trade, spent_outpoints);
 
     for sg in sweep_groups {
@@ -1758,6 +1089,186 @@ fn classify_group_kind(sells: &[BookOrder], buys: &[BookOrder]) -> GroupKind {
     }
 }
 
+/// A cross-book swap group: one swap order routed through two TOKEN/KAS books.
+///
+/// Atomic TX structure:
+///   Inputs:
+///     [0] Swap UTXO (user's source tokens, swap covenant)
+///     [1] Buy-source order (counterparty on SOURCE/KAS book who buys source tokens)
+///     [2] Sell-target order (counterparty on TARGET/KAS book who sells target tokens)
+///     [3] Matcher wallet UTXO
+///   Outputs:
+///     [0] Source tokens -> Buy-source counterparty
+///     [1] Target tokens -> swap user (covenant verifies this via toi)
+///     [2] KAS -> Sell-target counterparty
+///     [3] Change/surplus -> matcher
+#[derive(Debug, Clone)]
+pub struct CrossSwapGroup {
+    /// The swap entry from the swap book.
+    pub swap: crate::matcher::swap_book::SwapEntry,
+    /// Buy-source: counterparty on SOURCE/KAS book who wants to buy source tokens.
+    /// This order provides KAS in exchange for the swap user's source tokens.
+    pub buy_source: BookOrder,
+    /// Sell-target: counterparty on TARGET/KAS book who sells target tokens.
+    /// This order provides target tokens in exchange for KAS.
+    pub sell_target: BookOrder,
+    /// KAS flowing from buy_source to sell_target.
+    pub kas_flow: u64,
+    /// Matcher surplus (buy_source KAS - sell_target expected KAS).
+    pub surplus: u64,
+}
+
+/// Find cross-book swap routes.
+///
+/// For each swap order in the swap book:
+///   1. Look up the SOURCE token's book for a Buy order (someone buying source tokens with KAS).
+///   2. Look up the TARGET token's book for a Sell order (someone selling target tokens for KAS).
+///   3. Verify KAS math: Buy-source provides >= KAS needed to pay Sell-target.
+///   4. Verify the Sell-target provides >= min_target_amount of target tokens.
+///   5. If both sides found, produce a `CrossSwapGroup`.
+///
+/// Respects FIFO ordering (uses first eligible counterparty from BTreeMap iteration).
+/// Skips spent outpoints and orders already consumed by same-token matching.
+///
+/// # Arguments
+/// * `order_book` — The multi-pair order book (contains SOURCE/KAS and TARGET/KAS books).
+/// * `swap_book` — The swap order tracker.
+/// * `spent_outpoints` — Outpoints consumed by prior phases or under cooldown.
+/// * `used_outpoints` — Outpoints consumed by same-token matching in this cycle.
+pub fn match_swap_routes(
+    order_book: &OrderBook,
+    swap_book: &crate::matcher::swap_book::SwapBook,
+    spent_outpoints: Option<&std::collections::HashSet<String>>,
+    used_outpoints: &std::collections::HashSet<String>,
+) -> Vec<CrossSwapGroup> {
+    use std::collections::HashSet;
+
+    let empty_set = HashSet::new();
+    let spent = spent_outpoints.unwrap_or(&empty_set);
+
+    let mut groups: Vec<CrossSwapGroup> = Vec::new();
+    // Track outpoints claimed by swap routing to avoid double-use.
+    let mut claimed: HashSet<String> = HashSet::new();
+
+    for swap in swap_book.all_entries() {
+        let swap_outpoint = swap.outpoint_key();
+
+        // Skip if swap UTXO is spent or already used.
+        if spent.contains(&swap_outpoint) || used_outpoints.contains(&swap_outpoint) {
+            continue;
+        }
+
+        let source_cov_id = &swap.source_cov_id;
+        let target_cov_id = &swap.target_cov_id;
+
+        // 1. Find a Buy order on the SOURCE/KAS book.
+        //    This counterparty wants to buy source tokens, providing KAS.
+        let source_book = match order_book.pair_books.get(source_cov_id) {
+            Some(b) => b,
+            None => continue, // No book for source token.
+        };
+
+        let buy_source = source_book.bids.values().find(|bid| {
+            let key = bid.outpoint_key();
+            !spent.contains(&key)
+                && !used_outpoints.contains(&key)
+                && !claimed.contains(&key)
+                && !order_book.matched_outpoints.contains_key(&key)
+                && bid.price_num > 0
+                && bid.price_den > 0
+        });
+
+        let buy_source = match buy_source {
+            Some(b) => b,
+            None => continue, // No available buyer for source tokens.
+        };
+
+        // How much KAS does the buy-source provide?
+        // buy_source.value is the KAS locked in the buy order.
+        let kas_available = buy_source.value;
+
+        // How many source tokens does the buyer expect?
+        // expected_tokens = kas * price_num / price_den
+        let _buyer_expected_tokens = match kas_available.checked_mul(buy_source.price_num) {
+            Some(v) => v / buy_source.price_den.max(1),
+            None => continue, // overflow
+        };
+
+        // The swap UTXO provides swap.value source tokens.
+        // Check that the buyer wants at most what the swap provides.
+        // (If the buyer wants more tokens than the swap has, skip.)
+        if _buyer_expected_tokens > swap.value {
+            continue;
+        }
+
+        // 2. Find a Sell order on the TARGET/KAS book.
+        //    This counterparty sells target tokens, wants KAS.
+        let target_book = match order_book.pair_books.get(target_cov_id) {
+            Some(b) => b,
+            None => continue, // No book for target token.
+        };
+
+        let sell_target = target_book.asks.values().find(|ask| {
+            let key = ask.outpoint_key();
+            !spent.contains(&key)
+                && !used_outpoints.contains(&key)
+                && !claimed.contains(&key)
+                && !order_book.matched_outpoints.contains_key(&key)
+                && ask.price_num > 0
+                && ask.price_den > 0
+        });
+
+        let sell_target = match sell_target {
+            Some(a) => a,
+            None => continue, // No available seller of target tokens.
+        };
+
+        // How many target tokens does the sell order provide?
+        let target_tokens = sell_target.value;
+
+        // Does the sell order provide enough target tokens for the swap?
+        if target_tokens < swap.min_target_amount {
+            continue;
+        }
+
+        // How much KAS does the sell-target expect?
+        // expected_kas = target_tokens * ask.price_num / ask.price_den
+        let kas_needed = match target_tokens.checked_mul(sell_target.price_num) {
+            Some(v) => v / sell_target.price_den.max(1),
+            None => continue, // overflow
+        };
+
+        // KAS math: buy-source must provide enough KAS for sell-target.
+        if kas_available < kas_needed {
+            continue;
+        }
+
+        // Both legs viable. Surplus goes to matcher.
+        let surplus = kas_available.saturating_sub(kas_needed);
+
+        // Ensure minimum output values.
+        if kas_needed < kob_core::MIN_UTXO_VALUE {
+            continue;
+        }
+
+        claimed.insert(buy_source.outpoint_key());
+        claimed.insert(sell_target.outpoint_key());
+        claimed.insert(swap_outpoint.clone());
+
+        groups.push(CrossSwapGroup {
+            swap: swap.clone(),
+            buy_source: buy_source.clone(),
+            sell_target: sell_target.clone(),
+            kas_flow: kas_needed,
+            surplus,
+        });
+    }
+
+    // Sort by surplus descending (most profitable first).
+    groups.sort_by(|a, b| b.surplus.cmp(&a.surplus));
+    groups
+}
+
 #[cfg(test)]
 #[allow(deprecated)]
 mod tests {
@@ -1814,117 +1325,6 @@ mod tests {
     const FAKE_TOKEN: &str = "0102030405060708091011121314151617181920212223242526272829303132";
 
     #[test]
-    fn test_crossing_pair_detection() {
-        let mut ob = OrderBook::new();
-        ob.add_buy_order(make_buy(10_000_000, 1, 2, FAKE_TOKEN));
-        ob.add_sell_order(make_sell(10_000_000, 1, 2, FAKE_TOKEN));
-
-        let pairs = find_all_crossing_pairs(&ob);
-        assert_eq!(pairs.len(), 1, "Should find 1 crossing pair");
-        assert_eq!(pairs[0].expected_tokens, 5_000_000);
-        assert_eq!(pairs[0].expected_kas, 5_000_000);
-        // buyer_tokens = sell_tokens (10M), not expected_tokens (5M)
-        assert_eq!(pairs[0].buyer_tokens, 10_000_000);
-        // surplus = total_in - seller_kas - buyer_tokens = 20M - 5M - 10M = 5M
-        assert_eq!(pairs[0].surplus, 5_000_000);
-    }
-
-    #[test]
-    fn test_no_crossing_different_prices() {
-        let mut ob = OrderBook::new();
-        // Buy at 1/10 (low bid), sell at 5/1 (high ask)
-        ob.add_buy_order(make_buy(3_500_000, 1, 10, FAKE_TOKEN));
-        ob.add_sell_order(make_sell(3_500_000, 5, 1, FAKE_TOKEN));
-
-        let pairs = find_all_crossing_pairs(&ob);
-        assert!(pairs.is_empty(), "Non-overlapping prices should not cross");
-    }
-
-    #[test]
-    fn test_exact_price_match_no_surplus() {
-        let mut ob = OrderBook::new();
-        // Both at 1/1: surplus = 0, valid when mmfee allows fee from external UTXOs
-        ob.add_buy_order(make_buy(3_500_000, 1, 1, FAKE_TOKEN));
-        ob.add_sell_order(make_sell(3_500_000, 1, 1, FAKE_TOKEN));
-
-        let pairs = find_all_crossing_pairs(&ob);
-        assert_eq!(pairs.len(), 1, "Zero surplus is valid (matcher pays fee from fee UTXOs)");
-        assert_eq!(pairs[0].surplus, 0);
-    }
-
-    #[test]
-    fn test_large_order_values() {
-        let mut ob = OrderBook::new();
-        ob.add_buy_order(make_buy(1_000_000_000, 1, 2, FAKE_TOKEN));
-        ob.add_sell_order(make_sell(1_000_000_000, 1, 2, FAKE_TOKEN));
-
-        let pairs = find_all_crossing_pairs(&ob);
-        assert_eq!(pairs.len(), 1);
-        let p = &pairs[0];
-        // buyer_tokens = sell_tokens (1B), surplus = 2B - 500M - 1B = 500M
-        assert_eq!(p.surplus, 500_000_000);
-    }
-
-    #[test]
-    fn test_multi_pair_independent() {
-        let token_a = "0102030405060708091011121314151617181920212223242526272829303132";
-        let token_b = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-
-        let mut ob = OrderBook::new();
-        ob.add_buy_order(make_buy(10_000_000, 1, 2, token_a));
-        ob.add_sell_order(make_sell(10_000_000, 1, 2, token_a));
-        ob.add_buy_order(make_buy(20_000_000, 1, 3, token_b));
-        ob.add_sell_order(make_sell(20_000_000, 1, 3, token_b));
-
-        let pairs = find_all_crossing_pairs(&ob);
-        assert_eq!(pairs.len(), 2, "Should find 2 independent crossing pairs");
-
-        let token_ids: Vec<&str> = pairs.iter().map(|p| p.token_cov_id.as_str()).collect();
-        assert!(token_ids.contains(&token_a));
-        assert!(token_ids.contains(&token_b));
-    }
-
-    #[test]
-    fn test_storage_mass_minimum() {
-        let mut ob = OrderBook::new();
-        // Buy 5M at price 1/4 -> expected_tokens = 1.25M < MIN_UTXO_VALUE (3M)
-        ob.add_buy_order(make_buy(5_000_000, 1, 4, FAKE_TOKEN));
-        ob.add_sell_order(make_sell(5_000_000, 1, 4, FAKE_TOKEN));
-
-        let pairs = find_all_crossing_pairs(&ob);
-        assert!(
-            pairs.is_empty(),
-            "Should reject when buyer_tokens < MIN_UTXO_VALUE"
-        );
-    }
-
-    #[test]
-    fn test_multiply_first_arithmetic() {
-        // Verify multiply-first: (amount * price_num) / price_den
-        // With amount=7, pnum=3, pden=2:
-        //   multiply-first: (7 * 3) / 2 = 21 / 2 = 10
-        //   division-first: (7 / 2) * 3 = 3 * 3  = 9  (WRONG, loses precision)
-        let mut ob = OrderBook::new();
-        // Buy 20M at price 3/2 -> expected_tokens = (20M * 3) / 2 = 30M
-        ob.add_buy_order(make_buy(20_000_000, 3, 2, FAKE_TOKEN));
-        // Sell 10M at price 1/2 -> expected_kas = (10M * 1) / 2 = 5M
-        ob.add_sell_order(make_sell(10_000_000, 1, 2, FAKE_TOKEN));
-
-        let pairs = find_all_crossing_pairs(&ob);
-        assert!(!pairs.is_empty(), "Should find at least 1 crossing pair");
-        // Find the full-fill match
-        let full = pairs.iter().find(|p| p.match_type == MatchType::Full).expect("Should have full fill");
-        // expected_tokens = (20M * 3) / 2 = 30M (multiply-first)
-        assert_eq!(full.expected_tokens, 30_000_000);
-        // expected_kas = (10M * 1) / 2 = 5M
-        assert_eq!(full.expected_kas, 5_000_000);
-        // buyer_tokens = sell_tokens = 10M
-        assert_eq!(full.buyer_tokens, 10_000_000);
-        // surplus = (20M + 10M) - 5M - 10M = 15M
-        assert_eq!(full.surplus, 15_000_000);
-    }
-
-    #[test]
     fn test_multiply_first_precision() {
         // Case where division-first loses precision but multiply-first does not.
         // amount=7_000_001, pnum=1, pden=3:
@@ -1947,142 +1347,6 @@ mod tests {
         assert_eq!(division_first, 4_666_666);
     }
 
-    // M-3: orders with price_num=0 or price_den=0 must not cause division by zero.
-    #[test]
-    fn test_zero_price_fields_skipped() {
-        let mut ob = OrderBook::new();
-        // buy with price_num=0 (would divide by 0 in ceil division)
-        let bad_buy = BookOrder {
-            tx_id: "a".repeat(64),
-            index: 0,
-            value: 10_000_000,
-            token_cov_id: FAKE_TOKEN.to_string(),
-            price_num: 0,
-            price_den: 1,
-            min_fill: 1_000_000,
-            owner_hash: "b".repeat(64),
-            spk_hash: "11".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Buy,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
-        };
-        // sell with price_den=0 (would divide by 0 in expected_kas)
-        let bad_sell = BookOrder {
-            tx_id: "c".repeat(64),
-            index: 0,
-            value: 10_000_000,
-            token_cov_id: FAKE_TOKEN.to_string(),
-            price_num: 1,
-            price_den: 0,
-            min_fill: 1_000_000,
-            owner_hash: "d".repeat(64),
-            spk_hash: "22".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Sell,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
-        };
-        ob.add_buy_order(bad_buy);
-        ob.add_sell_order(bad_sell);
-        // Must not panic; should return empty (no valid crossing pairs)
-        let pairs = find_all_crossing_pairs(&ob);
-        assert!(pairs.is_empty(), "zero-price orders must not produce crossing pairs");
-    }
-
-    // MAX_MATCH_ITERATIONS: verify the loop breaks early and does not
-    // run the full N*M product when it would exceed the cap.
-    #[test]
-    fn test_match_iteration_cap() {
-        // Create enough orders on both sides that N*M > MAX_MATCH_ITERATIONS
-        // e.g., 300 bids x 300 asks = 90,000 > 50,000
-        let n = 300usize;
-        let mut ob = OrderBook::new();
-        for i in 0..n {
-            let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
-            buy.tx_id = format!("{:064x}", i);
-            buy.owner_hash = format!("{:064x}", i); // unique owner to avoid STP
-            ob.add_buy_order(buy);
-        }
-        for i in 0..n {
-            let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
-            sell.tx_id = format!("{:064x}", n + i);
-            sell.owner_hash = format!("{:064x}", n + i);
-            ob.add_sell_order(sell);
-        }
-
-        let pairs = find_all_crossing_pairs(&ob);
-        // Without the cap, we'd get up to 90,000 crossing pairs.
-        // With the cap at 50,000, the loop breaks early so we get fewer.
-        assert!(
-            pairs.len() < n * n,
-            "iteration cap should prevent full N*M enumeration (got {} pairs from {}x{})",
-            pairs.len(),
-            n,
-            n,
-        );
-    }
-
-    // Integer edge case tests (adversarial review follow-up)
-
-    #[test]
-    fn test_u64_max_price_num_overflow_skipped() {
-        // price_num = u64::MAX causes checked_mul overflow -> pair must be skipped, not panic
-        let mut ob = OrderBook::new();
-        let mut buy = make_buy(10_000_000, u64::MAX, 1, FAKE_TOKEN);
-        buy.owner_hash = "aa".repeat(32);
-        ob.add_buy_order(buy);
-        let mut sell = make_sell(10_000_000, 1, 1, FAKE_TOKEN);
-        sell.owner_hash = "bb".repeat(32);
-        ob.add_sell_order(sell);
-        // Must not panic; overflow is handled gracefully
-        let pairs = find_all_crossing_pairs(&ob);
-        // The overflowing pair should be skipped
-        assert!(
-            pairs.is_empty(),
-            "u64::MAX price_num should cause overflow skip, not a match"
-        );
-    }
-
-    #[test]
-    fn test_u64_max_price_den_no_panic() {
-        // price_den = u64::MAX -> division yields 0 or 1, below MIN_UTXO_VALUE -> no match
-        let mut ob = OrderBook::new();
-        let mut buy = make_buy(10_000_000, 1, u64::MAX, FAKE_TOKEN);
-        buy.owner_hash = "aa".repeat(32);
-        ob.add_buy_order(buy);
-        let mut sell = make_sell(10_000_000, 1, u64::MAX, FAKE_TOKEN);
-        sell.owner_hash = "bb".repeat(32);
-        ob.add_sell_order(sell);
-        let pairs = find_all_crossing_pairs(&ob);
-        // expected_tokens = 10M * 1 / u64::MAX = 0, below MIN_UTXO_VALUE
-        assert!(pairs.is_empty(), "u64::MAX denominator should produce dust -> no match");
-    }
-
-    #[test]
-    fn test_both_sides_overflow_handled() {
-        // Both buy and sell have price_num near u64::MAX
-        let mut ob = OrderBook::new();
-        let mut buy = make_buy(u64::MAX / 2, u64::MAX / 2, 1, FAKE_TOKEN);
-        buy.owner_hash = "aa".repeat(32);
-        ob.add_buy_order(buy);
-        let mut sell = make_sell(u64::MAX / 2, u64::MAX / 2, 1, FAKE_TOKEN);
-        sell.owner_hash = "bb".repeat(32);
-        ob.add_sell_order(sell);
-        // checked_mul(u64::MAX/2, u64::MAX/2) overflows -> skip
-        let pairs = find_all_crossing_pairs(&ob);
-        assert!(pairs.is_empty(), "double overflow should be safely skipped");
-    }
 
     #[test]
     fn test_zero_price_den_in_partial_fill() {
@@ -2101,447 +1365,7 @@ mod tests {
         assert!(result.is_none(), "price_num=0 must return None, not panic");
     }
 
-    #[test]
-    fn test_min_fill_equals_value_full_fill_only() {
-        // When min_fill == value, partial fill should not be possible
-        // (residual would be 0, below MIN_UTXO_VALUE)
-        let mut ob = OrderBook::new();
-        let mut buy = make_buy(10_000_000, 1, 2, FAKE_TOKEN);
-        buy.min_fill = 10_000_000; // min_fill = entire value
-        buy.owner_hash = "aa".repeat(32);
-        ob.add_buy_order(buy);
-        let mut sell = make_sell(10_000_000, 1, 2, FAKE_TOKEN);
-        sell.owner_hash = "bb".repeat(32);
-        ob.add_sell_order(sell);
-        let pairs = find_all_crossing_pairs(&ob);
-        // Full fill should work; partial fill should not appear
-        for p in &pairs {
-            assert_eq!(p.match_type, MatchType::Full, "only full fill allowed when min_fill == value");
-        }
-    }
 
-    #[test]
-    fn test_dust_output_prevention() {
-        // When expected_tokens or expected_kas is exactly at MIN_UTXO_VALUE boundary
-        let mut ob = OrderBook::new();
-        // Buy 6M at price 1/2 -> expected_tokens = 3M = MIN_UTXO_VALUE (assuming MIN_UTXO_VALUE = 3M)
-        let mut buy = make_buy(6_000_000, 1, 2, FAKE_TOKEN);
-        buy.owner_hash = "aa".repeat(32);
-        ob.add_buy_order(buy);
-        let mut sell = make_sell(6_000_000, 1, 2, FAKE_TOKEN);
-        sell.owner_hash = "bb".repeat(32);
-        ob.add_sell_order(sell);
-        let pairs = find_all_crossing_pairs(&ob);
-        // At 3M exactly (= MIN_UTXO_VALUE), it should be accepted
-        assert_eq!(pairs.len(), 1, "exact MIN_UTXO_VALUE should be accepted");
-    }
-
-    // Batch group tests
-
-    /// Helper: create a CrossingPair for batch group tests.
-    ///
-    /// `token` is the token_cov_id string, `id` is used to generate unique
-    /// tx_ids so pairs don't collide.
-    fn make_crossing_pair(token: &str, id: u32) -> CrossingPair {
-        let buy_tx = format!("{:0>64}", format!("buy{}", id));
-        let sell_tx = format!("{:0>64}", format!("sell{}", id));
-        CrossingPair {
-            token_cov_id: token.to_string(),
-            buy: BookOrder {
-                tx_id: buy_tx,
-                index: 0,
-                value: 10_000_000,
-                token_cov_id: token.to_string(),
-                price_num: 1,
-                price_den: 2,
-                min_fill: 1_000_000,
-                owner_hash: "b".repeat(64),
-                spk_hash: "11".repeat(32),
-                counterparty_spk: None,
-                redeem_script_hex: String::new(),
-                p2sh_script_hex: String::new(),
-                p2sh_version: 0,
-                side: OrderSide::Buy,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
-            },
-            sell: BookOrder {
-                tx_id: sell_tx,
-                index: 0,
-                value: 10_000_000,
-                token_cov_id: token.to_string(),
-                price_num: 1,
-                price_den: 2,
-                min_fill: 1_000_000,
-                owner_hash: "d".repeat(64),
-                spk_hash: "22".repeat(32),
-                counterparty_spk: None,
-                redeem_script_hex: String::new(),
-                p2sh_script_hex: String::new(),
-                p2sh_version: 0,
-                side: OrderSide::Sell,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
-            },
-            seller_kas: 5_000_000,
-            buyer_tokens: 5_000_000,
-            surplus: estimate_compute_mass(3, 5, 0) + 100_000,
-            expected_tokens: 5_000_000,
-            expected_kas: 5_000_000,
-            match_type: MatchType::Full,
-            fill_kas: None,
-            residual_kas: None,
-            fill_token_amount: None,
-            residual_tokens: None,
-        }
-    }
-
-    #[test]
-    fn test_find_batch_groups_single_pair_batched() {
-        let pairs = vec![make_crossing_pair(FAKE_TOKEN, 1)];
-        let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 1, "single pair should be batched");
-        assert_eq!(groups[0].len(), 1);
-    }
-
-    #[test]
-    fn test_find_batch_groups_two_pairs_same_token() {
-        let pairs = vec![
-            make_crossing_pair(FAKE_TOKEN, 1),
-            make_crossing_pair(FAKE_TOKEN, 2),
-        ];
-        let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 1, "should have 1 batch group");
-        assert_eq!(groups[0].len(), 2, "group should have 2 pairs");
-    }
-
-    #[test]
-    fn test_find_batch_groups_different_tokens() {
-        let token_b = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        let pairs = vec![
-            make_crossing_pair(FAKE_TOKEN, 1),
-            make_crossing_pair(token_b, 2),
-        ];
-        let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 2, "different tokens should produce 2 groups of 1");
-    }
-
-    #[test]
-    fn test_find_batch_groups_opn_limit() {
-        // 16 pairs of same token -> should be split: group of 15 + group of 1
-        let pairs: Vec<_> = (0..16).map(|i| make_crossing_pair(FAKE_TOKEN, i)).collect();
-        let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 2, "16 pairs should produce 2 groups (15 + 1)");
-        assert_eq!(groups[0].len(), 15, "first group should have 15 pairs");
-        assert_eq!(groups[1].len(), 1, "second group should have 1 pair");
-    }
-
-    #[test]
-    fn test_find_batch_groups_partial_fills_excluded() {
-        let mut pair = make_crossing_pair(FAKE_TOKEN, 1);
-        pair.match_type = MatchType::PartialBuy;
-        let pairs = vec![pair, make_crossing_pair(FAKE_TOKEN, 2)];
-        let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 1, "partial excluded, 1 full pair should batch");
-        assert_eq!(groups[0].len(), 1);
-    }
-
-    #[test]
-    fn test_find_batch_groups_mixed_full_and_partial() {
-        // 3 full + 1 partial for same token -> group of 3 full fills
-        let mut partial = make_crossing_pair(FAKE_TOKEN, 99);
-        partial.match_type = MatchType::PartialSell;
-        let pairs = vec![
-            make_crossing_pair(FAKE_TOKEN, 1),
-            make_crossing_pair(FAKE_TOKEN, 2),
-            partial,
-            make_crossing_pair(FAKE_TOKEN, 3),
-        ];
-        let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 1, "should have 1 batch group from the 3 full fills");
-        assert_eq!(groups[0].len(), 3);
-    }
-
-    #[test]
-    fn test_find_batch_groups_30_pairs_two_groups() {
-        // 30 pairs -> group of 15 + group of 15
-        let pairs: Vec<_> = (0..30).map(|i| make_crossing_pair(FAKE_TOKEN, i)).collect();
-        let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 2, "30 pairs should produce 2 groups of 15");
-        assert_eq!(groups[0].len(), 15);
-        assert_eq!(groups[1].len(), 15);
-    }
-
-    #[test]
-    fn test_find_batch_groups_multi_token_batches() {
-        let token_b = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-        // 3 pairs token_a + 2 pairs token_b -> 2 groups
-        let pairs = vec![
-            make_crossing_pair(FAKE_TOKEN, 1),
-            make_crossing_pair(FAKE_TOKEN, 2),
-            make_crossing_pair(FAKE_TOKEN, 3),
-            make_crossing_pair(token_b, 4),
-            make_crossing_pair(token_b, 5),
-        ];
-        let groups = find_batch_groups(&pairs);
-        assert_eq!(groups.len(), 2, "should have 2 groups (one per token)");
-    }
-
-    #[test]
-    fn test_find_batch_groups_empty_input() {
-        let groups = find_batch_groups(&[]);
-        assert!(groups.is_empty());
-    }
-
-    // Cross-pair batch group tests
-
-    const TOKEN_A_CP: &str = "0102030405060708091011121314151617181920212223242526272829303132";
-    const TOKEN_B_CP: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    const TOKEN_C_CP: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-
-    fn make_buy_cp(
-        tx_id_char: char,
-        value: u64,
-        price_num: u64,
-        price_den: u64,
-        token_cov_id: &str,
-    ) -> BookOrder {
-        BookOrder {
-            tx_id: tx_id_char.to_string().repeat(64),
-            index: 0,
-            value,
-            token_cov_id: token_cov_id.to_string(),
-            price_num,
-            price_den,
-            min_fill: 1_000_000,
-            owner_hash: "b".repeat(64),
-            spk_hash: "11".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Buy,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
-        }
-    }
-
-    fn make_sell_cp(
-        tx_id_char: char,
-        value: u64,
-        price_num: u64,
-        price_den: u64,
-        token_cov_id: &str,
-    ) -> BookOrder {
-        BookOrder {
-            tx_id: tx_id_char.to_string().repeat(64),
-            index: 1,
-            value,
-            token_cov_id: token_cov_id.to_string(),
-            price_num,
-            price_den,
-            min_fill: 1_000_000,
-            owner_hash: "d".repeat(64),
-            spk_hash: "22".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Sell,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
-        }
-    }
-
-    /// Test: combines same-pair crossings from two different tokens into one group.
-    #[test]
-    fn test_cross_pair_batch_groups_basic() {
-        let mut ob = OrderBook::new();
-        // Token A: crossing pair (sell + buy same token)
-        // Sell 20M Token A at price 1/2 (expects 10M KAS)
-        ob.add_sell_order(make_sell_cp('c', 20_000_000, 1, 2, TOKEN_A_CP));
-        // Buy Token A with 15M KAS at price 1/1 (expects 15M tokens)
-        // Crossing: buyer pays 15M KAS, seller expects 10M -> surplus = 5M
-        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 1, TOKEN_A_CP));
-
-        // Token B: crossing pair (sell + buy same token)
-        // Sell 10M Token B at price 1/3 (expects ~3.3M KAS)
-        ob.add_sell_order(make_sell_cp('f', 10_000_000, 1, 3, TOKEN_B_CP));
-        // Buy Token B with 5_000_000 KAS at price 1/1 (expects 5M tokens)
-        // Crossing: buyer pays 5M KAS, seller expects ~3.3M -> surplus ~ 1.7M
-        ob.add_buy_order(make_buy_cp('e', 5_000_000, 1, 1, TOKEN_B_CP));
-
-        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
-
-        assert_eq!(groups.len(), 1, "Should find 1 cross-pair batch group");
-        assert_eq!(groups[0].sells.len(), 2, "Group should have 2 sells (one per token)");
-        assert_eq!(groups[0].buys.len(), 2, "Group should have 2 buys (one per token)");
-        assert!(groups[0].total_surplus > 0);
-    }
-
-    /// Test: no same-pair crossings -> empty (sell A + buy B is not a valid crossing).
-    #[test]
-    fn test_cross_pair_batch_groups_no_route() {
-        let mut ob = OrderBook::new();
-        // Only a sell in Token A and a buy in Token B -- no same-pair crossing
-        ob.add_sell_order(make_sell_cp('c', 20_000_000, 1, 2, TOKEN_A_CP));
-        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 3, TOKEN_B_CP));
-
-        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
-        assert!(groups.is_empty(), "No same-pair crossings should yield no groups");
-    }
-
-    /// Test: single token with a crossing pair -> not a cross-pair group (needs >= 2 tokens).
-    #[test]
-    fn test_cross_pair_batch_groups_skips_single_token() {
-        let mut ob = OrderBook::new();
-        // Only Token A has a crossing pair
-        ob.add_sell_order(make_sell_cp('c', 20_000_000, 1, 2, TOKEN_A_CP));
-        ob.add_buy_order(make_buy_cp('a', 20_000_000, 1, 1, TOKEN_A_CP));
-
-        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
-        assert!(groups.is_empty(), "Single-token crossing is not a cross-pair group");
-    }
-
-    /// Test: crossings from 3 different tokens combined into one group.
-    #[test]
-    fn test_cross_pair_batch_groups_multiple_tokens() {
-        let mut ob = OrderBook::new();
-        // Token A crossing: surplus = 15M - 5M = 10M
-        ob.add_sell_order(make_sell_cp('c', 10_000_000, 1, 2, TOKEN_A_CP));
-        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 1, TOKEN_A_CP));
-        // Token B crossing: surplus = 15M - 5M = 10M
-        ob.add_sell_order(make_sell_cp('f', 15_000_000, 1, 3, TOKEN_B_CP));
-        ob.add_buy_order(make_buy_cp('e', 15_000_000, 1, 1, TOKEN_B_CP));
-        // Token C crossing: surplus = 20M - 10M = 10M
-        ob.add_sell_order(make_sell_cp('h', 20_000_000, 1, 2, TOKEN_C_CP));
-        ob.add_buy_order(make_buy_cp('g', 20_000_000, 1, 1, TOKEN_C_CP));
-
-        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
-
-        assert_eq!(groups.len(), 1, "All 3 token crossings fit in one group");
-        assert_eq!(groups[0].sells.len(), 3);
-        assert_eq!(groups[0].buys.len(), 3);
-        assert!(groups[0].total_surplus > 0);
-    }
-
-    /// Test: empty order book returns no groups.
-    #[test]
-    fn test_cross_pair_batch_groups_empty() {
-        let ob = OrderBook::new();
-        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
-        assert!(groups.is_empty());
-    }
-
-    /// Test: spent_outpoints filters out already-claimed orders.
-    #[test]
-    fn test_cross_pair_batch_groups_spent_filter() {
-        use std::collections::HashSet;
-        let mut ob = OrderBook::new();
-        // Token A crossing
-        let sell_a = make_sell_cp('c', 20_000_000, 1, 2, TOKEN_A_CP);
-        let sell_a_key = sell_a.outpoint_key();
-        ob.add_sell_order(sell_a);
-        ob.add_buy_order(make_buy_cp('a', 15_000_000, 1, 1, TOKEN_A_CP));
-        // Token B crossing
-        ob.add_sell_order(make_sell_cp('f', 10_000_000, 1, 3, TOKEN_B_CP));
-        ob.add_buy_order(make_buy_cp('e', 5_000_000, 1, 1, TOKEN_B_CP));
-
-        // Without spent filter: should find 1 group
-        let groups = find_cross_pair_batch_groups(&ob, 100, false, None);
-        assert_eq!(groups.len(), 1);
-
-        // Mark Token A sell as spent: only Token B crossing remains -> not enough for cross-pair
-        let mut spent = HashSet::new();
-        spent.insert(sell_a_key);
-        let groups = find_cross_pair_batch_groups(&ob, 100, false, Some(&spent));
-        assert!(groups.is_empty(), "With Token A sell spent, only 1 token crossing remains");
-    }
-
-    // Triangular batch group tests
-
-    const TOKEN_A_TRI: &str = "0102030405060708091011121314151617181920212223242526272829303132";
-    const TOKEN_B_TRI: &str = "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899";
-    const TOKEN_C_TRI: &str = "1111111111111111111111111111111111111111111111111111111111111111";
-
-    fn make_sell_tri(tx_id: &str, index: u32, value: u64, price_num: u64, price_den: u64, token: &str) -> BookOrder {
-        BookOrder {
-            tx_id: format!("{:0>64}", tx_id),
-            index,
-            value,
-            token_cov_id: token.to_string(),
-            price_num,
-            price_den,
-            min_fill: 1_000_000,
-            owner_hash: format!("owner_sell_{}", tx_id),
-            spk_hash: "22".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Sell,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
-        }
-    }
-
-    fn make_buy_tri(tx_id: &str, index: u32, value: u64, price_num: u64, price_den: u64, token: &str) -> BookOrder {
-        BookOrder {
-            tx_id: format!("{:0>64}", tx_id),
-            index,
-            value,
-            token_cov_id: token.to_string(),
-            price_num,
-            price_den,
-            min_fill: 1_000_000,
-            owner_hash: format!("owner_buy_{}", tx_id),
-            spk_hash: "11".repeat(32),
-            counterparty_spk: None,
-            redeem_script_hex: String::new(),
-            p2sh_script_hex: String::new(),
-            p2sh_version: 0,
-            side: OrderSide::Buy,
-            post_only: false,
-            expiry_daa: None,
-            is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
-        }
-    }
-
-    /// Test: triangular batch group correctly contains 3 sells + 3 buys.
-    #[test]
-    fn triangular_batch_group_basic() {
-        let mut ob = OrderBook::new();
-
-        // 3-leg cycle: A->B->C->A, each leg surplus = 5M
-        ob.add_sell_order(make_sell_tri("ts1", 1, 10_000_000, 1, 2, TOKEN_A_TRI));
-        ob.add_buy_order(make_buy_tri("tb1", 0, 10_000_000, 1, 2, TOKEN_B_TRI));
-
-        ob.add_sell_order(make_sell_tri("ts2", 1, 10_000_000, 1, 2, TOKEN_B_TRI));
-        ob.add_buy_order(make_buy_tri("tb2", 0, 10_000_000, 1, 2, TOKEN_C_TRI));
-
-        ob.add_sell_order(make_sell_tri("ts3", 1, 10_000_000, 1, 2, TOKEN_C_TRI));
-        ob.add_buy_order(make_buy_tri("tb3", 0, 10_000_000, 1, 2, TOKEN_A_TRI));
-
-        let groups = find_triangular_batch_groups(&ob, 10, true);
-
-        assert!(!groups.is_empty(), "Should find at least 1 triangular batch group");
-
-        let group = &groups[0];
-        assert_eq!(group.sells.len(), 3, "Triangular group should have 3 sell legs");
-        assert_eq!(group.buys.len(), 3, "Triangular group should have 3 buy legs");
-        assert_eq!(group.total_surplus, 15_000_000, "Total surplus = 3 * 5M");
-    }
 
     // E2E Integration: Full matching pipeline tests
 
@@ -2608,269 +1432,6 @@ mod tests {
         }
     }
 
-    /// E2E: Buy + sell cross -> batch group creation.
-    #[test]
-    fn e2e_match_creates_batch_group() {
-        let mut ob = OrderBook::new();
-        let token = FAKE_TOKEN;
-        let owner_a = "aa".repeat(32);
-        let owner_b = "bb".repeat(32);
-
-        // 3 buys and 3 sells that all cross at 1/2
-        for i in 0..3u32 {
-            ob.add_buy_order(make_buy_e2e(
-                &format!("b{}", "a".repeat(63)), i, 20_000_000, 1, 2, token, &owner_a,
-            ));
-            ob.add_sell_order(make_sell_e2e(
-                &format!("s{}", "c".repeat(63)), i, 20_000_000, 1, 2, token, &owner_b,
-            ));
-        }
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        assert!(!pairs.is_empty(), "Should find crossing pairs");
-
-        // Full-fill pairs should form batch groups
-        let groups = find_batch_groups(&pairs);
-        // With 3 crossing full-fill pairs of the same token, we get 1 batch group
-        if !groups.is_empty() {
-            let group = &groups[0];
-            assert!(group.len() >= 2, "Batch group needs at least 2 pairs");
-            assert!(group.len() <= MAX_BATCH_GROUP_SIZE);
-        }
-    }
-
-    /// E2E: Partial fill — large buy matched partially with small sell, remainder stays.
-    ///
-    /// For a partial buy to trigger:
-    ///   - expected_tokens (buy's demand) > sell.value (sell's supply of tokens)
-    ///   - full fill arithmetic must FAIL (sum > total_in, or surplus < threshold)
-    ///   - the partial amount must exceed min_fill and MIN_UTXO_VALUE thresholds
-    ///
-    /// Setup: buy 50M KAS at 3/1 (expects 150M tokens), sell 30M tokens at 2/1 (expects 60M KAS).
-    /// Full fill: sum = 60M + 150M = 210M > total_in = 50M + 30M = 80M -> full fill FAILS.
-    /// Partial buy: fill_kas = ceil(30M * 1 / 3) = 10M. fill_tokens = 10M * 3 / 1 = 30M.
-    /// seller_kas = 60M. residual_kas = 50M - 10M = 40M.
-    /// surplus = (50M + 30M) - 60M - 30M - 40M = -50M -> negative, won't work either.
-    ///
-    /// Actually, we need: buy price >= sell price (prices cross),
-    /// AND full fill fails, AND partial fill has enough surplus.
-    ///
-    /// Approach: buy at 2/1 (2 tokens per KAS), sell at 1/1 (1 token per KAS).
-    /// Buy: 50M KAS, expects 100M tokens. Sell: 30M tokens, expects 30M KAS.
-    /// Full fill: sum = 30M + 100M = 130M > total_in = 80M -> FAILS.
-    /// Partial buy: expected_tokens(100M) > sell.value(30M), so we try.
-    /// fill_kas = ceil(30M * 1/2) = 15M. fill_tokens = 15M * 2/1 = 30M.
-    /// seller_kas = 30M. residual = 50M - 15M = 35M.
-    /// surplus = (50M + 30M) - 30M - 30M - 35M = -15M -> still negative!
-    ///
-    /// The issue is that the sell expects too much KAS relative to what's available.
-    /// Let me use: buy 50M at 2/1, sell 10M tokens at 1/10.
-    /// Sell expects 10M * 1/10 = 1M KAS. Full fill: sum = 1M + 100M = 101M > 60M -> FAILS.
-    /// Partial: fill_kas = ceil(10M / 2) = 5M. fill_tokens = 5M * 2 = 10M.
-    /// seller_kas = 1M. residual = 50M - 5M = 45M.
-    /// surplus = (50M + 10M) - 1M - 10M - 45M = 4M >= 3.01M -> WORKS!
-    #[test]
-    fn e2e_partial_fill_large_buy_small_sell() {
-        let mut ob = OrderBook::new();
-        let token = FAKE_TOKEN;
-        let owner_a = "aa".repeat(32);
-        let owner_b = "bb".repeat(32);
-
-        // Large buy: 50M KAS at 2/1 (expects 100M tokens)
-        ob.add_buy_order(make_buy_e2e(
-            &"a".repeat(64), 0, 50_000_000, 2, 1, token, &owner_a,
-        ));
-        // Small sell: 20M tokens at 1/3 (expects ~6.67M KAS)
-        // Buy expects 100M tokens but sell has only 20M -> PartialBuy
-        // Surplus = ~3.33M >= estimated miner fee
-        ob.add_sell_order(make_sell_e2e(
-            &"c".repeat(64), 1, 20_000_000, 1, 3, token, &owner_b,
-        ));
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let partial_buys: Vec<_> = pairs.iter()
-            .filter(|p| p.match_type == MatchType::PartialBuy)
-            .collect();
-
-        assert!(!partial_buys.is_empty(), "Should find a partial buy match (found {} total pairs)", pairs.len());
-        let pb = &partial_buys[0];
-        assert!(pb.fill_kas.is_some(), "PartialBuy should have fill_kas");
-        assert!(pb.residual_kas.is_some(), "PartialBuy should have residual_kas");
-        let fill_kas = pb.fill_kas.unwrap();
-        let residual_kas = pb.residual_kas.unwrap();
-        assert!(fill_kas < pb.buy.value, "fill_kas < full buy amount");
-        assert!(residual_kas > 0, "should have non-zero residual");
-        assert_eq!(fill_kas + residual_kas, pb.buy.value, "fill + residual = buy value");
-        assert!(pb.surplus >= estimate_compute_mass(3, 5, 0), "surplus must cover mass-based miner fee");
-    }
-
-    /// E2E: Partial fill — large sell matched partially with small buy, remainder stays.
-    #[test]
-    fn e2e_partial_fill_large_sell_small_buy() {
-        let mut ob = OrderBook::new();
-        let token = FAKE_TOKEN;
-        let owner_a = "aa".repeat(32);
-        let owner_b = "bb".repeat(32);
-
-        // Small buy: 10M KAS at 1/2 (expects 5M tokens)
-        ob.add_buy_order(make_buy_e2e(
-            &"a".repeat(64), 0, 10_000_000, 1, 2, token, &owner_a,
-        ));
-        // Large sell: 100M tokens at 1/3 (expects ~33M KAS)
-        // sell price lower than buy price -> they cross
-        ob.add_sell_order(make_sell_e2e(
-            &"c".repeat(64), 1, 100_000_000, 1, 3, token, &owner_b,
-        ));
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let partial_sells: Vec<_> = pairs.iter()
-            .filter(|p| p.match_type == MatchType::PartialSell)
-            .collect();
-
-        // Should find partial sell since sell is much larger
-        if !partial_sells.is_empty() {
-            let ps = &partial_sells[0];
-            assert!(ps.fill_token_amount.is_some(), "PartialSell should have fill_token_amount");
-            assert!(ps.residual_tokens.is_some(), "PartialSell should have residual_tokens");
-            let fill_tokens = ps.fill_token_amount.unwrap();
-            let residual_tokens = ps.residual_tokens.unwrap();
-            assert!(fill_tokens < 100_000_000, "fill < full sell amount");
-            assert!(residual_tokens > 0, "should have non-zero residual");
-        }
-    }
-
-    /// E2E: Self-trade prevention — same owner on both sides should be skipped.
-    #[test]
-    fn e2e_stp_blocks_same_owner() {
-        let mut ob = OrderBook::new();
-        let token = FAKE_TOKEN;
-        let same_owner = "aa".repeat(32);
-
-        ob.add_buy_order(make_buy_e2e(
-            &"a".repeat(64), 0, 20_000_000, 1, 2, token, &same_owner,
-        ));
-        ob.add_sell_order(make_sell_e2e(
-            &"c".repeat(64), 1, 20_000_000, 1, 2, token, &same_owner,
-        ));
-
-        // With STP enabled (default), same owner pairs should be skipped
-        let pairs_stp = find_all_crossing_pairs(&ob);
-        assert!(pairs_stp.is_empty(), "STP should block same-owner match");
-
-        // With STP disabled, they should cross
-        let pairs_no_stp = find_all_crossing_pairs_with_stp(&ob, true);
-        assert!(!pairs_no_stp.is_empty(), "Without STP, same-owner should cross");
-    }
-
-    /// E2E: Matched outpoint prevents re-matching.
-    #[test]
-    fn e2e_matched_outpoint_prevents_rematch() {
-        let mut ob = OrderBook::new();
-        let token = FAKE_TOKEN;
-        let owner_a = "aa".repeat(32);
-        let owner_b = "bb".repeat(32);
-
-        let buy = make_buy_e2e(&"a".repeat(64), 0, 20_000_000, 1, 2, token, &owner_a);
-        let sell = make_sell_e2e(&"c".repeat(64), 1, 20_000_000, 1, 2, token, &owner_b);
-        let buy_key = buy.outpoint_key();
-        ob.add_buy_order(buy);
-        ob.add_sell_order(sell);
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        assert!(!pairs.is_empty(), "Should find match before removal");
-
-        // Simulate match execution: remove the buy order
-        ob.remove_order(&buy_key);
-
-        let pairs_after = find_all_crossing_pairs_with_stp(&ob, true);
-        assert!(pairs_after.is_empty(), "No match after buy order removed");
-    }
-
-    /// E2E: Cross-pair batch group combines same-pair crossings from two tokens.
-    #[test]
-    fn e2e_cross_pair_batch_group() {
-        let mut ob = OrderBook::new();
-        let token_a = "0a".repeat(32);
-        let token_b = "0b".repeat(32);
-        let owner_a = "aa".repeat(32);
-        let owner_b = "bb".repeat(32);
-        let owner_c = "cc".repeat(32);
-        let owner_d = "dd".repeat(32);
-
-        // Token A: same-pair crossing (sell A + buy A)
-        ob.add_sell_order(make_sell_e2e(
-            &"s".repeat(64), 0, 20_000_000, 1, 2, &token_a, &owner_a,
-        ));
-        ob.add_buy_order(make_buy_e2e(
-            &"b".repeat(64), 0, 20_000_000, 1, 1, &token_a, &owner_b,
-        ));
-        // Token B: same-pair crossing (sell B + buy B)
-        ob.add_sell_order(make_sell_e2e(
-            &"t".repeat(64), 0, 15_000_000, 1, 3, &token_b, &owner_c,
-        ));
-        ob.add_buy_order(make_buy_e2e(
-            &"u".repeat(64), 0, 10_000_000, 1, 1, &token_b, &owner_d,
-        ));
-
-        let groups = find_cross_pair_batch_groups(&ob, 10, true, None);
-        // Two same-pair crossings from different tokens -> 1 cross-pair group
-        assert!(!groups.is_empty(), "Should find cross-pair batch group");
-        let group = &groups[0];
-        assert_eq!(group.sells.len(), 2, "Should have sell from each token");
-        assert_eq!(group.buys.len(), 2, "Should have buy from each token");
-        assert!(group.total_surplus > 0);
-    }
-
-    /// E2E: Multiple pairs independently matched.
-    #[test]
-    fn e2e_multi_pair_matching() {
-        let mut ob = OrderBook::new();
-        let token_a = "0a".repeat(32);
-        let token_b = "0b".repeat(32);
-
-        // Pair A: crossing orders
-        ob.add_buy_order(make_buy_e2e(
-            &"a".repeat(64), 0, 20_000_000, 1, 2, &token_a, &"aa".repeat(32),
-        ));
-        ob.add_sell_order(make_sell_e2e(
-            &"b".repeat(64), 0, 20_000_000, 1, 2, &token_a, &"bb".repeat(32),
-        ));
-
-        // Pair B: crossing orders
-        ob.add_buy_order(make_buy_e2e(
-            &"c".repeat(64), 0, 30_000_000, 1, 3, &token_b, &"cc".repeat(32),
-        ));
-        ob.add_sell_order(make_sell_e2e(
-            &"d".repeat(64), 0, 30_000_000, 1, 3, &token_b, &"dd".repeat(32),
-        ));
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        // Should find matches in both pairs
-        let pair_a_matches: Vec<_> = pairs.iter().filter(|p| p.token_cov_id == token_a).collect();
-        let pair_b_matches: Vec<_> = pairs.iter().filter(|p| p.token_cov_id == token_b).collect();
-        assert!(!pair_a_matches.is_empty(), "Pair A should have matches");
-        assert!(!pair_b_matches.is_empty(), "Pair B should have matches");
-    }
-
-    /// E2E: Zero-price orders are skipped (M-3 guard).
-    #[test]
-    fn e2e_zero_price_orders_skipped() {
-        let mut ob = OrderBook::new();
-        let token = FAKE_TOKEN;
-
-        // Buy with price_num=0 (corrupted)
-        let mut bad_buy = make_buy(20_000_000, 1, 2, token);
-        bad_buy.price_num = 0;
-        bad_buy.tx_id = "z".repeat(64);
-        ob.add_buy_order(bad_buy);
-
-        ob.add_sell_order(make_sell_e2e(
-            &"c".repeat(64), 1, 20_000_000, 1, 2, token, &"dd".repeat(32),
-        ));
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        assert!(pairs.is_empty(), "Zero-price buy should be skipped by M-3 guard");
-    }
 
     // M-7: Minimum partial fill / rounding-drain guard tests
 
@@ -3043,38 +1604,6 @@ mod tests {
         assert_eq!(below, 0, "below minimum threshold, output must be 0");
     }
 
-    #[test]
-    fn test_normal_partial_fills_unaffected() {
-        // Normal partial fill scenario should still work exactly as before.
-        // This is a regression test against the e2e_partial_fill_large_buy_small_sell test.
-        let mut ob = OrderBook::new();
-        let token = FAKE_TOKEN;
-        let owner_a = "aa".repeat(32);
-        let owner_b = "bb".repeat(32);
-
-        // Large buy: 50M KAS at 2/1 (expects 100M tokens)
-        ob.add_buy_order(make_buy_e2e(
-            &"a".repeat(64), 0, 50_000_000, 2, 1, token, &owner_a,
-        ));
-        // Small sell: 20M tokens at 1/3 (expects ~6.67M KAS)
-        ob.add_sell_order(make_sell_e2e(
-            &"c".repeat(64), 1, 20_000_000, 1, 3, token, &owner_b,
-        ));
-
-        let pairs = find_all_crossing_pairs_with_stp(&ob, true);
-        let partial_buys: Vec<_> = pairs.iter()
-            .filter(|p| p.match_type == MatchType::PartialBuy)
-            .collect();
-
-        assert!(!partial_buys.is_empty(), "Normal partial buy should still work after M-7 guard");
-        let pb = &partial_buys[0];
-        let fill_kas = pb.fill_kas.unwrap();
-        // Verify output is non-zero
-        let output_tokens = fill_kas * pb.buy.price_num / pb.buy.price_den;
-        assert!(output_tokens > 0, "fill must produce non-zero tokens");
-    }
-
-    // Sweep group tests
 
     #[test]
     fn test_sweep_buy_3_sells() {

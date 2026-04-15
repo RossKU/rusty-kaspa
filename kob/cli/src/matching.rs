@@ -145,11 +145,12 @@ pub async fn run(
         compute_p2pk_spk_hash(&seller_pubkey)
     };
 
-    // Reconstruct redeemScripts (v6 or v8 depending on version flag).
-    // max_matcher_fee default matches the deploy default (10_000_000 sompi).
-    // cancel_pending = 0 (active, not pending cancel).
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
+    // Reconstruct redeemScripts (v13 or v14; the redeem-script layout is shared
+    // so the same builder handles both). max_matcher_fee default matches the
+    // deploy default (10_000_000 sompi). cancel_pending = 0 (active, not pending
+    // cancel).
+    if version != 13 && version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Supported: v13, v14.", version);
     }
     let buy_rs = contract::build_buy_redeem_script(
         &tcid,
@@ -659,9 +660,9 @@ pub async fn run_cross_pair(
         compute_p2pk_spk_hash(&seller_pubkey)
     };
 
-    // Reconstruct redeemScripts (v13 only)
-    if version != 13 {
-        anyhow::bail!("Unsupported contract version {}. Only v13 is supported.", version);
+    // Reconstruct redeemScripts (v13 or v14; same builder layout).
+    if version != 13 && version != 14 {
+        anyhow::bail!("Unsupported contract version {}. Supported: v13, v14.", version);
     }
     let buy_rs = contract::build_buy_redeem_script(
         &buy_tcid,

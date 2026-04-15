@@ -2091,6 +2091,36 @@ impl ReorgCollector {
     }
 }
 
+/// Process-wide log-dedup for `[INDEXER] skipped unmatchable` warnings.
+/// Entries are never removed; once a deploy is unmatchable (no counterparty
+/// SPK resolvable from its outputs) it stays unmatchable, and the set size
+/// is bounded by the number of such distinct outpoints observed.
+static UNMATCHABLE_LOGGED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Returns `true` when `order` has no populated `counterparty_spk` and
+/// therefore can never match under the batch matcher (which requires the
+/// counterparty SPK to build the fill TX). Emits a single `warn!` per
+/// outpoint so re-scans do not spam the log.
+///
+/// Defense-in-depth pair for the per-offender cooldown: this prevents the
+/// stale deploy from entering the book at all, avoiding the recycle cost
+/// of re-triggering the planner every 30s via the cooldown path.
+fn skip_if_no_counterparty_spk(order: &crate::matcher::order_book::BookOrder) -> bool {
+    if order.counterparty_spk.as_deref().map_or(true, str::is_empty) {
+        let key = order.outpoint_key();
+        let first_time = UNMATCHABLE_LOGGED
+            .lock()
+            .map(|mut s| s.insert(key.clone()))
+            .unwrap_or(false);
+        if first_time {
+            warn!("[INDEXER] skipped unmatchable order {} (no counterparty_spk)", key);
+        }
+        return true;
+    }
+    false
+}
+
 fn process_block_txs_all(
     txs: &[TransactionData],
     order_book: &mut OrderBook,
@@ -2291,6 +2321,13 @@ fn process_block_txs_all(
                             }
                         }
                     }
+                }
+
+                // Indexer filter: un-matchable orders (no counterparty_spk)
+                // never enter the book. Stale v0-style deploys would otherwise
+                // recycle through per-offender cooldown every 30s.
+                if skip_if_no_counterparty_spk(&book_order) {
+                    continue;
                 }
 
                 match parsed.order_type {
@@ -2497,6 +2534,13 @@ fn process_block_txs_all(
                         "[SCANNER-ALL] Skipping OCO sell with unknown token_cov_id: {}:{}",
                         &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
                     );
+                    continue;
+                }
+
+                // Indexer filter: TP and SL share the same counterparty_spk
+                // (extracted once from the deploy TX); checking tp_order is
+                // sufficient to cover both virtual orders.
+                if skip_if_no_counterparty_spk(&tp_order) {
                     continue;
                 }
 
@@ -6478,6 +6522,43 @@ mod tests {
 
         ob.remove_order(&outpoint);
         assert!(!ob.contains_outpoint(&outpoint), "should not contain outpoint after remove");
+    }
+
+    // Indexer filter: un-matchable orders (missing counterparty_spk) are
+    // skipped at discovery so they never enter the book. This prevents
+    // stale v0-style deploys from recycling through per-offender cooldown.
+    #[test]
+    fn indexer_filter_skips_order_without_counterparty_spk() {
+        let make = |spk: Option<String>| crate::matcher::order_book::BookOrder {
+            tx_id: "a".repeat(64),
+            index: 0,
+            value: 10_000_000,
+            token_cov_id: "aa".repeat(32),
+            price_num: 1,
+            price_den: 2,
+            min_fill: 1_000_000,
+            owner_hash: "cc".repeat(32),
+            spk_hash: "dd".repeat(32),
+            counterparty_spk: spk,
+            redeem_script_hex: String::new(),
+            p2sh_script_hex: String::new(),
+            p2sh_version: 0,
+            side: OrderSide::Buy,
+            post_only: false,
+            expiry_daa: None,
+            is_freezable: false,
+            max_matcher_fee: u64::MAX,
+            ifd_order_b_rs_hex: None,
+            oco_path: None,
+            oco_partner_key: None,
+            discovered_daa: 0,
+        };
+        assert!(skip_if_no_counterparty_spk(&make(None)),
+            "None counterparty_spk must be skipped");
+        assert!(skip_if_no_counterparty_spk(&make(Some(String::new()))),
+            "empty counterparty_spk must be skipped");
+        assert!(!skip_if_no_counterparty_spk(&make(Some("deadbeef".into()))),
+            "populated counterparty_spk must pass");
     }
 
     // Trade Bridge Tests (record_trade -> SharedState)

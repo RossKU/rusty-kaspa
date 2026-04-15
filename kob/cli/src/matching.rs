@@ -33,7 +33,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletContext;
-use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, converge_fee, MAX_TX_MASS};
+use kob_core::mass::{calc_mass_with_sigscripts, compute_storage_mass, MAX_TX_MASS};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
 use std::path::Path;
 use tracing::info;
@@ -423,63 +423,50 @@ pub async fn run(
             tx.outputs.push(TxOutput::new(tentative_matcher_change, wallet_spk_version, wallet_spk.clone(), None));
         }
 
-        // Phase 1: converge fee on change output (index 3 if it exists, else fold into seller)
+        // Single-sign fee convergence via placeholder P2PK sigscript (66 B,
+        // matches the real signed sigscript length byte-for-byte).
+        // `calc_mass_with_sigscripts` reads `ss.len()` only, so the mass
+        // computed with the placeholder equals the mass with the real sig.
+        // One signing pass, no Phase 2 re-sign.
+        //
+        // Structure flips are one-directional (4-output → 3-output) because
+        // `tentative_change >= MIN_UTXO_VALUE` is a necessary condition for
+        // a 4-output start, and the fee only subtracts from change.
         let min_fee_override = if fee > 0 { fee } else { 0 };
-        let has_change_output = tx.outputs.len() > 3;
-        let change_idx_m = tx.outputs.len().saturating_sub(1);
-        let (est_fee_m, _) = if has_change_output {
-            converge_fee(&mut tx, tentative_change, change_idx_m, min_fee_override)
-        } else {
-            let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-            (f, 0)
-        };
+        let placeholder_fee_ss = signing::build_p2pk_sigscript(&[0u8; 64]);
+        let mut sigscripts_probe = sigscripts.clone();
+        sigscripts_probe.push(placeholder_fee_ss);
 
-        let adj_change = tentative_change.saturating_sub(est_fee_m);
-        let (adj_seller_kas, adj_matcher_change) = if adj_change >= MIN_UTXO_VALUE {
-            (seller_kas, adj_change)
+        let mass1 = calc_mass_with_sigscripts(&tx, &sigscripts_probe);
+        let fee1 = mass1.max(min_fee_override);
+        let has_change_output = tx.outputs.len() > 3;
+        let (adj_seller_kas, adj_matcher_change) = if has_change_output {
+            let adj_change1 = tentative_change.saturating_sub(fee1);
+            if adj_change1 >= MIN_UTXO_VALUE {
+                (seller_kas, adj_change1)
+            } else {
+                // Drop change output; recompute mass with 3-output structure.
+                tx.outputs.pop();
+                let mass2 = calc_mass_with_sigscripts(&tx, &sigscripts_probe);
+                let fee2 = mass2.max(min_fee_override);
+                let adj_change2 = tentative_change.saturating_sub(fee2);
+                (seller_kas + adj_change2, 0u64)
+            }
         } else {
-            (seller_kas + adj_change, 0u64)
+            let adj_change1 = tentative_change.saturating_sub(fee1);
+            (seller_kas + adj_change1, 0u64)
         };
 
         tx.outputs[0].value = adj_seller_kas;
-        let has_co = tx.outputs.len() > 3;
-        if adj_matcher_change >= MIN_UTXO_VALUE {
-            if has_co { tx.outputs[3].value = adj_matcher_change; }
-            else { tx.outputs.push(TxOutput::new(adj_matcher_change, wallet_spk_version, wallet_spk.clone(), None)); }
-        } else if has_co {
-            tx.outputs.pop();
+        if tx.outputs.len() > 3 {
+            tx.outputs[3].value = adj_matcher_change;
         }
 
-        // Sign fee input (index 2) -- must sign AFTER final output adjustment
+        // Sign fee input (index 2) over post-convergence outputs — once.
         let sighash_fee = compute_sighash(&tx, 2)?;
         let sig_fee = signing::schnorr_sign(&privkey, &sighash_fee)?;
         let fee_ss = signing::build_p2pk_sigscript(&sig_fee);
-        sigscripts.push(fee_ss.clone());
-
-        // Phase 2: exact mass check with real sigscripts
-        let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-        let exact_fee = exact_mass.max(min_fee_override);
-
-        if exact_fee != est_fee_m {
-            let adj_change2 = tentative_change.saturating_sub(exact_fee);
-            let (adj_sk2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
-                (seller_kas, adj_change2)
-            } else {
-                (seller_kas + adj_change2, 0u64)
-            };
-            tx.outputs[0].value = adj_sk2;
-            let has_co2 = tx.outputs.len() > 3;
-            if adj_mc2 >= MIN_UTXO_VALUE {
-                if has_co2 { tx.outputs[3].value = adj_mc2; }
-                else { tx.outputs.push(TxOutput::new(adj_mc2, wallet_spk_version, wallet_spk.clone(), None)); }
-            } else if has_co2 {
-                tx.outputs.pop();
-            }
-            // Re-sign fee input
-            let sh = compute_sighash(&tx, 2)?;
-            let sf = signing::schnorr_sign(&privkey, &sh)?;
-            *sigscripts.last_mut().unwrap() = signing::build_p2pk_sigscript(&sf);
-        }
+        sigscripts.push(fee_ss);
 
         let actual_fee = {
             let ti: u64 = tx.inputs.iter().map(|i| i.value).sum();
@@ -953,71 +940,55 @@ pub async fn run_cross_pair(
         tx.outputs.push(TxOutput::new(tentative_matcher_change, wallet_spk_version, wallet_spk.clone(), None));
     }
 
-    // Phase 1: converge fee
+    // Single-sign fee convergence via placeholder P2PK sigscripts (66 B each,
+    // matches the real signed sigscript length byte-for-byte).
+    // Inputs 2 (token) and 3 (fee) are both P2PK, so two placeholders suffice.
+    // One pass of exact mass → one adjustment → two signs (no re-signs).
     let min_fee_override = if fee > 0 { fee } else { 0 };
-    let has_change_output = tx.outputs.len() > 3;
-    let change_idx_m2 = tx.outputs.len().saturating_sub(1);
-    let (est_fee_m2, _) = if has_change_output {
-        converge_fee(&mut tx, tentative_change, change_idx_m2, min_fee_override)
-    } else {
-        let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-        (f, 0)
-    };
+    let placeholder_ss = signing::build_p2pk_sigscript(&[0u8; 64]);
+    let sigscripts_probe: Vec<Vec<u8>> = vec![
+        sell_fill_ss.clone(),
+        buy_fill_ss.clone(),
+        placeholder_ss.clone(),
+        placeholder_ss,
+    ];
 
-    let adj_change = tentative_change.saturating_sub(est_fee_m2);
-    let (final_seller_kas, matcher_change) = if adj_change >= MIN_UTXO_VALUE {
-        (seller_kas, adj_change)
+    let mass1 = calc_mass_with_sigscripts(&tx, &sigscripts_probe);
+    let fee1 = mass1.max(min_fee_override);
+    let has_change_output = tx.outputs.len() > 3;
+    let (final_seller_kas, matcher_change) = if has_change_output {
+        let adj_change1 = tentative_change.saturating_sub(fee1);
+        if adj_change1 >= MIN_UTXO_VALUE {
+            (seller_kas, adj_change1)
+        } else {
+            // Drop change output; recompute mass with 3-output structure.
+            tx.outputs.pop();
+            let mass2 = calc_mass_with_sigscripts(&tx, &sigscripts_probe);
+            let fee2 = mass2.max(min_fee_override);
+            let adj_change2 = tentative_change.saturating_sub(fee2);
+            (seller_kas + adj_change2, 0u64)
+        }
     } else {
-        (seller_kas + adj_change, 0u64)
+        let adj_change1 = tentative_change.saturating_sub(fee1);
+        (seller_kas + adj_change1, 0u64)
     };
 
     tx.outputs[0].value = final_seller_kas;
-    let has_co = tx.outputs.len() > 3;
-    if matcher_change >= MIN_UTXO_VALUE {
-        if has_co { tx.outputs[3].value = matcher_change; }
-        else { tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk, None)); }
-    } else if has_co {
-        tx.outputs.pop();
+    if tx.outputs.len() > 3 {
+        tx.outputs[3].value = matcher_change;
     }
 
-    // Sign input 2 (token UTXO) -- must sign AFTER final output adjustment
+    // Sign inputs 2 (token) and 3 (fee) — once each over post-convergence outputs.
     let sighash_2 = compute_sighash(&tx, 2)?;
     let sig_2 = signing::schnorr_sign(&privkey, &sighash_2)?;
     let token_ss = signing::build_p2pk_sigscript(&sig_2);
 
-    // Sign input 3 (fee UTXO)
     let sighash_3 = compute_sighash(&tx, 3)?;
     let sig_3 = signing::schnorr_sign(&privkey, &sighash_3)?;
     let fee_ss = signing::build_p2pk_sigscript(&sig_3);
 
     // Sigscripts: [sell_fill, buy_fill, token_sign, fee_sign]
-    let mut sigscripts = vec![sell_fill_ss, buy_fill_ss, token_ss, fee_ss];
-
-    // Phase 2: exact mass check
-    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
-    if exact_fee != est_fee_m2 {
-        let adj_change2 = tentative_change.saturating_sub(exact_fee);
-        let (fsk2, mc2) = if adj_change2 >= MIN_UTXO_VALUE {
-            (seller_kas, adj_change2)
-        } else {
-            (seller_kas + adj_change2, 0u64)
-        };
-        tx.outputs[0].value = fsk2;
-        let has_co2 = tx.outputs.len() > 3;
-        if mc2 >= MIN_UTXO_VALUE {
-            if has_co2 { tx.outputs[3].value = mc2; }
-        } else if has_co2 {
-            tx.outputs.pop();
-        }
-        // Re-sign inputs 2 and 3
-        let sh2 = compute_sighash(&tx, 2)?;
-        let s2 = signing::schnorr_sign(&privkey, &sh2)?;
-        sigscripts[2] = signing::build_p2pk_sigscript(&s2);
-        let sh3 = compute_sighash(&tx, 3)?;
-        let s3 = signing::schnorr_sign(&privkey, &sh3)?;
-        sigscripts[3] = signing::build_p2pk_sigscript(&s3);
-    }
+    let sigscripts = vec![sell_fill_ss, buy_fill_ss, token_ss, fee_ss];
 
     // Fee transparency summary
     {

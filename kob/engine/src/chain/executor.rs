@@ -3186,7 +3186,14 @@ async fn run_scan_cycle(
             }
         }
 
-        // Convert BookOrders to BatchOrders
+        // Convert BookOrders to BatchOrders.
+        //
+        // When a single order in the group cannot be converted (e.g., v0
+        // payload-v1 BUY with no counterparty_spk, or unsupported RS size),
+        // mark ONLY that order as failed and skip the group — don't drag
+        // bystanders into 30s cooldown. Marking innocent buys/sells was the
+        // root cause of the P02 "one external v0 BUY kills the whole
+        // SellSweep" flake (Bug B counterparty_spk variant).
         let mut sells = Vec::new();
         let mut buys = Vec::new();
         let mut skip_group = false;
@@ -3195,7 +3202,9 @@ async fn run_scan_cycle(
             match book_order_to_batch_order(sell, "UNIFIED") {
                 Some(o) => sells.push(o),
                 None => {
-                    // C3 fix: mark as failed so it cools down
+                    // Only the offender cools down. Other orders in the
+                    // group are still fine and should remain eligible for
+                    // other matches (incl. Phase 3 swap routes).
                     spent_tracker.mark_failed(&sell.outpoint_key());
                     skip_group = true;
                     break;
@@ -3203,9 +3212,6 @@ async fn run_scan_cycle(
             }
         }
         if skip_group {
-            for buy in &group.buys {
-                spent_tracker.mark_failed(&buy.outpoint_key());
-            }
             continue;
         }
 
@@ -3220,16 +3226,15 @@ async fn run_scan_cycle(
             }
         }
         if skip_group {
-            for sell in &group.sells {
-                spent_tracker.mark_failed(&sell.outpoint_key());
-            }
             continue;
         }
 
         if sells.is_empty() || buys.is_empty() {
-            for o in group.all_orders() {
-                spent_tracker.mark_failed(&o.outpoint_key());
-            }
+            // Defensive: grouper should never emit an empty side. If it
+            // happens, treat as a grouper bug and skip the group without
+            // cooling down the individual orders — they may still match
+            // in another group.
+            warn!("[UNIFIED] Group had empty sells/buys after conversion, skipping without cooldown");
             continue;
         }
 

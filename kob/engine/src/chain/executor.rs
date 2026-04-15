@@ -732,6 +732,10 @@ pub async fn execute_batch_match(
     config: &AppConfig,
     spent_tracker: &mut SpentTracker,
     ifd_payload: Option<String>,
+    // H1: wallet SPK from cycle-level cache.
+    // All UTXOs for the same address share the same SPK, so re-fetching
+    // per group was pure overhead (~1 RPC roundtrip per match).
+    wallet_spk: (u16, &[u8]),
 ) -> Option<BatchMatchResult> {
     use crate::matcher::batch::OutputPurpose;
 
@@ -813,20 +817,11 @@ pub async fn execute_batch_match(
 
     // Add wallet input (P2PK, sigOpCount=1) if present
     if let Some((ref wallet_tx_id, wallet_index, wallet_value)) = plan.wallet_input {
-        // Fetch wallet UTXOs to get the SPK for sighash computation
-        let (utxos, wallet_spk_version, wallet_spk_script, _wallet_spk_hex) =
-            fetch_wallet_utxos(rpc, &config.address, "BATCH").await?;
-
-        // Find the specific wallet UTXO to get its SPK
-        let wallet_utxo = utxos.iter().find(|u| {
-            u.outpoint.transaction_id == *wallet_tx_id && u.outpoint.index == wallet_index
-        });
-        let (spk_version, spk_script) = if let Some(wu) = wallet_utxo {
-            wu.parse_spk()
-        } else {
-            // Fallback: use the first UTXO's SPK (same wallet, same SPK)
-            (wallet_spk_version, wallet_spk_script.clone())
-        };
+        // H1: Use cycle-level cached wallet SPK. All UTXOs owned by the same
+        // address share one SPK, so fetching again inside this function was
+        // redundant (the original code already had a fallback acknowledging
+        // "same wallet, same SPK").
+        let (spk_version, spk_script_ref) = wallet_spk;
 
         sighash_tx.inputs.push(kob_core::tx::TxInput {
             prev_tx_id: wallet_tx_id.clone(),
@@ -834,7 +829,7 @@ pub async fn execute_batch_match(
             sequence: 0,
             sig_op_count: 1,
             script_version: spk_version,
-            script_bytes: spk_script,
+            script_bytes: spk_script_ref.to_vec(),
             value: wallet_value,
         });
     }
@@ -3069,7 +3064,7 @@ async fn run_scan_cycle(
             (ctx, payload)
         };
 
-        match execute_batch_match(rpc, &mut plan, config, spent_tracker, ifd_payload).await {
+        match execute_batch_match(rpc, &mut plan, config, spent_tracker, ifd_payload, (wallet_spk_version, &wallet_spk_script)).await {
             Some(batch_result) => {
                 // IFD trigger
                 if let Some(ctx) = &ifd_ctx {

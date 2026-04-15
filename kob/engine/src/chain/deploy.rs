@@ -714,7 +714,7 @@ pub async fn run_deploy_test(
     };
 
     let mut spent_tracker = executor::SpentTracker::new();
-    let batch_result = executor::execute_batch_match(&rpc_lock, &mut plan, config, &mut spent_tracker, None).await;
+    let batch_result = executor::execute_batch_match(&rpc_lock, &mut plan, config, &mut spent_tracker, None, (wallet_spk_version, &wallet_spk_script)).await;
     drop(rpc_lock);
 
     match batch_result {

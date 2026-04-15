@@ -750,6 +750,7 @@ mod tests {
                 },
                 block_daa_score: 100_000,
                 is_coinbase: false,
+                covenant_id: None,
             },
         }
     }
@@ -770,6 +771,7 @@ mod tests {
                 },
                 block_daa_score: 100_000,
                 is_coinbase: false,
+                covenant_id: None,
             },
         }
     }

@@ -33,6 +33,13 @@ pub struct RpcUtxoEntry {
     pub block_daa_score: u64,
     #[serde(rename = "isCoinbase", default)]
     pub is_coinbase: bool,
+    /// Covenant id of the UTXO, if any (covenant-bound UTXOs only).
+    /// Kaspad serializes this field as `covenantId` (camelCase) in JSON-RPC
+    /// responses, or omits/nulls it for covenant-free UTXOs. The filter in
+    /// `kob-cli deploy sell` auto-select uses this to distinguish fresh token
+    /// UTXOs (carrying the token's covenant id) from incompatible ones.
+    #[serde(rename = "covenantId", default)]
+    pub covenant_id: Option<String>,
 }
 
 /// scriptPublicKey — handles both flat hex string and `{version, script}` object.
@@ -219,6 +226,7 @@ mod tests {
                 script_public_key: RpcSpk { version: 0, script: String::new() },
                 block_daa_score: 0,
                 is_coinbase: false,
+                covenant_id: None,
             },
         };
         assert_eq!(utxo.outpoint_key(), "abc123:2");
@@ -239,6 +247,7 @@ mod tests {
                 script_public_key: RpcSpk { version: 0, script: script_hex },
                 block_daa_score: 100,
                 is_coinbase: false,
+                covenant_id: None,
             },
         };
         let (version, script) = utxo.parse_spk();
@@ -259,6 +268,7 @@ mod tests {
             script_public_key: RpcSpk { version: 0, script: script_hex },
             block_daa_score: 0,
             is_coinbase: false,
+            covenant_id: None,
         };
         assert!(entry.is_p2sh());
     }

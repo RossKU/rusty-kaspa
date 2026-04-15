@@ -718,6 +718,68 @@ impl OrderBook {
         }
     }
 
+    /// Back-fill `counterparty_spk` on an existing order when a rescan
+    /// produces a non-None value that was not available on the first scan.
+    ///
+    /// Root-cause fix for executor dedup path: when the scanner sees a deploy
+    /// TX early (e.g., from a mempool/partial block payload where outputs
+    /// aren't fully resolved), `extract_owner_spk` returns None and the order
+    /// is inserted with `counterparty_spk = None`. Later when the block is
+    /// fully indexed, a rescan produces the same outpoint with `Some(spk)`,
+    /// but the dedup check discards it — leaving the order un-matchable in
+    /// `process_batch_unified` (which skips orders missing counterparty_spk).
+    ///
+    /// This method performs an in-place update that covers exactly the
+    /// None → Some transition; other fields are not touched so existing
+    /// matchers and reorg snapshots remain stable.
+    ///
+    /// Returns `true` when an update was performed.
+    pub fn update_counterparty_spk_if_missing(
+        &mut self,
+        outpoint_key: &str,
+        new_spk: &Option<String>,
+    ) -> bool {
+        let new_spk = match new_spk {
+            Some(s) if !s.is_empty() => s.clone(),
+            _ => return false,
+        };
+        let (token_cov_id, side) = match self.outpoint_index.get(outpoint_key) {
+            Some(v) => (v.0.clone(), v.1),
+            None => return false,
+        };
+        let book = match self.pair_books.get_mut(&token_cov_id) {
+            Some(b) => b,
+            None => return false,
+        };
+        match side {
+            OrderSide::Buy => {
+                let key = match book.bid_outpoints.get(outpoint_key) {
+                    Some(k) => k.clone(),
+                    None => return false,
+                };
+                if let Some(order) = book.bids.get_mut(&key) {
+                    if order.counterparty_spk.is_none() {
+                        order.counterparty_spk = Some(new_spk);
+                        return true;
+                    }
+                }
+            }
+            OrderSide::Sell => {
+                let key = match book.ask_outpoints.get(outpoint_key) {
+                    Some(k) => k.clone(),
+                    None => return false,
+                };
+                if let Some(order) = book.asks.get_mut(&key) {
+                    if order.counterparty_spk.is_none() {
+                        order.counterparty_spk = Some(new_spk);
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Look up the first order matching a txid in O(1).
     ///
     /// Uses the `txid_index` to find outpoint keys for this txid, then

@@ -226,6 +226,8 @@ struct RestUtxoEntryRaw {
     block_daa_score: u64,
     #[serde(rename = "isCoinbase", default)]
     is_coinbase: bool,
+    #[serde(rename = "covenantId", default)]
+    covenant_id: Option<String>,
 }
 
 impl RestUtxoRaw {
@@ -241,6 +243,7 @@ impl RestUtxoRaw {
                 script_public_key: spk,
                 block_daa_score: self.utxo_entry.block_daa_score,
                 is_coinbase: self.utxo_entry.is_coinbase,
+                covenant_id: self.utxo_entry.covenant_id,
             },
         }
     }

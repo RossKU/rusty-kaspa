@@ -200,14 +200,28 @@ impl RpcClient {
     pub async fn get_spendable_utxos(&self, address: &str) -> anyhow::Result<Vec<RpcUtxo>> {
         let utxos = self.get_utxos_by_addresses(&[address]).await?;
 
-        // Try mempool filtering
+        // Try mempool filtering.
+        //
+        // kaspad semantics (rpc/service/src/service.rs::extract_tx_query):
+        //   (filter=true,  include_orphan=true)  -> OrphansOnly
+        //   (filter=true,  include_orphan=false) -> InconsistentMempoolTxQuery error
+        //   (filter=false, include_orphan=true)  -> All
+        //   (filter=false, include_orphan=false) -> TransactionsOnly
+        //
+        // We want to know which wallet UTXOs are being spent by pending mempool
+        // transactions, so include orphans too -- a UTXO claimed by an orphan is
+        // still effectively unspendable.  Previously this sent (true, false) which
+        // is the only invalid combination -- the node returned an error, the error
+        // was silently swallowed by the `if let Ok` below, and the function returned
+        // all UTXOs as if none were in the mempool, racing fresh deploys against
+        // pending match TXs.
         let mempool_result = self
             .call(
                 "getMempoolEntriesByAddresses",
                 serde_json::json!({
                     "addresses": [address],
-                    "includeOrphanPool": false,
-                    "filterTransactionPool": true,
+                    "includeOrphanPool": true,
+                    "filterTransactionPool": false,
                 }),
             )
             .await;

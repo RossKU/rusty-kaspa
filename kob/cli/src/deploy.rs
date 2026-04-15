@@ -164,6 +164,82 @@ pub fn resolve_market_price(side: &str, amount: u64) -> (u64, u64) {
     }
 }
 
+/// Return `true` iff `utxo` is safe to use as the `input[0]` covenant source
+/// for a new sell-side deploy of the token identified by `token_covenant_hex`.
+///
+/// Motivation: `token_unit_P2SH` holds TWO kinds of UTXOs:
+///
+/// 1. **Fresh mint unit outputs** — created by `token mint`, covenant-bound to
+///    the token's genesis hash. The on-chain stored `utxo_entry.covenant_id`
+///    equals the token's covenant id, so spending it as `input[0]` of a new
+///    sell deploy is treated as a *continuation* of that covenant and the
+///    node-side covenants check passes.
+///
+/// 2. **Match-merged / remainder UTXOs with foreign lineage** — can appear at
+///    the same P2SH address (e.g., receipts folded back from prior matches or
+///    leftover token_remainder outputs from previous sell deploys using an
+///    unrelated token). Their `utxo_entry.covenant_id` is either `None` or a
+///    *different* hash. Spending one of these trips the consensus genesis-
+///    hashing check:
+///
+///    ```text
+///    covenants error: input #0 and outputs with covenant id <X>
+///    do not correspond to the expected genesis hashing
+///    ```
+///
+/// The discriminator is the optional `covenant_id` on `RpcUtxoEntry`, which
+/// Kaspad exposes as the `covenantId` camelCase field in `getUtxosByAddresses`
+/// responses. A UTXO is sell-deployable for this token iff its `covenant_id`
+/// is `Some(token_covenant_hex)` (case-insensitive compare). We use a simple
+/// lowercase equality since both sources (node RPC + kob-core) hex-encode
+/// lowercase.
+pub fn is_sell_deployable_token_utxo(
+    utxo: &crate::rpc::RpcUtxo,
+    token_covenant_hex: &str,
+) -> bool {
+    match utxo.utxo_entry.covenant_id.as_deref() {
+        Some(cid) => cid.eq_ignore_ascii_case(token_covenant_hex),
+        None => false,
+    }
+}
+
+/// Pick the best sell-deployable token UTXO from the candidate set.
+///
+/// Returns the index within `candidates` of the preferred UTXO, or `None` if
+/// no candidate is sell-deployable.
+///
+/// Selection rules (in priority order):
+/// 1. `covenant_id` must equal `token_covenant_hex` (fast prefilter via
+///    `is_sell_deployable_token_utxo`).
+/// 2. `amount >= min_amount` (must cover the desired order size).
+/// 3. Smallest `amount` first. Fresh mint outputs are fixed-size
+///    (e.g., 5_000_000_000 sompi for `token mint --amount 5000000000`) and
+///    are always a genuine covenant continuation. Problematic UTXOs
+///    (match-merged, accumulated remainders, foreign-lineage receipts that
+///    happened to land at the same P2SH) tend to have irregular / larger
+///    values. Choosing the smallest qualifying UTXO prefers the fresh-mint
+///    pattern and minimizes the chance of tripping the consensus "genesis
+///    hashing" covenant check.
+/// 4. Tiebreak on block_daa_score ascending (older UTXO = earlier mint).
+pub fn pick_sell_deployable_token_utxo(
+    candidates: &[&crate::rpc::RpcUtxo],
+    token_covenant_hex: &str,
+    min_amount: u64,
+) -> Option<usize> {
+    let mut qualified: Vec<(usize, u64, u64)> = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, u)| {
+            is_sell_deployable_token_utxo(u, token_covenant_hex)
+                && u.utxo_entry.amount >= min_amount
+        })
+        .map(|(i, u)| (i, u.utxo_entry.amount, u.utxo_entry.block_daa_score))
+        .collect();
+    // Prefer smallest amount, tie-break on oldest UTXO (earliest DAA score).
+    qualified.sort_by(|a, b| a.1.cmp(&b.1).then(a.2.cmp(&b.2)));
+    qualified.first().map(|(i, _, _)| *i)
+}
+
 /// Build an expiry-annotated payload for GTD orders.
 /// Standard RS payload + ":GTD:" + daa_score as LE u64 bytes.
 #[allow(dead_code)] // Public API: GTD order type for future use
@@ -781,9 +857,37 @@ pub async fn deploy_sell(
         );
         let unit_utxos = rpc.get_utxos_by_addresses(&[&unit_addr]).await?;
 
-        // Combine and pick the first available token UTXO
-        let all_token_utxos: Vec<_> = mint_utxos.iter().chain(unit_utxos.iter()).collect();
-        if let Some(token_utxo) = all_token_utxos.first() {
+        // Filter to sell-deployable UTXOs only (covenant_id matches this token).
+        // Rationale: unit_addr can hold match-merged / foreign-lineage UTXOs
+        // whose on-chain covenant_id differs from the token's, and feeding one
+        // as input[0] of a new sell deploy trips the consensus covenants check
+        // ("input #0 and outputs with covenant id X do not correspond to the
+        // expected genesis hashing"). mint_utxos are kept as last-resort
+        // fallback for covenant types that legitimately consume mint reserves.
+        //
+        // Even after the covenant_id check, the set of unit-address UTXOs
+        // can contain non-fresh-mint receipts whose on-chain covenant lineage
+        // happens to match but whose spendability as a sell-deploy input
+        // fails at the consensus "expected genesis hashing" check (observed
+        // on TN12: a 500 KAS accumulated remainder with the same covenant_id
+        // as the token still failed). We therefore prefer unit_addr UTXOs
+        // over mint_addr ones, and within each group pick the smallest-
+        // qualifying UTXO (fresh mint outputs are fixed-size; accumulated
+        // remainders grow).
+        let tok_cov_hex = token_covenant_id.expect("is_some() guard above");
+        // unit_addr UTXOs are preferred (spendable with token_unit sigscript);
+        // mint_addr UTXOs fall through as a last-resort (spending those
+        // requires the mint_sigscript path, which the signer auto-detects
+        // via script_bytes comparison).
+        let unit_refs: Vec<&_> = unit_utxos.iter().collect();
+        let mint_refs: Vec<&_> = mint_utxos.iter().collect();
+        let picked_unit = pick_sell_deployable_token_utxo(&unit_refs, tok_cov_hex, amount)
+            .map(|i| unit_refs[i]);
+        let picked = picked_unit.or_else(|| {
+            pick_sell_deployable_token_utxo(&mint_refs, tok_cov_hex, amount)
+                .map(|i| mint_refs[i])
+        });
+        if let Some(token_utxo) = picked {
             token_input_value = token_utxo.utxo_entry.amount;
             token_input_idx = 0;
             println!("Token UTXO: {}:{} ({} sompi)",
@@ -801,7 +905,8 @@ pub async fn deploy_sell(
                 value: token_input_value,
             });
         } else {
-            println!("WARNING: No token UTXO found at mint or unit P2SH addresses.");
+            println!("WARNING: No sell-deployable token UTXO found (covenant_id match) at mint or unit P2SH addresses.");
+            println!("  Token:     {}", tok_cov_hex);
             println!("  Mint addr: {}", &mint_addr[..40]);
             println!("  Unit addr: {}", &unit_addr[..40]);
             println!("  Deploying without covenant input (TX version 0).");
@@ -1243,8 +1348,19 @@ pub async fn deploy_oco_sell(
         let unit_p2sh = build_p2sh(&unit_rs);
         let unit_addr = crate::cancel::kaspa_address_encode(network.address_prefix(), 8, &unit_p2sh.script()[2..34]);
         let unit_utxos = rpc.get_utxos_by_addresses(&[&unit_addr]).await?;
-        let all_token_utxos: Vec<_> = mint_utxos.iter().chain(unit_utxos.iter()).collect();
-        if let Some(token_utxo) = all_token_utxos.first() {
+        // Filter to covenant-matching UTXOs (see deploy_sell for rationale).
+        // Prefer unit_addr over mint_addr, and smallest-qualifying UTXO first
+        // so fresh mint outputs win over accumulated remainders that may
+        // carry a matching covenant_id but fail the consensus genesis check.
+        let unit_refs: Vec<&_> = unit_utxos.iter().collect();
+        let mint_refs: Vec<&_> = mint_utxos.iter().collect();
+        let picked_unit = pick_sell_deployable_token_utxo(&unit_refs, token_covenant_id, amount)
+            .map(|i| unit_refs[i]);
+        let picked = picked_unit.or_else(|| {
+            pick_sell_deployable_token_utxo(&mint_refs, token_covenant_id, amount)
+                .map(|i| mint_refs[i])
+        });
+        if let Some(token_utxo) = picked {
             token_input_value = token_utxo.utxo_entry.amount;
             println!("Token UTXO: {}:{} ({} sompi)", &token_utxo.outpoint.transaction_id[..16], token_utxo.outpoint.index, token_input_value);
             tx.inputs.push(TxInput {
@@ -1257,7 +1373,7 @@ pub async fn deploy_oco_sell(
                 value: token_input_value,
             });
         } else {
-            anyhow::bail!("No token UTXO found. Use --token-utxo to specify one.");
+            anyhow::bail!("No sell-deployable token UTXO (covenant_id matching {}) found at mint/unit P2SH. Use --token-utxo to specify one explicitly.", token_covenant_id);
         }
     }
 

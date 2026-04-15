@@ -248,6 +248,7 @@ async fn setup_api_server(
     api_bind: &str,
     trades_file: &str,
     books: &SharedBooks,
+    rpc: Arc<Mutex<RpcClient>>,
 ) -> (Option<broadcast::Sender<matcher::api::WsEvent>>, Option<AppState>) {
     if api_port == 0 {
         return (None, None);
@@ -255,25 +256,26 @@ async fn setup_api_server(
 
     let (ws_tx, _) = broadcast::channel(1000);
     let ws_tx_clone = ws_tx.clone();
-    let shared_state: AppState = if trades_file.is_empty() {
-        Arc::new(RwLock::new(SharedState::new_with_ifd(
+    let state_core = if trades_file.is_empty() {
+        SharedState::new_with_ifd(
             ws_tx,
             books.order.clone(),
             books.stop.clone(),
             books.trailing_stop.clone(),
             books.ifd.clone(),
-        )))
+        )
     } else {
         info!("[TradeLog] File persistence enabled: {}", trades_file);
-        Arc::new(RwLock::new(SharedState::new_with_trades_file_and_ifd(
+        SharedState::new_with_trades_file_and_ifd(
             ws_tx,
             trades_file,
             books.order.clone(),
             books.stop.clone(),
             books.trailing_stop.clone(),
             books.ifd.clone(),
-        )))
+        )
     };
+    let shared_state: AppState = Arc::new(RwLock::new(state_core.with_rpc(rpc)));
 
     // Wire perp/lending/prediction books into SharedState.
     {
@@ -413,7 +415,7 @@ async fn run_continuous_mode(
     let books = load_shared_books(order_book, params.orderbook_path).await;
 
     let (ws_broadcaster, shared_state_for_executor) =
-        setup_api_server(params.api_port, params.api_bind, params.trades_file, &books).await;
+        setup_api_server(params.api_port, params.api_bind, params.trades_file, &books, rpc.clone()).await;
 
     init_history_store(
         params.history_db.as_deref(),

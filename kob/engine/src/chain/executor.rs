@@ -44,9 +44,104 @@ pub const DEFAULT_FEE_BPS: u16 = 30;
 /// Maximum allowed fee in basis points (1.00%). Prevents misconfiguration.
 pub const MAX_FEE_BPS: u16 = 100;
 
-/// Spent-tracker prune threshold in seconds. Entries older than this
-/// are removed each cycle to bound memory growth (H-1).
+/// Spent-tracker prune threshold in seconds (H-1 safety net only).
+///
+/// The primary cleanup path is `remove_spent_for_txids()` called in the
+/// block-processing loop which fires as soon as a TX lands in a block
+/// (or gets reorged). This timeout only matters for self-submitted TXs
+/// that drop out of the mempool without ever confirming (e.g. fee too
+/// low, node rejection that we didn't catch).
 const SPENT_PRUNE_AGE_SECS: u64 = 600;
+
+/// Hard cap for spent-tracker entry age (seconds).
+///
+/// `prune_spent()` normally preserves aged entries whose associated
+/// `submit_txid` is still in the mempool (preventing the scenario where
+/// a 600s-dwelling TX gets its inputs pruned, the matcher re-uses them,
+/// and the node rejects with "already spent ... in the mempool").
+/// If the RPC mempool check continually reports "in mempool" for a
+/// given txid due to a bug or malicious node, we fall back to a hard
+/// cap so the tracker cannot grow without bound.
+///
+/// 2 hours >> any realistic mempool dwell time; by this point the TX
+/// is surely dead.
+const SPENT_PRUNE_HARD_MAX_AGE_SECS: u64 = 7200;
+
+/// Probes the node mempool to check whether a transaction is still pending.
+///
+/// Abstracted behind a trait so unit tests can inject a deterministic probe
+/// without instantiating a full RpcClient + WebSocket.
+pub(crate) trait MempoolProbe {
+    /// Returns true if the given txid is currently in the node's mempool
+    /// (or orphan pool). RPC errors are treated as "absent".
+    fn is_in_mempool<'a>(
+        &'a self,
+        txid: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>>;
+}
+
+/// Production mempool probe backed by a live `RpcClient`.
+///
+/// Calls `getMempoolEntry` with `includeOrphanPool=true`. Non-null
+/// `mempoolEntry` in the response means the tx is still pending.
+pub(crate) struct RpcMempoolProbe<'a> {
+    pub(crate) rpc: &'a RpcClient,
+}
+
+impl<'b> MempoolProbe for RpcMempoolProbe<'b> {
+    fn is_in_mempool<'a>(
+        &'a self,
+        txid: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+        Box::pin(async move {
+            match self
+                .rpc
+                .call(
+                    "getMempoolEntry",
+                    serde_json::json!({
+                        "transactionId": txid,
+                        "includeOrphanPool": true,
+                        "filterTransactionPool": false,
+                    }),
+                )
+                .await
+            {
+                Ok(v) => {
+                    // kaspad returns {"mempoolEntry": {...}} on hit, or an
+                    // error when not found. Treat a non-null mempoolEntry
+                    // as "in mempool". Some servers nest the entry under
+                    // `entry` instead -- accept either.
+                    let has_entry = v
+                        .get("mempoolEntry")
+                        .map(|e| !e.is_null())
+                        .unwrap_or(false)
+                        || v.get("entry")
+                            .map(|e| !e.is_null())
+                            .unwrap_or(false);
+                    has_entry
+                }
+                Err(_) => false,
+            }
+        })
+    }
+}
+
+/// An entry in the SpentTracker `spent` map.
+#[derive(Debug, Clone)]
+pub struct SpentEntry {
+    /// Timestamp when the outpoint was first marked spent.
+    pub when: Instant,
+    /// The txid of the self-submitted transaction that spent this outpoint.
+    ///
+    /// Populated by `mark_submitted()` after a successful RPC submit.
+    /// Empty string means "unknown" (entry inserted via `mark_spent()` only,
+    /// which happens before the submit lands — in rare cases the submit
+    /// may have failed between mark_spent and mark_submitted, or the entry
+    /// came from an old-style call site that never learned its txid).
+    /// Empty-txid entries are treated as "mempool-unverifiable" and are
+    /// pruned purely by age.
+    pub submit_txid: String,
+}
 
 /// Tracks outpoints that have been used locally (spent in submitted TXs)
 /// to avoid selecting stale UTXOs before mempool catches up.
@@ -54,8 +149,9 @@ const SPENT_PRUNE_AGE_SECS: u64 = 600;
 #[allow(dead_code)] // Fields used in tests
 pub struct SpentTracker {
     /// Outpoints (txid:index) that were used as inputs in recently submitted TXs,
-    /// with the timestamp when they were marked spent.
-    pub spent: HashMap<String, Instant>,
+    /// with the timestamp when they were marked spent and the submit txid
+    /// (if known) to allow mempool-aware pruning.
+    pub spent: HashMap<String, SpentEntry>,
     /// Outpoints (txid:index) that were created as outputs in recently submitted TXs.
     /// These may become available once the TX propagates.
     pub pending_outputs: Vec<(String, u64)>, // (outpoint_key, value)
@@ -92,8 +188,55 @@ impl SpentTracker {
     }
 
     /// Mark an outpoint as spent (used as input in a submitted TX).
+    ///
+    /// The `submit_txid` field is left empty; callers that have the txid
+    /// available (the common case — all spent outpoints are marked on the
+    /// success path of `submit_transaction`) should call `mark_submitted()`
+    /// afterwards to populate it. This two-step API keeps existing call
+    /// sites unchanged.
     pub fn mark_spent(&mut self, outpoint_key: &str) {
-        self.spent.insert(outpoint_key.to_string(), Instant::now());
+        self.spent.insert(
+            outpoint_key.to_string(),
+            SpentEntry {
+                when: Instant::now(),
+                submit_txid: String::new(),
+            },
+        );
+    }
+
+    /// Associate a set of recently-marked outpoints with their submit txid.
+    ///
+    /// Called right after a successful `rpc.submit_transaction` that
+    /// includes these outpoints as inputs. This enables `prune_spent()` to
+    /// query the mempool and preserve entries whose TX is still pending
+    /// (preventing the "already spent in mempool" re-submit loop when the
+    /// 600s age-based prune fires on a still-dwelling TX).
+    ///
+    /// Keys that are not already in the spent map are inserted as a
+    /// defensive measure. Keys already carrying a submit_txid are
+    /// overwritten (idempotent across retries).
+    pub fn mark_submitted(&mut self, submit_txid: &str, outpoint_keys: &[String]) {
+        let now = Instant::now();
+        for key in outpoint_keys {
+            match self.spent.get_mut(key) {
+                Some(entry) => {
+                    entry.submit_txid = submit_txid.to_string();
+                }
+                None => {
+                    // Defensive: caller associated a txid with a key that
+                    // wasn't marked spent. Insert a fresh entry rather than
+                    // silently dropping, so this path still benefits from
+                    // mempool-aware pruning.
+                    self.spent.insert(
+                        key.clone(),
+                        SpentEntry {
+                            when: now,
+                            submit_txid: submit_txid.to_string(),
+                        },
+                    );
+                }
+            }
+        }
     }
 
     /// Mark an outpoint as permanently failed (TX submission rejected).
@@ -141,18 +284,107 @@ impl SpentTracker {
 
     /// Prune spent entries older than the given age (M-6).
     ///
-    /// Entries older than max_age_secs are removed. Spent outpoints that
-    /// have been confirmed in the DAG will not reappear as UTXOs, so pruning
-    /// is safe -- the worst case is a redundant RPC rejection if a stale
-    /// outpoint somehow reappears.
-    pub fn prune_spent(&mut self, max_age_secs: u64) {
+    /// Mempool-aware variant: entries older than `max_age_secs` are inspected;
+    /// for each unique `submit_txid` found among them, the mempool is queried
+    /// (via `getMempoolEntry` with `includeOrphanPool=true`). If the TX is
+    /// still pending, its associated spent-entries are retained -- pruning
+    /// them would cause the matcher to re-use those inputs, triggering
+    /// "already spent ... in the mempool" rejections from kaspad in a
+    /// retry loop until the TX eventually confirms (or the script exits).
+    ///
+    /// Entries with an empty `submit_txid` (old-style, or inserted without
+    /// a follow-up `mark_submitted`) fall through to pure age-based pruning.
+    ///
+    /// Safety valve: entries older than `SPENT_PRUNE_HARD_MAX_AGE_SECS` are
+    /// pruned unconditionally regardless of what the mempool reports. This
+    /// protects against unbounded growth if the RPC is broken or lying.
+    pub async fn prune_spent(&mut self, max_age_secs: u64, rpc: &RpcClient) {
+        self.prune_spent_with_probe(max_age_secs, &RpcMempoolProbe { rpc })
+            .await;
+    }
+
+    /// Testable variant of `prune_spent()` that accepts any mempool probe.
+    ///
+    /// Kept `pub(crate)` so unit tests can swap in a deterministic probe
+    /// without needing a full RpcClient / WebSocket harness.
+    pub(crate) async fn prune_spent_with_probe<P: MempoolProbe>(
+        &mut self,
+        max_age_secs: u64,
+        probe: &P,
+    ) {
+        // 1. Collect aged entries and the unique txids they reference.
+        let mut aged_keys: Vec<String> = Vec::new();
+        let mut hard_expired_keys: Vec<String> = Vec::new();
+        let mut aged_txids: HashSet<String> = HashSet::new();
+        for (key, entry) in self.spent.iter() {
+            let age = entry.when.elapsed().as_secs();
+            if age >= SPENT_PRUNE_HARD_MAX_AGE_SECS {
+                hard_expired_keys.push(key.clone());
+            } else if age >= max_age_secs {
+                aged_keys.push(key.clone());
+                if !entry.submit_txid.is_empty() {
+                    aged_txids.insert(entry.submit_txid.clone());
+                }
+            }
+        }
+
+        if aged_keys.is_empty() && hard_expired_keys.is_empty() {
+            return;
+        }
+
+        // 2. Query mempool for each unique txid.
+        //    tx still in mempool => retain its spent entries.
+        let mut txids_in_mempool: HashSet<String> = HashSet::new();
+        for txid in aged_txids.iter() {
+            if probe.is_in_mempool(txid).await {
+                txids_in_mempool.insert(txid.clone());
+            }
+        }
+
+        // 3. Decide which aged entries to actually prune.
+        let mut prune_keys: Vec<String> = hard_expired_keys;
+        for key in aged_keys {
+            if let Some(entry) = self.spent.get(&key) {
+                // Retain if the submit_txid is known AND still in mempool.
+                if !entry.submit_txid.is_empty()
+                    && txids_in_mempool.contains(&entry.submit_txid)
+                {
+                    continue;
+                }
+            }
+            prune_keys.push(key);
+        }
+
+        let pruned_count = prune_keys.len();
+        for key in prune_keys {
+            self.spent.remove(&key);
+        }
+
+        if pruned_count > 0 {
+            info!(
+                "[TRACKER] Pruned {} aged spent entries (>{} secs, {} mempool-retained), {} remaining (M-6 mempool-aware)",
+                pruned_count,
+                max_age_secs,
+                txids_in_mempool.len(),
+                self.spent.len(),
+            );
+        }
+    }
+
+    /// Pure age-based prune with no RPC dependency.
+    ///
+    /// Used only by tests and by callers that have no RPC handle (none
+    /// currently in production). Prefer `prune_spent()` in the main loop.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn prune_spent_by_age(&mut self, max_age_secs: u64) {
         let before = self.spent.len();
-        self.spent.retain(|_, when| when.elapsed().as_secs() < max_age_secs);
+        self.spent.retain(|_, entry| entry.when.elapsed().as_secs() < max_age_secs);
         let pruned = before - self.spent.len();
         if pruned > 0 {
             info!(
-                "[TRACKER] Pruned {} aged spent entries (>{} secs), {} remaining (M-6)",
-                pruned, max_age_secs, self.spent.len()
+                "[TRACKER] Pruned {} aged spent entries by age only (>{} secs), {} remaining",
+                pruned, max_age_secs, self.spent.len(),
             );
         }
     }
@@ -1244,18 +1476,26 @@ pub async fn execute_batch_match(
     info!("  Sells matched: {}", plan.sells.len());
     info!("  Buys matched:  {}", plan.buys.len());
 
-    // Track all spent outpoints
+    // Track all spent outpoints, recording the submit txid so prune_spent
+    // can detect mempool presence and avoid premature eviction.
+    let mut marked_keys: Vec<String> = Vec::new();
     for (sell, _) in &plan.sells {
         let key = format!("{}:{}", sell.outpoint.0, sell.outpoint.1);
         spent_tracker.mark_spent(&key);
+        marked_keys.push(key);
     }
     for (buy, _) in &plan.buys {
         let key = format!("{}:{}", buy.outpoint.0, buy.outpoint.1);
         spent_tracker.mark_spent(&key);
+        marked_keys.push(key);
     }
     if let Some((ref wallet_tx_id, wallet_index, _)) = plan.wallet_input {
         let key = format!("{}:{}", wallet_tx_id, wallet_index);
         spent_tracker.mark_spent(&key);
+        marked_keys.push(key);
+    }
+    if !tx_id.is_empty() {
+        spent_tracker.mark_submitted(&tx_id, &marked_keys);
     }
 
     // Compute total seller KAS from outputs
@@ -1291,12 +1531,22 @@ pub async fn execute_swap_fill(
     wallet_spk: &[u8],
     wallet_spk_version: u16,
     config: &AppConfig,
+    spent_tracker: &mut SpentTracker,
 ) -> Option<BatchMatchResult> {
+    // Helper: mark the 3 participating outpoints as failed (permanent) so
+    // Phase 3 does not retry this dead-end group.
+    let keys_of = || [
+        sg.swap.outpoint_key(),
+        sg.buy_source.outpoint_key(),
+        sg.sell_target.outpoint_key(),
+    ];
+
     // --- Parse swap entry ---
     let swap_rs = match hex::decode(&sg.swap.redeem_script_hex) {
         Ok(rs) if !rs.is_empty() => rs,
         _ => {
             warn!("[SWAP-FILL] Failed to decode swap RS");
+            for k in keys_of().iter() { spent_tracker.mark_failed(k); }
             return None;
         }
     };
@@ -1306,9 +1556,20 @@ pub async fn execute_swap_fill(
     let owner_spk_raw = match &sg.swap.owner_spk {
         Some(h) => match hex::decode(h) {
             Ok(v) if v.len() > 2 => v,
-            _ => { warn!("[SWAP-FILL] Invalid owner_spk hex"); return None; }
+            _ => {
+                warn!("[SWAP-FILL] Invalid owner_spk hex");
+                for k in keys_of().iter() { spent_tracker.mark_failed(k); }
+                return None;
+            }
         },
-        None => { warn!("[SWAP-FILL] Missing owner_spk — cannot build fill"); return None; }
+        None => {
+            // Missing owner_spk is transient: the L1 scanner may populate it
+            // later by matching the SPK hash against observed TX outputs.
+            // Don't permanently blacklist the orders.
+            warn!("[SWAP-FILL] Missing owner_spk — cannot build fill (deferred)");
+            for k in keys_of().iter() { spent_tracker.mark_transient(k); }
+            return None;
+        }
     };
     let owner_spk_version = u16::from_le_bytes([owner_spk_raw[0], owner_spk_raw[1]]);
     let owner_spk_script = &owner_spk_raw[2..];
@@ -1327,6 +1588,8 @@ pub async fn execute_swap_fill(
             &sg.swap.source_cov_id[..16.min(sg.swap.source_cov_id.len())],
             &sg.sell_target.token_cov_id[..16.min(sg.sell_target.token_cov_id.len())],
         );
+        // Receipt mismatch is specific to this swap order's config — permanent.
+        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
         return None;
     };
 
@@ -1335,6 +1598,7 @@ pub async fn execute_swap_fill(
         == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN
     {
         warn!("[SWAP-FILL] v15 buy not supported in cross-pair swap — skip");
+        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
         return None;
     }
 
@@ -1349,7 +1613,12 @@ pub async fn execute_swap_fill(
     // --- Wallet ---
     let wallet = match wallet_utxo {
         Some(w) => w,
-        None => { warn!("[SWAP-FILL] No wallet UTXO"); return None; }
+        None => {
+            // Transient: wallet may have UTXOs in the next cycle.
+            warn!("[SWAP-FILL] No wallet UTXO (deferred)");
+            for k in keys_of().iter() { spent_tracker.mark_transient(k); }
+            return None;
+        }
     };
 
     // --- Output values ---
@@ -1364,13 +1633,16 @@ pub async fn execute_swap_fill(
     // (token values cancel: swap.value → output[0], sell.value → output[1])
     let matcher_change = (sg.surplus + wallet.2).saturating_sub(estimated_fee);
 
-    // Minimum value checks
+    // Minimum value checks — these are a function of the price/amount
+    // numbers on the orders themselves, so permanent for this triple.
     if kas_to_seller < MIN_UTXO_VALUE {
         warn!("[SWAP-FILL] KAS to seller {} below min {}", kas_to_seller, MIN_UTXO_VALUE);
+        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
         return None;
     }
     if matcher_change < MIN_UTXO_VALUE {
         warn!("[SWAP-FILL] Matcher change {} below min {}", matcher_change, MIN_UTXO_VALUE);
+        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
         return None;
     }
 
@@ -1489,11 +1761,21 @@ pub async fn execute_swap_fill(
     let mut privkey = config.private_key_bytes();
     let sighash = match kob_core::compute_sighash(&sighash_tx, wallet_input_idx) {
         Ok(sh) => sh,
-        Err(e) => { privkey.zeroize(); error!("[SWAP-FILL] Sighash failed: {}", e); return None; }
+        Err(e) => {
+            privkey.zeroize();
+            error!("[SWAP-FILL] Sighash failed: {}", e);
+            for k in keys_of().iter() { spent_tracker.mark_failed(k); }
+            return None;
+        }
     };
     let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
         Ok(s) => s,
-        Err(e) => { privkey.zeroize(); error!("[SWAP-FILL] Signing failed: {}", e); return None; }
+        Err(e) => {
+            privkey.zeroize();
+            error!("[SWAP-FILL] Signing failed: {}", e);
+            for k in keys_of().iter() { spent_tracker.mark_failed(k); }
+            return None;
+        }
     };
     privkey.zeroize();
     let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
@@ -1505,6 +1787,7 @@ pub async fn execute_swap_fill(
     let in_vals = vec![sg.swap.value, sell_target.utxo_value, buy_source.utxo_value, wallet.2];
     let out_vals = vec![source_token_amount, target_token_amount, kas_to_seller, matcher_change];
     if check_mass_presubmit(&in_vals, &out_vals, "SWAP-FILL").is_none() {
+        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
         return None;
     }
 
@@ -1523,16 +1806,52 @@ pub async fn execute_swap_fill(
         Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
-            if err_str.contains("sequence locks") {
+            let is_transient = err_str.contains("sequence locks");
+            if is_transient {
                 warn!("[SWAP-FILL] CSV not yet mature (transient): {}", err_str);
             } else {
                 error!("[SWAP-FILL] Submit failed: {}", err_str);
             }
+            // Mark the 3 participating outpoints so Phase 3's None branch
+            // does NOT need to re-mark them (caller treats None uniformly).
+            let mark_all = |tracker: &mut SpentTracker| {
+                let keys = [
+                    sg.swap.outpoint_key(),
+                    sg.buy_source.outpoint_key(),
+                    sg.sell_target.outpoint_key(),
+                ];
+                for k in &keys {
+                    if is_transient {
+                        tracker.mark_transient(k);
+                    } else {
+                        tracker.mark_failed(k);
+                    }
+                }
+            };
+            mark_all(spent_tracker);
             return None;
         }
     };
     if !result.ok {
-        error!("[SWAP-FILL] TX rejected: {}", result.error.as_deref().unwrap_or("unknown"));
+        let err_str = result.error.clone().unwrap_or_else(|| "unknown".to_string());
+        let is_transient = err_str.contains("sequence locks");
+        if is_transient {
+            warn!("[SWAP-FILL] CSV not yet mature (TX rejected, transient): {}", err_str);
+        } else {
+            error!("[SWAP-FILL] TX rejected: {}", err_str);
+        }
+        let keys = [
+            sg.swap.outpoint_key(),
+            sg.buy_source.outpoint_key(),
+            sg.sell_target.outpoint_key(),
+        ];
+        for k in &keys {
+            if is_transient {
+                spent_tracker.mark_transient(k);
+            } else {
+                spent_tracker.mark_failed(k);
+            }
+        }
         return None;
     }
 
@@ -1919,6 +2238,21 @@ fn process_block_txs_all(
 
                 let outpoint_key = book_order.outpoint_key();
                 if order_book.contains_outpoint(&outpoint_key) {
+                    // Root-fix for counterparty_spk populate timing:
+                    // when the first scan sees the deploy TX without fully
+                    // resolved outputs, `extract_owner_spk` returns None. The
+                    // subsequent rescan has the complete TX and produces
+                    // Some(spk). Back-fill the existing order in that case so
+                    // the unified batcher can include it.
+                    if order_book.update_counterparty_spk_if_missing(
+                        &outpoint_key,
+                        &book_order.counterparty_spk,
+                    ) {
+                        info!(
+                            "[SCANNER-ALL] Back-filled counterparty_spk on {}",
+                            &outpoint_key[..outpoint_key.len().min(20)]
+                        );
+                    }
                     continue; // dedup
                 }
 
@@ -3076,6 +3410,7 @@ async fn run_scan_cycle(
                 );
 
                 // Mark all sells as spent + emit events + record trades
+                let mut unified_marked_keys: Vec<String> = Vec::new();
                 for sell in &group.sells {
                     let sk = sell.outpoint_key();
                     if let Some(ws) = ws_tx {
@@ -3099,8 +3434,10 @@ async fn run_scan_cycle(
                     // C5 fix: Use BookOrder clone partner key directly
                     let sell_oco_partner = sell.oco_partner_key.clone();
                     spent_tracker.mark_spent(&sk);
+                    unified_marked_keys.push(sk);
                     if let Some(ref partner_key) = sell_oco_partner {
                         spent_tracker.mark_spent(partner_key);
+                        unified_marked_keys.push(partner_key.clone());
                         info!("[OCO] Marked partner spent (pending): {}", partner_key);
                     }
                 }
@@ -3127,12 +3464,24 @@ async fn run_scan_cycle(
                         None,
                     ).await;
                     spent_tracker.mark_spent(&bk);
+                    unified_marked_keys.push(bk);
                 }
 
                 // Mark wallet outpoint as spent
                 if let Some(ref wu) = plan.wallet_input {
                     let wk = format!("{}:{}", wu.0, wu.1);
                     spent_tracker.mark_spent(&wk);
+                    unified_marked_keys.push(wk);
+                }
+
+                // Associate all marked outpoints with the submit txid so
+                // prune_spent() can preserve them while the TX dwells in
+                // the mempool.
+                if !batch_result.tx_id.is_empty() {
+                    spent_tracker.mark_submitted(
+                        &batch_result.tx_id,
+                        &unified_marked_keys,
+                    );
                 }
 
                 // Push MatchResults for stop/trailing stop triggers
@@ -3219,7 +3568,16 @@ async fn run_scan_cycle(
         let swab = swap_book.lock().await;
         if !swab.is_empty() {
             // Collect currently spent/used outpoints for exclusion.
-            let swap_spent_keys = spent_tracker.spent_keys();
+            // Include failed outpoints under cooldown so we don't hammer
+            // the node with transient-failure retries (e.g. CSV not yet
+            // mature — the swap covenant has a 50-DAA OP_CSV gate, and
+            // the plain buy/sell legs do too).
+            let mut swap_spent_keys = spent_tracker.spent_keys();
+            for (key, when) in &spent_tracker.failed {
+                if when.elapsed().as_secs() < spent_tracker.cooldown_secs {
+                    swap_spent_keys.insert(key.clone());
+                }
+            }
             let swap_groups = matching::match_swap_routes(
                 order_book, &swab, Some(&swap_spent_keys), &std::collections::HashSet::new(),
             );
@@ -3287,9 +3645,13 @@ async fn run_scan_cycle(
 
                 // Build and submit the swap atomic TX directly (not via plan_batch_match,
                 // which can't handle cross-pair token routing).
+                // execute_swap_fill marks participating outpoints as transient
+                // (CSV not mature) or failed (permanent) on its own when it
+                // returns None. The caller only marks on the success path.
                 match execute_swap_fill(
                     rpc, sg, &sell_target_batch, &buy_source_batch,
                     wallet_utxo.clone(), &wallet_spk_script, wallet_spk_version, config,
+                    spent_tracker,
                 ).await {
                     Some(batch_result) => {
                         info!(
@@ -3300,9 +3662,14 @@ async fn run_scan_cycle(
                         );
 
                         // Mark all 3 orders as spent
-                        spent_tracker.mark_spent(&sg.swap.outpoint_key());
-                        spent_tracker.mark_spent(&sg.buy_source.outpoint_key());
-                        spent_tracker.mark_spent(&sg.sell_target.outpoint_key());
+                        let swap_key = sg.swap.outpoint_key();
+                        let buy_source_key = sg.buy_source.outpoint_key();
+                        let sell_target_key = sg.sell_target.outpoint_key();
+                        spent_tracker.mark_spent(&swap_key);
+                        spent_tracker.mark_spent(&buy_source_key);
+                        spent_tracker.mark_spent(&sell_target_key);
+                        let mut swap_marked_keys: Vec<String> =
+                            vec![swap_key, buy_source_key, sell_target_key];
 
                         // Emit events for counterparty orders
                         if let Some(ws) = ws_tx {
@@ -3346,6 +3713,17 @@ async fn run_scan_cycle(
                         if let Some(ref wu) = wallet_utxo {
                             let wk = format!("{}:{}", wu.0, wu.1);
                             spent_tracker.mark_spent(&wk);
+                            swap_marked_keys.push(wk);
+                        }
+
+                        // Associate all 4 marked outpoints with the submit txid
+                        // so the mempool-aware prune preserves them while the
+                        // TX dwells in the mempool.
+                        if !batch_result.tx_id.is_empty() {
+                            spent_tracker.mark_submitted(
+                                &batch_result.tx_id,
+                                &swap_marked_keys,
+                            );
                         }
 
                         // Push MatchResult for stop/trailing stop triggers
@@ -3363,10 +3741,10 @@ async fn run_scan_cycle(
                         });
                     }
                     None => {
-                        warn!("[SWAP-ROUTE] Execution failed for swap group");
-                        spent_tracker.mark_failed(&sg.swap.outpoint_key());
-                        spent_tracker.mark_failed(&sg.buy_source.outpoint_key());
-                        spent_tracker.mark_failed(&sg.sell_target.outpoint_key());
+                        // execute_swap_fill already marked the 3 outpoints
+                        // (transient for CSV, failed for permanent) before
+                        // returning. Just log here.
+                        warn!("[SWAP-ROUTE] Execution returned no result (see [SWAP-FILL] log above)");
                     }
                 }
             }
@@ -3654,6 +4032,12 @@ async fn run_scan_cycle(
                                 }
                                 spent_tracker.mark_spent(&long_key);
                                 spent_tracker.mark_spent(&short_key);
+                                if !tx_id.is_empty() {
+                                    spent_tracker.mark_submitted(
+                                        &tx_id,
+                                        &[long_key.clone(), short_key.clone()],
+                                    );
+                                }
                             }
                             Ok(result) => {
                                 let err_msg = result.error.unwrap_or_else(|| "Unknown error".to_string());
@@ -3904,6 +4288,12 @@ async fn run_scan_cycle(
 
                                 spent_tracker.mark_spent(&offer_key);
                                 spent_tracker.mark_spent(&request_key);
+                                if !tx_id.is_empty() {
+                                    spent_tracker.mark_submitted(
+                                        &tx_id,
+                                        &[offer_key.clone(), request_key.clone()],
+                                    );
+                                }
                             }
                             Ok(result) => {
                                 let err_msg = result.error.unwrap_or_else(|| "Unknown error".to_string());
@@ -4499,9 +4889,17 @@ async fn run_scan_cycle(
                         if is_final_fill { 0 } else { entry.periods_remaining - 1 },
                     );
                     // Mark inputs as spent.
-                    spent_tracker.mark_spent(&entry.outpoint_key());
+                    let dca_entry_key = entry.outpoint_key();
+                    let dca_wallet_key = wallet_utxo.outpoint_key();
+                    spent_tracker.mark_spent(&dca_entry_key);
                     spent_tracker.mark_spent(&sell_key);
-                    spent_tracker.mark_spent(&wallet_utxo.outpoint_key());
+                    spent_tracker.mark_spent(&dca_wallet_key);
+                    if !tx_id.is_empty() {
+                        spent_tracker.mark_submitted(
+                            &tx_id,
+                            &[dca_entry_key.clone(), sell_key.clone(), dca_wallet_key],
+                        );
+                    }
 
                     // Remove the consumed DCA entry.  The continuation UTXO (if any)
                     // will be rediscovered by the scanner in a subsequent block and
@@ -4719,10 +5117,17 @@ pub async fn run_continuous_with_ws(
         cycle += 1;
         debug!("--- Scan cycle {} ---", cycle);
 
-        // M-6 / H-1: Age-based pruning of spent tracker entries every cycle.
-        // Uses SPENT_PRUNE_AGE_SECS (600s) to prevent OOM from unbounded growth
-        // while keeping entries long enough for mempool propagation.
-        spent_tracker.prune_spent(SPENT_PRUNE_AGE_SECS);
+        // M-6 / H-1: Mempool-aware pruning of spent tracker entries every cycle.
+        // Uses SPENT_PRUNE_AGE_SECS (600s) for the base age threshold, but
+        // retains aged entries whose submit_txid is still in the mempool to
+        // prevent "already spent ... in the mempool" rejections when a
+        // self-submitted TX dwells past 600s before confirming. A hard cap
+        // at SPENT_PRUNE_HARD_MAX_AGE_SECS (7200s) guards against unbounded
+        // growth if the mempool RPC misbehaves.
+        {
+            let rpc_lock = rpc.lock().await;
+            spent_tracker.prune_spent(SPENT_PRUNE_AGE_SECS, &*rpc_lock).await;
+        }
         spent_tracker.expire_failed();
 
         // Phase 0: Process block notifications (event-driven).
@@ -4901,6 +5306,16 @@ pub async fn run_continuous_with_ws(
 
                     // Commit provenance data to the reorg tracker
                     if let (Some(bh), Some(rc)) = (block_hash, collector) {
+                        // Primary SpentTracker cleanup: any of our self-submitted
+                        // TXs that just landed are now confirmed on-chain, so
+                        // their spent-input marks are no longer needed (kaspad
+                        // will reject any attempt to re-spend those UTXOs
+                        // anyway). This runs unconditionally per block, so
+                        // stale bids can never resurface between our submit
+                        // and the TX confirming — regardless of mempool dwell
+                        // time (root-fix for P23 run24).
+                        spent_tracker.remove_spent_for_txids(&rc.txids);
+
                         if !rc.orders_added.is_empty() || !rc.orders_spent.is_empty() {
                             reorg_tracker.record_block(
                                 bh.clone(),
@@ -5773,11 +6188,11 @@ mod tests {
         assert_eq!(tracker.spent.len(), 2);
 
         // Prune with a very large age -- nothing should be removed
-        tracker.prune_spent(9999);
+        tracker.prune_spent_by_age(9999);
         assert_eq!(tracker.spent.len(), 2, "no entries should be pruned with large age");
 
         // Prune with age=0 -- everything should be removed
-        tracker.prune_spent(0);
+        tracker.prune_spent_by_age(0);
         assert_eq!(tracker.spent.len(), 0, "all entries should be pruned with age=0");
     }
 
@@ -5785,11 +6200,11 @@ mod tests {
     fn m6_spent_tracker_has_timestamps() {
         let mut tracker = SpentTracker::new();
         tracker.mark_spent("tx1:0");
-        // Verify the entry has a timestamp (HashMap<String, Instant>)
-        let instant = tracker.spent.get("tx1:0");
-        assert!(instant.is_some(), "spent entry must have a timestamp");
+        // Verify the entry has a timestamp (HashMap<String, SpentEntry>)
+        let entry = tracker.spent.get("tx1:0");
+        assert!(entry.is_some(), "spent entry must have a timestamp");
         // The elapsed time should be very small (we just inserted it)
-        assert!(instant.unwrap().elapsed().as_secs() < 2, "timestamp should be recent");
+        assert!(entry.unwrap().when.elapsed().as_secs() < 2, "timestamp should be recent");
     }
 
     #[test]
@@ -5798,8 +6213,183 @@ mod tests {
         assert!(!tracker.is_spent("tx1:0"), "should not be spent initially");
         tracker.mark_spent("tx1:0");
         assert!(tracker.is_spent("tx1:0"), "should be spent after marking");
-        tracker.prune_spent(0);
+        tracker.prune_spent_by_age(0);
         assert!(!tracker.is_spent("tx1:0"), "should not be spent after pruning");
+    }
+
+    // Mempool-aware prune: unit tests for prune_spent_with_probe
+
+    /// Deterministic in-memory mempool probe for tests.
+    struct FakeMempool {
+        txids_in_mempool: HashSet<String>,
+    }
+
+    impl FakeMempool {
+        fn new<I: IntoIterator<Item = String>>(txids: I) -> Self {
+            Self {
+                txids_in_mempool: txids.into_iter().collect(),
+            }
+        }
+    }
+
+    impl MempoolProbe for FakeMempool {
+        fn is_in_mempool<'a>(
+            &'a self,
+            txid: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send + 'a>> {
+            let present = self.txids_in_mempool.contains(txid);
+            Box::pin(async move { present })
+        }
+    }
+
+    #[tokio::test]
+    async fn mempool_prune_skips_entries_whose_txid_is_in_mempool() {
+        let mut tracker = SpentTracker::new();
+        tracker.mark_spent("op_alive:0");
+        tracker.mark_spent("op_alive:1");
+        tracker.mark_submitted(
+            "txid_alive",
+            &["op_alive:0".to_string(), "op_alive:1".to_string()],
+        );
+
+        // Age-threshold = 0 forces both entries to be considered aged.
+        let probe = FakeMempool::new(std::iter::once("txid_alive".to_string()));
+        tracker.prune_spent_with_probe(0, &probe).await;
+
+        assert_eq!(
+            tracker.spent.len(),
+            2,
+            "entries whose submit_txid is in mempool must be retained",
+        );
+    }
+
+    #[tokio::test]
+    async fn mempool_prune_removes_entries_whose_txid_is_absent() {
+        let mut tracker = SpentTracker::new();
+        tracker.mark_spent("op_dead:0");
+        tracker.mark_submitted("txid_dead", &["op_dead:0".to_string()]);
+
+        // Empty mempool: no txid is in mempool.
+        let probe = FakeMempool::new(std::iter::empty::<String>());
+        tracker.prune_spent_with_probe(0, &probe).await;
+
+        assert!(
+            tracker.spent.is_empty(),
+            "entries whose submit_txid is absent from mempool must be pruned",
+        );
+    }
+
+    #[tokio::test]
+    async fn mempool_prune_handles_empty_submit_txid() {
+        // Entries with an empty submit_txid (e.g. from an old-style call
+        // site that never called mark_submitted) should be pruned purely
+        // by age, with no mempool check.
+        let mut tracker = SpentTracker::new();
+        tracker.mark_spent("op_unknown:0");
+        // No mark_submitted -> submit_txid stays empty.
+
+        let probe = FakeMempool::new(std::iter::empty::<String>());
+        tracker.prune_spent_with_probe(0, &probe).await;
+
+        assert!(
+            tracker.spent.is_empty(),
+            "entries with empty submit_txid should be pruned by age alone",
+        );
+    }
+
+    #[tokio::test]
+    async fn mempool_prune_retains_recent_entries() {
+        // Entries younger than max_age must be retained regardless of
+        // mempool status (we never probe them).
+        let mut tracker = SpentTracker::new();
+        tracker.mark_spent("op_young:0");
+        tracker.mark_submitted("txid_young", &["op_young:0".to_string()]);
+
+        // Max age = 999999 -> nothing qualifies as aged.
+        let probe = FakeMempool::new(std::iter::empty::<String>());
+        tracker.prune_spent_with_probe(999_999, &probe).await;
+
+        assert_eq!(
+            tracker.spent.len(),
+            1,
+            "young entries must never be pruned",
+        );
+    }
+
+    #[tokio::test]
+    async fn mempool_prune_hard_cap_evicts_even_mempool_retained() {
+        // Defense against a misbehaving mempool RPC that perpetually says
+        // "in mempool": entries older than HARD_MAX_AGE must be evicted.
+        let mut tracker = SpentTracker::new();
+
+        // Build a manual SpentEntry that is artificially old (beyond the
+        // hard cap). We can't actually wait 2 hours in a unit test, so we
+        // backdate the Instant.
+        let long_ago = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(
+                SPENT_PRUNE_HARD_MAX_AGE_SECS + 60,
+            ))
+            .expect("should be able to backdate");
+        tracker.spent.insert(
+            "op_ancient:0".to_string(),
+            SpentEntry {
+                when: long_ago,
+                submit_txid: "txid_liar".to_string(),
+            },
+        );
+
+        // Probe lies: says the txid is still in mempool.
+        let probe = FakeMempool::new(std::iter::once("txid_liar".to_string()));
+        tracker.prune_spent_with_probe(0, &probe).await;
+
+        assert!(
+            tracker.spent.is_empty(),
+            "hard cap must override mempool-retention",
+        );
+    }
+
+    #[tokio::test]
+    async fn mempool_prune_mixed_entries() {
+        // A mix: one txid in mempool (retain), one absent (prune), one
+        // with empty txid (prune by age).
+        let mut tracker = SpentTracker::new();
+        tracker.mark_spent("op_a:0");
+        tracker.mark_spent("op_b:0");
+        tracker.mark_spent("op_c:0"); // will have empty txid
+        tracker.mark_submitted("tx_alive", &["op_a:0".to_string()]);
+        tracker.mark_submitted("tx_dead", &["op_b:0".to_string()]);
+
+        let probe = FakeMempool::new(std::iter::once("tx_alive".to_string()));
+        tracker.prune_spent_with_probe(0, &probe).await;
+
+        assert!(tracker.is_spent("op_a:0"), "op_a (tx_alive) must be retained");
+        assert!(!tracker.is_spent("op_b:0"), "op_b (tx_dead) must be pruned");
+        assert!(!tracker.is_spent("op_c:0"), "op_c (empty txid) must be pruned by age");
+    }
+
+    #[tokio::test]
+    async fn mark_submitted_populates_txid() {
+        let mut tracker = SpentTracker::new();
+        tracker.mark_spent("op1:0");
+        assert_eq!(tracker.spent.get("op1:0").unwrap().submit_txid, "");
+        tracker.mark_submitted("my_tx", &["op1:0".to_string()]);
+        assert_eq!(
+            tracker.spent.get("op1:0").unwrap().submit_txid,
+            "my_tx",
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_submitted_inserts_missing_keys() {
+        let mut tracker = SpentTracker::new();
+        // Defensive path: mark_submitted for a key that was never
+        // mark_spent'd. Should still insert the entry.
+        tracker.mark_submitted("my_tx", &["op1:0".to_string()]);
+        assert!(tracker.is_spent("op1:0"));
+        assert_eq!(
+            tracker.spent.get("op1:0").unwrap().submit_txid,
+            "my_tx",
+        );
     }
 
     // M-7: Scanner order dedup

@@ -79,6 +79,16 @@ pub struct SharedState {
     pub prediction_book: Option<Arc<Mutex<PredictionBook>>>,
     /// Market settlement tracker. None until prediction module is implemented.
     pub market_tracker: Option<Arc<Mutex<MarketTracker>>>,
+
+    // === Wallet / RPC ===
+    /// Shared reference to the engine's RPC client. Used by wallet UTXO query
+    /// endpoint (`/api/v1/wallet/utxos`) so CLI callers can route through the
+    /// engine's already-subscribed spent_outpoints tracking instead of hitting
+    /// the node directly.
+    ///
+    /// `None` in tests (SharedState constructed without RPC) and when the
+    /// engine was built without passing an RPC handle via `with_rpc`.
+    pub rpc: Option<Arc<Mutex<crate::rpc::RpcClient>>>,
 }
 
 impl SharedState {
@@ -116,7 +126,15 @@ impl SharedState {
             loan_tracker: None,
             prediction_book: None,
             market_tracker: None,
+            rpc: None,
         }
+    }
+
+    /// Attach an RPC client to this state. Enables the `/api/v1/wallet/utxos`
+    /// endpoint. Safe to call at most once during server setup.
+    pub fn with_rpc(mut self, rpc: Arc<Mutex<crate::rpc::RpcClient>>) -> Self {
+        self.rpc = Some(rpc);
+        self
     }
 
     /// Create with file-backed trade log. Loads existing trades and replays
@@ -161,6 +179,7 @@ impl SharedState {
             loan_tracker: None,
             prediction_book: None,
             market_tracker: None,
+            rpc: None,
         }
     }
 }
@@ -472,6 +491,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/ifo", post(handle_submit_ifo))
         .route("/api/v1/ifo/cancel", post(handle_cancel_ifo))
         .route("/api/v1/status", get(handle_status))
+        .route("/api/v1/wallet/utxos", get(handle_wallet_utxos))
         // --- Perp endpoints ---
         .route("/api/v1/perp/orderbook", get(handle_perp_orderbook))
         .route("/api/v1/perp/positions", get(handle_perp_positions))
@@ -1127,6 +1147,93 @@ async fn handle_status(
         total_orders: stats.total_bids + stats.total_asks,
         total_trades: s.trade_log.total_count(),
     })
+}
+
+// Wallet UTXO endpoint
+
+/// Query params for `/api/v1/wallet/utxos`.
+#[derive(Deserialize)]
+struct WalletUtxosQuery {
+    address: String,
+    #[serde(default)]
+    min_amount: Option<u64>,
+}
+
+/// Response row for `/api/v1/wallet/utxos`.
+///
+/// Shape mirrors the flattened fields of `kob_core::rpc_types::RpcUtxo`
+/// (transactionId + index + amount + scriptPublicKey + ...), with
+/// `scriptPublicKey` emitted as a single hex string (`version` LE-encoded as
+/// 4 hex chars + script hex) for compactness. Clients should re-wrap into the
+/// nested Kaspad shape if they need to pass it back to the node.
+///
+/// `covenantId` (optional, lowercase hex) mirrors the node's `covenantId`
+/// field on `utxoEntry` — required for callers that need to distinguish
+/// covenant-bound UTXOs (e.g., fresh token mints vs. incompatible match-
+/// merged token UTXOs when auto-selecting a sell-deploy token input).
+#[derive(Serialize)]
+struct WalletUtxoResponse {
+    /// Concatenated outpoint key "txid:index" for convenience.
+    outpoint: String,
+    #[serde(rename = "transactionId")]
+    transaction_id: String,
+    index: u32,
+    amount: u64,
+    #[serde(rename = "scriptPublicKey")]
+    script_public_key: String,
+    #[serde(rename = "blockDaaScore")]
+    block_daa_score: u64,
+    #[serde(rename = "isCoinbase")]
+    is_coinbase: bool,
+    #[serde(rename = "covenantId", skip_serializing_if = "Option::is_none")]
+    covenant_id: Option<String>,
+}
+
+/// GET `/api/v1/wallet/utxos?address=...&min_amount=...` — return the UTXOs
+/// for `address` filtered through the engine's spent-outpoint tracking.
+///
+/// Returns 503 if the engine was not built with an RPC handle (e.g., in tests
+/// or when `with_rpc` was not called), and 502 on node RPC failure.
+async fn handle_wallet_utxos(
+    State(state): State<AppState>,
+    Query(params): Query<WalletUtxosQuery>,
+) -> Result<Json<Vec<WalletUtxoResponse>>, (StatusCode, Json<ErrorResponse>)> {
+    let s = state.read().await;
+    let rpc_arc = s.rpc.clone().ok_or_else(|| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Engine RPC not configured",
+        )
+    })?;
+    // Release the SharedState read lock before the (potentially slow) RPC call
+    // so other handlers aren't blocked.
+    drop(s);
+
+    let rpc = rpc_arc.lock().await;
+    let utxos = rpc
+        .get_spendable_utxos(&params.address, params.min_amount)
+        .await
+        .map_err(|e| json_error(StatusCode::BAD_GATEWAY, &format!("RPC error: {}", e)))?;
+    drop(rpc);
+
+    let rows: Vec<WalletUtxoResponse> = utxos
+        .into_iter()
+        .map(|u| WalletUtxoResponse {
+            outpoint: format!("{}:{}", u.outpoint.transaction_id, u.outpoint.index),
+            transaction_id: u.outpoint.transaction_id,
+            index: u.outpoint.index,
+            amount: u.utxo_entry.amount,
+            script_public_key: format!(
+                "{:04x}{}",
+                u.utxo_entry.script_public_key.version,
+                u.utxo_entry.script_public_key.script
+            ),
+            block_daa_score: u.utxo_entry.block_daa_score,
+            is_coinbase: u.utxo_entry.is_coinbase,
+            covenant_id: u.utxo_entry.covenant_id,
+        })
+        .collect();
+    Ok(Json(rows))
 }
 
 // IFD / IFO Handlers

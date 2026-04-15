@@ -20,6 +20,14 @@ struct Cli {
     #[arg(long)]
     rest_api: Option<String>,
 
+    /// KOB engine base URL (e.g. http://127.0.0.1:7070). When set, UTXO
+    /// queries route through the engine's `/api/v1/wallet/utxos` endpoint so
+    /// concurrent CLI invocations share the engine's in-flight spent-outpoint
+    /// tracking and don't collide on the same UTXO. Falls back to direct node
+    /// query when unset.
+    #[arg(long, env = "KOB_ENGINE_URL")]
+    engine_url: Option<String>,
+
     /// Path to wallet.json file.
     #[arg(long, default_value = "wallet.json")]
     wallet: String,
@@ -53,6 +61,14 @@ async fn main() -> anyhow::Result<()> {
     // Set global REST API URL override if provided
     if let Some(ref rest_url) = cli.rest_api {
         kob_cli::node::set_rest_url(rest_url);
+    }
+
+    // Set global engine-URL override if provided (flag or KOB_ENGINE_URL env).
+    if let Some(ref eurl) = cli.engine_url {
+        if !eurl.is_empty() {
+            kob_cli::node::set_engine_url(eurl);
+            info!(engine_url = %eurl, "Routing UTXO queries through engine");
+        }
     }
 
     info!(node = %cli.node, wallet = %cli.wallet, network = %cli.network, fee = fee, "KOB CLI starting");

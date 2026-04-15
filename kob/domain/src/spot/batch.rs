@@ -294,6 +294,13 @@ pub struct BatchPlan {
     /// instead of Op1 (full fill) or Op5 (IOC fill).  The buy contract's D&R path
     /// creates a continuation UTXO at `residual_output_idx` with the residual KAS.
     pub buy_partial_fills: HashMap<usize, (u64, u16, u16)>,
+    /// Output index for each sell (koi). Length = sells.len() if populated.
+    /// When empty, build_tx falls back to tuple's input_idx (current behavior).
+    pub sell_output_idx: Vec<usize>,
+    /// Output index for each buy (toi). Length = buys.len() if populated.
+    pub buy_output_idx: Vec<usize>,
+    /// Covenant output index for each buy (coi). Length = buys.len() if populated.
+    pub buy_coi: Vec<u16>,
 }
 
 /// Which side of the IOC is the sweeper.
@@ -318,7 +325,12 @@ impl BatchPlan {
 
         // === Build sell inputs ===
         for (i, (sell, input_idx)) in self.sells.iter().enumerate() {
-            let koi = *input_idx; // seller's KAS output is at output[input_idx]
+            // Use merged sell_output_idx if populated, else fall back to input_idx (legacy 1:1).
+            let koi = if !self.sell_output_idx.is_empty() {
+                self.sell_output_idx[i]
+            } else {
+                *input_idx
+            };
 
             // Detect partial fill: sell_fill_amounts[i] < sell.utxo_value means
             // buyers didn't absorb all tokens.  The full-fill path (Op1) F4 check
@@ -381,11 +393,23 @@ impl BatchPlan {
                 })?;
 
             // Buy's output index = N + j where j is position in buys vec
-            let toi = self.sells.len() + buy_idx;
+            // (or merged buy_output_idx[buy_idx] if populated).
+            let toi = if !self.buy_output_idx.is_empty() {
+                self.buy_output_idx[buy_idx]
+            } else {
+                self.sells.len() + buy_idx
+            };
 
-            // coi = index of this buy's output among all covenant outputs for this token
-            let coi = *cov_out_counter.get(&token_hex).unwrap_or(&0);
-            *cov_out_counter.entry(token_hex).or_insert(0) += 1;
+            // coi = index of this buy's output among all covenant outputs for this token.
+            // When buy_coi is populated (merged path), use the precomputed value;
+            // otherwise count covenant outputs sequentially per token.
+            let coi = if !self.buy_coi.is_empty() {
+                self.buy_coi[buy_idx]
+            } else {
+                let c = *cov_out_counter.get(&token_hex).unwrap_or(&0);
+                *cov_out_counter.entry(token_hex).or_insert(0) += 1;
+                c
+            };
 
             // Indices >16 are handled by data-push encoding (no OpN limit).
             let is_v15 = buy.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN;
@@ -770,12 +794,15 @@ fn emit_matcher_fee(
 /// * `buyer_token_output_offset` — index into `outputs` where buyer j's token
 ///   output lives (= `buyer_token_output_offset + j`).  Dust shares are added
 ///   to that token output instead of creating a new BuyerChange output.
+///   When buy outputs are merged (multiple buys -> 1 output), pass
+///   `buy_output_idx` to override the j-based mapping.
 fn distribute_buyer_refund(
     outputs: &mut Vec<PlannedOutput>,
     refund: u64,
     buys: &[&BatchOrder],
     total_buy_kas: u64,
     buyer_token_output_offset: usize,
+    buy_output_idx: Option<&[usize]>,
 ) {
     let mut refunded = 0u64;
     for (j, buy) in buys.iter().enumerate() {
@@ -796,8 +823,12 @@ fn distribute_buyer_refund(
             });
             refunded += share;
         } else if share > 0 {
-            // Dust: add to this buyer's token output
-            outputs[buyer_token_output_offset + j].value += share;
+            // Dust: add to this buyer's token output (use merged idx if provided)
+            let idx = match buy_output_idx {
+                Some(map) => map[j],
+                None => buyer_token_output_offset + j,
+            };
+            outputs[idx].value += share;
             refunded += share;
         }
     }
@@ -917,8 +948,17 @@ pub fn plan_batch_match(
     //   output[N+j] = expected_tokens (tokens to buyer)
     let mut outputs: Vec<PlannedOutput> = Vec::new();
 
-    // Seller KAS outputs
+    // Seller KAS outputs — MERGED by (spk, spk_version) to reduce storage mass.
+    // Each merged output sums all sell KAS for the same counterparty.
+    // Covenant safety: order.rs:326 OpSwap OpGTE OpVerify checks
+    // output[koi].value >= expected_kas (GTE), and order.rs:330 SPK hash check
+    // is bytewise == — but all merged sells share the same counterparty_spk so
+    // the same hash holds.  See task brief.
     let mut total_seller_kas: u64 = 0;
+    // (spk_bytes, spk_version) -> outputs index
+    let mut seller_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
+    let mut sell_output_idx: Vec<usize> = Vec::with_capacity(sells.len());
+    let mut sell_expected_kas: Vec<u64> = Vec::with_capacity(sells.len());
     for (i, sell) in sells.iter().enumerate() {
         if sell.price_den == 0 {
             return Err(BatchError::ZeroPriceDenominator { index: i, side: "sell" });
@@ -940,16 +980,41 @@ pub fn plan_batch_match(
             });
         }
         total_seller_kas += expected_kas;
-        outputs.push(PlannedOutput {
-            value: expected_kas,
-            script_public_key: sell.counterparty_spk.clone(),
-            spk_version: sell.counterparty_spk_version,
-            purpose: OutputPurpose::SellerKas,
-        });
+        sell_expected_kas.push(expected_kas);
+
+        let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
+        if let Some(&existing) = seller_group_idx.get(&key) {
+            outputs[existing].value += expected_kas;
+            sell_output_idx.push(existing);
+        } else {
+            let new_idx = outputs.len();
+            outputs.push(PlannedOutput {
+                value: expected_kas,
+                script_public_key: sell.counterparty_spk.clone(),
+                spk_version: sell.counterparty_spk_version,
+                purpose: OutputPurpose::SellerKas,
+            });
+            seller_group_idx.insert(key, new_idx);
+            sell_output_idx.push(new_idx);
+        }
     }
 
-    // Buyer token outputs
+    // Buyer token outputs — MERGED by (token_cov_id, spk, spk_version).
+    // Covenant safety: order.rs:337 F4 token conservation is also GTE, so
+    // summing buyer token outputs that share the same covenant + counterparty
+    // satisfies the per-buy >= constraint.
+    //
+    // coi assignment: per token_cov_id, in order of first appearance among
+    // merged outputs.  Buys sharing the same merged output share the same coi.
     let mut total_buyer_tokens_by_cov: HashMap<String, u64> = HashMap::new();
+    // (token_cov_id_hex, spk_bytes, spk_version) -> outputs index
+    let mut buyer_group_idx: HashMap<(String, Vec<u8>, u16), usize> = HashMap::new();
+    // token_cov_id_hex -> next coi to assign
+    let mut next_coi_per_token: HashMap<String, u16> = HashMap::new();
+    // outputs idx -> coi (so buys merging into same group reuse the coi)
+    let mut output_idx_to_coi: HashMap<usize, u16> = HashMap::new();
+    let mut buy_output_idx: Vec<usize> = Vec::with_capacity(buys.len());
+    let mut buy_coi: Vec<u16> = Vec::with_capacity(buys.len());
     for (j, buy) in buys.iter().enumerate() {
         if buy.price_den == 0 {
             return Err(BatchError::ZeroPriceDenominator { index: n + j, side: "buy" });
@@ -971,13 +1036,29 @@ pub fn plan_batch_match(
             });
         }
         let token_hex = hex::encode(buy.token_cov_id);
-        *total_buyer_tokens_by_cov.entry(token_hex).or_insert(0) += expected_tokens;
-        outputs.push(PlannedOutput {
-            value: expected_tokens,
-            script_public_key: buy.counterparty_spk.clone(),
-            spk_version: buy.counterparty_spk_version,
-            purpose: OutputPurpose::BuyerTokens,
-        });
+        *total_buyer_tokens_by_cov.entry(token_hex.clone()).or_insert(0) += expected_tokens;
+
+        let key = (token_hex.clone(), buy.counterparty_spk.clone(), buy.counterparty_spk_version);
+        if let Some(&existing) = buyer_group_idx.get(&key) {
+            outputs[existing].value += expected_tokens;
+            buy_output_idx.push(existing);
+            buy_coi.push(*output_idx_to_coi.get(&existing).expect("coi tracked for existing group"));
+        } else {
+            let new_idx = outputs.len();
+            outputs.push(PlannedOutput {
+                value: expected_tokens,
+                script_public_key: buy.counterparty_spk.clone(),
+                spk_version: buy.counterparty_spk_version,
+                purpose: OutputPurpose::BuyerTokens,
+            });
+            buyer_group_idx.insert(key, new_idx);
+            // Assign next coi for this token covenant
+            let coi = *next_coi_per_token.entry(token_hex.clone()).or_insert(0);
+            *next_coi_per_token.entry(token_hex).or_insert(0) += 1;
+            output_idx_to_coi.insert(new_idx, coi);
+            buy_output_idx.push(new_idx);
+            buy_coi.push(coi);
+        }
     }
 
     // Compute KAS surplus
@@ -1059,15 +1140,24 @@ pub fn plan_batch_match(
         }
     }
     if sell_excess > 0 {
+        // Merge SellRemainder outputs by (spk, spk_version) too.
+        let mut remainder_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
         for (i, sell) in sells.iter().enumerate() {
             let this_excess = sell.utxo_value.saturating_sub(per_sell_fill[i]);
             if this_excess >= MIN_UTXO_VALUE {
-                outputs.push(PlannedOutput {
-                    value: this_excess,
-                    script_public_key: sell.counterparty_spk.clone(),
-                    spk_version: sell.counterparty_spk_version,
-                    purpose: OutputPurpose::SellRemainder,
-                });
+                let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
+                if let Some(&existing) = remainder_group_idx.get(&key) {
+                    outputs[existing].value += this_excess;
+                } else {
+                    let new_idx = outputs.len();
+                    outputs.push(PlannedOutput {
+                        value: this_excess,
+                        script_public_key: sell.counterparty_spk.clone(),
+                        spk_version: sell.counterparty_spk_version,
+                        purpose: OutputPurpose::SellRemainder,
+                    });
+                    remainder_group_idx.insert(key, new_idx);
+                }
             }
         }
     }
@@ -1082,7 +1172,7 @@ pub fn plan_batch_match(
     // Refund excess surplus to buyers pro-rata by KAS input
     if buyer_refund > 0 {
         let buy_refs: Vec<&BatchOrder> = buys.iter().collect();
-        distribute_buyer_refund(&mut outputs, buyer_refund, &buy_refs, total_buy_kas, n);
+        distribute_buyer_refund(&mut outputs, buyer_refund, &buy_refs, total_buy_kas, n, Some(&buy_output_idx));
     }
 
     let matcher_surplus = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
@@ -1135,6 +1225,9 @@ pub fn plan_batch_match(
         ioc_mode,
         sell_fill_amounts,
         buy_partial_fills: HashMap::new(),
+        sell_output_idx,
+        buy_output_idx,
+        buy_coi,
     })
 }
 
@@ -1342,6 +1435,9 @@ pub fn plan_ioc_match(
         ioc_mode: Some(IocSide::Buy),
         sell_fill_amounts: Vec::new(),
         buy_partial_fills: HashMap::new(),
+        sell_output_idx: Vec::new(),
+        buy_output_idx: Vec::new(),
+        buy_coi: Vec::new(),
     })
 }
 
@@ -1506,7 +1602,7 @@ pub fn plan_sell_ioc_match(
 
     // Refund BPS cap excess to buyers pro-rata by KAS input
     if buyer_refund_from_bps > 0 {
-        distribute_buyer_refund(&mut outputs, buyer_refund_from_bps, &filled_buys, total_buy_value, 1);
+        distribute_buyer_refund(&mut outputs, buyer_refund_from_bps, &filled_buys, total_buy_value, 1, None);
     }
 
     // sell_ioc: matcher_surplus = full capped amount (even dust)
@@ -1540,6 +1636,9 @@ pub fn plan_sell_ioc_match(
         ioc_mode: Some(IocSide::Sell),
         sell_fill_amounts,
         buy_partial_fills: HashMap::new(),
+        sell_output_idx: Vec::new(),
+        buy_output_idx: Vec::new(),
+        buy_coi: Vec::new(),
     })
 }
 
@@ -1638,21 +1737,25 @@ mod tests {
         assert_eq!(plan.buys[0].1, 2);
         assert_eq!(plan.buys[1].1, 3);
 
-        // Output indices: seller_kas[0]=0, seller_kas[1]=1, buyer_tokens[0]=2, buyer_tokens[1]=3,
-        //                 sell_remainder + matcher_fee
-        assert!(plan.outputs.len() >= 4, "at least 4 order outputs");
+        // Outputs are MERGED by (spk, spk_version) — both sells share the same
+        // counterparty_spk (0xDD), and both buys share (0xEE) + TOKEN_A, so:
+        //   outputs[0] = merged SellerKas = 5M + 5M = 10M
+        //   outputs[1] = merged BuyerTokens = 3_333_333 + 3_333_333 = 6_666_666
+        //   (+ sell_remainder / matcher_fee as appropriate)
+        assert!(plan.outputs.len() >= 2, "at least 2 merged order outputs");
         assert_eq!(plan.outputs[0].purpose, OutputPurpose::SellerKas);
-        assert_eq!(plan.outputs[1].purpose, OutputPurpose::SellerKas);
-        assert_eq!(plan.outputs[2].purpose, OutputPurpose::BuyerTokens);
-        assert_eq!(plan.outputs[3].purpose, OutputPurpose::BuyerTokens);
+        assert_eq!(plan.outputs[1].purpose, OutputPurpose::BuyerTokens);
 
-        // Seller KAS: 10M * 1/2 = 5M each
-        assert_eq!(plan.outputs[0].value, 5_000_000);
-        assert_eq!(plan.outputs[1].value, 5_000_000);
+        // Merged seller KAS: 5M + 5M = 10M (same counterparty SPK)
+        assert_eq!(plan.outputs[0].value, 10_000_000);
 
-        // Buyer tokens: 10M * 1/3 = 3_333_333 each
-        assert_eq!(plan.outputs[2].value, 3_333_333);
-        assert_eq!(plan.outputs[3].value, 3_333_333);
+        // Merged buyer tokens: 3_333_333 * 2 = 6_666_666 (same token, same SPK)
+        assert_eq!(plan.outputs[1].value, 6_666_666);
+
+        // Verify merge-index mapping: both sells -> output 0, both buys -> output 1, coi=0
+        assert_eq!(plan.sell_output_idx, vec![0, 0]);
+        assert_eq!(plan.buy_output_idx, vec![1, 1]);
+        assert_eq!(plan.buy_coi, vec![0, 0]);
 
         // Build TX and verify
         let tx = plan.build_tx().expect("build_tx should succeed");
@@ -1710,12 +1813,21 @@ mod tests {
         assert_eq!(plan.buys[0].1, 2);
         assert_eq!(plan.buys[1].1, 3);
 
-        // Outputs: 2 seller KAS + 2 buyer tokens + potential matcher fee
-        assert!(plan.outputs.len() >= 4, "at least 4 outputs");
+        // Outputs are MERGED by (spk, spk_version). Both sells share 0xDD SPK
+        // so they merge to a single SellerKas output. Buyers share 0xEE SPK but
+        // have different token_cov_id (TOKEN_A vs TOKEN_B) so they stay separate.
+        //   outputs[0] = merged SellerKas (sell_a + sell_b = 10M + 10M = 20M)
+        //   outputs[1] = BuyerTokens (buy_b, TOKEN_B, 5M)
+        //   outputs[2] = BuyerTokens (buy_a, TOKEN_A, 5M)
+        assert!(plan.outputs.len() >= 3, "at least 3 merged outputs");
         assert_eq!(plan.outputs[0].purpose, OutputPurpose::SellerKas);
-        assert_eq!(plan.outputs[1].purpose, OutputPurpose::SellerKas);
+        assert_eq!(plan.outputs[1].purpose, OutputPurpose::BuyerTokens);
         assert_eq!(plan.outputs[2].purpose, OutputPurpose::BuyerTokens);
-        assert_eq!(plan.outputs[3].purpose, OutputPurpose::BuyerTokens);
+
+        // Both sells merged into output 0
+        assert_eq!(plan.sell_output_idx, vec![0, 0]);
+        // Buys keep separate outputs because of distinct token_cov_id
+        assert_eq!(plan.buy_output_idx, vec![1, 2]);
 
         // Build TX
         let tx = plan.build_tx().expect("build should succeed");
@@ -2323,23 +2435,30 @@ mod tests {
         let tx = plan.build_tx().expect("20+20 build_tx should succeed");
         // 20 sells + 20 buys = 40 inputs (no token_unit)
         assert_eq!(tx.inputs.len(), 40);
-        // 20 seller KAS + 20 buyer tokens + sell_remainder + matcher_fee
+        // Merge: all 20 sells share counterparty 0xDD => 1 SellerKas output.
+        // All 20 buys share TOKEN_A + counterparty 0xEE => 1 BuyerTokens output.
+        // Plus sell_remainder (merged, 1) + matcher_fee (1) at most.
         let output_count = tx.outputs.len();
-        assert!(output_count >= 40, "at least 40 outputs (20 seller + 20 buyer)");
+        assert!(output_count >= 2, "at least 2 merged outputs");
+        assert!(output_count <= 4, "merge should collapse 40 outputs down to <=4");
 
-        // Verify sell koi=19 uses data-push [0x01, 19] (2 bytes, 17..127 range)
+        // All 20 sells point at the single merged seller output 0
+        assert_eq!(plan.sell_output_idx, vec![0usize; 20]);
+        // All 20 buys point at the single merged buyer output 1
+        assert_eq!(plan.buy_output_idx, vec![1usize; 20]);
+        // All share the same coi=0 for TOKEN_A
+        assert_eq!(plan.buy_coi, vec![0u16; 20]);
+
+        // Verify sell koi=0 uses Op0 (merged target)
         let sell19_ss = &tx.inputs[19].sigscript;
-        assert_eq!(sell19_ss[0], 0x01, "sell koi=19: OpData1");
-        assert_eq!(sell19_ss[1], 19, "sell koi=19: value byte");
+        assert_eq!(sell19_ss[0], 0x00, "sell koi=0 (merged target): Op0");
 
-        // Verify buy toi = 20 + buy_pos (e.g., toi=20 for first buy)
-        // Buy[0] at input[20]: toi=20, tii=0 (sell input, same token), coi=0
+        // Buy[0] at input[20]: toi=1 (merged), tii=0, coi=0
         let buy0_ss = &tx.inputs[20].sigscript;
-        // toi=20 -> [0x01, 20]
-        assert_eq!(buy0_ss[0], 0x01, "buy0 toi=20: OpData1");
-        assert_eq!(buy0_ss[1], 20, "buy0 toi=20: value byte");
+        // toi=1 -> Op1 (0x51)
+        assert_eq!(buy0_ss[0], 0x51, "buy0 toi=1 (merged): Op1");
         // tii=0 -> Op0 (0x00)
-        assert_eq!(buy0_ss[2], 0x00, "buy0 tii=0: Op0 (sell provides covenant)");
+        assert_eq!(buy0_ss[1], 0x00, "buy0 tii=0: Op0 (sell provides covenant)");
     }
 
     // Test: push_index sign-extension for index 128 (regression for >127 batches)

@@ -2570,23 +2570,76 @@ mod tests {
     }
 
     // =========================================================================
-    // Phase-3 race regression tests (Bug A + Bug B).
+    // Phase-3 race regression tests
     //
-    // The race was: scanner discovers an OCO sell → find_sweep_groups groups it
-    // with buys that don't absorb the full OCO UTXO → plan_sell_ioc_match
-    // returns Ok and build_tx emits selector=5 sigscript → OCO v1 covenant
-    // rejects on-chain with "script verification failed" → executor calls
-    // mark_failed on ALL grouped orders → P23 cross-pair BUY stuck in
-    // cooldown → Phase 3 (match_swap_routes) starves.
+    // These tests lock in the behavior fixed in the Phase-3 race investigation
+    // (see /tmp/phase3_race_investigation.md).  The race was:
     //
-    // Fix has three pieces:
-    //   * plan_sell_ioc_match / plan_batch_match return OcoRemainderUnsupported
-    //     when sell.oco_path.is_some() && fill < utxo_value.
-    //   * executor treats OcoRemainderUnsupported as skip-without-cooldown
+    //   1. Scanner discovers an OCO sell on token A (TP+SL, single UTXO, added
+    //      to the book as two virtual entries with suffixed outpoint_keys).
+    //   2. find_sweep_groups picks up the cheaper OCO leg (SL price) and 2+ buys
+    //      as a SellSweep candidate.  The buys don't absorb the full 200M-token
+    //      OCO UTXO — there's a remainder.
+    //   3. plan_sell_ioc_match happily returns a plan.  build_tx() in batch.rs
+    //      dispatches to build_sell_ioc_fill_sigscript because has_remainder is
+    //      true — emitting selector=5 in the sigscript.
+    //   4. OCO v1 covenant's dispatch has no selector=5 path.  sel=5 falls
+    //      through to the SL-branch's `Op2 OpEqual OpVerify` check, which
+    //      fails (5 != 2).  The node rejects the TX with
+    //      "script ran, but verification failed".
+    //   5. executor marks ALL orders in the group as failed with 30-sec
+    //      cooldown — dragging the P23 cross-pair BUY into cooldown.
+    //   6. Phase 3 (match_swap_routes) excludes cooldown-failed orders;
+    //      the P23 swap route has no `buy_source` candidate and returns empty.
+    //   7. 30 sec later the cooldown clears, Phase 1 re-plans the same OCO
+    //      batch, the same failure cascades, and P23 never gets matched.
+    //
+    // The fix has three pieces:
+    //
+    //   * plan_sell_ioc_match returns BatchError::OcoRemainderUnsupported when
+    //     sell is OCO and buys leave a token remainder.
+    //   * plan_batch_match returns the same error for OCO sells under same
+    //     condition.
+    //   * executor treats OcoRemainderUnsupported as a skip-without-cooldown
     //     (same pattern as MinFillViolation).
-    //   * match_swap_routes already filters on spent_outpoints; this test
-    //     locks in that contract.
+    //
     // =========================================================================
+
+    /// Helper: build a BookOrder with an explicit owner_hash to bypass STP.
+    #[allow(dead_code)]
+    fn make_buy_with_owner(
+        tx_id: &str,
+        index: u32,
+        value: u64,
+        price_num: u64,
+        price_den: u64,
+        token_cov_id: &str,
+        owner: &str,
+    ) -> BookOrder {
+        let mut o = make_buy(value, price_num, price_den, token_cov_id);
+        o.tx_id = tx_id.to_string();
+        o.index = index;
+        o.owner_hash = owner.to_string();
+        o
+    }
+
+    /// Helper: build a SELL BookOrder with explicit owner.
+    #[allow(dead_code)]
+    fn make_sell_with_owner(
+        tx_id: &str,
+        index: u32,
+        value: u64,
+        price_num: u64,
+        price_den: u64,
+        token_cov_id: &str,
+        owner: &str,
+    ) -> BookOrder {
+        let mut o = make_sell(value, price_num, price_den, token_cov_id);
+        o.tx_id = tx_id.to_string();
+        o.index = index;
+        o.owner_hash = owner.to_string();
+        o
+    }
 
     /// Helper: construct a minimal SwapEntry for the swap book.
     fn make_swap_entry(
@@ -2615,45 +2668,58 @@ mod tests {
         }
     }
 
-    /// Regression for Bug B: Phase 3 cannot route when the only `buy_source`
-    /// candidate is in cooldown. Reproduces the symptom that the OCO batch
-    /// failure produces when it marks all grouped orders failed.
+    /// Regression for Bug B (Phase-3 starvation by Phase-1 cooldown).
+    ///
+    /// Sets up a swap order (source=TOKEN_A, target=TOKEN_B) and a BUY on
+    /// TOKEN_A that Phase 3 would use as `buy_source`. The test simulates
+    /// the symptom where Phase 1 marked the P23 BUY as cooldown-failed by
+    /// passing its outpoint_key in `spent_outpoints`.
+    ///
+    /// Pre-fix behavior: match_swap_routes skips the P23 BUY → returns empty.
+    /// With the fix applied upstream (plan_*_match now returns
+    /// OcoRemainderUnsupported without calling mark_failed), this cooldown
+    /// set would never include the P23 BUY in the first place; but we still
+    /// exercise the direct match_swap_routes filter to lock in behavior.
     #[test]
     fn test_phase3_starves_when_buy_source_in_cooldown() {
         let token_a = "aa".repeat(32);
         let token_b = "bb".repeat(32);
 
+        // Build order book with:
+        //   - TOKEN_A: P23 BUY @ 1/24 for 2400M KAS (wants 100M tokens).
+        //   - TOKEN_B: P23 SELL @ 1/15 for 60M tokens.
         let mut ob = OrderBook::new();
-        let mut p23_buy = make_buy(2_400_000_000, 1, 24, &token_a);
-        p23_buy.tx_id = "08".repeat(32);
-        p23_buy.index = 0;
-        p23_buy.owner_hash = "aa".repeat(32);
+
+        let mut p23_buy = make_buy_with_owner(
+            &"08".repeat(32), 0, 2_400_000_000, 1, 24, &token_a, &"aa".repeat(32),
+        );
         p23_buy.discovered_daa = 1;
         ob.add_buy_order(p23_buy);
 
-        let mut p23_sell_b = make_sell(60_000_000, 1, 15, &token_b);
-        p23_sell_b.tx_id = "3d".repeat(32);
-        p23_sell_b.index = 0;
-        p23_sell_b.owner_hash = "bb".repeat(32);
+        let mut p23_sell_b = make_sell_with_owner(
+            &"3d".repeat(32), 0, 60_000_000, 1, 15, &token_b, &"bb".repeat(32),
+        );
         p23_sell_b.discovered_daa = 1;
         ob.add_sell_order(p23_sell_b);
 
+        // Build the swap book with a single swap order matching TOKEN_A -> TOKEN_B.
         let mut swap = crate::swap_book::SwapBook::new();
         let swap_entry = make_swap_entry(
             &"9c".repeat(32), 0, &token_a, &token_b,
-            100_000_000, 1_000_000,
+            100_000_000, // 100M source tokens
+            1_000_000,   // min_target_amount: 1M
         );
         swap.add(swap_entry);
 
-        // No cooldown: Phase 3 finds the route.
-        let groups_no_cooldown = match_swap_routes(&ob, &swap, None, &std::collections::HashSet::new());
+        // --- Phase 1: no cooldown. Phase 3 should find the route. ---
+        let groups_before_cooldown = match_swap_routes(&ob, &swap, None, &std::collections::HashSet::new());
         assert_eq!(
-            groups_no_cooldown.len(),
+            groups_before_cooldown.len(),
             1,
             "Phase 3 must find the cross-pair route when no orders are in cooldown",
         );
 
-        // P23 BUY in cooldown (simulates mark_failed from OCO batch failure).
+        // --- Phase 2: P23 BUY is in cooldown (simulates mark_failed). ---
         let mut cooldown: std::collections::HashSet<String> = std::collections::HashSet::new();
         cooldown.insert(format!("{}:0", "08".repeat(32)));
         let groups_with_cooldown = match_swap_routes(
@@ -2665,13 +2731,23 @@ mod tests {
         );
     }
 
-    /// Regression for Bug A: plan_sell_ioc_match must refuse OCO sells that
-    /// would leave a token remainder, since the on-chain OCO v1 covenant
-    /// has no IOC (selector=5) path.
+    /// Regression for Bug A (OCO sweep with remainder structurally fails).
+    ///
+    /// This covers the domain layer: when a sweep is composed of an OCO sell
+    /// and buys that leave a token remainder, plan_sell_ioc_match must refuse
+    /// to produce a plan. The on-chain OCO v1 covenant has no IOC (selector=5)
+    /// path, so any sigscript emitted with selector=5 would fail verification.
+    ///
+    /// Pre-fix: plan_sell_ioc_match returned Ok with sell_fill_amounts < utxo_value,
+    /// build_tx emitted build_sell_ioc_fill_sigscript (Op5), OCO rejected on-chain.
+    /// Post-fix: plan_sell_ioc_match returns Err(OcoRemainderUnsupported).
     #[test]
     fn test_plan_sell_ioc_rejects_oco_with_remainder() {
         use crate::batch::{BatchOrder, OrderType, plan_sell_ioc_match, BatchError};
 
+        // Minimal OCO sell RS (just needs to pass the size check in book_order_to_batch_order).
+        // plan_sell_ioc_match doesn't validate the RS itself, so we pass a placeholder
+        // (the real guard fires on sell.oco_path being Some and sell_fill < utxo_value).
         let oco_rs = vec![0u8; kob_core::OCO_SELL_RS_SIZE];
 
         let sell = BatchOrder {
@@ -2680,7 +2756,7 @@ mod tests {
             version: 14,
             token_cov_id: [0x76u8; 32],
             price_num: 1,
-            price_den: 30,
+            price_den: 30, // SL price
             amount: 200_000_000,
             redeem_script: oco_rs,
             utxo_value: 200_000_000,
@@ -2690,9 +2766,10 @@ mod tests {
             oco_path: Some(kob_core::OcoPath::StopLoss),
         };
 
-        // Two buys that don't absorb the full 200M tokens:
+        // Two buys that don't absorb the full 200M tokens.
         // buy[0]: 500M KAS @ 1/14 -> 35.71M tokens
         // buy[1]: 300M KAS @ 1/15 -> 20M tokens
+        // total filled tokens: ~55.71M << 200M
         let mk_buy_rs = |pnum: u64, pden: u64| {
             kob_core::contract::build_buy_redeem_script(
                 &[0x76; 32], pnum, pden, 1_000_000, &[0xBB; 32], &[0xCC; 32], 0, 0, 0,
@@ -2747,7 +2824,8 @@ mod tests {
             Err(other) => panic!("Expected OcoRemainderUnsupported, got {:?}", other),
             Ok(_) => panic!(
                 "Pre-fix: plan_sell_ioc_match returned Ok for OCO with remainder — \
-                 this is Bug A causing 'script ran, but verification failed' on-chain."
+                 this is the Bug A that causes 'script ran, but verification failed' on-chain. \
+                 Fix: reject OCO + remainder before submit."
             ),
         }
     }

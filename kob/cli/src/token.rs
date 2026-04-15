@@ -510,9 +510,14 @@ pub async fn token_mint(
                 )
             })?
     } else {
+        // Smallest-first (WASM spec): avoids consuming large consolidated UTXOs
+        // when a small one suffices, and avoids repeatedly picking the same
+        // top-tier UTXO across consecutive mints (which can collide with
+        // mempool-pending TXs chained off it).
         wallet_utxos
             .iter()
-            .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= needed_from_fee)
+            .filter(|u| !u.is_p2sh() && u.utxo_entry.amount >= needed_from_fee)
+            .min_by_key(|u| u.utxo_entry.amount)
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "No P2PK UTXO with >= {} sompi for token funding + fee ({} UTXOs available)",
@@ -910,21 +915,27 @@ pub async fn token_transfer(
     // Pre-estimate fee for UTXO selection (2 inputs, 3 outputs max)
     let est_fee_send_pre = kob_core::mass::estimate_compute_mass(2, 3, 0);
 
-    // Find a fee UTXO
+    // Find a fee UTXO — smallest-first (WASM spec), primary requires change headroom.
+    // Matches the mint-path fix: avoids repeatedly picking the largest (DESC-sorted head)
+    // UTXO, which tends to be the most recently mempool-chained one.
     let fee_utxo = all_utxos
         .iter()
-        .find(|u| {
+        .filter(|u| {
             !u.is_p2sh()
                 && u.utxo_entry.amount >= est_fee_send_pre + MIN_UTXO_VALUE
                 && !(u.outpoint.transaction_id == txid && u.outpoint.index == index)
         })
+        .min_by_key(|u| u.utxo_entry.amount)
         .or_else(|| {
-            // Fallback: try without change headroom
-            all_utxos.iter().find(|u| {
-                !u.is_p2sh()
-                    && u.utxo_entry.amount >= est_fee_send_pre
-                    && !(u.outpoint.transaction_id == txid && u.outpoint.index == index)
-            })
+            // Fallback: drop change headroom (exact-fit)
+            all_utxos
+                .iter()
+                .filter(|u| {
+                    !u.is_p2sh()
+                        && u.utxo_entry.amount >= est_fee_send_pre
+                        && !(u.outpoint.transaction_id == txid && u.outpoint.index == index)
+                })
+                .min_by_key(|u| u.utxo_entry.amount)
         })
         .ok_or_else(|| {
             anyhow::anyhow!(

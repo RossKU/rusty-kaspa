@@ -471,14 +471,21 @@ impl RpcClient {
             }
         }
 
-        // 2. Mempool query fallback (may fail on some node versions)
+        // 2. Mempool query fallback.
+        //
+        // kaspad rpc/service/src/service.rs::extract_tx_query treats
+        // (filter=true, include_orphan=false) as the only invalid combination
+        // (returns InconsistentMempoolTxQuery).  Previously this sent that combo
+        // and the error was silently swallowed, leaving local tracking as the
+        // only defense against picking mempool-spent UTXOs.  Use (false, true)
+        // so kaspad returns *all* mempool entries and we can filter properly.
         let mempool_result = self
             .call(
                 "getMempoolEntriesByAddresses",
                 serde_json::json!({
                     "addresses": [address],
-                    "includeOrphanPool": false,
-                    "filterTransactionPool": true,
+                    "includeOrphanPool": true,
+                    "filterTransactionPool": false,
                 }),
             )
             .await;

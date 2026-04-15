@@ -100,6 +100,11 @@ cleanup_engine() {
     # from the previous run (which pin UTXOs still in mempool and block new matches).
     rm -f "$OB" 2>/dev/null
     rm -f "$OB" "$OB".*.json "$LOG"
+    # Clear CLI order cache so match-batch does not look up stale (outpoint,
+    # price, value) tuples from prior runs.  Without this, P22/P25 can match
+    # against old outpoints that share a txid prefix, producing dust outputs
+    # and "insufficient fee UTXO" failures.
+    rm -f /tmp/orders.json 2>/dev/null
     sleep 1
 }
 
@@ -777,14 +782,19 @@ p08_post_only() {
     # engine / CLI should accept it as maker-only deploy.
     out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 50 \
         --min-fill 1000000 --amount 50000000 --post-only 2>&1)
-    # Orphan retry: post-only deploy chain can orphan if a prior genesis/mint
-    # TX hasn't propagated yet. 15s + retry is sufficient on TN12.
-    if echo "$out" | grep -qi "orphan"; then
-        log "  orphan — waiting 15s then retrying..."
-        sleep 15
+    # Orphan retry: post-only deploy chain can orphan if the parent mint TX is
+    # still propagating on TN12.  Retry up to 3 times with increasing backoff
+    # (5s / 15s / 30s) to cover both short propagation blips and longer stalls.
+    local attempt
+    for attempt in 5 15 30; do
+        if ! echo "$out" | grep -qi "orphan"; then
+            break
+        fi
+        log "  orphan — waiting ${attempt}s then retrying..."
+        sleep "$attempt"
         out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 50 \
             --min-fill 1000000 --amount 50000000 --post-only 2>&1)
-    fi
+    done
     log "  post-only deploy: $(echo "$out" | tail -3)"
     if echo "$out" | grep -qiE "deployed|TXID"; then
         record "$id" PASS "$(extract_outpoint "$out")" "post-only deploy accepted"
@@ -903,23 +913,30 @@ p22_batch_n_m() {
     log "=== $id: BATCH N:M same-pair (match-batch non-IOC) ==="
     # P01/P02 exercise engine-driven N:M via auto-scan. Here we verify the
     # explicit match-batch CLI path (2 sells + 2 buys, non-IOC mode).
+    # Sizing guarantees every planned output >= MIN_UTXO_VALUE (3M sompi):
+    #   seller_kas = sell.amount * price_num / price_den (sell side)
+    #   buyer_tokens = buy.amount * price_num / price_den (buy side)
+    #   s1: 500M tokens @ 1/10 -> 50M KAS (>= 3M)
+    #   s2: 500M tokens @ 1/11 -> 45M KAS (>= 3M)
+    #   b1: 4B KAS @ 1/8 -> 500M tokens (>= 3M)
+    #   b2: 4.5B KAS @ 1/9 -> 500M tokens (>= 3M)
+    # Buy-side prices cross the sell-side (buy 1/8 > sell 1/10), so the batch
+    # has non-zero spread and plan_batch_match accepts it.
     local s1_out s2_out b1_out b2_out s1 s2 b1 b2
-    # Size sells so that seller KAS receive >= MIN_UTXO_VALUE (3M sompi).
-    # At price 1/10, 300M tokens -> 30M KAS receive per sell (well above dust).
     s1_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 10 \
-        --min-fill 3000000 --amount 300000000 2>&1)
+        --min-fill 3000000 --amount 500000000 2>&1)
     s1=$(extract_outpoint "$s1_out")
     sleep $DEPLOY_WAIT
     s2_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 11 \
-        --min-fill 3000000 --amount 300000000 2>&1)
+        --min-fill 3000000 --amount 500000000 2>&1)
     s2=$(extract_outpoint "$s2_out")
     sleep $DEPLOY_WAIT
     b1_out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 8 \
-        --min-fill 3000000 --amount 2400000000 2>&1)
+        --min-fill 3000000 --amount 4000000000 2>&1)
     b1=$(extract_outpoint "$b1_out")
     sleep $DEPLOY_WAIT
     b2_out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 9 \
-        --min-fill 3000000 --amount 2700000000 2>&1)
+        --min-fill 3000000 --amount 4500000000 2>&1)
     b2=$(extract_outpoint "$b2_out")
     sleep $DEPLOY_WAIT
     if [ -z "$s1" ] || [ -z "$s2" ] || [ -z "$b1" ] || [ -z "$b2" ]; then
@@ -975,18 +992,24 @@ p25_match_batch_ioc() {
     log "=== $id: Match-batch CLI explicit (IOC sweep) ==="
     # Complement to P22: same-pair N:1 explicit match-batch in IOC mode
     # (1 buy sweeps 2 sells, unspent KAS returned to buyer as change).
+    # Sizing guarantees every planned output >= MIN_UTXO_VALUE (3M sompi) AND
+    # the buy KAS covers the full sweep of both sells:
+    #   s1: 500M tokens @ 1/10 -> 50M KAS needed
+    #   s2: 500M tokens @ 1/12 -> ~41.7M KAS needed
+    #   b1: 6B KAS @ 1/6 (>> s1+s2 = ~92M KAS) -> buys both sells and returns
+    #       ~5.9B KAS change to the buyer.  buyer_tokens = 6B / 6 = 1B (>= 3M).
+    # Buy price 1/6 > sell prices 1/10 and 1/12, so the trade is profitable.
     local s1_out s2_out b1_out s1 s2 b1
-    # Size sells so sell_kas >= MIN_UTXO_VALUE (3M). At 1/10, 300M tokens -> 30M KAS.
     s1_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 10 \
-        --min-fill 3000000 --amount 300000000 2>&1)
+        --min-fill 3000000 --amount 500000000 2>&1)
     s1=$(extract_outpoint "$s1_out")
     sleep $DEPLOY_WAIT
     s2_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 12 \
-        --min-fill 3000000 --amount 300000000 2>&1)
+        --min-fill 3000000 --amount 500000000 2>&1)
     s2=$(extract_outpoint "$s2_out")
     sleep $DEPLOY_WAIT
-    b1_out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 7 \
-        --min-fill 3000000 --amount 4200000000 2>&1)
+    b1_out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 6 \
+        --min-fill 3000000 --amount 6000000000 2>&1)
     b1=$(extract_outpoint "$b1_out")
     sleep $DEPLOY_WAIT
     if [ -z "$s1" ] || [ -z "$s2" ] || [ -z "$b1" ]; then

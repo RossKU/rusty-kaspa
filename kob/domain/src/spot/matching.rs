@@ -2569,4 +2569,237 @@ mod tests {
         );
     }
 
+    // =========================================================================
+    // Phase-3 race regression tests (Bug A + Bug B).
+    //
+    // The race was: scanner discovers an OCO sell → find_sweep_groups groups it
+    // with buys that don't absorb the full OCO UTXO → plan_sell_ioc_match
+    // returns Ok and build_tx emits selector=5 sigscript → OCO v1 covenant
+    // rejects on-chain with "script verification failed" → executor calls
+    // mark_failed on ALL grouped orders → P23 cross-pair BUY stuck in
+    // cooldown → Phase 3 (match_swap_routes) starves.
+    //
+    // Fix has three pieces:
+    //   * plan_sell_ioc_match / plan_batch_match return OcoRemainderUnsupported
+    //     when sell.oco_path.is_some() && fill < utxo_value.
+    //   * executor treats OcoRemainderUnsupported as skip-without-cooldown
+    //     (same pattern as MinFillViolation).
+    //   * match_swap_routes already filters on spent_outpoints; this test
+    //     locks in that contract.
+    // =========================================================================
+
+    /// Helper: construct a minimal SwapEntry for the swap book.
+    fn make_swap_entry(
+        tx_id: &str,
+        index: u32,
+        source_cov_id: &str,
+        target_cov_id: &str,
+        value: u64,
+        min_target_amount: u64,
+    ) -> crate::swap_book::SwapEntry {
+        crate::swap_book::SwapEntry {
+            tx_id: tx_id.to_string(),
+            index,
+            value,
+            source_cov_id: source_cov_id.to_string(),
+            target_cov_id: target_cov_id.to_string(),
+            min_target_amount,
+            owner_hash: "ee".repeat(32),
+            owner_spk_hash: "ff".repeat(32),
+            receipt_cov_id: "11".repeat(32),
+            redeem_script_hex: String::new(),
+            p2sh_script_hex: String::new(),
+            p2sh_version: 0,
+            discovered_daa: 0,
+            owner_spk: Some("0000".to_string()),
+        }
+    }
+
+    /// Regression for Bug B: Phase 3 cannot route when the only `buy_source`
+    /// candidate is in cooldown. Reproduces the symptom that the OCO batch
+    /// failure produces when it marks all grouped orders failed.
+    #[test]
+    fn test_phase3_starves_when_buy_source_in_cooldown() {
+        let token_a = "aa".repeat(32);
+        let token_b = "bb".repeat(32);
+
+        let mut ob = OrderBook::new();
+        let mut p23_buy = make_buy(2_400_000_000, 1, 24, &token_a);
+        p23_buy.tx_id = "08".repeat(32);
+        p23_buy.index = 0;
+        p23_buy.owner_hash = "aa".repeat(32);
+        p23_buy.discovered_daa = 1;
+        ob.add_buy_order(p23_buy);
+
+        let mut p23_sell_b = make_sell(60_000_000, 1, 15, &token_b);
+        p23_sell_b.tx_id = "3d".repeat(32);
+        p23_sell_b.index = 0;
+        p23_sell_b.owner_hash = "bb".repeat(32);
+        p23_sell_b.discovered_daa = 1;
+        ob.add_sell_order(p23_sell_b);
+
+        let mut swap = crate::swap_book::SwapBook::new();
+        let swap_entry = make_swap_entry(
+            &"9c".repeat(32), 0, &token_a, &token_b,
+            100_000_000, 1_000_000,
+        );
+        swap.add(swap_entry);
+
+        // No cooldown: Phase 3 finds the route.
+        let groups_no_cooldown = match_swap_routes(&ob, &swap, None, &std::collections::HashSet::new());
+        assert_eq!(
+            groups_no_cooldown.len(),
+            1,
+            "Phase 3 must find the cross-pair route when no orders are in cooldown",
+        );
+
+        // P23 BUY in cooldown (simulates mark_failed from OCO batch failure).
+        let mut cooldown: std::collections::HashSet<String> = std::collections::HashSet::new();
+        cooldown.insert(format!("{}:0", "08".repeat(32)));
+        let groups_with_cooldown = match_swap_routes(
+            &ob, &swap, Some(&cooldown), &std::collections::HashSet::new(),
+        );
+        assert!(
+            groups_with_cooldown.is_empty(),
+            "Phase 3 must return empty when the only buy_source candidate is in cooldown (reproduces Bug B symptom)",
+        );
+    }
+
+    /// Regression for Bug A: plan_sell_ioc_match must refuse OCO sells that
+    /// would leave a token remainder, since the on-chain OCO v1 covenant
+    /// has no IOC (selector=5) path.
+    #[test]
+    fn test_plan_sell_ioc_rejects_oco_with_remainder() {
+        use crate::batch::{BatchOrder, OrderType, plan_sell_ioc_match, BatchError};
+
+        let oco_rs = vec![0u8; kob_core::OCO_SELL_RS_SIZE];
+
+        let sell = BatchOrder {
+            outpoint: ("6a".repeat(32), 0),
+            order_type: OrderType::Sell,
+            version: 14,
+            token_cov_id: [0x76u8; 32],
+            price_num: 1,
+            price_den: 30,
+            amount: 200_000_000,
+            redeem_script: oco_rs,
+            utxo_value: 200_000_000,
+            counterparty_spk: vec![0u8; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: Some(kob_core::OcoPath::StopLoss),
+        };
+
+        // Two buys that don't absorb the full 200M tokens:
+        // buy[0]: 500M KAS @ 1/14 -> 35.71M tokens
+        // buy[1]: 300M KAS @ 1/15 -> 20M tokens
+        let mk_buy_rs = |pnum: u64, pden: u64| {
+            kob_core::contract::build_buy_redeem_script(
+                &[0x76; 32], pnum, pden, 1_000_000, &[0xBB; 32], &[0xCC; 32], 0, 0, 0,
+            ).unwrap()
+        };
+        let buys = vec![
+            BatchOrder {
+                outpoint: ("19".repeat(32), 0),
+                order_type: OrderType::Buy,
+                version: 14,
+                token_cov_id: [0x76u8; 32],
+                price_num: 1,
+                price_den: 14,
+                amount: 500_000_000,
+                redeem_script: mk_buy_rs(1, 14),
+                utxo_value: 500_000_000,
+                counterparty_spk: vec![0u8; 34],
+                counterparty_spk_version: 0,
+                min_fill: 1_000_000,
+                oco_path: None,
+            },
+            BatchOrder {
+                outpoint: ("a7".repeat(32), 0),
+                order_type: OrderType::Buy,
+                version: 14,
+                token_cov_id: [0x76u8; 32],
+                price_num: 1,
+                price_den: 15,
+                amount: 300_000_000,
+                redeem_script: mk_buy_rs(1, 15),
+                utxo_value: 300_000_000,
+                counterparty_spk: vec![0u8; 34],
+                counterparty_spk_version: 0,
+                min_fill: 1_000_000,
+                oco_path: None,
+            },
+        ];
+
+        let result = plan_sell_ioc_match(
+            &sell, &buys, None, &vec![0u8; 34], 0, Some(30),
+        );
+
+        match result {
+            Err(BatchError::OcoRemainderUnsupported { utxo_value, filled_tokens, .. }) => {
+                assert_eq!(utxo_value, 200_000_000);
+                assert!(
+                    filled_tokens < utxo_value,
+                    "filled_tokens {} should be less than utxo_value {} for this to be a remainder case",
+                    filled_tokens, utxo_value,
+                );
+            }
+            Err(other) => panic!("Expected OcoRemainderUnsupported, got {:?}", other),
+            Ok(_) => panic!(
+                "Pre-fix: plan_sell_ioc_match returned Ok for OCO with remainder — \
+                 this is Bug A causing 'script ran, but verification failed' on-chain."
+            ),
+        }
+    }
+
+    /// Symmetric regression for plan_batch_match.
+    #[test]
+    fn test_plan_batch_rejects_oco_with_remainder() {
+        use crate::batch::{BatchOrder, OrderType, plan_batch_match, BatchError};
+
+        let oco_rs = vec![0u8; kob_core::OCO_SELL_RS_SIZE];
+        let sell = BatchOrder {
+            outpoint: ("6a".repeat(32), 0),
+            order_type: OrderType::Sell,
+            version: 14,
+            token_cov_id: [0x76u8; 32],
+            price_num: 1,
+            price_den: 30,
+            amount: 200_000_000,
+            redeem_script: oco_rs,
+            utxo_value: 200_000_000,
+            counterparty_spk: vec![0u8; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: Some(kob_core::OcoPath::StopLoss),
+        };
+
+        let buys = vec![BatchOrder {
+            outpoint: ("19".repeat(32), 0),
+            order_type: OrderType::Buy,
+            version: 14,
+            token_cov_id: [0x76u8; 32],
+            price_num: 1,
+            price_den: 14,
+            amount: 500_000_000,
+            redeem_script: kob_core::contract::build_buy_redeem_script(
+                &[0x76; 32], 1, 14, 1_000_000, &[0xBB; 32], &[0xCC; 32], 0, 0, 0,
+            ).unwrap(),
+            utxo_value: 500_000_000,
+            counterparty_spk: vec![0u8; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: None,
+        }];
+
+        let result = plan_batch_match(
+            &[sell], &buys, None, &vec![0u8; 34], 0, Some(30),
+        );
+
+        match result {
+            Err(BatchError::OcoRemainderUnsupported { .. }) => {} // expected
+            Err(other) => panic!("Expected OcoRemainderUnsupported, got {:?}", other),
+            Ok(_) => panic!("Pre-fix: plan_batch_match accepted OCO with remainder. Fix required."),
+        }
+    }
 }

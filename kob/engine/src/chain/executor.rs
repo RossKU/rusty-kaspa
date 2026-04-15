@@ -2974,6 +2974,20 @@ async fn run_scan_cycle(
                 info!("[UNIFIED] MinFill violation (skipping, will retry): {}", e);
                 continue;
             }
+            Err(ref e) if matches!(e, crate::matcher::batch::BatchError::OcoRemainderUnsupported { .. }) => {
+                // OCO v1 covenant has no IOC path. A sweep/batch that leaves
+                // any OCO token remainder is structurally unexecutable — the
+                // planner would otherwise emit a TX using selector=5, which
+                // OCO's dispatch rejects with "script verification failed".
+                //
+                // Don't mark any order in the group as failed: the OCO UTXO
+                // is fine, and the buys in this group should remain available
+                // for other matches (including Phase 3 cross-pair swaps).
+                // Marking them failed here was the root cause of the P23
+                // Phase 3 starvation race (see phase3_race_investigation.md).
+                info!("[UNIFIED] OCO remainder not supported (skipping group, no cooldown): {}", e);
+                continue;
+            }
             Err(e) => {
                 warn!("[UNIFIED] Plan failed: {}, skipping group", e);
                 for o in group.all_orders() {

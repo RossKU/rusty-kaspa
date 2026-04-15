@@ -165,6 +165,20 @@ pub enum BatchError {
     FeeBpsCappedToZero,
     /// A partially-filled sell does not meet its min_fill requirement.
     MinFillViolation { index: usize, fill_kas: u64, min_fill: u64 },
+    /// OCO sell in a sweep/batch where the buys would leave a token remainder.
+    ///
+    /// The OCO v1 covenant dispatch has no IOC (selector=5) path — only
+    /// TP (Op1), SL (Op2), cancel (Op0), and expire (Op4). Attempting to
+    /// use build_sell_ioc_fill_sigscript with OCO produces a sigscript with
+    /// selector=5 which runs the SL-path branch and then fails
+    /// `Op2 OpEqual OpVerify`, causing "script ran, but verification failed"
+    /// on-chain. The planner must reject such batches rather than emit a
+    /// TX that will be rejected by the node.
+    ///
+    /// The OCO UTXO remains in the book and will be matched in a later scan
+    /// cycle when a counterparty that consumes the full 200M-token value is
+    /// available, or when OCO gets rewritten with an IOC path (future HF).
+    OcoRemainderUnsupported { outpoint: String, utxo_value: u64, filled_tokens: u64 },
 }
 
 impl std::fmt::Display for BatchError {
@@ -203,6 +217,9 @@ impl std::fmt::Display for BatchError {
             }
             BatchError::MinFillViolation { index, fill_kas, min_fill } => {
                 write!(f, "Sell[{}] partial fill {} KAS below min_fill {}", index, fill_kas, min_fill)
+            }
+            BatchError::OcoRemainderUnsupported { outpoint, utxo_value, filled_tokens } => {
+                write!(f, "OCO sell {} cannot be partially filled (utxo_value={} filled_tokens={}); OCO v1 covenant has no IOC path", outpoint, utxo_value, filled_tokens)
             }
         }
     }
@@ -1016,6 +1033,20 @@ pub fn plan_batch_match(
         for (i, sell) in sells.iter().enumerate() {
             let fta = per_sell_fill[i];
             if fta < sell.utxo_value && fta > 0 && sell.price_den > 0 {
+                // Bug-A guard: OCO v1 covenant has no IOC (selector=5) path.
+                // If this OCO sell has a remainder, the resulting sigscript
+                // would be `[koi][fta][Op5][RS]`, and OCO's dispatch would
+                // route sel=5 into the SL-branch's `Op2 OpEqual OpVerify`
+                // which fails on-chain. Reject before submit. See
+                // core/src/contract/spot/oco.rs OCO_SELL_BODY.
+                if sell.oco_path.is_some() {
+                    return Err(BatchError::OcoRemainderUnsupported {
+                        outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
+                        utxo_value: sell.utxo_value,
+                        filled_tokens: fta,
+                    });
+                }
+
                 let fill_kas = fta as u128 * sell.price_num as u128 / sell.price_den as u128;
                 if (fill_kas as u64) < sell.min_fill {
                     return Err(BatchError::MinFillViolation {
@@ -1378,6 +1409,22 @@ pub fn plan_sell_ioc_match(
         return Err(BatchError::InsufficientFee {
             needed: buys[0].amount as u64,
             available: sell_tokens,
+        });
+    }
+
+    // Bug-A guard: OCO v1 covenant has no IOC path (no selector=5 dispatch).
+    // If the sell is OCO and buys leave a token remainder, the resulting
+    // sigscript would be `[koi][fta][Op5][RS]`, and OCO's script would run
+    // the SL-branch `Op2 OpEqual OpVerify` which fails for selector=5.
+    // See core/src/contract/spot/oco.rs OCO_SELL_BODY dispatch table.
+    //
+    // Reject here so the executor can skip the group without mark_failed
+    // (which would drag any co-grouped orders into cooldown — see Bug B).
+    if sell.oco_path.is_some() && total_tokens_sold < sell.utxo_value {
+        return Err(BatchError::OcoRemainderUnsupported {
+            outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
+            utxo_value: sell.utxo_value,
+            filled_tokens: total_tokens_sold,
         });
     }
 

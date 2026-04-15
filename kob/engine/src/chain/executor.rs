@@ -911,6 +911,75 @@ pub async fn execute_batch_match(
         ));
     }
 
+    // M1: Early mass pre-check with placeholder wallet sigscript.
+    //
+    // P2PK sigscript length is a constant 66 bytes regardless of signature
+    // content (build_p2pk_sigscript uses a fixed [0x41, sig(64), type(1)]
+    // layout). `calc_mass_with_sigscripts` reads `ss.len()` only, so the
+    // placeholder produces identical compute mass to the real signature.
+    //
+    // Storage mass here uses pre-convergence output values (fee not yet
+    // reclaimed by `apply_exact_fee`), which is a strict upper bound on the
+    // post-convergence storage mass (Phase 2 only *increases* output values,
+    // and storage mass ~ C/amount is monotonically decreasing in amount).
+    //
+    // Purpose: short-circuit `schnorr_sign` + privkey zeroize + Phase 2
+    // re-sign on mass-violation. Pass-through implies the late check at
+    // [executor.rs §"Mass pre-check"] will also pass.
+    {
+        let in_vals_early: Vec<u64> = plan.sells.iter().map(|(s, _)| s.utxo_value).chain(
+            plan.buys.iter().map(|(b, _)| b.utxo_value)
+        ).chain(
+            plan.wallet_input.iter().map(|(_, _, val)| *val)
+        ).collect();
+        let out_vals_early: Vec<u64> = plan.outputs.iter().map(|o| o.value).collect();
+
+        // 1. Storage mass (pre-convergence — conservative upper bound).
+        if check_mass_presubmit(&in_vals_early, &out_vals_early, "BATCH/early").is_none() {
+            for (sell, _) in &plan.sells {
+                spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
+            }
+            for (buy, _) in &plan.buys {
+                spent_tracker.mark_failed(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
+            }
+            return None;
+        }
+
+        // 2. Compute mass with placeholder wallet sigscript.
+        let placeholder_wallet_ss = if has_wallet {
+            kob_core::contract::build_p2pk_sigscript(&[0u8; 64])
+        } else {
+            Vec::new()
+        };
+        let sigscripts_early: Vec<Vec<u8>> = batch_tx.inputs.iter().enumerate().map(|(i, inp)| {
+            if has_wallet && i == wallet_input_idx {
+                placeholder_wallet_ss.clone()
+            } else {
+                inp.sigscript.clone()
+            }
+        }).collect();
+        let compute_mass_early = kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts_early);
+        let storage_mass_early = kob_core::mass::compute_storage_mass(&in_vals_early, &out_vals_early);
+        let effective_early = compute_mass_early.max(storage_mass_early);
+        info!(
+            "[BATCH] Mass check (early, placeholder): compute={}, storage={}, effective={}, limit={}",
+            compute_mass_early, storage_mass_early, effective_early, kob_core::MAX_TX_MASS
+        );
+        if effective_early > kob_core::MAX_TX_MASS {
+            error!(
+                "[BATCH] Early effective mass {} exceeds limit {} — skipping wallet sign",
+                effective_early, kob_core::MAX_TX_MASS
+            );
+            for (sell, _) in &plan.sells {
+                spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
+            }
+            for (buy, _) in &plan.buys {
+                spent_tracker.mark_failed(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
+            }
+            return None;
+        }
+    }
+
     // Sign the wallet input if present
     if has_wallet {
         let mut privkey = config.private_key_bytes();

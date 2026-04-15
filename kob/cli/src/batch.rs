@@ -109,7 +109,7 @@ fn default_min_fill() -> u64 {
 }
 
 fn default_version() -> u8 {
-    13
+    14
 }
 
 /// Result of a single batch operation.
@@ -380,7 +380,7 @@ async fn execute_operation(
                 *price_den,
                 *min_fill,
                 *amount,
-                13, // v13 default for batch
+                14, // v14 default for batch (match deploy CLI default)
                 fee,
                 false, // post_only not supported in batch mode
                 None,  // expiry_daa: None = GTC
@@ -409,7 +409,7 @@ async fn execute_operation(
                 *price_den,
                 *min_fill,
                 *amount,
-                13, // v13 default for batch
+                14, // v14 default for batch (match deploy CLI default)
                 fee,
                 false, // post_only not supported in batch mode
                 None,  // expiry_daa: None = GTC
@@ -517,7 +517,7 @@ async fn execute_operation(
                 buyer_pubkey,
                 seller_pubkey,
                 None,
-                13, // v13 default for batch
+                14, // v14 default for batch (match deploy CLI default)
                 fee,
                 0, // buy_expiry (GTC)
                 0, // sell_expiry (GTC)
@@ -643,7 +643,7 @@ mod tests {
                 assert_eq!(*price_num, 1000);
                 assert_eq!(*price_den, 1);
                 assert_eq!(*min_fill, 3_000_000);
-                assert_eq!(*version, 13); // default_version
+                assert_eq!(*version, 14); // default_version
                 assert_eq!(*expiry_daa, 0); // default
             }
             _ => panic!("Expected Cancel"),

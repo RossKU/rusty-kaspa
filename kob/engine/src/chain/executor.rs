@@ -906,107 +906,26 @@ pub async fn execute_batch_match(
         ));
     }
 
-    // M1: Early mass pre-check with placeholder wallet sigscript.
+    // Phase 2: Exact fee convergence BEFORE signing.
     //
-    // P2PK sigscript length is a constant 66 bytes regardless of signature
-    // content (build_p2pk_sigscript uses a fixed [0x41, sig(64), type(1)]
-    // layout). `calc_mass_with_sigscripts` reads `ss.len()` only, so the
-    // placeholder produces identical compute mass to the real signature.
+    // `calc_mass_with_sigscripts` reads sigscript LENGTHS only. P2PK wallet
+    // sigscript is a constant 66 bytes regardless of signature content, so
+    // we can converge the fee with a placeholder [0u8; 64] sig — yielding
+    // post-convergence output values that the wallet will sign over ONCE
+    // below, with no re-sign needed.
     //
-    // Storage mass here uses pre-convergence output values (fee not yet
-    // reclaimed by `apply_exact_fee`), which is a strict upper bound on the
-    // post-convergence storage mass (Phase 2 only *increases* output values,
-    // and storage mass ~ C/amount is monotonically decreasing in amount).
-    //
-    // Purpose: short-circuit `schnorr_sign` + privkey zeroize + Phase 2
-    // re-sign on mass-violation. Pass-through implies the late check at
-    // [executor.rs §"Mass pre-check"] will also pass.
+    // This also makes the subsequent M1 mass check see the final output
+    // values, matching the late check byte-exact (storage mass depends on
+    // output values; apply_exact_fee raises one output by `delta`).
     {
-        let in_vals_early: Vec<u64> = plan.sells.iter().map(|(s, _)| s.utxo_value).chain(
-            plan.buys.iter().map(|(b, _)| b.utxo_value)
-        ).chain(
-            plan.wallet_input.iter().map(|(_, _, val)| *val)
-        ).collect();
-        let out_vals_early: Vec<u64> = plan.outputs.iter().map(|o| o.value).collect();
-
-        // 1. Storage mass (pre-convergence — conservative upper bound).
-        if check_mass_presubmit(&in_vals_early, &out_vals_early, "BATCH/early").is_none() {
-            for (sell, _) in &plan.sells {
-                spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
-            }
-            for (buy, _) in &plan.buys {
-                spent_tracker.mark_failed(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
-            }
-            return None;
-        }
-
-        // 2. Compute mass with placeholder wallet sigscript.
         let placeholder_wallet_ss = if has_wallet {
             kob_core::contract::build_p2pk_sigscript(&[0u8; 64])
         } else {
             Vec::new()
         };
-        let sigscripts_early: Vec<Vec<u8>> = batch_tx.inputs.iter().enumerate().map(|(i, inp)| {
-            if has_wallet && i == wallet_input_idx {
-                placeholder_wallet_ss.clone()
-            } else {
-                inp.sigscript.clone()
-            }
-        }).collect();
-        let compute_mass_early = kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts_early);
-        let storage_mass_early = kob_core::mass::compute_storage_mass(&in_vals_early, &out_vals_early);
-        let effective_early = compute_mass_early.max(storage_mass_early);
-        info!(
-            "[BATCH] Mass check (early, placeholder): compute={}, storage={}, effective={}, limit={}",
-            compute_mass_early, storage_mass_early, effective_early, kob_core::MAX_TX_MASS
-        );
-        if effective_early > kob_core::MAX_TX_MASS {
-            error!(
-                "[BATCH] Early effective mass {} exceeds limit {} — skipping wallet sign",
-                effective_early, kob_core::MAX_TX_MASS
-            );
-            for (sell, _) in &plan.sells {
-                spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
-            }
-            for (buy, _) in &plan.buys {
-                spent_tracker.mark_failed(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
-            }
-            return None;
-        }
-    }
-
-    // Sign the wallet input if present
-    if has_wallet {
-        let mut privkey = config.private_key_bytes();
-        let sighash = kob_core::compute_sighash(&sighash_tx, wallet_input_idx).ok()?;
-        let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
-            Ok(s) => s,
-            Err(e) => {
-                privkey.zeroize();
-                error!("[BATCH] Wallet input signing failed: {}", e);
-                return None;
-            }
-        };
-        privkey.zeroize();
-        let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
-
-        let wallet_inp = &batch_tx.inputs[wallet_input_idx];
-        rpc_inputs.push(deploy::build_rpc_input(
-            &wallet_inp.tx_id,
-            wallet_inp.index,
-            &hex::encode(&wallet_ss),
-            1, // sigOpCount = 1 for P2PK
-        ));
-        wallet_sigscript = Some(wallet_ss);
-    }
-
-    // Phase 2: exact fee convergence with real sigscripts.
-    // The plan's estimated fee (from estimate_compute_mass) is conservative.
-    // Compute exact mass from real sigscripts and reclaim the overpayment.
-    {
         let sigscripts_for_conv: Vec<Vec<u8>> = batch_tx.inputs.iter().enumerate().map(|(i, inp)| {
             if has_wallet && i == wallet_input_idx {
-                wallet_sigscript.clone().unwrap_or_default()
+                placeholder_wallet_ss.clone()
             } else {
                 inp.sigscript.clone()
             }
@@ -1019,7 +938,7 @@ pub async fn execute_batch_match(
             );
             plan.apply_exact_fee(exact_fee);
 
-            // Rebuild sighash_tx outputs from adjusted plan
+            // Rebuild sighash_tx outputs and rpc_outputs from adjusted plan.
             sighash_tx.outputs.clear();
             rpc_outputs.clear();
             let n = plan.sells.len();
@@ -1074,33 +993,93 @@ pub async fn execute_batch_match(
                     out.value, out.spk_version, out.script_public_key.clone(), None,
                 ));
             }
-
-            // Re-sign wallet input (outputs changed -> sighash changed)
-            if has_wallet {
-                // Remove old wallet rpc_input (last one) and re-sign
-                rpc_inputs.pop();
-                let mut privkey = config.private_key_bytes();
-                let sighash = kob_core::compute_sighash(&sighash_tx, wallet_input_idx).ok()?;
-                let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        privkey.zeroize();
-                        error!("[BATCH] Phase 2 wallet re-sign failed: {}", e);
-                        return None;
-                    }
-                };
-                privkey.zeroize();
-                let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
-                let wallet_inp = &batch_tx.inputs[wallet_input_idx];
-                rpc_inputs.push(deploy::build_rpc_input(
-                    &wallet_inp.tx_id,
-                    wallet_inp.index,
-                    &hex::encode(&wallet_ss),
-                    1,
-                ));
-                wallet_sigscript = Some(wallet_ss);
-            }
         }
+    }
+
+    // M1: Mass pre-check with placeholder wallet sigscript (post-convergence).
+    //
+    // Since Phase 2 already applied the exact fee, the values here are final.
+    // The late check below will observe the same compute/storage mass
+    // byte-exact (sigscript length 66B is constant between placeholder and
+    // real Schnorr sig).
+    //
+    // Purpose: short-circuit `schnorr_sign` + privkey zeroize on
+    // mass-violation.
+    {
+        let in_vals: Vec<u64> = plan.sells.iter().map(|(s, _)| s.utxo_value).chain(
+            plan.buys.iter().map(|(b, _)| b.utxo_value)
+        ).chain(
+            plan.wallet_input.iter().map(|(_, _, val)| *val)
+        ).collect();
+        let out_vals: Vec<u64> = plan.outputs.iter().map(|o| o.value).collect();
+
+        if check_mass_presubmit(&in_vals, &out_vals, "BATCH/early").is_none() {
+            for (sell, _) in &plan.sells {
+                spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
+            }
+            for (buy, _) in &plan.buys {
+                spent_tracker.mark_failed(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
+            }
+            return None;
+        }
+
+        let placeholder_wallet_ss = if has_wallet {
+            kob_core::contract::build_p2pk_sigscript(&[0u8; 64])
+        } else {
+            Vec::new()
+        };
+        let sigscripts_early: Vec<Vec<u8>> = batch_tx.inputs.iter().enumerate().map(|(i, inp)| {
+            if has_wallet && i == wallet_input_idx {
+                placeholder_wallet_ss.clone()
+            } else {
+                inp.sigscript.clone()
+            }
+        }).collect();
+        let compute_mass_early = kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts_early);
+        let storage_mass_early = kob_core::mass::compute_storage_mass(&in_vals, &out_vals);
+        let effective_early = compute_mass_early.max(storage_mass_early);
+        info!(
+            "[BATCH] Mass check (early, placeholder): compute={}, storage={}, effective={}, limit={}",
+            compute_mass_early, storage_mass_early, effective_early, kob_core::MAX_TX_MASS
+        );
+        if effective_early > kob_core::MAX_TX_MASS {
+            error!(
+                "[BATCH] Early effective mass {} exceeds limit {} — skipping wallet sign",
+                effective_early, kob_core::MAX_TX_MASS
+            );
+            for (sell, _) in &plan.sells {
+                spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
+            }
+            for (buy, _) in &plan.buys {
+                spent_tracker.mark_failed(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
+            }
+            return None;
+        }
+    }
+
+    // Sign the wallet input ONCE (post-convergence sighash).
+    if has_wallet {
+        let mut privkey = config.private_key_bytes();
+        let sighash = kob_core::compute_sighash(&sighash_tx, wallet_input_idx).ok()?;
+        let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
+            Ok(s) => s,
+            Err(e) => {
+                privkey.zeroize();
+                error!("[BATCH] Wallet input signing failed: {}", e);
+                return None;
+            }
+        };
+        privkey.zeroize();
+        let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
+
+        let wallet_inp = &batch_tx.inputs[wallet_input_idx];
+        rpc_inputs.push(deploy::build_rpc_input(
+            &wallet_inp.tx_id,
+            wallet_inp.index,
+            &hex::encode(&wallet_ss),
+            1, // sigOpCount = 1 for P2PK
+        ));
+        wallet_sigscript = Some(wallet_ss);
     }
 
     // Mass pre-check: storage mass + compute mass (with real sigscripts)

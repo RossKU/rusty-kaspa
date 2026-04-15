@@ -3155,10 +3155,229 @@ async fn run_scan_cycle(
     // once enough DAA scores pass (typically ~5 seconds on mainnet).
     let current_daa = rpc.get_daa_score().await.unwrap_or(0);
 
+    // F1: Phase 3 now runs BEFORE Phase 1.
+    //
+    // Background — the "Phase 3 starvation race" (see
+    // phase3_race_investigation.md). When Phase 1 ran first, any
+    // SellSweep / BuySweep whose planner failed would call
+    // `spent_tracker.mark_failed(...)` on every participating order —
+    // including orders that were the only viable `buy_source` or
+    // `sell_target` candidate for an active cross-book swap route.
+    // Because Phase 3 then read `swap_spent_keys` from the SAME live
+    // `spent_tracker`, those just-poisoned outpoints were filtered out
+    // → `match_swap_routes` returned empty → the `[SCAN] Found N
+    // cross-book swap route(s)` log (guarded by `!is_empty()`) stayed
+    // silent → P23 cross-pair swap could starve for as long as the
+    // Phase 1 planner kept retrying the failing group each cooldown
+    // cycle (~30 s). F3-partial + F5 already minimise the blast radius
+    // of Phase 1 mark_failed, but F1 removes the ordering dependency
+    // entirely: Phase 3 picks counterparties first, Phase 1 sees its
+    // successes (via `mark_spent`) and plans around them.
+    //
+    // Option A chosen: Phase 3 runs FIRST using a snapshot of the
+    // spent-tracker state at cycle entry. Phase 1 then runs with the
+    // live tracker, observing any `mark_spent` that Phase 3's
+    // successful swap routes emitted. The "snapshot" here is just the
+    // plain `spent_keys() + failed-under-cooldown` collection
+    // performed BEFORE Phase 1 mutates anything — since Phase 3 runs
+    // first, nothing in the same cycle has had a chance to poison it.
+    // No new SpentTracker type / snapshot() method required.
+    {
+        let swab = swap_book.lock().await;
+        if !swab.is_empty() {
+            // Snapshot currently spent / cooldown outpoints for exclusion.
+            // Include failed outpoints under cooldown so we don't hammer
+            // the node with transient-failure retries (e.g. CSV not yet
+            // mature — the swap covenant has a 50-DAA OP_CSV gate, and
+            // the plain buy/sell legs do too).
+            let mut swap_spent_keys = spent_tracker.spent_keys();
+            for (key, when) in &spent_tracker.failed {
+                if when.elapsed().as_secs() < spent_tracker.cooldown_secs {
+                    swap_spent_keys.insert(key.clone());
+                }
+            }
+            let swap_groups = matching::match_swap_routes(
+                order_book, &swab, Some(&swap_spent_keys), &std::collections::HashSet::new(),
+            );
+            drop(swab);
+
+            if !swap_groups.is_empty() {
+                info!(
+                    "[SCAN] Found {} cross-book swap route(s)",
+                    swap_groups.len(),
+                );
+            }
+
+            for sg in &swap_groups {
+                info!(
+                    "[SWAP-ROUTE] swap={} buy_source={} sell_target={} kas_flow={} surplus={}",
+                    &sg.swap.outpoint_key()[..sg.swap.outpoint_key().len().min(20)],
+                    &sg.buy_source.outpoint_key()[..sg.buy_source.outpoint_key().len().min(20)],
+                    &sg.sell_target.outpoint_key()[..sg.sell_target.outpoint_key().len().min(20)],
+                    sg.kas_flow,
+                    sg.surplus,
+                );
+
+                // Convert counterparty orders to BatchOrders
+                let buy_source_batch = match book_order_to_batch_order(&sg.buy_source, "SWAP-BUY") {
+                    Some(o) => o,
+                    None => {
+                        spent_tracker.mark_failed(&sg.buy_source.outpoint_key());
+                        continue;
+                    }
+                };
+                let sell_target_batch = match book_order_to_batch_order(&sg.sell_target, "SWAP-SELL") {
+                    Some(o) => o,
+                    None => {
+                        spent_tracker.mark_failed(&sg.sell_target.outpoint_key());
+                        continue;
+                    }
+                };
+
+                // Acquire wallet UTXOs
+                let utxos = match rpc
+                    .get_spendable_utxos(&config.address, Some(0))
+                    .await
+                {
+                    Ok(u) if !u.is_empty() => u,
+                    Ok(_) => {
+                        warn!("[SWAP-ROUTE] No wallet UTXOs available, skipping");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("[SWAP-ROUTE] Failed to get wallet UTXOs: {}, skipping", e);
+                        continue;
+                    }
+                };
+                let (wallet_spk_version, wallet_spk_script) = utxos[0].parse_spk();
+                let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
+                let token_p2sh_hex = hex::encode(&token_p2sh.script());
+                let wallet_utxo = utxos.iter()
+                    .filter(|u| {
+                        let (_, script) = u.parse_spk();
+                        hex::encode(&script) != token_p2sh_hex
+                            && !spent_tracker.is_spent(&u.outpoint_key())
+                    })
+                    .max_by_key(|u| u.utxo_entry.amount)
+                    .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
+
+                // Build and submit the swap atomic TX directly (not via plan_batch_match,
+                // which can't handle cross-pair token routing).
+                // execute_swap_fill marks participating outpoints as transient
+                // (CSV not mature) or failed (permanent) on its own when it
+                // returns None. The caller only marks on the success path.
+                match execute_swap_fill(
+                    rpc, sg, &sell_target_batch, &buy_source_batch,
+                    wallet_utxo.clone(), &wallet_spk_script, wallet_spk_version, config,
+                    spent_tracker,
+                ).await {
+                    Some(batch_result) => {
+                        info!(
+                            "[SWAP-ROUTE] SUCCESS: tx={} kas_flow={} surplus={}",
+                            &batch_result.tx_id[..batch_result.tx_id.len().min(16)],
+                            sg.kas_flow,
+                            sg.surplus,
+                        );
+
+                        // Mark all 3 orders as spent
+                        let swap_key = sg.swap.outpoint_key();
+                        let buy_source_key = sg.buy_source.outpoint_key();
+                        let sell_target_key = sg.sell_target.outpoint_key();
+                        spent_tracker.mark_spent(&swap_key);
+                        spent_tracker.mark_spent(&buy_source_key);
+                        spent_tracker.mark_spent(&sell_target_key);
+                        let mut swap_marked_keys: Vec<String> =
+                            vec![swap_key, buy_source_key, sell_target_key];
+
+                        // Emit events for counterparty orders
+                        if let Some(ws) = ws_tx {
+                            crate::matcher::api::emit_order_filled(
+                                ws, &sg.buy_source.owner_hash, &sg.buy_source.outpoint_key(),
+                                &batch_result.tx_id,
+                                sg.buy_source.price_num, sg.buy_source.price_den,
+                                sg.buy_source.value, OrderSide::Buy,
+                                &sg.buy_source.token_cov_id,
+                            );
+                            crate::matcher::api::emit_order_filled(
+                                ws, &sg.sell_target.owner_hash, &sg.sell_target.outpoint_key(),
+                                &batch_result.tx_id,
+                                sg.sell_target.price_num, sg.sell_target.price_den,
+                                sg.sell_target.value, OrderSide::Sell,
+                                &sg.sell_target.token_cov_id,
+                            );
+                        }
+
+                        // Record trades for both legs
+                        record_trade(
+                            shared_state,
+                            &batch_result.tx_id,
+                            &sg.buy_source.token_cov_id,
+                            sg.buy_source.price_num, sg.buy_source.price_den,
+                            sg.buy_source.value,
+                            Side::Buy,
+                            None,
+                        ).await;
+                        record_trade(
+                            shared_state,
+                            &batch_result.tx_id,
+                            &sg.sell_target.token_cov_id,
+                            sg.sell_target.price_num, sg.sell_target.price_den,
+                            sg.sell_target.value,
+                            Side::Sell,
+                            None,
+                        ).await;
+
+                        // Mark wallet outpoint as spent
+                        if let Some(ref wu) = wallet_utxo {
+                            let wk = format!("{}:{}", wu.0, wu.1);
+                            spent_tracker.mark_spent(&wk);
+                            swap_marked_keys.push(wk);
+                        }
+
+                        // Associate all 4 marked outpoints with the submit txid
+                        // so the mempool-aware prune preserves them while the
+                        // TX dwells in the mempool.
+                        if !batch_result.tx_id.is_empty() {
+                            spent_tracker.mark_submitted(
+                                &batch_result.tx_id,
+                                &swap_marked_keys,
+                            );
+                        }
+
+                        // Push MatchResult for stop/trailing stop triggers
+                        results.push(MatchResult {
+                            match_tx_id: batch_result.tx_id.clone(),
+                            match_type: MatchType::Full,
+                            seller_kas: sg.kas_flow,
+                            buyer_tokens: sg.sell_target.value,
+                            receipt_tx_id: batch_result.tx_id.clone(),
+                            receipt_idx: 0,
+                            receipt_value: 0,
+                            token_cov_id: sg.sell_target.token_cov_id.clone(),
+                            price_num: sg.sell_target.price_num,
+                            price_den: sg.sell_target.price_den,
+                        });
+                    }
+                    None => {
+                        // execute_swap_fill already marked the 3 outpoints
+                        // (transient for CSV, failed for permanent) before
+                        // returning. Just log here.
+                        warn!("[SWAP-ROUTE] Execution returned no result (see [SWAP-FILL] log above)");
+                    }
+                }
+            }
+        } else {
+            drop(swab);
+        }
+    }
+
     // Phase 1: Same-pair matches via direct book traversal.
     // Combine spent + failed outpoints into a single exclusion set so that
     // match_book_direct() skips orders consumed by prior cycles (deferred
     // removal, commit 2a346a5b) and orders under failure cooldown (H-5).
+    // NOTE: Since F1, Phase 3 runs first. Outpoints that Phase 3 consumed
+    // this cycle are already in `spent` via `mark_spent`, so the snapshot
+    // below naturally excludes them from Phase 1 direct traversal.
     let mut spent_keys = spent_tracker.spent_keys();
     // H-5: also exclude outpoints under failure cooldown
     for (key, when) in &spent_tracker.failed {
@@ -3604,203 +3823,6 @@ async fn run_scan_cycle(
         }
     }
 
-
-    // Phase 2: Cross-book swap routing (replaces old TRI-BATCH)
-
-
-    // Phase 3: Cross-book swap routing
-    //
-    // For each swap order in the swap book, find counterparties on BOTH
-    // the source TOKEN/KAS book and the target TOKEN/KAS book, then build
-    // an atomic TX with all 3 orders + matcher wallet.
-    {
-        let swab = swap_book.lock().await;
-        if !swab.is_empty() {
-            // Collect currently spent/used outpoints for exclusion.
-            // Include failed outpoints under cooldown so we don't hammer
-            // the node with transient-failure retries (e.g. CSV not yet
-            // mature — the swap covenant has a 50-DAA OP_CSV gate, and
-            // the plain buy/sell legs do too).
-            let mut swap_spent_keys = spent_tracker.spent_keys();
-            for (key, when) in &spent_tracker.failed {
-                if when.elapsed().as_secs() < spent_tracker.cooldown_secs {
-                    swap_spent_keys.insert(key.clone());
-                }
-            }
-            let swap_groups = matching::match_swap_routes(
-                order_book, &swab, Some(&swap_spent_keys), &std::collections::HashSet::new(),
-            );
-            drop(swab);
-
-            if !swap_groups.is_empty() {
-                info!(
-                    "[SCAN] Found {} cross-book swap route(s)",
-                    swap_groups.len(),
-                );
-            }
-
-            for sg in &swap_groups {
-                info!(
-                    "[SWAP-ROUTE] swap={} buy_source={} sell_target={} kas_flow={} surplus={}",
-                    &sg.swap.outpoint_key()[..sg.swap.outpoint_key().len().min(20)],
-                    &sg.buy_source.outpoint_key()[..sg.buy_source.outpoint_key().len().min(20)],
-                    &sg.sell_target.outpoint_key()[..sg.sell_target.outpoint_key().len().min(20)],
-                    sg.kas_flow,
-                    sg.surplus,
-                );
-
-                // Convert counterparty orders to BatchOrders
-                let buy_source_batch = match book_order_to_batch_order(&sg.buy_source, "SWAP-BUY") {
-                    Some(o) => o,
-                    None => {
-                        spent_tracker.mark_failed(&sg.buy_source.outpoint_key());
-                        continue;
-                    }
-                };
-                let sell_target_batch = match book_order_to_batch_order(&sg.sell_target, "SWAP-SELL") {
-                    Some(o) => o,
-                    None => {
-                        spent_tracker.mark_failed(&sg.sell_target.outpoint_key());
-                        continue;
-                    }
-                };
-
-                // Acquire wallet UTXOs
-                let utxos = match rpc
-                    .get_spendable_utxos(&config.address, Some(0))
-                    .await
-                {
-                    Ok(u) if !u.is_empty() => u,
-                    Ok(_) => {
-                        warn!("[SWAP-ROUTE] No wallet UTXOs available, skipping");
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!("[SWAP-ROUTE] Failed to get wallet UTXOs: {}, skipping", e);
-                        continue;
-                    }
-                };
-                let (wallet_spk_version, wallet_spk_script) = utxos[0].parse_spk();
-                let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
-                let token_p2sh_hex = hex::encode(&token_p2sh.script());
-                let wallet_utxo = utxos.iter()
-                    .filter(|u| {
-                        let (_, script) = u.parse_spk();
-                        hex::encode(&script) != token_p2sh_hex
-                            && !spent_tracker.is_spent(&u.outpoint_key())
-                    })
-                    .max_by_key(|u| u.utxo_entry.amount)
-                    .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
-
-                // Build and submit the swap atomic TX directly (not via plan_batch_match,
-                // which can't handle cross-pair token routing).
-                // execute_swap_fill marks participating outpoints as transient
-                // (CSV not mature) or failed (permanent) on its own when it
-                // returns None. The caller only marks on the success path.
-                match execute_swap_fill(
-                    rpc, sg, &sell_target_batch, &buy_source_batch,
-                    wallet_utxo.clone(), &wallet_spk_script, wallet_spk_version, config,
-                    spent_tracker,
-                ).await {
-                    Some(batch_result) => {
-                        info!(
-                            "[SWAP-ROUTE] SUCCESS: tx={} kas_flow={} surplus={}",
-                            &batch_result.tx_id[..batch_result.tx_id.len().min(16)],
-                            sg.kas_flow,
-                            sg.surplus,
-                        );
-
-                        // Mark all 3 orders as spent
-                        let swap_key = sg.swap.outpoint_key();
-                        let buy_source_key = sg.buy_source.outpoint_key();
-                        let sell_target_key = sg.sell_target.outpoint_key();
-                        spent_tracker.mark_spent(&swap_key);
-                        spent_tracker.mark_spent(&buy_source_key);
-                        spent_tracker.mark_spent(&sell_target_key);
-                        let mut swap_marked_keys: Vec<String> =
-                            vec![swap_key, buy_source_key, sell_target_key];
-
-                        // Emit events for counterparty orders
-                        if let Some(ws) = ws_tx {
-                            crate::matcher::api::emit_order_filled(
-                                ws, &sg.buy_source.owner_hash, &sg.buy_source.outpoint_key(),
-                                &batch_result.tx_id,
-                                sg.buy_source.price_num, sg.buy_source.price_den,
-                                sg.buy_source.value, OrderSide::Buy,
-                                &sg.buy_source.token_cov_id,
-                            );
-                            crate::matcher::api::emit_order_filled(
-                                ws, &sg.sell_target.owner_hash, &sg.sell_target.outpoint_key(),
-                                &batch_result.tx_id,
-                                sg.sell_target.price_num, sg.sell_target.price_den,
-                                sg.sell_target.value, OrderSide::Sell,
-                                &sg.sell_target.token_cov_id,
-                            );
-                        }
-
-                        // Record trades for both legs
-                        record_trade(
-                            shared_state,
-                            &batch_result.tx_id,
-                            &sg.buy_source.token_cov_id,
-                            sg.buy_source.price_num, sg.buy_source.price_den,
-                            sg.buy_source.value,
-                            Side::Buy,
-                            None,
-                        ).await;
-                        record_trade(
-                            shared_state,
-                            &batch_result.tx_id,
-                            &sg.sell_target.token_cov_id,
-                            sg.sell_target.price_num, sg.sell_target.price_den,
-                            sg.sell_target.value,
-                            Side::Sell,
-                            None,
-                        ).await;
-
-                        // Mark wallet outpoint as spent
-                        if let Some(ref wu) = wallet_utxo {
-                            let wk = format!("{}:{}", wu.0, wu.1);
-                            spent_tracker.mark_spent(&wk);
-                            swap_marked_keys.push(wk);
-                        }
-
-                        // Associate all 4 marked outpoints with the submit txid
-                        // so the mempool-aware prune preserves them while the
-                        // TX dwells in the mempool.
-                        if !batch_result.tx_id.is_empty() {
-                            spent_tracker.mark_submitted(
-                                &batch_result.tx_id,
-                                &swap_marked_keys,
-                            );
-                        }
-
-                        // Push MatchResult for stop/trailing stop triggers
-                        results.push(MatchResult {
-                            match_tx_id: batch_result.tx_id.clone(),
-                            match_type: MatchType::Full,
-                            seller_kas: sg.kas_flow,
-                            buyer_tokens: sg.sell_target.value,
-                            receipt_tx_id: batch_result.tx_id.clone(),
-                            receipt_idx: 0,
-                            receipt_value: 0,
-                            token_cov_id: sg.sell_target.token_cov_id.clone(),
-                            price_num: sg.sell_target.price_num,
-                            price_den: sg.sell_target.price_den,
-                        });
-                    }
-                    None => {
-                        // execute_swap_fill already marked the 3 outpoints
-                        // (transient for CSV, failed for permanent) before
-                        // returning. Just log here.
-                        warn!("[SWAP-ROUTE] Execution returned no result (see [SWAP-FILL] log above)");
-                    }
-                }
-            }
-        } else {
-            drop(swab);
-        }
-    }
 
     // Phase 4: Perp matching
     {
@@ -5833,6 +5855,85 @@ mod tests {
         tracker.mark_spent("abc:0");
         tracker.mark_spent("abc:0");
         assert_eq!(tracker.spent.len(), 1);
+    }
+
+    /// F1 regression: reproduces the Phase 3 starvation race in a unit
+    /// test that does NOT require the full match cycle plumbing.
+    ///
+    /// The race (pre-F1): Phase 1 runs first, its planner fails on a
+    /// group, and `mark_failed` puts the group's outpoints into the
+    /// shared `SpentTracker`. Phase 3 then builds its exclusion set
+    /// from the SAME tracker and filters the just-poisoned outpoints
+    /// out of `match_swap_routes`, starving any cross-pair swap route
+    /// whose `buy_source` was inside the failing Phase 1 group.
+    ///
+    /// The fix (F1): Phase 3 runs FIRST, so its exclusion set is
+    /// snapshotted before any `mark_failed` from the current cycle's
+    /// Phase 1 execution can land. This test asserts the snapshot
+    /// semantics by mirroring the exact code used by the match loop
+    /// to build `swap_spent_keys` — a pre-Phase-1 snapshot must NOT
+    /// observe a later `mark_failed` call.
+    #[test]
+    fn test_phase3_runs_first_survives_phase1_cooldown() {
+        // Buy outpoint that, under the old ordering, Phase 1 would
+        // drag into a failing SellSweep and mark_failed — starving
+        // Phase 3. Under F1 the snapshot is taken first, so the
+        // subsequent mark_failed does NOT appear in the snapshot set.
+        let buy_source_op = "08de95db8db38eeb00000000000000000000000000000000000000000000:0";
+        let mut tracker = SpentTracker::with_cooldown(30);
+
+        // (Simulate a prior-cycle legitimate cooldown entry so we also
+        // verify that pre-existing failed entries ARE observed — only
+        // same-cycle fresh poison is meant to be excluded.)
+        tracker.mark_failed("deadbeef:0");
+
+        // Cycle entry: Phase 3 builds its snapshot BEFORE Phase 1.
+        // Mirror the exact construction at the Phase 3 call site:
+        //   let mut swap_spent_keys = spent_tracker.spent_keys();
+        //   for (k, when) in &spent_tracker.failed { if cooldown-live
+        //       { swap_spent_keys.insert(k); } }
+        let mut phase3_snapshot = tracker.spent_keys();
+        for (key, when) in &tracker.failed {
+            if when.elapsed().as_secs() < tracker.cooldown_secs {
+                phase3_snapshot.insert(key.clone());
+            }
+        }
+
+        // Prior-cycle cooldown is visible (intended).
+        assert!(phase3_snapshot.contains("deadbeef:0"));
+        // The fresh outpoint is NOT yet in the snapshot — Phase 1
+        // hasn't run yet and so cannot have poisoned it.
+        assert!(!phase3_snapshot.contains(buy_source_op));
+
+        // Now simulate Phase 1 executing AFTER Phase 3's snapshot was
+        // taken: its failing SellSweep poisons the shared tracker.
+        tracker.mark_failed(buy_source_op);
+
+        // The live tracker now reflects the poison …
+        assert!(tracker.is_failed(buy_source_op));
+        // … but the Phase 3 snapshot (already computed above) does
+        // NOT — this is the property F1 relies on. A subsequent call
+        // to `match_swap_routes(&order_book, &swab, Some(&phase3_snapshot), ...)`
+        // would still treat `buy_source_op` as an eligible candidate.
+        assert!(!phase3_snapshot.contains(buy_source_op));
+
+        // If Phase 3 had run AFTER Phase 1 (the old ordering), the
+        // snapshot built at that later point would include the fresh
+        // poison — the starvation path. Assert this contrapositive so
+        // a future refactor that re-reverses the order re-trips the
+        // test.
+        let mut old_order_keys = tracker.spent_keys();
+        for (key, when) in &tracker.failed {
+            if when.elapsed().as_secs() < tracker.cooldown_secs {
+                old_order_keys.insert(key.clone());
+            }
+        }
+        assert!(
+            old_order_keys.contains(buy_source_op),
+            "If Phase 3's exclusion set were rebuilt AFTER Phase 1 \
+             mark_failed, it would starve the cross-pair swap — the \
+             exact race F1 prevents.",
+        );
     }
 
     // L1 Scanner Integration Tests

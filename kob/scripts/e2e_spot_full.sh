@@ -302,10 +302,13 @@ p05_ioc() {
     log "=== $id: IOC (Immediate-Or-Cancel) ==="
     local mark=$(log_line_count)
 
-    # Deploy a buy with IOC that crosses a small existing sell.
-    # Auto-select
+    # Deploy a buy with IOC that crosses an existing sell.
+    # Sell amount raised from 150M to 500M so the cross output for the partial
+    # IOC fill clears MIN_UTXO_VALUE=3M (at 150M @ 1/23 the cross output came
+    # out to 1,785,714 sompi and the planner rejected with "Output[0] value
+    # 1785714 below MIN_UTXO_VALUE 3000000").
     $KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 23 \
-        --min-fill 1000000 --amount 150000000 >>"$CLI_STDERR" 2>&1
+        --min-fill 1000000 --amount 500000000 >>"$CLI_STDERR" 2>&1
     sleep $DEPLOY_WAIT
     local out
     out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 13 \

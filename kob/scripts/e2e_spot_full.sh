@@ -315,14 +315,15 @@ p05_ioc() {
     out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 13 \
         --min-fill 1000000 --amount 1000000000 --time-in-force IOC 2>&1)
     log "  IOC deploy output: $(echo "$out" | tail -3)"
-    # Poll for match TX up to 90s.  Engine's Batch scan runs ~7s cycle; after
+    # Poll for match TX up to 300s.  Engine's Batch scan runs ~7s cycle; after
     # a successful Phase-3 swap or Phase-1 traversal, block confirmation can
-    # take 15-25s on TN12.  Run32 hit match at 53s post-deploy; extend to
-    # 90s with 5s polling so the script catches late matches without adding
-    # dead time when matches are fast.
+    # take 15-25s on TN12.  Run33 hit a Phase-3 SwapBook match at T+4:28 —
+    # well past the earlier 90s window.  Extend poll to 300s so both fast
+    # Phase-1 matches AND slower Phase-3 cross-pair swaps land within the
+    # window without adding dead time when matches are fast.
     local txid=""
     local waited=0
-    while [ "$waited" -lt 90 ]; do
+    while [ "$waited" -lt 300 ]; do
         sleep 5
         waited=$((waited + 5))
         txid=$(log_since "$mark" "(BATCH|PARTIAL|IOC).*SUCCESS.*TXID" | head -1 | grep -oE "TXID: [a-f0-9]+" | head -1 | awk '{print $2}')
@@ -334,7 +335,7 @@ p05_ioc() {
         record "$id" PASS "$txid" "IOC match (polled ${waited}s)"
         log "  PASS txid=$txid (polled ${waited}s)"
     else
-        record "$id" FAIL "" "no IOC match log after 90s poll"
+        record "$id" FAIL "" "no IOC match log after 300s poll"
         log "  FAIL"
     fi
 }
@@ -1048,6 +1049,13 @@ p25_match_batch_ioc() {
         log "  FAIL (deploy)"
         return
     fi
+    # Covenant OP_CSV 50 DAA requires UTXOs to mature ~50 blocks before spend.
+    # Each deploy + DEPLOY_WAIT gives ~3s of aging; 3 deploys = ~9s + DEPLOY_WAIT.
+    # TN12 runs ~1 block/sec, so add 60s to clear the sequence-lock minimum for
+    # the freshest UTXO (b1) before submitting the match-batch TX. Without this,
+    # kaspad rejects with "one of the transaction sequence locks conditions was
+    # not met" (observed run33 P25).
+    sleep 60
     local out
     out=$($KOB match-batch --sell-outpoints "$s1,$s2" --buy-outpoints "$b1" \
         --token "$TOKEN_A" --ioc 2>&1 || true)

@@ -156,9 +156,10 @@ seed_tokens() {
     log "  TOKEN_A=$TOKEN_A create_txid=$create_txid"
     sleep $DEPLOY_WAIT
 
-    # Mint 16 token UTXOs for Token A (expanded matrix: P04/P07/P08/P10/P20/P22/P25/P30/P31 also consume sell-side UTXOs)
+    # Mint 20 token UTXOs for Token A (expanded matrix: P04/P07/P08/P10/P20/P22/P25/P30/P31/P36 consume sell-side UTXOs;
+    # P34/P35 don't consume token UTXOs but headroom is kept for safety).
     local prev=$create_txid
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16; do
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
         out=$($KOB token mint --txid "$prev" --token "$TOKEN_A" --amount 5000000000 2>&1)
         local txid=$(extract_txid "$out")
         if [ -z "$txid" ]; then
@@ -314,14 +315,26 @@ p05_ioc() {
     out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 13 \
         --min-fill 1000000 --amount 1000000000 --time-in-force IOC 2>&1)
     log "  IOC deploy output: $(echo "$out" | tail -3)"
-    sleep $MATCH_WAIT
-    local txid
-    txid=$(log_since "$mark" "(BATCH|PARTIAL|IOC).*SUCCESS.*TXID" | head -1 | grep -oE "TXID: [a-f0-9]+" | head -1 | awk '{print $2}')
+    # Poll for match TX up to 90s.  Engine's Batch scan runs ~7s cycle; after
+    # a successful Phase-3 swap or Phase-1 traversal, block confirmation can
+    # take 15-25s on TN12.  Run32 hit match at 53s post-deploy; extend to
+    # 90s with 5s polling so the script catches late matches without adding
+    # dead time when matches are fast.
+    local txid=""
+    local waited=0
+    while [ "$waited" -lt 90 ]; do
+        sleep 5
+        waited=$((waited + 5))
+        txid=$(log_since "$mark" "(BATCH|PARTIAL|IOC).*SUCCESS.*TXID" | head -1 | grep -oE "TXID: [a-f0-9]+" | head -1 | awk '{print $2}')
+        if [ -n "$txid" ]; then
+            break
+        fi
+    done
     if [ -n "$txid" ]; then
-        record "$id" PASS "$txid" "IOC match"
-        log "  PASS txid=$txid"
+        record "$id" PASS "$txid" "IOC match (polled ${waited}s)"
+        log "  PASS txid=$txid (polled ${waited}s)"
     else
-        record "$id" FAIL "" "no IOC match log"
+        record "$id" FAIL "" "no IOC match log after 90s poll"
         log "  FAIL"
     fi
 }
@@ -366,6 +379,21 @@ p09_oco() {
         --tp-price-num 1 --tp-price-den 8 --tp-min-fill 1000000 \
         --sl-price-num 1 --sl-price-den 30 --sl-min-fill 1000000 \
         --amount 200000000 --token-utxo "${TOKEN_A_UTXOS[5]}" 2>&1)
+    # Orphan retry: OCO deploy chains on token UTXO parent; if the parent is still
+    # propagating on TN12, the mempool rejects with "orphan where orphan is
+    # disallowed".  Retry with backoff (5s / 15s / 30s) same as P08.
+    local attempt
+    for attempt in 5 15 30; do
+        if ! echo "$out" | grep -qi "orphan"; then
+            break
+        fi
+        log "  orphan — waiting ${attempt}s then retrying..."
+        sleep "$attempt"
+        out=$($KOB deploy oco-sell --token "$TOKEN_A" \
+            --tp-price-num 1 --tp-price-den 8 --tp-min-fill 1000000 \
+            --sl-price-num 1 --sl-price-den 30 --sl-min-fill 1000000 \
+            --amount 200000000 --token-utxo "${TOKEN_A_UTXOS[5]}" 2>&1)
+    done
     log "  oco-sell deploy: $(echo "$out" | tail -3)"
     if echo "$out" | grep -qi "deployed\|TXID"; then
         local op
@@ -1066,11 +1094,23 @@ p30_cancel_mark() {
     local deploy_out
     deploy_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 34 \
         --min-fill 1000000 --amount 40000000 2>&1)
+    # Orphan retry: deploy-sell can orphan when fee UTXO parent is unconfirmed.
+    # Retry with backoff (5s / 15s / 30s) same as P08/P09.
+    local attempt
+    for attempt in 5 15 30; do
+        if ! echo "$deploy_out" | grep -qi "orphan"; then
+            break
+        fi
+        log "  orphan — waiting ${attempt}s then retrying..."
+        sleep "$attempt"
+        deploy_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 34 \
+            --min-fill 1000000 --amount 40000000 2>&1)
+    done
     local op
     op=$(extract_outpoint "$deploy_out")
     sleep $DEPLOY_WAIT
     if [ -z "$op" ]; then
-        record "$id" FAIL "" "cancel-mark deploy failed"
+        record "$id" FAIL "" "cancel-mark deploy failed: $(echo "$deploy_out" | tail -1)"
         log "  FAIL (deploy)"
         return
     fi
@@ -1147,11 +1187,107 @@ p33_mm_dryrun() {
     fi
 }
 
+# ---------- P34: IFO (If-Done + OCO, matcher-registered) ----------
+p34_ifo() {
+    local id="P34"
+    log ""
+    log "=== $id: IFO (buy entry + TP/SL OCO exit via Matcher) ==="
+    local out
+    out=$($KOB deploy ifo --token "$TOKEN_A" \
+        --buy-price-num 1 --buy-price-den 15 --buy-amount 300000000 --buy-min-fill 1000000 \
+        --tp-price-num 1 --tp-price-den 9  --tp-min-fill 1000000 \
+        --sl-price-num 1 --sl-price-den 25 --sl-min-fill 1000000 \
+        --matcher-url http://127.0.0.1:8080 2>&1)
+    log "  ifo deploy: $(echo "$out" | tail -5)"
+    if echo "$out" | grep -qiE "deployed|TXID|txid="; then
+        record "$id" PASS "" "IFO deploy accepted (buy entry + OCO exit registered)"
+        log "  PASS"
+    else
+        record "$id" FAIL "" "$(echo "$out" | tail -1)"
+        log "  FAIL"
+    fi
+}
+
+# ---------- P35: IFO Trustless (bracket via IFD payload, no Matcher) ----------
+p35_ifo_trustless() {
+    local id="P35"
+    log ""
+    log "=== $id: IFO Trustless (bracket via IFD payload) ==="
+    local out
+    out=$($KOB deploy ifo-trustless --token "$TOKEN_A" \
+        --buy-price-num 1 --buy-price-den 15 --buy-amount 300000000 --buy-min-fill 1000000 \
+        --tp-price-num 1 --tp-price-den 9  --tp-min-fill 1000000 \
+        --sl-price-num 1 --sl-price-den 25 --sl-min-fill 1000000 2>&1)
+    log "  ifo-trustless deploy: $(echo "$out" | tail -5)"
+    if echo "$out" | grep -qiE "deployed|TXID|txid="; then
+        record "$id" PASS "" "IFO-trustless deploy accepted (bracket in IFD payload)"
+        log "  PASS"
+    else
+        record "$id" FAIL "" "$(echo "$out" | tail -1)"
+        log "  FAIL"
+    fi
+}
+
+# ---------- P36: Explicit partial-fill (owner-initiated, CLI path) ----------
+# P03 covers engine-side BATCH partial. This exercises the `kob-cli partial-fill`
+# subcommand: deploy a sell, then have the owner execute a CLI partial-fill on
+# part of it, producing a residual order UTXO.
+#
+# Sizing note: price 1/10 with fill 100M tokens -> seller_kas = 10M sompi
+# (>= MIN_UTXO_VALUE 3M). Residual 200M tokens (>= MIN_UTXO_VALUE). See
+# partial_fill.rs:581/597 for the MIN_UTXO_VALUE checks.
+p36_partial_fill_cli() {
+    local id="P36"
+    log ""
+    log "=== $id: Explicit partial-fill via CLI (owner-initiated) ==="
+    # Deploy a sell that will be partially filled.
+    local deploy_out
+    deploy_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 10 \
+        --min-fill 1000000 --amount 300000000 2>&1)
+    # Orphan retry (parent mint may still be propagating).
+    local attempt
+    for attempt in 5 15 30; do
+        if ! echo "$deploy_out" | grep -qi "orphan"; then
+            break
+        fi
+        log "  orphan — waiting ${attempt}s then retrying..."
+        sleep "$attempt"
+        deploy_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 10 \
+            --min-fill 1000000 --amount 300000000 2>&1)
+    done
+    local op
+    op=$(extract_outpoint "$deploy_out")
+    log "  sell deploy: outpoint=$op"
+    sleep $DEPLOY_WAIT
+    if [ -z "$op" ]; then
+        record "$id" FAIL "" "sell deploy for partial-fill failed: $(echo "$deploy_out" | tail -1)"
+        log "  FAIL (deploy)"
+        return
+    fi
+    # Let the deploy settle past CSV before partial fill.
+    sleep 6
+    local pf_out
+    pf_out=$($KOB --fee-rate 5000 partial-fill \
+        --outpoint "$op" --side sell --token "$TOKEN_A" \
+        --price-num 1 --price-den 10 --min-fill 1000000 \
+        --fill-amount 100000000 2>&1)
+    log "  partial-fill: $(echo "$pf_out" | tail -8)"
+    local pf_txid
+    pf_txid=$(echo "$pf_out" | grep "^TXID:" | head -1 | awk '{print $2}')
+    if [ -n "$pf_txid" ] && echo "$pf_out" | grep -qiE "SUCCESS|Residual order"; then
+        record "$id" PASS "$pf_txid" "CLI partial-fill accepted; residual at ${pf_txid}:1"
+        log "  PASS txid=$pf_txid"
+    else
+        record "$id" FAIL "" "$(echo "$pf_out" | tail -1)"
+        log "  FAIL"
+    fi
+}
+
 # ============================================================================
 # Main dispatch
 # ============================================================================
 
-ALL_AUTO=(1 2 3 4 5 6 7 8 9 10 11 12 "12b" 13 14 15 16 17 20 21 22 23 24 25 26 27 28 29 30 31 32 33)
+ALL_AUTO=(1 2 3 4 5 6 7 8 9 10 11 12 "12b" 13 14 15 16 17 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)
 
 run_pattern() {
     case "$1" in
@@ -1187,6 +1323,9 @@ run_pattern() {
         31)   p31_batch_file ;;
         32)   p32_recover ;;
         33)   p33_mm_dryrun ;;
+        34)   p34_ifo ;;
+        35)   p35_ifo_trustless ;;
+        36)   p36_partial_fill_cli ;;
         *)    log "  [skip] pattern $1 not implemented in sh (manual or not yet ported)" ;;
     esac
 }
@@ -1197,7 +1336,7 @@ summary() {
     log "SUMMARY"
     log "=============================================================="
     local pass=0 fail=0
-    for id in P01 P02 P03 P04 P05 P06 P07 P08 P09 P10 P11 P12a P12b P13 P14 P15 P16 P17 P20 P21 P22 P23 P24 P25 P26 P27 P28 P29 P30 P31 P32 P33; do
+    for id in P01 P02 P03 P04 P05 P06 P07 P08 P09 P10 P11 P12a P12b P13 P14 P15 P16 P17 P20 P21 P22 P23 P24 P25 P26 P27 P28 P29 P30 P31 P32 P33 P34 P35 P36; do
         local st=${RESULTS[$id]:-SKIP}
         local tx=${TXIDS[$id]:-}
         local note=${NOTES[$id]:-}

@@ -82,6 +82,19 @@ must confirm beyond "command accepted".
 - [x] **P34** IFO (buy entry + auto-deploy TP+SL, Matcher-registered, `deploy ifo`)
 - [x] **P35** IFO Trustless (bracket via IFD payload, `deploy ifo-trustless`) — 333 B OCO sell in payload
 
+## XII. Combination paths (TiF x Batch / Advanced x Batch)
+
+- [?] **P37** OCO-TP consumed via Batch (Op1 full-fill) — engine Batch planner picks OCO sell's TP leg
+  - [?] Op1 sigscript dispatch; counterparty_spk populated for full-fill
+  - [?] OCO partner (SL leg) automatically invalidated after TP consumption
+- [?] **P38** OCO F5 partial-fill reject (OcoRemainderUnsupported) — engine planner skips without cooldown
+  - [?] Small buy vs large OCO sell → BatchError::OcoRemainderUnsupported (batch.rs:181)
+  - [?] OCO stays in book after F5 reject (no permanent cooldown, executor.rs:3579)
+  - [?] A later full-fill buy CAN still consume the same OCO
+- [?] **P39** FOK buy consumed via Batch (full-fill) — min_fill == expected enforced in Batch path
+  - [?] Sufficient sell supply → Batch full-fill succeeds
+  - [?] Insufficient supply → FOK buy NOT matched (fill-or-kill semantics)
+
 ## V. Matcher-managed orders (Matcher HTTP API running)
 
 - [x] **P14** Stop-Limit buy/sell (`stop deploy-buy/sell --type stop-limit`)
@@ -289,6 +302,7 @@ Both FAILs are **script-side** (poll window + CSV pre-match sleep), not engine.
 4. **Behavior/adversarial assertions** (sections X, XI) — grounded in source, but
    most are covered only indirectly by the 35-pattern run; targeted regression
    tests (`[?]` rows) are candidate follow-ups.
+5. **Combination coverage** — Tier 2-5 patterns (P40-P48: GTD x Batch, Post-Only x Batch, Mixed TiF, Bracket-exit x Batch, IFD-child x Batch, DCA-tranche x Batch, IFO/Stop/Trailing -> Batch, STP x Batch) planned but not yet automated.
 
 #### Prior runs (compressed)
 

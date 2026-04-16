@@ -156,10 +156,11 @@ seed_tokens() {
     log "  TOKEN_A=$TOKEN_A create_txid=$create_txid"
     sleep $DEPLOY_WAIT
 
-    # Mint 20 token UTXOs for Token A (expanded matrix: P04/P07/P08/P10/P20/P22/P25/P30/P31/P36 consume sell-side UTXOs;
-    # P34/P35 don't consume token UTXOs but headroom is kept for safety).
+    # Mint 23 token UTXOs for Token A (expanded matrix: P04/P07/P08/P10/P20/P22/P25/P30/P31/P36 consume sell-side UTXOs;
+    # P34/P35 don't consume token UTXOs but headroom is kept for safety;
+    # P37/P38/P39 consume indices 20/21/22 respectively).
     local prev=$create_txid
-    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do
         out=$($KOB token mint --txid "$prev" --token "$TOKEN_A" --amount 5000000000 2>&1)
         local txid=$(extract_txid "$out")
         if [ -z "$txid" ]; then
@@ -790,7 +791,7 @@ p04_gtc() {
     local out
     # GTC is the default; exercising it explicitly for matrix coverage.
     out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 28 \
-        --min-fill 1000000 --amount 50000000 --time-in-force GTC 2>&1)
+        --min-fill 1000000 --amount 100000000 --time-in-force GTC 2>&1)
     log "  gtc deploy: $(echo "$out" | tail -3)"
     if echo "$out" | grep -qiE "deployed|TXID"; then
         record "$id" PASS "$(extract_outpoint "$out")" "GTC deploy accepted"
@@ -1307,11 +1308,211 @@ p36_partial_fill_cli() {
     fi
 }
 
+# ---------- P37: OCO-TP consumed via Batch (full-fill) ----------
+p37_oco_batch_tp() {
+    local id="P37"
+    log ""
+    log "=== $id: OCO-TP consumed via Batch (full-fill) ==="
+    local mark=$(log_line_count)
+
+    # Deploy OCO sell: TP at 1/20, SL at 1/30, amount 100M tokens
+    # Seller payout at TP: 100M/20 = 5M KAS (above MIN_UTXO_VALUE=3M)
+    if [ ${#TOKEN_A_UTXOS[@]} -lt 21 ]; then
+        record "$id" FAIL "" "insufficient token UTXOs (need index 20)"
+        log "  SKIP"
+        return
+    fi
+    local out
+    out=$($KOB deploy oco-sell --token "$TOKEN_A" \
+        --tp-price-num 1 --tp-price-den 20 --tp-min-fill 1000000 \
+        --sl-price-num 1 --sl-price-den 30 --sl-min-fill 1000000 \
+        --amount 100000000 --token-utxo "${TOKEN_A_UTXOS[20]}" 2>&1)
+    # Orphan retry
+    local attempt
+    for attempt in 5 15 30; do
+        if ! echo "$out" | grep -qi "orphan"; then break; fi
+        log "  orphan — waiting ${attempt}s then retrying..."
+        sleep "$attempt"
+        out=$($KOB deploy oco-sell --token "$TOKEN_A" \
+            --tp-price-num 1 --tp-price-den 20 --tp-min-fill 1000000 \
+            --sl-price-num 1 --sl-price-den 30 --sl-min-fill 1000000 \
+            --amount 100000000 --token-utxo "${TOKEN_A_UTXOS[20]}" 2>&1)
+    done
+    log "  oco-sell deploy: $(echo "$out" | tail -3)"
+    if ! echo "$out" | grep -qiE "deployed|TXID"; then
+        record "$id" FAIL "" "oco-sell deploy failed"
+        log "  FAIL (deploy)"
+        return
+    fi
+
+    # Deploy buy at TP price (1/20) with exact same amount → triggers full-fill via Op1
+    local buy_out
+    buy_out=$($KOB deploy buy --token "$TOKEN_A" \
+        --price-num 1 --price-den 20 \
+        --min-fill 1000000 --amount 100000000 2>&1)
+    log "  buy deploy: $(echo "$buy_out" | tail -3)"
+    if ! echo "$buy_out" | grep -qiE "deployed|TXID"; then
+        record "$id" FAIL "" "buy deploy failed"
+        log "  FAIL (buy deploy)"
+        return
+    fi
+
+    # Wait for engine to auto-match via Batch planner
+    sleep "$MATCH_WAIT"
+    local txid
+    txid=$(log_since "$mark" "BATCH.*SUCCESS.*TXID" | grep -oP 'TXID=\K[0-9a-f]+' | head -1)
+    if [ -n "$txid" ]; then
+        record "$id" PASS "$txid" "OCO-TP consumed via Batch (Op1 full-fill)"
+        log "  PASS txid=$txid"
+    else
+        # Check if engine matched but via different path
+        local any_match
+        any_match=$(log_since "$mark" "SPENT\|matched\|SUCCESS" | head -3)
+        if [ -n "$any_match" ]; then
+            record "$id" PASS "" "OCO-TP matched (non-BATCH path)"
+            log "  PASS (alternative path)"
+        else
+            record "$id" FAIL "" "OCO-TP not matched within ${MATCH_WAIT}s"
+            log "  FAIL"
+        fi
+    fi
+}
+
+# ---------- P38: OCO F5 partial-fill reject (OcoRemainderUnsupported) ----------
+p38_oco_f5_reject() {
+    local id="P38"
+    log ""
+    log "=== $id: OCO F5 partial-fill reject (OcoRemainderUnsupported) ==="
+    local mark=$(log_line_count)
+
+    # Deploy large OCO sell (200M tokens @ TP 1/15)
+    if [ ${#TOKEN_A_UTXOS[@]} -lt 22 ]; then
+        record "$id" FAIL "" "insufficient token UTXOs (need index 21)"
+        log "  SKIP"
+        return
+    fi
+    local out
+    out=$($KOB deploy oco-sell --token "$TOKEN_A" \
+        --tp-price-num 1 --tp-price-den 15 --tp-min-fill 1000000 \
+        --sl-price-num 1 --sl-price-den 30 --sl-min-fill 1000000 \
+        --amount 200000000 --token-utxo "${TOKEN_A_UTXOS[21]}" 2>&1)
+    local attempt
+    for attempt in 5 15 30; do
+        if ! echo "$out" | grep -qi "orphan"; then break; fi
+        log "  orphan — waiting ${attempt}s then retrying..."
+        sleep "$attempt"
+        out=$($KOB deploy oco-sell --token "$TOKEN_A" \
+            --tp-price-num 1 --tp-price-den 15 --tp-min-fill 1000000 \
+            --sl-price-num 1 --sl-price-den 30 --sl-min-fill 1000000 \
+            --amount 200000000 --token-utxo "${TOKEN_A_UTXOS[21]}" 2>&1)
+    done
+    log "  oco-sell deploy: $(echo "$out" | tail -3)"
+    if ! echo "$out" | grep -qiE "deployed|TXID"; then
+        record "$id" FAIL "" "oco-sell deploy failed"
+        log "  FAIL (deploy)"
+        return
+    fi
+
+    # Deploy SMALL buy (50M tokens @ 1/15) — partial relative to 200M OCO
+    local buy_out
+    buy_out=$($KOB deploy buy --token "$TOKEN_A" \
+        --price-num 1 --price-den 15 \
+        --min-fill 1000000 --amount 50000000 2>&1)
+    log "  small buy deploy: $(echo "$buy_out" | tail -3)"
+    if ! echo "$buy_out" | grep -qiE "deployed|TXID"; then
+        record "$id" FAIL "" "small buy deploy failed"
+        log "  FAIL (buy deploy)"
+        return
+    fi
+
+    # Wait two scan cycles; F5 should reject partial match with OcoRemainderUnsupported
+    sleep "$MATCH_WAIT"
+    local f5_hit
+    f5_hit=$(log_since "$mark" "OcoRemainder\|remainder.*unsupported\|skipping.*oco\|skip.*without.*cooldown" | head -1)
+    if [ -n "$f5_hit" ]; then
+        record "$id" PASS "" "F5 OcoRemainderUnsupported triggered (skip-without-cooldown)"
+        log "  PASS (F5 reject confirmed in engine log)"
+    else
+        # Check if engine matched them anyway (would be a BUG)
+        local matched
+        matched=$(log_since "$mark" "BATCH.*SUCCESS.*TXID" | head -1)
+        if [ -n "$matched" ]; then
+            record "$id" FAIL "" "BUG: OCO partial-fill matched (F5 should have rejected)"
+            log "  FAIL (F5 bypass — this is a real bug)"
+        else
+            record "$id" FAIL "" "no F5 log evidence within ${MATCH_WAIT}s (engine may not log OcoRemainderUnsupported)"
+            log "  FAIL (no log evidence — check engine log format)"
+        fi
+    fi
+}
+
+# ---------- P39: FOK × Batch (full-fill or kill) ----------
+p39_fok_batch() {
+    local id="P39"
+    log ""
+    log "=== $id: FOK buy consumed via Batch (full-fill) ==="
+    local mark=$(log_line_count)
+
+    # Deploy a sell first (100M @ 1/18) to ensure supply exists
+    if [ ${#TOKEN_A_UTXOS[@]} -lt 23 ]; then
+        record "$id" FAIL "" "insufficient token UTXOs (need index 22)"
+        log "  SKIP"
+        return
+    fi
+    local sell_out
+    sell_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 18 \
+        --min-fill 1000000 --amount 100000000 --token-utxo "${TOKEN_A_UTXOS[22]}" 2>&1)
+    local attempt
+    for attempt in 5 15 30; do
+        if ! echo "$sell_out" | grep -qi "orphan"; then break; fi
+        log "  sell orphan — waiting ${attempt}s then retrying..."
+        sleep "$attempt"
+        sell_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 18 \
+            --min-fill 1000000 --amount 100000000 --token-utxo "${TOKEN_A_UTXOS[22]}" 2>&1)
+    done
+    log "  sell deploy: $(echo "$sell_out" | tail -3)"
+    if ! echo "$sell_out" | grep -qiE "deployed|TXID"; then
+        record "$id" FAIL "" "sell deploy failed"
+        log "  FAIL (sell deploy)"
+        return
+    fi
+
+    # Deploy FOK buy for exactly 100M @ 1/18 — must fully match or kill
+    local buy_out
+    buy_out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 18 \
+        --min-fill 1000000 --amount 100000000 --time-in-force FOK 2>&1)
+    log "  FOK buy deploy: $(echo "$buy_out" | tail -3)"
+    if ! echo "$buy_out" | grep -qiE "deployed|TXID"; then
+        record "$id" FAIL "" "FOK buy deploy failed"
+        log "  FAIL (FOK buy deploy)"
+        return
+    fi
+
+    # Wait for engine batch match
+    sleep "$MATCH_WAIT"
+    local txid
+    txid=$(log_since "$mark" "BATCH.*SUCCESS.*TXID" | grep -oP 'TXID=\K[0-9a-f]+' | head -1)
+    if [ -n "$txid" ]; then
+        record "$id" PASS "$txid" "FOK buy consumed via Batch (full-fill)"
+        log "  PASS txid=$txid"
+    else
+        local any_match
+        any_match=$(log_since "$mark" "SPENT\|matched\|SUCCESS" | head -3)
+        if [ -n "$any_match" ]; then
+            record "$id" PASS "" "FOK matched (non-BATCH path)"
+            log "  PASS (alternative path)"
+        else
+            record "$id" FAIL "" "FOK buy not matched within ${MATCH_WAIT}s"
+            log "  FAIL"
+        fi
+    fi
+}
+
 # ============================================================================
 # Main dispatch
 # ============================================================================
 
-ALL_AUTO=(1 2 3 4 5 6 7 8 9 10 11 12 "12b" 13 14 15 16 17 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36)
+ALL_AUTO=(1 2 3 4 5 6 7 8 9 10 11 12 "12b" 13 14 15 16 17 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39)
 
 run_pattern() {
     case "$1" in
@@ -1350,6 +1551,9 @@ run_pattern() {
         34)   p34_ifo ;;
         35)   p35_ifo_trustless ;;
         36)   p36_partial_fill_cli ;;
+        37)   p37_oco_batch_tp ;;
+        38)   p38_oco_f5_reject ;;
+        39)   p39_fok_batch ;;
         *)    log "  [skip] pattern $1 not implemented in sh (manual or not yet ported)" ;;
     esac
 }
@@ -1360,7 +1564,7 @@ summary() {
     log "SUMMARY"
     log "=============================================================="
     local pass=0 fail=0
-    for id in P01 P02 P03 P04 P05 P06 P07 P08 P09 P10 P11 P12a P12b P13 P14 P15 P16 P17 P20 P21 P22 P23 P24 P25 P26 P27 P28 P29 P30 P31 P32 P33 P34 P35 P36; do
+    for id in P01 P02 P03 P04 P05 P06 P07 P08 P09 P10 P11 P12a P12b P13 P14 P15 P16 P17 P20 P21 P22 P23 P24 P25 P26 P27 P28 P29 P30 P31 P32 P33 P34 P35 P36 P37 P38 P39; do
         local st=${RESULTS[$id]:-SKIP}
         local tx=${TXIDS[$id]:-}
         local note=${NOTES[$id]:-}

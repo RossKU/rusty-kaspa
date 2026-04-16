@@ -1315,8 +1315,8 @@ p37_oco_batch_tp() {
     log "=== $id: OCO-TP consumed via Batch (full-fill) ==="
     local mark=$(log_line_count)
 
-    # Deploy OCO sell: TP at 1/20, SL at 1/30, amount 100M tokens
-    # Seller payout at TP: 100M/20 = 5M KAS (above MIN_UTXO_VALUE=3M)
+    # Deploy OCO sell: TP at 1/8, SL at 1/30, amount 200M tokens
+    # Seller payout at TP: 200M/8 = 25M KAS (well above MIN_UTXO_VALUE=3M)
     if [ ${#TOKEN_A_UTXOS[@]} -lt 21 ]; then
         record "$id" FAIL "" "insufficient token UTXOs (need index 20)"
         log "  SKIP"
@@ -1324,9 +1324,9 @@ p37_oco_batch_tp() {
     fi
     local out
     out=$($KOB deploy oco-sell --token "$TOKEN_A" \
-        --tp-price-num 1 --tp-price-den 20 --tp-min-fill 1000000 \
+        --tp-price-num 1 --tp-price-den 8 --tp-min-fill 1000000 \
         --sl-price-num 1 --sl-price-den 30 --sl-min-fill 1000000 \
-        --amount 100000000 --token-utxo "${TOKEN_A_UTXOS[20]}" 2>&1)
+        --amount 200000000 --token-utxo "${TOKEN_A_UTXOS[20]}" 2>&1)
     # Orphan retry
     local attempt
     for attempt in 5 15 30; do
@@ -1334,9 +1334,9 @@ p37_oco_batch_tp() {
         log "  orphan — waiting ${attempt}s then retrying..."
         sleep "$attempt"
         out=$($KOB deploy oco-sell --token "$TOKEN_A" \
-            --tp-price-num 1 --tp-price-den 20 --tp-min-fill 1000000 \
+            --tp-price-num 1 --tp-price-den 8 --tp-min-fill 1000000 \
             --sl-price-num 1 --sl-price-den 30 --sl-min-fill 1000000 \
-            --amount 100000000 --token-utxo "${TOKEN_A_UTXOS[20]}" 2>&1)
+            --amount 200000000 --token-utxo "${TOKEN_A_UTXOS[20]}" 2>&1)
     done
     log "  oco-sell deploy: $(echo "$out" | tail -3)"
     if ! echo "$out" | grep -qiE "deployed|TXID"; then
@@ -1345,11 +1345,11 @@ p37_oco_batch_tp() {
         return
     fi
 
-    # Deploy buy at TP price (1/20) with exact same amount → triggers full-fill via Op1
+    # Deploy buy at TP price (1/8) with exact same amount → triggers full-fill via Op1
     local buy_out
     buy_out=$($KOB deploy buy --token "$TOKEN_A" \
-        --price-num 1 --price-den 20 \
-        --min-fill 1000000 --amount 100000000 2>&1)
+        --price-num 1 --price-den 8 \
+        --min-fill 1000000 --amount 200000000 2>&1)
     log "  buy deploy: $(echo "$buy_out" | tail -3)"
     if ! echo "$buy_out" | grep -qiE "deployed|TXID"; then
         record "$id" FAIL "" "buy deploy failed"
@@ -1428,7 +1428,7 @@ p38_oco_f5_reject() {
     # Wait two scan cycles; F5 should reject partial match with OcoRemainderUnsupported
     sleep "$MATCH_WAIT"
     local f5_hit
-    f5_hit=$(log_since "$mark" "OcoRemainder\|remainder.*unsupported\|skipping.*oco\|skip.*without.*cooldown" | head -1)
+    f5_hit=$(log_since "$mark" "OCO remainder\|remainder not supported\|skipping group.*no cooldown" | head -1)
     if [ -n "$f5_hit" ]; then
         record "$id" PASS "" "F5 OcoRemainderUnsupported triggered (skip-without-cooldown)"
         log "  PASS (F5 reject confirmed in engine log)"
@@ -1453,22 +1453,23 @@ p39_fok_batch() {
     log "=== $id: FOK buy consumed via Batch (full-fill) ==="
     local mark=$(log_line_count)
 
-    # Deploy a sell first (100M @ 1/18) to ensure supply exists
+    # Deploy a sell first (500M @ 1/8) to ensure supply exists
+    # Seller payout: 500M/8 = 62.5M KAS (well above MIN_UTXO_VALUE=3M)
     if [ ${#TOKEN_A_UTXOS[@]} -lt 23 ]; then
         record "$id" FAIL "" "insufficient token UTXOs (need index 22)"
         log "  SKIP"
         return
     fi
     local sell_out
-    sell_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 18 \
-        --min-fill 1000000 --amount 100000000 --token-utxo "${TOKEN_A_UTXOS[22]}" 2>&1)
+    sell_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 8 \
+        --min-fill 1000000 --amount 500000000 --token-utxo "${TOKEN_A_UTXOS[22]}" 2>&1)
     local attempt
     for attempt in 5 15 30; do
         if ! echo "$sell_out" | grep -qi "orphan"; then break; fi
         log "  sell orphan — waiting ${attempt}s then retrying..."
         sleep "$attempt"
-        sell_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 18 \
-            --min-fill 1000000 --amount 100000000 --token-utxo "${TOKEN_A_UTXOS[22]}" 2>&1)
+        sell_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 8 \
+            --min-fill 1000000 --amount 500000000 --token-utxo "${TOKEN_A_UTXOS[22]}" 2>&1)
     done
     log "  sell deploy: $(echo "$sell_out" | tail -3)"
     if ! echo "$sell_out" | grep -qiE "deployed|TXID"; then
@@ -1477,10 +1478,10 @@ p39_fok_batch() {
         return
     fi
 
-    # Deploy FOK buy for exactly 100M @ 1/18 — must fully match or kill
+    # Deploy FOK buy for exactly 500M @ 1/8 — must fully match or kill
     local buy_out
-    buy_out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 18 \
-        --min-fill 1000000 --amount 100000000 --time-in-force FOK 2>&1)
+    buy_out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 8 \
+        --min-fill 1000000 --amount 500000000 --time-in-force FOK 2>&1)
     log "  FOK buy deploy: $(echo "$buy_out" | tail -3)"
     if ! echo "$buy_out" | grep -qiE "deployed|TXID"; then
         record "$id" FAIL "" "FOK buy deploy failed"

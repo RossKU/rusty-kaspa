@@ -303,13 +303,29 @@ p05_ioc() {
     log "=== $id: IOC (Immediate-Or-Cancel) ==="
     local mark=$(log_line_count)
 
-    # Deploy a buy with IOC that crosses an existing sell.
-    # Sell amount raised from 150M to 500M so the cross output for the partial
-    # IOC fill clears MIN_UTXO_VALUE=3M (at 150M @ 1/23 the cross output came
-    # out to 1,785,714 sompi and the planner rejected with "Output[0] value
-    # 1785714 below MIN_UTXO_VALUE 3000000").
-    $KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 23 \
-        --min-fill 1000000 --amount 500000000 >>"$CLI_STDERR" 2>&1
+    # Deploy a sell counterparty so the IOC buy has a direct match target.
+    # Sell amount is 500M so the cross output clears MIN_UTXO_VALUE=3M.
+    #
+    # Orphan retry (run34 root cause): on TN12 the sell deploy's fee-UTXO
+    # parent is often still in mempool, and kaspad rejects the child TX
+    # with "is an orphan where orphan is disallowed".  Without the sell
+    # on-chain, the IOC buy falls back to slow Phase-3 cross-pair routing
+    # which exceeds the poll window.  Retry up to 3 times with backoff to
+    # let the fee-UTXO parent confirm.
+    local sell_out
+    sell_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 23 \
+        --min-fill 1000000 --amount 500000000 2>&1)
+    local attempt
+    for attempt in 5 15 30; do
+        if ! echo "$sell_out" | grep -qi "orphan"; then
+            break
+        fi
+        log "  sell orphan — waiting ${attempt}s then retrying..."
+        sleep "$attempt"
+        sell_out=$($KOB deploy sell --token "$TOKEN_A" --price-num 1 --price-den 23 \
+            --min-fill 1000000 --amount 500000000 2>&1)
+    done
+    echo "$sell_out" >>"$CLI_STDERR"
     sleep $DEPLOY_WAIT
     local out
     out=$($KOB deploy buy --token "$TOKEN_A" --price-num 1 --price-den 13 \

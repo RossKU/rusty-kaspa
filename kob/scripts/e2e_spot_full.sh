@@ -160,6 +160,7 @@ seed_tokens() {
     # P34/P35 don't consume token UTXOs but headroom is kept for safety;
     # P37/P38/P39 consume indices 20/21/22 respectively).
     local prev=$create_txid
+    local mint_wait=8  # longer than DEPLOY_WAIT — mint chain needs fee UTXO confirmation
     for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23; do
         out=$($KOB token mint --txid "$prev" --token "$TOKEN_A" --amount 5000000000 2>&1)
         local txid=$(extract_txid "$out")
@@ -169,7 +170,7 @@ seed_tokens() {
         fi
         TOKEN_A_UTXOS+=("${txid}:1")
         prev=$txid
-        sleep $DEPLOY_WAIT
+        sleep $mint_wait
     done
     log "  TOKEN_A_UTXOS (${#TOKEN_A_UTXOS[@]}): ${TOKEN_A_UTXOS[*]}"
 
@@ -188,7 +189,7 @@ seed_tokens() {
         if [ -z "$txid" ]; then log "  MINT B$i FAILED"; break; fi
         TOKEN_B_UTXOS+=("${txid}:1")
         prev=$txid
-        sleep $DEPLOY_WAIT
+        sleep $mint_wait
     done
     log "  TOKEN_B_UTXOS (${#TOKEN_B_UTXOS[@]}): ${TOKEN_B_UTXOS[*]}"
 

@@ -382,7 +382,9 @@ fn spawn_mm_bot(app_config: &AppConfig, params: &ContinuousParams<'_>) {
     };
     info!("[MM] Starting in-process market maker for {}", mm_config.token);
     tokio::spawn(async move {
-        if let Err(e) = mm::run(&wp, &node_url, network, &mm_config).await {
+        // In-process MM (engine `continuous` mode) defaults to cleanup_on_shutdown=true
+        // so a Ctrl+C on the engine cancels MM-deployed orders too.
+        if let Err(e) = mm::run(&wp, &node_url, network, &mm_config, true).await {
             error!("[MM] Bot exited with error: {}", e);
         }
     });
@@ -594,6 +596,7 @@ fn build_mm_config(
         version: 11,
         min_fill: mm_min_fill,
         requote_threshold_bps: 500,
+        deploy_delay_secs: 2,
     };
     config.validate()?;
     Ok(config)

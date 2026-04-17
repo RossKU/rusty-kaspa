@@ -967,12 +967,12 @@ pub async fn cancel_bracket_v4(
 /// doesn't exist yet at bracket deploy time), this command requires the
 /// receipt to already be deployed and the covenant ID to be known.
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // Public API: legacy bracket deploy command
 pub async fn run(
     wallet_path: &Path,
     node_url: &str,
     _network: Network,
     pair_id_hex: &str,
+    side: &str,
     entry_price_num: u64,
     entry_price_den: u64,
     tp_price_num: u64,
@@ -983,6 +983,11 @@ pub async fn run(
     min_receipt_value: u64,
     receipt_cov_id_hex: &str,
 ) -> anyhow::Result<()> {
+    let entry_type: u64 = match side {
+        "buy" => 0,
+        "sell" => 1,
+        _ => anyhow::bail!("Invalid side '{}'. Use 'buy' or 'sell'.", side),
+    };
     // Parse pair_id
     let pair_id_bytes = hex::decode(pair_id_hex)?;
     if pair_id_bytes.len() != 32 {
@@ -1058,7 +1063,7 @@ pub async fn run(
 
     // Build bracket_order_v6 redeemScript (single oco_sell at output[2])
     let redeem_script = contract::build_bracket_redeem_script(
-        0, // entry_type = buy
+        entry_type,
         &pair_id,
         entry_price_num,
         entry_price_den,
@@ -1076,6 +1081,7 @@ pub async fn run(
     println!("Deploy Bracket Order (bracket_order_v6)");
     println!("========================================");
     println!("Pair ID:        {}", pair_id_hex);
+    println!("Side:           {}", side);
     println!("Entry Price:    {} ({:.6})", entry_price, entry_price.as_f64());
     println!("Take Profit:    {} ({:.6})", tp_price, tp_price.as_f64());
     println!("Stop Loss:      {} ({:.6})", sl_price, sl_price.as_f64());
@@ -1139,6 +1145,9 @@ pub async fn run(
 
     // Output 0: bracket_order_v6 P2SH
     tx.outputs.push(TxOutput::new(amount, 0, p2sh.script().to_vec(), None));
+
+    // TX payload: RS for engine L1 discovery (same as deploy_bracket_v4)
+    tx.payload = build_order_payload(&redeem_script, false);
 
     // Output 1: tentative change for mass calculation
     let wallet_spk = hex::decode(&funding.utxo_entry.script_public_key.script)?;

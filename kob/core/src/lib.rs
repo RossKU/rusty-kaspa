@@ -76,7 +76,9 @@ pub use wallet::{SecureKey, WalletContext, LegacyWalletJson};
 pub use wallet::{EncryptedWalletFile, encrypt_wallet, save_encrypted, derive_key_public};
 pub use wallet::{HdWallet, WalletFileV2, AccountEntry, WatchOnlyExport, pubkey_to_address};
 pub use mass::{
-    compute_storage_mass, check_storage_mass, check_tx_storage_mass,
+    compute_storage_mass, compute_storage_mass_ex,
+    check_storage_mass, check_storage_mass_ex, check_tx_storage_mass,
+    check_buy_match_mass, check_sell_match_mass, minimum_sell_min_fill,
     min_penalty_free_output, suggest_deploy_amount,
     calc_compute_mass, calc_miner_fee, converge_fee,
     calc_mass_with_sigscripts, estimate_compute_mass,

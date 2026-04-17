@@ -151,6 +151,7 @@ pub async fn run(
             value,
             next_execution_daa,
         } => {
+            crate::deploy::validate_amount_not_dust(*amount_per_period, "--amount-per-period")?;
             deploy(
                 wallet_path,
                 node_url,

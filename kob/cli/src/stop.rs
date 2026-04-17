@@ -506,7 +506,7 @@ async fn build_signed_buy_tx_json(
 
 /// Build a signed deploy sell TX and return the serialized JSON payload string.
 ///
-/// Mirrors `deploy::deploy_sell` v12 logic: P2PK UTXOs fund the order,
+/// Mirrors `deploy::deploy_sell` v14 logic: P2PK UTXOs fund the order,
 /// covenant binding tags the output for token tracking.
 #[allow(clippy::too_many_arguments)]
 async fn build_signed_sell_tx_json(

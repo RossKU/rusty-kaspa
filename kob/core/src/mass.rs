@@ -9,7 +9,7 @@
 
 use std::fmt;
 
-use kaspa_consensus_core::mass::{calc_storage_mass as kaspa_calc_storage_mass, UtxoCell};
+use kaspa_consensus_core::mass::{calc_storage_mass as kaspa_calc_storage_mass, utxo_plurality, UtxoCell};
 
 /// Storage mass constant C = 10^12 (Kaspa KIP-0009).
 pub const STORAGE_MASS_PARAMETER: u64 = kaspa_consensus_core::constants::STORAGE_MASS_PARAMETER;
@@ -43,13 +43,16 @@ impl fmt::Display for MassError {
 
 impl std::error::Error for MassError {}
 
-/// Calculate storage mass for a transaction via kaspad's `calc_storage_mass`.
+/// Calculate storage mass for a transaction via kaspad's `calc_storage_mass`,
+/// assuming plurality=1 for all UTXOs.
+///
+/// This is a convenience wrapper for contexts where all UTXOs are standard
+/// P2PK (33-byte SPK) or P2SH (35-byte SPK) without covenants. For
+/// covenant-aware calculation, use `compute_storage_mass_ex` instead.
 ///
 /// Returns 0 if inputs "absorb" more mass than outputs create (net negative).
 /// Zero-value outputs produce `u64::MAX` mass (infinite penalty).
 /// Zero-value inputs are skipped (no credit).
-///
-/// All standard KOB UTXOs have plurality=1 (33-byte SPK).
 pub fn compute_storage_mass(input_values: &[u64], output_values: &[u64]) -> u64 {
     // Handle zero-value outputs: kaspad's calc_storage_mass requires non-zero amounts
     // (it divides by amount). Return u64::MAX immediately for any zero output.
@@ -94,6 +97,54 @@ pub fn compute_storage_mass(input_values: &[u64], output_values: &[u64]) -> u64 
     .unwrap_or(u64::MAX)
 }
 
+/// Calculate storage mass with explicit per-UTXO plurality.
+///
+/// Each element is `(value, plurality)` where plurality is the number of
+/// 100-byte storage units the UTXO occupies (see `utxo_plurality`).
+/// Standard P2PK UTXOs without covenant have plurality=1.
+/// Covenant UTXOs (P2PK + 32-byte covenant ID) have plurality=2.
+///
+/// Returns 0 if inputs absorb more mass than outputs create.
+/// Zero-value outputs produce `u64::MAX` mass.
+pub fn compute_storage_mass_ex(
+    inputs: &[(u64, u64)],
+    outputs: &[(u64, u64)],
+) -> u64 {
+    if outputs.iter().any(|&(v, _)| v == 0) {
+        return u64::MAX;
+    }
+    if outputs.is_empty() {
+        return 0;
+    }
+
+    let input_cells: Vec<UtxoCell> = inputs
+        .iter()
+        .copied()
+        .filter(|&(v, _)| v > 0)
+        .map(|(v, p)| UtxoCell::new(p, v))
+        .collect();
+    let output_cells: Vec<UtxoCell> = outputs
+        .iter()
+        .copied()
+        .map(|(v, p)| UtxoCell::new(p, v))
+        .collect();
+
+    if input_cells.is_empty() {
+        return output_cells
+            .iter()
+            .map(|o| STORAGE_MASS_PARAMETER * o.plurality * o.plurality / o.amount)
+            .fold(0u64, |acc, v| acc.saturating_add(v));
+    }
+
+    kaspa_calc_storage_mass(
+        false,
+        input_cells.iter().copied(),
+        output_cells.into_iter(),
+        STORAGE_MASS_PARAMETER,
+    )
+    .unwrap_or(u64::MAX)
+}
+
 /// Check storage mass for a transaction. Returns `Ok(mass)` if within limits,
 /// or `Err(MassError)` if the computed mass exceeds `MAX_TX_MASS`.
 pub fn check_storage_mass(
@@ -110,6 +161,38 @@ pub fn check_storage_mass(
                     u64::MAX
                 } else {
                     STORAGE_MASS_PARAMETER / v
+                };
+                (v, contribution)
+            })
+            .collect();
+
+        Err(MassError {
+            computed_mass: mass,
+            limit: MAX_TX_MASS,
+            output_breakdown,
+        })
+    } else {
+        Ok(mass)
+    }
+}
+
+/// Check storage mass with explicit per-UTXO plurality.
+///
+/// Like `check_storage_mass` but accepts `(value, plurality)` tuples.
+pub fn check_storage_mass_ex(
+    inputs: &[(u64, u64)],
+    outputs: &[(u64, u64)],
+) -> Result<u64, MassError> {
+    let mass = compute_storage_mass_ex(inputs, outputs);
+
+    if mass > MAX_TX_MASS {
+        let output_breakdown = outputs
+            .iter()
+            .map(|&(v, p)| {
+                let contribution = if v == 0 {
+                    u64::MAX
+                } else {
+                    STORAGE_MASS_PARAMETER * p * p / v
                 };
                 (v, contribution)
             })
@@ -223,13 +306,123 @@ pub fn suggest_deploy_amount(
     (min_amount, max_amount, recommended)
 }
 
+/// Predict whether a match TX for a buy order would exceed storage mass limits.
+///
+/// A buy match produces a BuyerTokens covenant output of value
+/// `buy_amount * price_num / price_den`.  Covenant outputs have
+/// plurality >= 2, so small token amounts create huge mass.
+///
+/// Returns `Err(min_buy_amount)` if the order is unmatchable, where
+/// `min_buy_amount` is the smallest value that would keep mass within limits.
+/// Returns `Ok(estimated_mass)` if matchable.
+pub fn check_buy_match_mass(buy_amount: u64, price_num: u64, price_den: u64) -> Result<u64, u64> {
+    // Covenant output plurality (conservative: P2PK 34B SPK + 32B covenant)
+    // ceil((63 + 34 + 32) / 100) = ceil(1.29) = 2
+    const COVENANT_PLURALITY: u64 = 2;
+
+    // Buyer receives tokens: expected_tokens = buy_amount * price_num / price_den
+    // (matches batch.rs:1030-1031 calculation)
+    let buyer_tokens = if price_num == 0 || price_den == 0 {
+        return Err(u64::MAX);
+    } else {
+        (buy_amount as u128 * price_num as u128 / price_den as u128) as u64
+    };
+
+    if buyer_tokens == 0 {
+        return Err(u64::MAX);
+    }
+
+    // Mass contribution of the BuyerTokens covenant output
+    let mass_contribution = STORAGE_MASS_PARAMETER
+        .saturating_mul(COVENANT_PLURALITY * COVENANT_PLURALITY)
+        / buyer_tokens;
+
+    // Use full MAX_TX_MASS as budget. Input credits (buy UTXO + sell UTXO +
+    // fee UTXO) offset output mass, so net storage mass is well below this
+    // conservative output-only estimate.
+    let budget = MAX_TX_MASS;
+
+    if mass_contribution > budget {
+        // min_buyer_tokens = C * p² / budget
+        let min_tokens = STORAGE_MASS_PARAMETER
+            .saturating_mul(COVENANT_PLURALITY * COVENANT_PLURALITY)
+            .div_ceil(budget);
+        // min_buy_amount = min_tokens * price_den / price_num (inverse of tokens = amount * pnum / pden)
+        let min_buy = if price_num == 0 { u64::MAX } else {
+            (min_tokens as u128).saturating_mul(price_den as u128).div_ceil(price_num as u128) as u64
+        };
+        Err(min_buy)
+    } else {
+        Ok(mass_contribution)
+    }
+}
+
+/// Predict whether a match TX for a sell order would exceed storage mass limits.
+///
+/// When a sell is partially filled, the SellRemainder covenant output may be
+/// small enough to blow the mass budget. This checks the worst case: a
+/// `min_fill`-sized partial fill leaving `sell_amount - min_fill` as remainder.
+///
+/// Returns `Err(min_sell_amount)` if unmatchable, `Ok(estimated_mass)` if OK.
+pub fn check_sell_match_mass(_sell_amount: u64, min_fill: u64) -> Result<u64, u64> {
+    const COVENANT_PLURALITY: u64 = 2;
+
+    // Check only the fill output mass. The match TX always has input credits
+    // (sell UTXO + buy UTXO + fee UTXO) that offset output mass significantly.
+    // Remainder mass depends on the actual fill amount and is checked by the
+    // engine's check_mass_presubmit at match time with full TX context.
+    let fill_mass = if min_fill == 0 {
+        return Err(u64::MAX);
+    } else {
+        STORAGE_MASS_PARAMETER
+            .saturating_mul(COVENANT_PLURALITY * COVENANT_PLURALITY)
+            / min_fill
+    };
+
+    let budget = MAX_TX_MASS;
+
+    if fill_mass > budget {
+        let min_mf = STORAGE_MASS_PARAMETER
+            .saturating_mul(COVENANT_PLURALITY * COVENANT_PLURALITY)
+            .div_ceil(budget);
+        Err(min_mf)
+    } else {
+        Ok(fill_mass)
+    }
+}
+
+/// Minimum viable `min_fill` for sell orders, derived from storage mass constraints.
+/// CLI uses this as the default when `--min-fill` is omitted.
+pub fn minimum_sell_min_fill() -> u64 {
+    const COVENANT_PLURALITY: u64 = 2;
+    STORAGE_MASS_PARAMETER
+        .saturating_mul(COVENANT_PLURALITY * COVENANT_PLURALITY)
+        .div_ceil(MAX_TX_MASS)
+}
+
 /// Check storage mass for a pre-built `Transaction` (from kob-core tx types).
 ///
-/// Extracts input and output values from the transaction and runs the mass check.
+/// Extracts input/output values and computes proper UTXO plurality from each
+/// output's `script_public_key` length and covenant presence. Input plurality
+/// is derived from the UTXO's SPK bytes stored on each `TxInput`.
 pub fn check_tx_storage_mass(tx: &crate::tx::Transaction) -> Result<u64, MassError> {
-    let input_values: Vec<u64> = tx.inputs.iter().map(|i| i.value).collect();
-    let output_values: Vec<u64> = tx.outputs.iter().map(|o| o.value).collect();
-    check_storage_mass(&input_values, &output_values)
+    let inputs: Vec<(u64, u64)> = tx.inputs.iter().map(|i| {
+        let spk = kaspa_consensus_core::tx::ScriptPublicKey::from_vec(
+            i.script_version,
+            i.script_bytes.clone(),
+        );
+        // Inputs reference existing UTXOs; their covenant status is unknown here
+        // but the SPK is always P2SH (35 bytes) or P2PK (33 bytes), both giving
+        // plurality=1 even with the +32 covenant term: ceil((63+35+32)/100)=2
+        // only if has_covenant. Since we lack that info, use false (conservative
+        // undercount is at most p=1→2 for inputs, which would only help us by
+        // providing more credit, so false is the safe direction).
+        (i.value, utxo_plurality(&spk, false))
+    }).collect();
+    let outputs: Vec<(u64, u64)> = tx.outputs.iter().map(|o| {
+        (o.value, utxo_plurality(&o.script_public_key, o.covenant.is_some()))
+    }).collect();
+    check_storage_mass_ex(&inputs, &outputs)
 }
 
 // ---------------------------------------------------------------------------

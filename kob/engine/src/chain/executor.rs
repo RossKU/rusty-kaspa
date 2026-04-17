@@ -9,6 +9,7 @@ use zeroize::Zeroize;
 
 use crate::config::AppConfig;
 use kob_core::MIN_UTXO_VALUE;
+use crate::matcher::batch::OutputPurpose;
 use crate::matcher::deploy;
 use crate::matcher::matching::{self, MatchType};
 use crate::matcher::order_book::{OrderBook, OrderSide};
@@ -20,7 +21,7 @@ use crate::rpc::{RpcClient, RpcUtxo};
 use crate::matcher::scanner::{
     BlockScanner, TransactionData, ScanResult,
     PerpDeploySide, LendingOrderType, PredictionItemType,
-    BUY_RS_SIZE, SELL_RS_SIZE,
+    BUY_RS_SIZE, SELL_RS_SIZE, BRACKET_RS_SIZE,
 };
 
 /// Default cooldown for permanently failed outpoints (seconds).
@@ -34,10 +35,9 @@ const TRANSIENT_COOLDOWN_SECS: u64 = 6;
 
 /// Maximum number of blocks to retain in the reorg tracker.
 /// Kaspa's finality window is ~4 hours (~14,400 blocks at 10 BPS).
-/// We keep a smaller window (1,000 blocks) since deep reorgs beyond this
-/// depth are extremely unlikely and the startup UTXO validation handles
-/// any edge cases.
-const REORG_TRACKER_MAX_BLOCKS: usize = 1_000;
+/// H2: 10_000 blocks (~17min at 10 BPS). Beyond any realistic reorg depth
+/// but cheap to keep in memory; startup UTXO validation covers edge cases.
+const REORG_TRACKER_MAX_BLOCKS: usize = 10_000;
 
 /// Default matcher fee in basis points (0.30%).
 pub const DEFAULT_FEE_BPS: u16 = 30;
@@ -66,6 +66,138 @@ const SPENT_PRUNE_AGE_SECS: u64 = 600;
 /// 2 hours >> any realistic mempool dwell time; by this point the TX
 /// is surely dead.
 const SPENT_PRUNE_HARD_MAX_AGE_SECS: u64 = 7200;
+
+/// TTL for entries in the invalid covenant ID cache (seconds).
+///
+/// Tokens may be deployed after an order is first seen, so invalid entries
+/// expire and trigger a fresh RPC re-check on the next encounter.
+const INVALID_COVENANT_TTL_SECS: u64 = 300; // 5 minutes
+
+/// Maximum entries in the CovenantCache `valid` set before eviction (M8).
+/// In practice a matcher only interacts with a limited set of tokens, so
+/// 50,000 is generous headroom. When exceeded, the entire valid set is
+/// cleared and re-verified on demand (cache miss → pending → RPC check).
+const COVENANT_CACHE_VALID_MAX: usize = 50_000;
+
+/// On-chain covenant ID verification cache.
+///
+/// Prevents the engine from accepting orders with fake/non-existent covenant
+/// IDs into the order book. Once a covenant ID is verified on-chain, it is
+/// permanently cached (`valid`). Unverifiable IDs are cached with a TTL
+/// (`invalid`) so newly deployed tokens can be picked up after the TTL
+/// expires.
+///
+/// Verification flow (async, performed by the main loop after block scan):
+///   1. Block scanner encounters an unknown covenant ID and collects it into
+///      `pending_checks`.
+///   2. After the synchronous scan completes, the async caller queries the
+///      node RPC (e.g., `getUtxosByAddresses`) to verify each pending ID.
+///   3. Verified IDs are moved to `valid`; unverifiable ones go to `invalid`.
+///   4. On the next scan cycle, orders with now-valid IDs pass through.
+pub struct CovenantCache {
+    /// Covenant IDs confirmed to exist on-chain. Permanent (tokens don't
+    /// get un-created).
+    valid: HashSet<String>,
+    /// Covenant IDs that failed on-chain verification, with expiry timestamp.
+    /// Entries older than `INVALID_COVENANT_TTL_SECS` are pruned on access.
+    invalid: HashMap<String, Instant>,
+    /// Covenant IDs encountered during the current scan cycle that are not
+    /// in either cache. Populated by the synchronous scanner, drained by
+    /// the async verification step.
+    pending_checks: Vec<String>,
+}
+
+impl CovenantCache {
+    pub fn new() -> Self {
+        Self {
+            valid: HashSet::new(),
+            invalid: HashMap::new(),
+            pending_checks: Vec::new(),
+        }
+    }
+
+    /// Pre-seed a known-good covenant ID (e.g., from MM config at startup).
+    pub fn seed_valid(&mut self, cov_id: &str) {
+        if cov_id.len() == 64 {
+            if self.valid.len() >= COVENANT_CACHE_VALID_MAX {
+                tracing::warn!(
+                    "[COVENANT] Valid cache reached {} entries during seed, clearing (M8)",
+                    self.valid.len()
+                );
+                self.valid.clear();
+            }
+            self.valid.insert(cov_id.to_string());
+        }
+    }
+
+    /// Returns `true` if the covenant ID is in the permanent valid set.
+    pub fn is_valid(&self, cov_id: &str) -> bool {
+        self.valid.contains(cov_id)
+    }
+
+    /// Returns `true` if the covenant ID is in the invalid cache and the
+    /// entry has not expired.
+    pub fn is_invalid(&self, cov_id: &str) -> bool {
+        if let Some(when) = self.invalid.get(cov_id) {
+            when.elapsed().as_secs() < INVALID_COVENANT_TTL_SECS
+        } else {
+            false
+        }
+    }
+
+    /// Check a covenant ID against the cache. Returns:
+    /// - `Some(true)` if known valid
+    /// - `Some(false)` if known invalid (and not expired)
+    /// - `None` if unknown (needs RPC verification)
+    pub fn check(&mut self, cov_id: &str) -> Option<bool> {
+        if self.valid.contains(cov_id) {
+            return Some(true);
+        }
+        if self.is_invalid(cov_id) {
+            return Some(false);
+        }
+        // Unknown: prune expired invalid entry if present, collect for async check
+        self.invalid.remove(cov_id);
+        if !self.pending_checks.iter().any(|id| id == cov_id) {
+            self.pending_checks.push(cov_id.to_string());
+        }
+        None
+    }
+
+    /// Mark a covenant ID as verified on-chain (permanent).
+    ///
+    /// If the valid cache exceeds `COVENANT_CACHE_VALID_MAX`, it is cleared
+    /// first. This prevents unbounded growth (M8). Cleared entries will be
+    /// re-verified on demand (cache miss → pending_checks → RPC).
+    pub fn mark_valid(&mut self, cov_id: &str) {
+        self.invalid.remove(cov_id);
+        if self.valid.len() >= COVENANT_CACHE_VALID_MAX {
+            tracing::warn!(
+                "[COVENANT] Valid cache reached {} entries, clearing (M8)",
+                self.valid.len()
+            );
+            self.valid.clear();
+        }
+        self.valid.insert(cov_id.to_string());
+    }
+
+    /// Mark a covenant ID as not found on-chain (TTL-based).
+    pub fn mark_invalid(&mut self, cov_id: &str) {
+        self.invalid.insert(cov_id.to_string(), Instant::now());
+    }
+
+    /// Drain pending covenant IDs that need async RPC verification.
+    pub fn take_pending(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.pending_checks)
+    }
+
+    /// Prune expired entries from the invalid cache.
+    pub fn prune_expired(&mut self) {
+        self.invalid.retain(|_, when| {
+            when.elapsed().as_secs() < INVALID_COVENANT_TTL_SECS
+        });
+    }
+}
 
 /// Probes the node mempool to check whether a transaction is still pending.
 ///
@@ -689,16 +821,38 @@ async fn fetch_wallet_utxos(
 }
 
 
+/// Compute UTXO plurality for a planned output.
+///
+/// Covenant outputs (BuyerTokens, SellRemainder) carry a 32-byte covenant ID
+/// that increases storage occupancy.  The formula mirrors
+/// `kaspa_consensus_core::mass::utxo_plurality`.
+fn planned_output_plurality(out: &crate::matcher::batch::PlannedOutput) -> u64 {
+    // UTXO fixed overhead: 32 (txid) + 4 (index) + 8 (amount) + 8 (daa) + 1 (coinbase) + 2 (spk ver) + 8 (spk len) = 63
+    const UTXO_CONST_STORAGE: usize = 63;
+    const UTXO_UNIT_SIZE: usize = 100;
+    const COVENANT_HASH_SIZE: usize = 32;
+
+    let has_covenant = matches!(
+        out.purpose,
+        OutputPurpose::BuyerTokens | OutputPurpose::SellRemainder
+    );
+    let total = UTXO_CONST_STORAGE
+        + out.script_public_key.len()
+        + if has_covenant { COVENANT_HASH_SIZE } else { 0 };
+    total.div_ceil(UTXO_UNIT_SIZE) as u64
+}
+
 /// Pre-check storage mass for a match TX before submission.
 ///
-/// Extracts input/output values and returns `Some(mass)` if within limits,
-/// or `None` if mass exceeds the limit (logging an error).
+/// Accepts `(value, plurality)` tuples for proper covenant-aware mass
+/// calculation.  Returns `Some(mass)` if within limits, or `None` if mass
+/// exceeds the limit (logging an error).
 fn check_mass_presubmit(
-    input_values: &[u64],
-    output_values: &[u64],
+    inputs: &[(u64, u64)],
+    outputs: &[(u64, u64)],
     label: &str,
 ) -> Option<u64> {
-    match kob_core::check_storage_mass(input_values, output_values) {
+    match kob_core::check_storage_mass_ex(inputs, outputs) {
         Ok(mass) => {
             if mass > 0 {
                 info!("[{}] Storage mass pre-check: {} (limit {})", label, mass, kob_core::MAX_TX_MASS);
@@ -826,8 +980,14 @@ pub(crate) fn pair_to_batch_orders(
         warn!("[{}] Unsupported sell RS size {}, skipping (v14={}, oco={})", label, sell_rs.len(), SELL_RS_SIZE, kob_core::OCO_SELL_RS_SIZE);
         return None;
     }
-    if buy_rs.len() != BUY_RS_SIZE && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
-        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v15={})", label, buy_rs.len(), BUY_RS_SIZE, kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN);
+    if buy_rs.len() != BUY_RS_SIZE
+        && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN
+        && buy_rs.len() != BRACKET_RS_SIZE
+    {
+        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v15={}, bracket={})",
+            label, buy_rs.len(), BUY_RS_SIZE,
+            kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN,
+            BRACKET_RS_SIZE);
         return None;
     }
 
@@ -860,9 +1020,21 @@ pub(crate) fn pair_to_batch_orders(
         counterparty_spk_version: seller_spk_ver,
         min_fill: pair.sell.min_fill,
         oco_path: pair.sell.oco_path,
+        bracket_meta: None,
     };
 
-    let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN { 15u8 } else { 14u8 };
+    let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+        15u8
+    } else if buy_rs.len() == BRACKET_RS_SIZE {
+        16u8
+    } else {
+        14u8
+    };
+    let bracket_meta = if buy_version == 16 {
+        extract_bracket_meta(&buy_rs)
+    } else {
+        None
+    };
     let buy_order = crate::matcher::batch::BatchOrder {
         outpoint: (pair.buy.tx_id.clone(), pair.buy.index),
         order_type: crate::matcher::batch::OrderType::Buy,
@@ -877,6 +1049,7 @@ pub(crate) fn pair_to_batch_orders(
         counterparty_spk_version: buyer_spk_ver,
         min_fill: pair.buy.min_fill,
         oco_path: None,
+        bracket_meta,
     };
 
     Some((sell_order, buy_order))
@@ -904,7 +1077,7 @@ pub(crate) fn book_order_to_batch_order(
 
     let rs = hex::decode(&order.redeem_script_hex).unwrap_or_default();
 
-    // RS sizes: sell v14=416, OCO=333, buy v14=396, buy v15=479
+    // RS sizes: sell v14=416, OCO=333; buy v14=396, v15=479, bracket=365
     match order.side {
         crate::matcher::order_book::OrderSide::Sell => {
             if rs.len() != SELL_RS_SIZE && rs.len() != kob_core::OCO_SELL_RS_SIZE {
@@ -913,7 +1086,10 @@ pub(crate) fn book_order_to_batch_order(
             }
         }
         crate::matcher::order_book::OrderSide::Buy => {
-            if rs.len() != BUY_RS_SIZE && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+            if rs.len() != BUY_RS_SIZE
+                && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN
+                && rs.len() != BRACKET_RS_SIZE
+            {
                 warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
                 return None;
             }
@@ -933,7 +1109,18 @@ pub(crate) fn book_order_to_batch_order(
         crate::matcher::order_book::OrderSide::Sell => crate::matcher::batch::OrderType::Sell,
     };
 
-    let version = if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN { 15u8 } else { 14u8 };
+    let version = if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+        15u8
+    } else if rs.len() == BRACKET_RS_SIZE {
+        16u8
+    } else {
+        14u8
+    };
+    let bracket_meta = if version == 16 {
+        extract_bracket_meta(&rs)
+    } else {
+        None
+    };
     Some(crate::matcher::batch::BatchOrder {
         outpoint: (order.tx_id.clone(), order.index),
         order_type,
@@ -948,6 +1135,50 @@ pub(crate) fn book_order_to_batch_order(
         counterparty_spk_version: spk_ver,
         min_fill: order.min_fill,
         oco_path: order.oco_path,
+        bracket_meta,
+    })
+}
+
+/// Extract bracket metadata from a 365B bracket entry redeemScript.
+///
+/// State layout (224B):
+///   [0x08][entry_type 8B]        = bytes 0..9
+///   [0x20][token_cov_id 32B]     = bytes 9..42
+///   [0x08][epnum 8B]             = bytes 42..51
+///   [0x08][epden 8B]             = bytes 51..60
+///   [0x25][oco_spk 37B]          = bytes 60..98
+///   [0x08][oco_min_val 8B]       = bytes 98..107
+///   [0x08][min_fill 8B]          = bytes 107..116
+///   [0x08][min_receipt_val 8B]   = bytes 116..125
+///   [0x20][receipt_cov_id 32B]   = bytes 125..158
+fn extract_bracket_meta(rs: &[u8]) -> Option<crate::matcher::batch::BracketMeta> {
+    if rs.len() != BRACKET_RS_SIZE {
+        return None;
+    }
+
+    let entry_type = u64::from_le_bytes(rs[1..9].try_into().ok()?);
+
+    // OCO SPK: 37 bytes at offset 61..98 (after 0x25 push prefix at byte 60)
+    let oco_spk_version = u16::from_le_bytes([rs[61], rs[62]]);
+    let oco_spk = rs[61..98].to_vec(); // full 37 bytes (version + script)
+
+    // OCO min value: 8 bytes at offset 99..107 (after 0x08 push prefix at byte 98)
+    let oco_min_val = u64::from_le_bytes(rs[99..107].try_into().ok()?);
+
+    // Min receipt value: 8 bytes at offset 117..125 (after 0x08 push prefix at byte 116)
+    let min_receipt_val = u64::from_le_bytes(rs[117..125].try_into().ok()?);
+
+    // Receipt covenant ID: 32 bytes at offset 126..158 (after 0x20 push prefix at byte 125)
+    let mut receipt_cov_id = [0u8; 32];
+    receipt_cov_id.copy_from_slice(&rs[126..158]);
+
+    Some(crate::matcher::batch::BracketMeta {
+        receipt_cov_id,
+        min_receipt_val,
+        oco_spk,
+        oco_spk_version,
+        oco_min_val,
+        entry_type,
     })
 }
 
@@ -969,8 +1200,6 @@ pub async fn execute_batch_match(
     // per group was pure overhead (~1 RPC roundtrip per match).
     wallet_spk: (u16, &[u8]),
 ) -> Option<BatchMatchResult> {
-    use crate::matcher::batch::OutputPurpose;
-
     // Validate the plan before building
     if let Err(e) = plan.validate() {
         error!("[BATCH] Plan validation failed: {}", e);
@@ -1238,14 +1467,18 @@ pub async fn execute_batch_match(
     // Purpose: short-circuit `schnorr_sign` + privkey zeroize on
     // mass-violation.
     {
-        let in_vals: Vec<u64> = plan.sells.iter().map(|(s, _)| s.utxo_value).chain(
-            plan.buys.iter().map(|(b, _)| b.utxo_value)
+        // Input plurality: P2SH (35B SPK) and P2PK (33B SPK) both give p=1.
+        let in_cells: Vec<(u64, u64)> = plan.sells.iter().map(|(s, _)| (s.utxo_value, 1u64)).chain(
+            plan.buys.iter().map(|(b, _)| (b.utxo_value, 1u64))
         ).chain(
-            plan.wallet_input.iter().map(|(_, _, val)| *val)
+            plan.wallet_input.iter().map(|(_, _, val)| (*val, 1u64))
         ).collect();
-        let out_vals: Vec<u64> = plan.outputs.iter().map(|o| o.value).collect();
+        // Output plurality: covenant outputs (BuyerTokens/SellRemainder) get p>1.
+        let out_cells: Vec<(u64, u64)> = plan.outputs.iter()
+            .map(|o| (o.value, planned_output_plurality(o)))
+            .collect();
 
-        if check_mass_presubmit(&in_vals, &out_vals, "BATCH/early").is_none() {
+        if check_mass_presubmit(&in_cells, &out_cells, "BATCH/early").is_none() {
             for (sell, _) in &plan.sells {
                 spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
             }
@@ -1268,7 +1501,7 @@ pub async fn execute_batch_match(
             }
         }).collect();
         let compute_mass_early = kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts_early);
-        let storage_mass_early = kob_core::mass::compute_storage_mass(&in_vals, &out_vals);
+        let storage_mass_early = kob_core::mass::compute_storage_mass_ex(&in_cells, &out_cells);
         let effective_early = compute_mass_early.max(storage_mass_early);
         info!(
             "[BATCH] Mass check (early, placeholder): compute={}, storage={}, effective={}, limit={}",
@@ -1316,15 +1549,17 @@ pub async fn execute_batch_match(
 
     // Mass pre-check: storage mass + compute mass (with real sigscripts)
     {
-        let in_vals: Vec<u64> = plan.sells.iter().map(|(s, _)| s.utxo_value).chain(
-            plan.buys.iter().map(|(b, _)| b.utxo_value)
+        let in_cells: Vec<(u64, u64)> = plan.sells.iter().map(|(s, _)| (s.utxo_value, 1u64)).chain(
+            plan.buys.iter().map(|(b, _)| (b.utxo_value, 1u64))
         ).chain(
-            plan.wallet_input.iter().map(|(_, _, val)| *val)
+            plan.wallet_input.iter().map(|(_, _, val)| (*val, 1u64))
         ).collect();
-        let out_vals: Vec<u64> = plan.outputs.iter().map(|o| o.value).collect();
+        let out_cells: Vec<(u64, u64)> = plan.outputs.iter()
+            .map(|o| (o.value, planned_output_plurality(o)))
+            .collect();
 
         // 1. Storage mass check
-        if check_mass_presubmit(&in_vals, &out_vals, "BATCH").is_none() {
+        if check_mass_presubmit(&in_cells, &out_cells, "BATCH").is_none() {
             for (sell, _) in &plan.sells {
                 spent_tracker.mark_failed(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
             }
@@ -1343,7 +1578,7 @@ pub async fn execute_batch_match(
             }
         }).collect();
         let compute_mass = kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts);
-        let storage_mass = kob_core::mass::compute_storage_mass(&in_vals, &out_vals);
+        let storage_mass = kob_core::mass::compute_storage_mass_ex(&in_cells, &out_cells);
         let effective_mass = compute_mass.max(storage_mass);
         info!(
             "[BATCH] Mass check: compute={}, storage={}, effective={}, limit={}",
@@ -1784,9 +2019,23 @@ pub async fn execute_swap_fill(
     ));
 
     // --- Mass pre-check ---
-    let in_vals = vec![sg.swap.value, sell_target.utxo_value, buy_source.utxo_value, wallet.2];
-    let out_vals = vec![source_token_amount, target_token_amount, kas_to_seller, matcher_change];
-    if check_mass_presubmit(&in_vals, &out_vals, "SWAP-FILL").is_none() {
+    // Inputs: all P2SH (35B) → p=1.
+    let in_cells: Vec<(u64, u64)> = vec![
+        (sg.swap.value, 1), (sell_target.utxo_value, 1),
+        (buy_source.utxo_value, 1), (wallet.2, 1),
+    ];
+    // Outputs: Token outputs carry covenant (p=2 for 33B P2PK + 32B cov);
+    // KAS/change outputs have no covenant (p=1).
+    let swap_out_plurality = |spk_len: usize, has_cov: bool| -> u64 {
+        (63 + spk_len + if has_cov { 32 } else { 0 }).div_ceil(100) as u64
+    };
+    let out_cells: Vec<(u64, u64)> = vec![
+        (source_token_amount, swap_out_plurality(buy_source.counterparty_spk.len(), true)),
+        (target_token_amount, swap_out_plurality(owner_spk_script.len(), true)),
+        (kas_to_seller, swap_out_plurality(sell_target.counterparty_spk.len(), false)),
+        (matcher_change, swap_out_plurality(wallet_spk.len(), false)),
+    ];
+    if check_mass_presubmit(&in_cells, &out_cells, "SWAP-FILL").is_none() {
         for k in keys_of().iter() { spent_tracker.mark_failed(k); }
         return None;
     }
@@ -2092,11 +2341,13 @@ impl ReorgCollector {
 }
 
 /// Process-wide log-dedup for `[INDEXER] skipped unmatchable` warnings.
-/// Entries are never removed; once a deploy is unmatchable (no counterparty
-/// SPK resolvable from its outputs) it stays unmatchable, and the set size
-/// is bounded by the number of such distinct outpoints observed.
+/// Capped at `UNMATCHABLE_LOGGED_MAX` entries to prevent unbounded growth (M7).
+/// When the cap is reached, the set is cleared and re-populated organically.
 static UNMATCHABLE_LOGGED: std::sync::LazyLock<std::sync::Mutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(HashSet::new()));
+
+/// Maximum entries in the UNMATCHABLE_LOGGED dedup set before it is cleared (M7).
+const UNMATCHABLE_LOGGED_MAX: usize = 10_000;
 
 /// Returns `true` when `order` has no populated `counterparty_spk` and
 /// therefore can never match under the batch matcher (which requires the
@@ -2111,7 +2362,18 @@ fn skip_if_no_counterparty_spk(order: &crate::matcher::order_book::BookOrder) ->
         let key = order.outpoint_key();
         let first_time = UNMATCHABLE_LOGGED
             .lock()
-            .map(|mut s| s.insert(key.clone()))
+            .map(|mut s| {
+                // M7: Cap the dedup set to prevent unbounded growth.
+                // Clearing is safe — worst case a few duplicated log lines.
+                if s.len() >= UNMATCHABLE_LOGGED_MAX {
+                    warn!(
+                        "[INDEXER] UNMATCHABLE_LOGGED reached {} entries, clearing (M7)",
+                        s.len()
+                    );
+                    s.clear();
+                }
+                s.insert(key.clone())
+            })
             .unwrap_or(false);
         if first_time {
             warn!("[INDEXER] skipped unmatchable order {} (no counterparty_spk)", key);
@@ -2128,6 +2390,7 @@ fn process_block_txs_all(
     perp_book: &mut crate::matcher::perp_book::PerpOrderBook,
     lending_book: &mut crate::matcher::lending_book::LendingBook,
     prediction_book: &mut crate::matcher::prediction_book::PredictionBook,
+    mut covenant_cache: Option<&mut CovenantCache>,
     ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
     current_daa: u64,
     mut ifd_book: Option<&mut crate::matcher::ifd::IfdBook>,
@@ -2166,6 +2429,26 @@ fn process_block_txs_all(
         // Reorg tracking: record TX ID
         if let Some(ref mut rc) = reorg_collector {
             rc.txids.insert(tx.tx_id.clone());
+        }
+
+        // Passive covenant learning: any TX output with a covenant_id
+        // proves that covenant exists on-chain (kaspad validates covenant
+        // bindings at TX acceptance). Learn these before order parsing so
+        // buy orders referencing the same covenant in the same block pass.
+        if let Some(ref mut cache) = covenant_cache {
+            for out in &tx.outputs {
+                if let Some(cov_bytes) = &out.covenant_id {
+                    let cov_hex = hex::encode(cov_bytes);
+                    if !cache.is_valid(&cov_hex) {
+                        cache.mark_valid(&cov_hex);
+                        debug!(
+                            "[COVENANT] Learned valid covenant {} from TX {}",
+                            &cov_hex[..cov_hex.len().min(16)],
+                            &tx.tx_id[..tx.tx_id.len().min(16)],
+                        );
+                    }
+                }
+            }
         }
 
         // Phase 1: Remove spent orders from ALL books
@@ -2330,6 +2613,41 @@ fn process_block_txs_all(
                     continue;
                 }
 
+                // Covenant ID on-chain verification (applies to both buy and sell).
+                // Buy orders embed the covenant ID in their redeem script so it's
+                // tamper-proof from a script perspective, but an attacker can still
+                // deploy a buy order referencing a non-existent token to waste
+                // matcher resources. Sell orders derive the covenant ID from the
+                // UTXO output — a fake ID means the match TX would fail on-chain.
+                //
+                // Skip orders with unverified covenant IDs. They'll be re-discovered
+                // on the next scan after async RPC verification completes.
+                if book_order.token_cov_id != "0".repeat(64) {
+                    if let Some(ref mut cache) = covenant_cache {
+                        match cache.check(&book_order.token_cov_id) {
+                            Some(true) => { /* known valid, proceed */ }
+                            Some(false) => {
+                                warn!(
+                                    "[SCANNER-ALL] Skipping {} order with invalid covenant ID {}: {}:{}",
+                                    match parsed.order_type { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" },
+                                    &book_order.token_cov_id[..book_order.token_cov_id.len().min(16)],
+                                    &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                                );
+                                continue;
+                            }
+                            None => {
+                                info!(
+                                    "[SCANNER-ALL] Deferring {} order pending covenant verification {}: {}:{}",
+                                    match parsed.order_type { OrderSide::Buy => "BUY", OrderSide::Sell => "SELL" },
+                                    &book_order.token_cov_id[..book_order.token_cov_id.len().min(16)],
+                                    &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                                );
+                                continue;
+                            }
+                        }
+                    }
+                }
+
                 match parsed.order_type {
                     OrderSide::Buy => {
                         if let Some(ws) = ws_tx {
@@ -2348,7 +2666,7 @@ fn process_block_txs_all(
                     OrderSide::Sell => {
                         if book_order.token_cov_id == "0".repeat(64) {
                             warn!(
-                                "[SCANNER-ALL] Skipping SELL order with unknown token_cov_id: {}:{}",
+                                "[SCANNER-ALL] Skipping SELL order with unknown token_cov_id (all zeros): {}:{}",
                                 &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
                             );
                             continue;
@@ -2719,20 +3037,12 @@ async fn scan_new_blocks(
         added_hashes.len(),
     );
 
-    // Process each new block
-    // Limit blocks per cycle to avoid blocking the main loop too long.
-    // 200 blocks ≈ 20 seconds at 10 BPS — covers brief engine downtime without
-    // permanently skipping blocks. Higher values cost more RPC calls per cycle.
-    let max_blocks = 200;
-    let blocks_to_scan = if added_hashes.len() > max_blocks {
-        warn!(
-            "[SCAN-BLOCKS] {} blocks queued, processing last {} only",
-            added_hashes.len(), max_blocks,
-        );
-        &added_hashes[added_hashes.len() - max_blocks..]
-    } else {
-        &added_hashes
-    };
+    // H4: no cap. H1 persists the cursor so restart-side catchup may be large;
+    // dropping older blocks would permanently miss orders.
+    if added_hashes.len() > 2000 {
+        warn!("[SCAN-BLOCKS] large catchup: {} blocks — this may take a while", added_hashes.len());
+    }
+    let blocks_to_scan = &added_hashes[..];
 
     // Track already-scanned block hashes to avoid duplicates (a merge set
     // block may appear in multiple chain blocks' merge sets).
@@ -2808,6 +3118,7 @@ async fn scan_new_blocks(
                 perp_book,
                 lending_book,
                 prediction_book,
+                None, // No covenant cache in catchup path
                 ws_tx,
                 current_daa,
                 None, // No IFD book in scan_new_blocks (unused path)
@@ -2975,11 +3286,11 @@ async fn record_trade(
     }
 }
 
-// Expire TX builder for v12 GTD orders
+// Expire TX builder for v14 GTD orders
 
-/// Build and submit expire TXs for expired v12 orders.
+/// Build and submit expire TXs for expired v14 orders.
 ///
-/// v12 orders with `expiry_daa > 0` can be permissionlessly reclaimed after
+/// v14 orders with `expiry_daa > 0` can be permissionlessly reclaimed after
 /// the DAA score exceeds the expiry. The expire TX:
 ///   - Input: the expired order UTXO (P2SH, sigscript = expire sigscript)
 ///   - Output: owner's address (from bspkh/sspkh in the RS), value = input - fee
@@ -5059,6 +5370,17 @@ pub async fn run_continuous_with_ws(
         std::process::exit(1);
     });
 
+    // C3: share the shutdown flag with the RPC client so reconnect()'s backoff
+    // sleep can be interrupted by Ctrl+C instead of waiting up to 60s.
+    // C4: obtain a handle to the notification-dropped flag; checked each cycle
+    // below to trigger a backfill scan when the reader task had to drop
+    // notifications due to channel overflow.
+    let notif_dropped_flag = {
+        let mut rpc_lock = rpc.lock().await;
+        rpc_lock.set_shutdown_flag(shutdown.clone());
+        rpc_lock.notification_dropped_handle()
+    };
+
     info!("Scanning for orders... Press Ctrl+C to stop.");
 
     // Stop/trailing stop/IFD persistence paths (alongside order book file).
@@ -5069,27 +5391,68 @@ pub async fn run_continuous_with_ws(
     let lending_book_path = format!("{}.lending.json", orderbook_path);
     let prediction_book_path = format!("{}.prediction.json", orderbook_path);
     let swap_book_path = format!("{}.swap.json", orderbook_path);
+    let scan_state_path = format!("{}.scan.json", orderbook_path);
 
     let mut cycle = 0u64;
     let mut spent_tracker = SpentTracker::new();
     let mut reorg_tracker = ReorgTracker::new();
+    let mut covenant_cache = CovenantCache::new();
 
-    // H2: Track the last seen block hash for catchup after WS reconnection.
-    // Initialized from the current sink hash so scan_new_blocks can use
-    // getVirtualChainFromBlock to discover blocks missed during downtime.
-    let mut last_seen_hash: Option<String> = {
+    // Pre-seed covenant cache from existing pair book keys.
+    // The order book's pair_books map is keyed by token_cov_id; any token
+    // present in the persisted book was validated in a prior session.
+    {
+        let ob = order_book.lock().await;
+        let zero_id = "0".repeat(64);
+        for cov_id in ob.pair_books.keys() {
+            if !cov_id.is_empty() && *cov_id != zero_id {
+                covenant_cache.seed_valid(cov_id);
+            }
+        }
+        let n = covenant_cache.valid.len();
+        if n > 0 {
+            info!("[COVENANT] Pre-seeded {} valid covenant ID(s) from persisted order book", n);
+        }
+    }
+
+    // H1: prefer persisted cursor; fall back to current sink.
+    let mut last_seen_hash: Option<String> = std::fs::read_to_string(&scan_state_path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("last_seen_hash").and_then(|h| h.as_str()).map(String::from));
+    if let Some(ref h) = last_seen_hash {
+        info!("[H1] Resuming from persisted last_seen_hash={}...", &h[..h.len().min(16)]);
+    } else {
         let rpc_lock = rpc.lock().await;
         match rpc_lock.get_sink_hash().await {
             Ok(h) => {
-                info!("[H2] Initial last_seen_hash = {}...", &h[..h.len().min(16)]);
-                Some(h)
+                info!("[H1] No cursor; initial last_seen_hash = {}...", &h[..h.len().min(16)]);
+                last_seen_hash = Some(h);
             }
-            Err(e) => {
-                warn!("[H2] Failed to get initial sink hash: {}", e);
-                None
-            }
+            Err(e) => warn!("[H1] Failed to get initial sink hash: {}", e),
         }
-    };
+    }
+
+    if let Some(ref hash) = last_seen_hash.clone() {
+        let rpc_bf = rpc.lock().await;
+        let current_daa = rpc_bf.get_daa_score().await.unwrap_or(0);
+        let mut ob = order_book.lock().await;
+        let mut pb = shared_perp_book.lock().await;
+        let mut lb = shared_lending_book.lock().await;
+        let mut pred = shared_prediction_book.lock().await;
+        let (new_hash, counters) = scan_new_blocks(
+            &*rpc_bf, &mut ob, &mut pb, &mut lb, &mut pred,
+            hash, ws_tx.as_ref(), current_daa,
+        ).await;
+        if new_hash != *hash {
+            info!(
+                "[H1] startup catchup: tip {} (spot+{}, perp+{})",
+                &new_hash[..new_hash.len().min(16)],
+                counters.spot_added, counters.perp_added,
+            );
+            last_seen_hash = Some(new_hash);
+        }
+    }
 
     // Subscribe to BlockAdded and VirtualChainChanged notifications.
     //
@@ -5130,6 +5493,14 @@ pub async fn run_continuous_with_ws(
             if rpc_lock.needs_reconnect() {
                 warn!("[RPC] Connection dead, attempting reconnect...");
                 if let Err(e) = rpc_lock.reconnect().await {
+                    // C3: reconnect() returns Err("shutdown") when the shared
+                    // shutdown flag is set — break the outer loop immediately
+                    // so Ctrl+C does not have to wait 5s before the next check.
+                    if e == "shutdown" || shutdown.load(std::sync::atomic::Ordering::SeqCst) {
+                        info!("[RPC] Reconnect aborted due to shutdown");
+                        drop(rpc_lock);
+                        break;
+                    }
                     warn!("[RPC] Reconnect failed: {}, retrying in 5s...", e);
                     drop(rpc_lock);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -5211,6 +5582,35 @@ pub async fn run_continuous_with_ws(
         //
         // Reorg handling: when removedChainBlockHashes are received, the
         // ReorgTracker rolls back orders added/spent by those blocks.
+        // C4: if the WS reader task had to drop notifications due to channel
+        // overflow during the last cycle, trigger a backfill scan from
+        // last_seen_hash so orders in dropped blocks are still discovered.
+        // swap(false) atomically consumes the flag, so a concurrent overflow
+        // during the backfill will set the flag for the next cycle.
+        if notif_dropped_flag.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            warn!("[NOTIFY] Notification channel overflow detected -- backfilling missed blocks");
+            if let Some(ref hash) = last_seen_hash.clone() {
+                let rpc_bf = rpc.lock().await;
+                let current_daa = rpc_bf.get_daa_score().await.unwrap_or(0);
+                let mut ob = order_book.lock().await;
+                let mut pb = shared_perp_book.lock().await;
+                let mut lb = shared_lending_book.lock().await;
+                let mut pred = shared_prediction_book.lock().await;
+                let (new_hash, counters) = scan_new_blocks(
+                    &*rpc_bf, &mut ob, &mut pb, &mut lb, &mut pred,
+                    hash, ws_tx.as_ref(), current_daa,
+                ).await;
+                if new_hash != *hash {
+                    info!(
+                        "[NOTIFY-BACKFILL] recovered tip {} (spot+{}, perp+{})",
+                        &new_hash[..new_hash.len().min(16)],
+                        counters.spot_added, counters.perp_added,
+                    );
+                    last_seen_hash = Some(new_hash);
+                }
+            }
+        }
+
         {
             let scanner = BlockScanner::new();
             let mut blocks_processed = 0u64;
@@ -5369,6 +5769,7 @@ pub async fn run_continuous_with_ws(
 
                     let counters = process_block_txs_all(
                         txs, &mut ob, &scanner, &mut pb, &mut lb, &mut pred,
+                        Some(&mut covenant_cache),
                         ws_tx.as_ref(), current_daa, Some(&mut ib),
                         Some(&mut dcab),
                         Some(&mut swab),
@@ -5412,6 +5813,41 @@ pub async fn run_continuous_with_ws(
                 }
             }
 
+            // Post-block covenant verification: drain pending IDs that
+            // weren't resolved by passive learning during this batch.
+            // Mark them invalid (TTL-based) so they're rejected until the
+            // next re-check window. Also prune expired invalid entries.
+            {
+                let pending = covenant_cache.take_pending();
+                if !pending.is_empty() {
+                    let mut resolved = 0usize;
+                    let mut rejected = 0usize;
+                    for cov_id in &pending {
+                        if covenant_cache.is_valid(cov_id) {
+                            // Passive learning resolved it during this batch
+                            resolved += 1;
+                        } else {
+                            covenant_cache.mark_invalid(cov_id);
+                            warn!(
+                                "[COVENANT] Marking covenant {} invalid (not seen on-chain, TTL={}s)",
+                                &cov_id[..cov_id.len().min(16)],
+                                INVALID_COVENANT_TTL_SECS,
+                            );
+                            rejected += 1;
+                        }
+                    }
+                    if resolved > 0 || rejected > 0 {
+                        info!(
+                            "[COVENANT] Verification: {} resolved, {} rejected (valid={}, invalid={})",
+                            resolved, rejected,
+                            covenant_cache.valid.len(),
+                            covenant_cache.invalid.len(),
+                        );
+                    }
+                }
+                covenant_cache.prune_expired();
+            }
+
             if blocks_processed > 0 {
                 let any_found = total_counters.spot_added > 0
                     || total_counters.perp_added > 0
@@ -5435,7 +5871,7 @@ pub async fn run_continuous_with_ws(
 
         // F20: Prune stale matched_outpoints entries (time-based eviction).
         // Time-based pruning (10-min TTL) runs every 100 cycles.
-        if cycle.is_multiple_of(100) {
+        if cycle % 100 == 0 {
             let mut ob = order_book.lock().await;
             ob.prune_matched_outpoints();
         }
@@ -5583,7 +6019,7 @@ pub async fn run_continuous_with_ws(
             }
         }
 
-        // Expire v12 GTD/IOC/FOK orders (every cycle)
+        // Expire v14 GTD/IOC/FOK orders (every cycle)
         // Runs every cycle (not every 10) so that IOC/FOK orders with short
         // expiry_daa (~current_daa + 10 blocks) are expired promptly. The
         // get_current_daa RPC call is lightweight (single getBlockDagInfo).
@@ -5608,8 +6044,8 @@ pub async fn run_continuous_with_ws(
 
         drop(rpc_lock);
 
-        // Save order book and stop orders periodically (every 10 cycles)
-        if cycle.is_multiple_of(10) {
+        // H3: save every 2 cycles (~10s at default 5s interval) to reduce crash-loss window.
+        if cycle % 2 == 0 {
             let ob = order_book.lock().await;
             if let Err(e) = persistence::save_order_book(orderbook_path, &ob) {
                 warn!("Failed to save order book: {}", e);
@@ -5662,6 +6098,10 @@ pub async fn run_continuous_with_ws(
                 if let Err(e) = persistence::save_swap_book(&swap_book_path, &swab) {
                     warn!("Failed to save swap book: {}", e);
                 }
+            }
+            if let Some(ref h) = last_seen_hash {
+                let json = serde_json::json!({ "last_seen_hash": h });
+                let _ = std::fs::write(&scan_state_path, json.to_string());
             }
         }
 
@@ -5725,6 +6165,10 @@ pub async fn run_continuous_with_ws(
         if let Err(e) = persistence::save_swap_book(&swap_book_path, &swab) {
             warn!("Failed to save swap book on shutdown: {}", e);
         }
+    }
+    if let Some(ref h) = last_seen_hash {
+        let json = serde_json::json!({ "last_seen_hash": h });
+        let _ = std::fs::write(&scan_state_path, json.to_string());
     }
     info!("[SHUTDOWN] Complete. All books saved (spot, perp, lending, prediction, swap).");
 }

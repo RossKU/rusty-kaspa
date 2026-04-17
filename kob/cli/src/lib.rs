@@ -45,6 +45,33 @@ pub mod watch;
 
 use clap::Subcommand;
 
+/// C5: interactive confirmation for destructive commands.
+///
+/// - If `skip` (e.g. `--yes`) is set, auto-confirm.
+/// - If stdin is not a terminal (pipes, E2E scripts, CI), auto-confirm with
+///   a warning so non-interactive flows are not broken.
+/// - Otherwise, prompt and require the user to type `yes` exactly.
+pub fn confirm_or_abort(prompt: &str, skip: bool) -> anyhow::Result<()> {
+    if skip {
+        return Ok(());
+    }
+    use std::io::{IsTerminal, Write};
+    if !std::io::stdin().is_terminal() {
+        eprintln!("[CONFIRM] non-interactive stdin — auto-confirming: {}", prompt);
+        return Ok(());
+    }
+    eprintln!("{}", prompt);
+    eprint!("Type 'yes' to proceed (anything else aborts): ");
+    std::io::stderr().flush().ok();
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input)?;
+    if input.trim() == "yes" {
+        Ok(())
+    } else {
+        anyhow::bail!("aborted by user");
+    }
+}
+
 /// Subcommand enum for the top-level CLI.
 #[derive(Subcommand, Debug)]
 pub enum Commands {
@@ -55,6 +82,17 @@ pub enum Commands {
     Wallet {
         #[command(subcommand)]
         action: Option<wallet::WalletCommand>,
+    },
+
+    /// Show wallet KAS balance (shortcut for `wallet balance`).
+    Balance {
+        /// HD account index (default: 0).
+        #[arg(long, default_value = "0")]
+        account: u32,
+
+        /// Number of derived addresses to scan (default: 20).
+        #[arg(long, default_value = "20")]
+        count: u32,
     },
 
     /// Deploy an order.
@@ -96,11 +134,11 @@ pub enum Commands {
         #[arg(long)]
         order_value: Option<u64>,
 
-        /// Contract version (only 13 is supported). Must match the version used to deploy the order.
+        /// Contract version (only 14 is supported). Must match the version used to deploy the order.
         #[arg(long)]
         version: Option<u8>,
 
-        /// Expiry DAA score (required for v13 orders to reconstruct RS). 0 = GTC.
+        /// Expiry DAA score (required for v14 orders to reconstruct RS). 0 = GTC.
         #[arg(long)]
         expiry: Option<u64>,
 
@@ -119,10 +157,22 @@ pub enum Commands {
         max_matcher_fee: Option<u64>,
     },
 
-    /// Mark an order for cancellation (cpend 0 -> 1).
+    /// Safely retire an order in two steps: first mark it, then cancel it.
     ///
-    /// Transitions the cancel_pending flag, blocking new fills while allowing
-    /// the owner to cancel-complete. Useful for safe 2-step cancellation.
+    /// This is step 1 of a 2-step cancel. It flips the order's cancel-pending
+    /// flag from 0 to 1, which immediately blocks any new fills or partial
+    /// fills. The order funds stay locked in a new P2SH UTXO (same parameters,
+    /// cpend=1) that only you can spend via `kob-cli cancel` (step 2).
+    ///
+    /// Use this when you want to retire an order without racing an incoming
+    /// fill: once marked, the order cannot match, and you can safely follow
+    /// up with `cancel` to recover the KAS. One-shot `cancel` skips the mark
+    /// and races with the mempool -- mark first if funds are large.
+    ///
+    /// EXAMPLES:
+    ///   kob-cli cancel-mark --outpoint <txid:0> --side buy  --token <covid> \
+    ///       --price-num 100 --price-den 1 --min-fill 1000000
+    ///   kob-cli cancel --outpoint <new_txid:0> --cpend 1   # step 2
     CancelMark {
         /// Outpoint of the order to mark (txid:index).
         #[arg(long)]
@@ -152,11 +202,11 @@ pub enum Commands {
         #[arg(long)]
         order_value: Option<u64>,
 
-        /// Contract version (only 13 is supported). Must match the version used to deploy the order.
+        /// Contract version (only 14 is supported). Must match the version used to deploy the order.
         #[arg(long, default_value_t = 14)]
         version: u8,
 
-        /// Expiry DAA score (required for v13 orders to reconstruct RS). 0 = GTC.
+        /// Expiry DAA score (required for v14 orders to reconstruct RS). 0 = GTC.
         #[arg(long, default_value = "0")]
         expiry: u64,
 
@@ -223,11 +273,11 @@ pub enum Commands {
         #[arg(long)]
         fee_input: Option<String>,
 
-        /// Contract version (only 13 is supported).
+        /// Contract version (only 14 is supported).
         #[arg(long, default_value = "14")]
         version: u8,
 
-        /// Expiry DAA score (required for v13 RS reconstruction). 0 = GTC.
+        /// Expiry DAA score (required for v14 RS reconstruction). 0 = GTC.
         #[arg(long, default_value = "0")]
         expiry: u64,
 
@@ -338,17 +388,24 @@ pub enum Commands {
         #[arg(long)]
         buy_token: Option<String>,
 
-        /// Contract version (only 13 is supported).
+        /// Contract version (only 14 is supported).
         #[arg(long, default_value = "14")]
         version: u8,
 
-        /// Buy order expiry DAA score (for v13 RS reconstruction). 0 = GTC.
+        /// Buy order expiry DAA score (for v14 RS reconstruction). 0 = GTC.
         #[arg(long, default_value = "0")]
         buy_expiry: u64,
 
-        /// Sell order expiry DAA score (for v13 RS reconstruction). 0 = GTC.
+        /// Sell order expiry DAA score (for v14 RS reconstruction). 0 = GTC.
         #[arg(long, default_value = "0")]
         sell_expiry: u64,
+
+        /// Adversarial tamper mode for security testing. Deliberately constructs
+        /// an invalid match TX to verify covenant rejection. The node MUST reject.
+        ///
+        /// Modes: f2-redirect-seller, f2-redirect-buyer, f4-remove-binding, f4-reduce-value
+        #[arg(long)]
+        tamper: Option<String>,
     },
 
     /// N:M atomic batch match -- fills multiple sell and buy orders in a single TX.
@@ -553,25 +610,25 @@ pub enum Commands {
         #[arg(long)]
         outpoint: String,
 
-        /// Old order side: buy or sell.
+        /// Old order side: buy or sell. Resolved from orders cache if omitted.
         #[arg(long)]
-        old_side: String,
+        old_side: Option<String>,
 
-        /// Old order token covenant ID (hex, 64 chars). Required for buy.
+        /// Old order token covenant ID (hex, 64 chars). Required for buy if not in cache.
         #[arg(long)]
         old_token: Option<String>,
 
-        /// Old order price numerator.
+        /// Old order price numerator. Resolved from orders cache if omitted.
         #[arg(long)]
-        old_price_num: u64,
+        old_price_num: Option<u64>,
 
-        /// Old order price denominator.
+        /// Old order price denominator. Resolved from orders cache if omitted.
         #[arg(long)]
-        old_price_den: u64,
+        old_price_den: Option<u64>,
 
-        /// Old order minimum fill.
+        /// Old order minimum fill. Resolved from orders cache if omitted.
         #[arg(long)]
-        old_min_fill: u64,
+        old_min_fill: Option<u64>,
 
         /// Old order UTXO value in sompi (queried from chain if omitted).
         #[arg(long)]
@@ -601,19 +658,19 @@ pub enum Commands {
         #[arg(long)]
         new_amount: u64,
 
-        /// Contract version of the old order being cancelled (only 13 is supported). Must match the version used to deploy.
-        #[arg(long, default_value = "14")]
-        old_version: u8,
+        /// Contract version of the old order. Resolved from orders cache if omitted (defaults to 14).
+        #[arg(long)]
+        old_version: Option<u8>,
 
-        /// Contract version for new order (only 13 is supported).
+        /// Contract version for new order (only 14 is supported).
         #[arg(long, default_value = "14")]
         new_version: u8,
 
-        /// Old order expiry DAA score (for v13 RS reconstruction). 0 = GTC.
-        #[arg(long, default_value = "0")]
-        old_expiry: u64,
+        /// Old order expiry DAA score. Resolved from orders cache if omitted (0 = GTC).
+        #[arg(long)]
+        old_expiry: Option<u64>,
 
-        /// New order expiry DAA score (for v13 RS construction). 0 = GTC.
+        /// New order expiry DAA score (for v14 RS construction). 0 = GTC.
         #[arg(long, default_value = "0")]
         new_expiry: u64,
 
@@ -625,9 +682,9 @@ pub enum Commands {
         #[arg(long)]
         fee_utxo: Option<String>,
 
-        /// Max matcher fee (sompi) for the old order's redeemScript.
-        #[arg(long, default_value = "10000000")]
-        old_max_matcher_fee: u64,
+        /// Max matcher fee (sompi) for the old order's redeemScript. Resolved from orders cache if omitted.
+        #[arg(long)]
+        old_max_matcher_fee: Option<u64>,
 
         /// Max matcher fee (sompi) for the new order's redeemScript.
         #[arg(long, default_value = "10000000")]
@@ -647,6 +704,10 @@ pub enum Commands {
         /// Path to orders cache file (default: orders.json).
         #[arg(long)]
         orders_file: Option<String>,
+
+        /// Skip the interactive confirmation prompt (C5).
+        #[arg(long)]
+        yes: bool,
     },
 
     /// List all MY open orders across all pairs.
@@ -666,12 +727,11 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
 
-        /// Engine API URL (e.g. http://localhost:8080) to enrich trade
-        /// records with fill details (fill_txid, filled_amount). Without
-        /// this, spent orders use a heuristic (cancel_pending flag) and
-        /// default to status "SPENT".
-        #[arg(long)]
-        engine_url: Option<String>,
+        /// Engine API URL to enrich trade records with fill details
+        /// (fill_txid, filled_amount). Defaults to http://localhost:8080;
+        /// pass an empty string to skip enrichment.
+        #[arg(long, default_value = "http://localhost:8080")]
+        engine_url: String,
     },
 
     /// Send KAS to an address.
@@ -680,13 +740,21 @@ pub enum Commands {
         #[arg(long)]
         to: String,
 
-        /// Amount in sompi to send.
+        /// Amount in sompi to send. Mutually exclusive with --amount-kas.
+        #[arg(long, conflicts_with = "amount_kas")]
+        amount: Option<u64>,
+
+        /// Amount in KAS (e.g., 1.5 = 150_000_000 sompi). Mutually exclusive with --amount.
         #[arg(long)]
-        amount: u64,
+        amount_kas: Option<f64>,
 
         /// Override the default fee (in sompi).
         #[arg(long)]
         fee: Option<u64>,
+
+        /// Skip the interactive confirmation prompt (C5).
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Estimate transaction mass and fees before submitting.
@@ -727,15 +795,15 @@ pub enum Commands {
         #[arg(long)]
         amount: u64,
 
-        /// Min fill per order in sompi (default: 1_000_000).
-        #[arg(long, default_value = "1000000")]
+        /// Min fill per order in sompi (default: 10_000_000 = 0.1 KAS, from storage mass).
+        #[arg(long, default_value = "10000000")]
         min_fill: u64,
 
         /// Requote check interval in seconds (default: 10).
         #[arg(long, default_value = "10")]
         interval: u64,
 
-        /// Contract version (only 13 is supported).
+        /// Contract version (only 14 is supported).
         #[arg(long, default_value = "14")]
         version: u8,
 
@@ -746,11 +814,19 @@ pub enum Commands {
         /// Requote all if mid drifts more than this many bps (default: 500 = 5%).
         #[arg(long, default_value = "500")]
         requote_threshold_bps: u64,
+
+        /// Skip the on-shutdown cancel sweep (orders stay on-chain when Ctrl+C).
+        #[arg(long)]
+        no_cleanup: bool,
+
+        /// Delay (seconds) between successive deploy TXs (H12).
+        #[arg(long, default_value = "2")]
+        deploy_delay_secs: u64,
     },
 
     /// Watch blocks for fill TXs (trustless price discovery).
     ///
-    /// Scans recent blocks for v13 fill transactions, displays price info,
+    /// Scans recent blocks for v14 fill transactions, displays price info,
     /// then subscribes to new blocks and prints fills as they appear.
     Watch {
         /// Token covenant ID to filter by (hex, 64 chars). Shows all fills if omitted.
@@ -842,27 +918,31 @@ pub enum DeployCommands {
         price: Option<String>,
 
         /// Price numerator (tokens per KAS). Auto-set if --market.
-        #[arg(long, default_value = "1")]
-        price_num: u64,
+        #[arg(long)]
+        price_num: Option<u64>,
 
         /// Price denominator (tokens per KAS). Auto-set if --market.
-        #[arg(long, default_value = "1")]
-        price_den: u64,
-
-        /// Minimum fill amount in token units.
         #[arg(long)]
-        min_fill: u64,
+        price_den: Option<u64>,
 
-        /// Amount of KAS to lock (in sompi). Mutually exclusive with --amount-kas.
+        /// Minimum fill amount in sompi. Auto-calculated from storage mass
+        /// constraints if omitted.
+        #[arg(long)]
+        min_fill: Option<u64>,
+
+        /// Amount of KAS to lock (in sompi). Values below 100,000 sompi (0.001 KAS)
+        /// are rejected as likely mistakes. Use --amount-kas for KAS denomination.
+        /// Mutually exclusive with --amount-kas.
         #[arg(long, required_unless_present = "amount_kas")]
         amount: Option<u64>,
 
         /// Amount of KAS as decimal (e.g., "5" = 5 KAS = 500_000_000 sompi).
+        /// Preferred over --amount for human-friendly input.
         /// Mutually exclusive with --amount.
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version (only 13 is supported).
+        /// Contract version (only 14 is supported).
         #[arg(long, default_value = "14")]
         version: u8,
 
@@ -886,7 +966,7 @@ pub enum DeployCommands {
         matcher_url: Option<String>,
 
         /// GTD expiry: DAA score after which the order is considered expired.
-        /// For v13, this is enforced on-chain via CLTV (0 = GTC, no expiry).
+        /// For v14, this is enforced on-chain via CLTV (0 = GTC, no expiry).
         /// For older versions, matchers enforce expiry off-chain.
         #[arg(long)]
         expiry: Option<u64>,
@@ -924,27 +1004,31 @@ pub enum DeployCommands {
         price: Option<String>,
 
         /// Price numerator (tokens per KAS). Auto-set if --market.
-        #[arg(long, default_value = "1")]
-        price_num: u64,
+        #[arg(long)]
+        price_num: Option<u64>,
 
         /// Price denominator (tokens per KAS). Auto-set if --market.
-        #[arg(long, default_value = "1")]
-        price_den: u64,
-
-        /// Minimum fill amount in sompi.
         #[arg(long)]
-        min_fill: u64,
+        price_den: Option<u64>,
 
-        /// Amount of tokens to lock (in sompi value). Mutually exclusive with --amount-kas.
+        /// Minimum fill amount in sompi. Auto-calculated from storage mass
+        /// constraints if omitted.
+        #[arg(long)]
+        min_fill: Option<u64>,
+
+        /// Amount of tokens to lock (in sompi value). Values below 100,000 sompi
+        /// (0.001 KAS) are rejected as likely mistakes. Use --amount-kas for KAS denomination.
+        /// Mutually exclusive with --amount-kas.
         #[arg(long, required_unless_present = "amount_kas")]
         amount: Option<u64>,
 
         /// Amount as decimal KAS (e.g., "5" = 500_000_000 sompi).
+        /// Preferred over --amount for human-friendly input.
         /// Mutually exclusive with --amount.
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version (only 13 is supported).
+        /// Contract version (only 14 is supported).
         #[arg(long, default_value = "14")]
         version: u8,
 
@@ -968,7 +1052,7 @@ pub enum DeployCommands {
         matcher_url: Option<String>,
 
         /// GTD expiry: DAA score after which the order is considered expired.
-        /// For v12, this is enforced on-chain via CLTV (0 = GTC, no expiry).
+        /// For v14, this is enforced on-chain via CLTV (0 = GTC, no expiry).
         #[arg(long)]
         expiry: Option<u64>,
 
@@ -1033,6 +1117,11 @@ pub enum DeployCommands {
         /// Amount to lock (in sompi).
         #[arg(long)]
         amount: u64,
+
+        /// Receipt covenant ID (hex, 64 chars). Used for N4 security check.
+        /// If omitted, defaults to the token covenant ID (suitable for testing).
+        #[arg(long)]
+        receipt_cov_id: Option<String>,
     },
 
     /// Deploy an IFD order (If Done: buy entry, auto-deploy sell exit on fill).
@@ -1652,6 +1741,10 @@ pub async fn dispatch(
                 wallet::run(wallet_path, node, network).await?;
             }
         }
+        Commands::Balance { account, count } => {
+            let cmd = wallet::WalletCommand::Balance { account, count };
+            wallet::run_command(wallet_path, node, network, &cmd).await?;
+        }
         Commands::Deploy { order_type } => match order_type {
             DeployCommands::Buy {
                 token,
@@ -1671,7 +1764,12 @@ pub async fn dispatch(
                 max_matcher_fee,
                 mmfee_bps,
             } => {
-                // When --mmfee-bps is set, auto-upgrade to v15
+                // v15 is the default when --mmfee-bps is set; otherwise
+                // respect the user's --version flag (default=14).
+                // v14 is needed for cross-pair swap fills because the
+                // v15 F6 surplus cap check reads the counterparty sell's
+                // price, which is incompatible when buy and sell are for
+                // different tokens.
                 let version = if mmfee_bps.is_some() { 15 } else { version };
 
                 // Resolve token alias
@@ -1681,14 +1779,32 @@ pub async fn dispatch(
                 let amount = if let Some(ref kas_str) = amount_kas {
                     deploy::parse_kas_amount(kas_str)?
                 } else {
-                    amount.ok_or_else(|| anyhow::anyhow!("Either --amount or --amount-kas is required"))?
+                    let raw = amount.ok_or_else(|| anyhow::anyhow!("Either --amount or --amount-kas is required"))?;
+                    deploy::validate_amount_not_dust(raw, "--amount")?
                 };
 
-                // Resolve price: --price takes priority via conflicts_with
+                // Resolve price: --price takes priority via conflicts_with.
+                // Neither --price nor --price-num/--price-den have defaults;
+                // the user must supply a price explicitly (or use --market).
                 let (price_num, price_den) = if let Some(ref p) = price {
                     deploy::parse_decimal_price(p)?
                 } else {
-                    (price_num, price_den)
+                    match (price_num, price_den) {
+                        (Some(n), Some(d)) => (n, d),
+                        (Some(_), None) | (None, Some(_)) => {
+                            anyhow::bail!("Both --price-num and --price-den are required when specifying price as a fraction");
+                        }
+                        (None, None) => {
+                            if !market {
+                                anyhow::bail!(
+                                    "Price is required. Use --price <decimal> (e.g. --price 0.05), \
+                                     --price-num/--price-den, or --market"
+                                );
+                            }
+                            // Placeholder; will be overwritten by market price below
+                            (0, 1)
+                        }
+                    }
                 };
 
                 let mut tif_policy: tif::TimeInForce = time_in_force.parse()
@@ -1720,15 +1836,13 @@ pub async fn dispatch(
                 if post_only {
                     println!("Post-only order: will be rejected if it would cross the spread.");
                 }
-                if version == 14 && max_matcher_fee == 0 {
-                    println!("WARNING: --max-matcher-fee=0 prevents partial fills (F6 constraint).");
-                }
                 if let Some(bps) = mmfee_bps {
                     if bps > 10000 {
                         anyhow::bail!("--mmfee-bps must be 0..=10000 (basis points). Got {}.", bps);
                     }
                     println!("V15 buy order: mmfee_bps = {} ({}%)", bps, bps as f64 / 100.0);
                 }
+                let min_fill = min_fill.unwrap_or_else(kob_core::minimum_sell_min_fill);
                 let deploy_txid = deploy::deploy_buy(
                     wallet_path,
                     node,
@@ -1796,14 +1910,32 @@ pub async fn dispatch(
                 let amount = if let Some(ref kas_str) = amount_kas {
                     deploy::parse_kas_amount(kas_str)?
                 } else {
-                    amount.ok_or_else(|| anyhow::anyhow!("Either --amount or --amount-kas is required"))?
+                    let raw = amount.ok_or_else(|| anyhow::anyhow!("Either --amount or --amount-kas is required"))?;
+                    deploy::validate_amount_not_dust(raw, "--amount")?
                 };
 
-                // Resolve price: --price takes priority via conflicts_with
+                // Resolve price: --price takes priority via conflicts_with.
+                // Neither --price nor --price-num/--price-den have defaults;
+                // the user must supply a price explicitly (or use --market).
                 let (price_num, price_den) = if let Some(ref p) = price {
                     deploy::parse_decimal_price(p)?
                 } else {
-                    (price_num, price_den)
+                    match (price_num, price_den) {
+                        (Some(n), Some(d)) => (n, d),
+                        (Some(_), None) | (None, Some(_)) => {
+                            anyhow::bail!("Both --price-num and --price-den are required when specifying price as a fraction");
+                        }
+                        (None, None) => {
+                            if !market {
+                                anyhow::bail!(
+                                    "Price is required. Use --price <decimal> (e.g. --price 0.05), \
+                                     --price-num/--price-den, or --market"
+                                );
+                            }
+                            // Placeholder; will be overwritten by market price below
+                            (0, 1)
+                        }
+                    }
                 };
 
                 let mut tif_policy: tif::TimeInForce = time_in_force.parse()
@@ -1842,6 +1974,7 @@ pub async fn dispatch(
                 if max_matcher_fee == 0 {
                     println!("WARNING: --max-matcher-fee=0 prevents partial fills (F6 constraint).");
                 }
+                let min_fill = min_fill.unwrap_or_else(kob_core::minimum_sell_min_fill);
                 let deploy_txid = deploy::deploy_sell(
                     wallet_path,
                     node,
@@ -1890,9 +2023,12 @@ pub async fn dispatch(
                 sl_num,
                 sl_den,
                 amount,
+                receipt_cov_id,
             } => {
+                deploy::validate_amount_not_dust(amount, "--amount")?;
                 let token = token::resolve_token(&token, None)?;
-                deploy::deploy_bracket(
+                let rcid = receipt_cov_id.unwrap_or_else(|| token.clone());
+                bracket::run(
                     wallet_path,
                     node,
                     network,
@@ -1905,6 +2041,8 @@ pub async fn dispatch(
                     sl_num,
                     sl_den,
                     amount,
+                    kob_core::MIN_UTXO_VALUE, // min_receipt_value
+                    &rcid,
                 )
                 .await?;
             }
@@ -1920,6 +2058,7 @@ pub async fn dispatch(
                 sell_expiry,
                 matcher_url: _,
             } => {
+                deploy::validate_amount_not_dust(buy_amount, "--buy-amount")?;
                 let token = token::resolve_token(&token, None)?;
                 ifd::deploy_ifd(
                     wallet_path,
@@ -1952,6 +2091,7 @@ pub async fn dispatch(
                 sl_min_fill,
                 matcher_url,
             } => {
+                deploy::validate_amount_not_dust(buy_amount, "--buy-amount")?;
                 let token = token::resolve_token(&token, None)?;
                 ifd::deploy_ifo(
                     wallet_path,
@@ -1988,6 +2128,7 @@ pub async fn dispatch(
                 expiry,
                 max_matcher_fee,
             } => {
+                deploy::validate_amount_not_dust(buy_amount, "--buy-amount")?;
                 let token = token::resolve_token(&token, None)?;
                 ifd::deploy_ifo_trustless(
                     wallet_path,
@@ -2024,6 +2165,7 @@ pub async fn dispatch(
                 token_utxo,
                 fee_utxo,
             } => {
+                deploy::validate_amount_not_dust(amount, "--amount")?;
                 let token = token::resolve_token(&token, None)?;
                 if tp_price_num == 0 || tp_price_den == 0 {
                     anyhow::bail!("TP price must be > 0");
@@ -2209,6 +2351,7 @@ pub async fn dispatch(
             version,
             buy_expiry,
             sell_expiry,
+            tamper,
         } => {
             let token = token::resolve_token(&token, None)?;
             let buy_token = if let Some(bt) = buy_token {
@@ -2216,7 +2359,20 @@ pub async fn dispatch(
             } else {
                 None
             };
+            let tamper_mode = if let Some(ref t) = tamper {
+                Some(matching::TamperMode::parse(t).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Unknown --tamper mode '{}'. Valid: f2-redirect-seller, f2-redirect-buyer, f4-remove-binding, f4-reduce-value",
+                        t
+                    )
+                })?)
+            } else {
+                None
+            };
             if cross_pair {
+                if tamper_mode.is_some() {
+                    anyhow::bail!("--tamper is not supported with --cross-pair");
+                }
                 matching::run_cross_pair(
                     wallet_path,
                     node,
@@ -2275,6 +2431,7 @@ pub async fn dispatch(
                     fee,
                     buy_expiry,
                     sell_expiry,
+                    tamper_mode,
                 )
                 .await?;
             }
@@ -2529,6 +2686,10 @@ pub async fn dispatch(
                 let path = std::path::Path::new(path_str);
                 token::register_alias(path, &name, &covenant_id)?;
             }
+            token::TokenCommand::Aliases { alias_file, json } => {
+                let path = alias_file.as_deref().map(std::path::Path::new);
+                token::list_aliases(path, json)?;
+            }
         },
         Commands::AutoMatch {
             pair_id,
@@ -2724,6 +2885,7 @@ pub async fn dispatch(
             } else {
                 None
             };
+            deploy::validate_amount_not_dust(new_amount, "--new-amount")?;
             let new_token = token::resolve_token(&new_token, None)?;
             let new_params = requote::NewOrderParams {
                 side: new_side,
@@ -2739,7 +2901,7 @@ pub async fn dispatch(
                 node,
                 network,
                 &outpoint,
-                &old_side,
+                old_side.as_deref(),
                 old_token.as_deref(),
                 old_price_num,
                 old_price_den,
@@ -2756,12 +2918,23 @@ pub async fn dispatch(
             )
             .await?;
         }
-        Commands::CancelAll { token, dry_run, orders_file } => {
+        Commands::CancelAll { token, dry_run, orders_file, yes } => {
             let token = if let Some(t) = token {
                 Some(token::resolve_token(&t, None)?)
             } else {
                 None
             };
+            if !dry_run {
+                let scope = token.as_deref().unwrap_or("ALL tokens");
+                confirm_or_abort(
+                    &format!(
+                        "[CONFIRM] This will cancel all live orders for: {}\n\
+                         This is irreversible and will submit on-chain cancel TXs.",
+                        scope,
+                    ),
+                    yes,
+                )?;
+            }
             cancel_all::run(
                 wallet_path,
                 node,
@@ -2782,6 +2955,7 @@ pub async fn dispatch(
             .await?;
         }
         Commands::TradeHistory { limit, json, engine_url } => {
+            let engine_url = if engine_url.is_empty() { None } else { Some(engine_url) };
             history::run(
                 wallet_path,
                 node,
@@ -2792,7 +2966,28 @@ pub async fn dispatch(
             )
             .await?;
         }
-        Commands::Send { to, amount, fee: send_fee } => {
+        Commands::Send { to, amount, amount_kas, fee: send_fee, yes } => {
+            let amount = match (amount, amount_kas) {
+                (Some(s), None) => s,
+                (None, Some(k)) => {
+                    if !k.is_finite() || k <= 0.0 {
+                        anyhow::bail!("--amount-kas must be a positive finite number");
+                    }
+                    (k * 1e8).round() as u64
+                }
+                (Some(_), Some(_)) => anyhow::bail!("Pass either --amount or --amount-kas, not both"),
+                (None, None) => anyhow::bail!("Missing --amount (sompi) or --amount-kas"),
+            };
+            deploy::validate_amount_not_dust(amount, "--amount")?;
+            let amount_kas_disp = amount as f64 / 100_000_000.0;
+            confirm_or_abort(
+                &format!(
+                    "[CONFIRM] Send {} sompi ({:.8} KAS) to {}\n\
+                     KAS transfers are IRREVERSIBLE. Verify the address is correct.",
+                    amount, amount_kas_disp, to,
+                ),
+                yes,
+            )?;
             wallet_send::run(
                 wallet_path,
                 node,
@@ -2831,7 +3026,10 @@ pub async fn dispatch(
             version,
             dry_run,
             requote_threshold_bps,
+            no_cleanup,
+            deploy_delay_secs,
         } => {
+            deploy::validate_amount_not_dust(amount, "--amount")?;
             let token = token::resolve_token(&token, None)?;
             let config = mm::MmConfig {
                 token,
@@ -2845,8 +3043,9 @@ pub async fn dispatch(
                 version,
                 min_fill,
                 requote_threshold_bps,
+                deploy_delay_secs,
             };
-            mm::run(wallet_path, node, network, &config).await?;
+            mm::run(wallet_path, node, network, &config, !no_cleanup).await?;
         }
         Commands::Perp { action } => {
             perp::run(wallet_path, node, network, fee, &action).await?;
@@ -2865,6 +3064,7 @@ pub async fn dispatch(
                 rate_mode,
                 rate_floor_num,
             } => {
+                deploy::validate_amount_not_dust(amount, "--amount")?;
                 lending::deploy_offer(
                     wallet_path, node, network, amount, rate_num, rate_den,
                     duration_daa, min_collateral_ratio, &token, fee,

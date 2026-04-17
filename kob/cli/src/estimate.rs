@@ -44,9 +44,9 @@ const P2PK_SPK_SIZE: u64 = 34;
 const P2SH_SPK_SIZE: u64 = 35;
 
 
-/// buy_order v13 redeemScript: 145B state + 242B body = 387B.
+/// buy_order v14 redeemScript: 145B state + 242B body = 387B.
 const BUY_RS_SIZE: u64 = 387;
-/// sell_order v13 redeemScript: 112B state + 244B body = 356B.
+/// sell_order v14 redeemScript: 112B state + 244B body = 356B.
 const SELL_RS_SIZE: u64 = 356;
 /// bracket_order v6 redeemScript: 224B state + 141B body = 365B.
 #[allow(dead_code)] // Kept for fee estimation reference
@@ -66,19 +66,19 @@ const SWAP_RS_SIZE: u64 = 243;
 const SWAP_CANCEL_SS_SIZE: u64 = 346;
 
 
-/// buy_v13 fill sigscript: 4 opcodes + pushData(387) = 4 + 3 + 387 = 394.
+/// buy_v14 fill sigscript: 4 opcodes + pushData(387) = 4 + 3 + 387 = 394.
 const BUY_FILL_SS_SIZE: u64 = 394;
-/// sell_v13 fill sigscript: 2 opcodes + pushData(356) = 2 + 3 + 356 = 361.
+/// sell_v14 fill sigscript: 2 opcodes + pushData(356) = 2 + 3 + 356 = 361.
 const SELL_FILL_SS_SIZE: u64 = 361;
 
-/// buy_v13 cancel sigscript: 1 + 66 + 33 + 3 + 387 = 490.
+/// buy_v14 cancel sigscript: 1 + 66 + 33 + 3 + 387 = 490.
 const BUY_CANCEL_SS_SIZE: u64 = 490;
-/// sell_v13 cancel sigscript: 66 + 33 + 1 + 3 + 356 = 459.
+/// sell_v14 cancel sigscript: 66 + 33 + 1 + 3 + 356 = 459.
 const SELL_CANCEL_SS_SIZE: u64 = 459;
 
-/// buy_v13 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 387 = 402.
+/// buy_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 387 = 402.
 const BUY_PARTIAL_SS_SIZE: u64 = 402;
-/// sell_v13 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 356 = 371.
+/// sell_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 356 = 371.
 const SELL_PARTIAL_SS_SIZE: u64 = 371;
 
 /// P2PK wallet input sigscript: pushData(sig+sighash 65B) = 66B.
@@ -91,8 +91,8 @@ pub enum EstimateCommand {
         /// Amount of KAS to lock (in sompi).
         #[arg(long)]
         amount: u64,
-        /// Contract version (only 13 supported).
-        #[arg(long, default_value = "13")]
+        /// Contract version (only 14 supported).
+        #[arg(long, default_value = "14")]
         version: u8,
     },
     /// Estimate fee for deploying a sell order.
@@ -100,8 +100,8 @@ pub enum EstimateCommand {
         /// Amount of tokens to lock (in sompi value).
         #[arg(long)]
         amount: u64,
-        /// Contract version (only 13 supported).
-        #[arg(long, default_value = "13")]
+        /// Contract version (only 14 supported).
+        #[arg(long, default_value = "14")]
         version: u8,
     },
     /// Estimate fee for matching a buy and sell order.
@@ -112,8 +112,8 @@ pub enum EstimateCommand {
         /// Sell order value in sompi.
         #[arg(long)]
         sell_value: u64,
-        /// Contract version (only 13 supported).
-        #[arg(long, default_value = "13")]
+        /// Contract version (only 14 supported).
+        #[arg(long, default_value = "14")]
         version: u8,
     },
     /// Estimate fee for a partial fill.
@@ -127,8 +127,8 @@ pub enum EstimateCommand {
         /// Total order value in sompi.
         #[arg(long)]
         order_value: u64,
-        /// Contract version (only 13 supported).
-        #[arg(long, default_value = "13")]
+        /// Contract version (only 14 supported).
+        #[arg(long, default_value = "14")]
         version: u8,
     },
     /// Estimate fee for cancelling an order.
@@ -139,8 +139,8 @@ pub enum EstimateCommand {
         /// Order UTXO value in sompi.
         #[arg(long)]
         order_value: u64,
-        /// Contract version (only 13 supported).
-        #[arg(long, default_value = "13")]
+        /// Contract version (only 14 supported).
+        #[arg(long, default_value = "14")]
         version: u8,
     },
     /// Estimate fee for consolidating multiple UTXOs into one.
@@ -856,7 +856,7 @@ pub fn run(cmd: &EstimateCommand) {
 
 fn validate_version(version: u8) {
     if version != 6 && version != 8 && version != 9 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 {
-        error!("unsupported contract version {}. Use 6, 8, 9, 10, 11, 12, 13, or 14.", version);
+        error!("unsupported contract version {}. Use 14 (or legacy: 6, 8-13).", version);
         std::process::exit(1);
     }
     if version != 14 {

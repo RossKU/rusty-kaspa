@@ -1,10 +1,14 @@
-//! `kob-cli cancel-mark` -- Mark an order for cancellation (cpend 0 -> 1).
+//! `kob-cli cancel-mark` -- Step 1 of a safe 2-step cancel.
 //!
-//! Transitions the cancel_pending flag from 0 to 1, producing a new UTXO
-//! with the same order parameters but cpend=1 in the redeemScript.
+//! Flips the order's cancel_pending flag from 0 to 1 by producing a new UTXO
+//! with the same parameters at a new P2SH address (cpend=1 in the redeemScript).
+//! Once marked, new fills and partial fills are blocked by the covenant, so the
+//! order cannot race an incoming match. The owner then runs `kob-cli cancel`
+//! (step 2) on the new outpoint to recover the KAS.
 //!
-//! After cancel-mark, the order can still be cancelled (cpend=1 allows cancel-complete),
-//! but fill and partial fill are blocked.
+//! Use this when the order's locked value is large enough that losing it to a
+//! mempool race during a one-shot cancel would matter. For small orders, the
+//! one-shot `cancel` path is fine.
 //!
 //! Cancel-mark TX structure:
 //!   input[0]: order UTXO (P2SH, cancel-mark sigscript, sigOpCount=1)

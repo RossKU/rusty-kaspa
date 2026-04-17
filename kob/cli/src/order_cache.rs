@@ -46,10 +46,10 @@ pub struct OrderCacheEntry {
     /// Used by cancel and cancel-all to reconstruct the redeemScript.
     #[serde(default)]
     pub token: Option<String>,
-    /// Contract version (only 13 supported).
+    /// Contract version (only 14 supported).
     #[serde(default = "default_cache_version")]
     pub version: u8,
-    /// Expiry DAA score (v13 only, 0 = GTC).
+    /// Expiry DAA score (v14 only, 0 = GTC).
     #[serde(default)]
     pub expiry_daa: u64,
     /// Max matcher fee embedded in the redeemScript (sompi).
@@ -59,7 +59,7 @@ pub struct OrderCacheEntry {
 }
 
 fn default_cache_version() -> u8 {
-    13
+    14
 }
 
 fn default_max_matcher_fee() -> u64 {
@@ -179,7 +179,7 @@ mod tests {
             p2sh_hash: "cc".repeat(32),
             value: 50_000_000,
             token: Some("ff".repeat(32)),
-            version: 13,
+            version: 14,
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(decoded.outpoint, "abc123:0");
         assert_eq!(decoded.side, "buy");
         assert_eq!(decoded.price_num, 100);
-        assert_eq!(decoded.version, 13);
+        assert_eq!(decoded.version, 14);
     }
 
     #[test]
@@ -203,7 +203,7 @@ mod tests {
             "value": 5000000
         }"#;
         let entry: OrderCacheEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.version, 13, "default version must be 13");
+        assert_eq!(entry.version, 14, "default version must be 14");
     }
 
     #[test]
@@ -233,7 +233,7 @@ mod tests {
             p2sh_hash: "dd".repeat(32),
             value: 10_000_000,
             token: None,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
@@ -288,7 +288,7 @@ mod tests {
             p2sh_hash: "dd".repeat(32),
             value: 10_000_000,
             token: None,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
@@ -315,7 +315,7 @@ mod tests {
             p2sh_hash: "dd".repeat(32),
             value: 10_000_000,
             token: None,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
@@ -332,7 +332,7 @@ mod tests {
             p2sh_hash: "ff".repeat(32),
             value: 10_000_000,
             token: None,
-            version: 13,
+            version: 14,
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,

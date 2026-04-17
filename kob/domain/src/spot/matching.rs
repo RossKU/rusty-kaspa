@@ -1189,6 +1189,13 @@ pub fn match_swap_routes(
     // Track outpoints claimed by swap routing to avoid double-use.
     let mut claimed: HashSet<String> = HashSet::new();
 
+    tracing::debug!(
+        "[SWAP-SCAN] match_swap_routes: {} swap entries, {} pair books, {} spent keys",
+        swap_book.len(),
+        order_book.pair_books.len(),
+        spent.len(),
+    );
+
     for swap in swap_book.all_entries() {
         let swap_outpoint = swap.outpoint_key();
 

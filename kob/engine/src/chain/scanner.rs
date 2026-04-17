@@ -12,7 +12,7 @@ pub use kob_core::{ParsedDcaOrder, parse_dca_order_rs, DCA_V2_RS_SIZE};
 pub use kob_core::{ParsedSwapOrder, parse_swap_order_rs, SWAP_RS_SIZE};
 
 // Re-export spot RS size constants used by tests.
-pub use kob_core::contract::spot::parse::{BUY_RS_SIZE, SELL_RS_SIZE};
+pub use kob_core::contract::spot::parse::{BUY_RS_SIZE, SELL_RS_SIZE, BRACKET_RS_SIZE};
 
 /// Transaction data from block notifications or RPC queries.
 #[derive(Debug, Clone)]

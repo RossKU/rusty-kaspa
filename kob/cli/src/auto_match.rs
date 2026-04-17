@@ -250,12 +250,12 @@ pub async fn submit_match(
     let buy_p2sh = build_p2sh(&buy.redeem_script);
     let sell_p2sh = build_p2sh(&sell.redeem_script);
 
-    // Build fill sigscripts (permissionless, no signature needed) -- v13 only
+    // Build fill sigscripts (permissionless, no signature needed) -- v14 only
     if buy.redeem_script.len() != 387 {
-        anyhow::bail!("Unsupported buy RS length {}. Only v13 (387B) is supported.", buy.redeem_script.len());
+        anyhow::bail!("Unsupported buy RS length {}. Only v14 (387B) is supported.", buy.redeem_script.len());
     }
     if sell.redeem_script.len() != 356 {
-        anyhow::bail!("Unsupported sell RS length {}. Only v13 (356B) is supported.", sell.redeem_script.len());
+        anyhow::bail!("Unsupported sell RS length {}. Only v14 (356B) is supported.", sell.redeem_script.len());
     }
     let buy_fill_ss = contract::build_buy_fill_sigscript(1, 1, 0, &buy.redeem_script);
     let sell_fill_ss = contract::build_sell_fill_sigscript(0, &sell.redeem_script);
@@ -479,7 +479,7 @@ pub async fn submit_partial_buy_fill(
 
     // Build partial fill sigscript
     // output[0] = residual order, output[1] = buyer tokens
-    // v13 only partial fill
+    // v14 only partial fill
     let buy_pf_ss = contract::build_buy_partial_fill_sigscript(&buy.redeem_script, fill_kas, 0, 1);
 
     // Build receipt
@@ -936,7 +936,7 @@ pub async fn submit_cross_pair_match(
     // Token B P2SH (TOKEN_RS)
     let token_p2sh = build_p2sh(kob_core::TOKEN_RS);
 
-    // Build v13 fill sigscripts
+    // Build v14 fill sigscripts
     // Sell fill: kas_output_idx=0 (seller KAS at output[0])
     let sell_fill_ss = contract::build_sell_fill_sigscript(0, &sell.redeem_script);
     // Buy fill: token_output_idx=1, token_input_idx=2, cov_output_idx=0

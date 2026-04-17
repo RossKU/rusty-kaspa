@@ -18,7 +18,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tracing::{error, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 /// Configuration for the market maker bot.
 #[derive(Debug, Clone)]
@@ -39,12 +41,14 @@ pub struct MmConfig {
     pub interval_secs: u64,
     /// Print orders without deploying.
     pub dry_run: bool,
-    /// Contract version (v13 only).
+    /// Contract version (v14 only).
     pub version: u8,
     /// Min fill per order (sompi).
     pub min_fill: u64,
     /// Requote threshold: cancel all if mid drifts more than this many bps.
     pub requote_threshold_bps: u64,
+    /// Delay between successive deploy TXs in seconds (H12).
+    pub deploy_delay_secs: u64,
 }
 
 impl MmConfig {
@@ -410,15 +414,39 @@ pub fn state_file_path(wallet_path: &Path) -> PathBuf {
         .join("mm_state.json")
 }
 
+/// Sleep for `secs` seconds OR return early if `shutdown` is signaled.
+/// Returns `true` if shutdown was triggered (caller should break out of its loop).
+async fn interruptible_sleep(secs: u64, shutdown: &Arc<AtomicBool>) -> bool {
+    let dur = std::time::Duration::from_secs(secs);
+    let poll = std::time::Duration::from_millis(200);
+    let deadline = std::time::Instant::now() + dur;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = std::time::Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        let remaining = deadline - now;
+        tokio::time::sleep(remaining.min(poll)).await;
+    }
+}
+
 /// Run the market maker bot (async entry point called from main).
 ///
 /// In dry-run mode, prints the plan and exits.
 /// In live mode, deploys initial orders and enters the monitor loop.
+///
+/// `cleanup_on_shutdown`: when true (default), Ctrl+C triggers a best-effort
+/// cancel of every active order before exit. When false, orders are left
+/// on-chain for manual cleanup or resume.
 pub async fn run(
     wallet_path: &Path,
     node_url: &str,
     _network: kob_core::types::Network,
     config: &MmConfig,
+    cleanup_on_shutdown: bool,
 ) -> anyhow::Result<()> {
     config.validate()?;
 
@@ -430,20 +458,40 @@ pub async fn run(
         return Ok(());
     }
 
+    // Shutdown signaling: a background task watches for Ctrl+C and flips
+    // `shutdown` so the bot can exit at the next checkpoint and run cleanup.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                eprintln!();
+                eprintln!("[MM] Shutdown signal received. Will exit at next checkpoint.");
+                shutdown.store(true, Ordering::SeqCst);
+            }
+        });
+    }
+
     println!("Starting market maker...");
-    println!("Press Ctrl+C to stop.");
+    if cleanup_on_shutdown {
+        println!("Press Ctrl+C to stop and cancel all active orders.");
+    } else {
+        println!("Press Ctrl+C to stop (orders will be left on-chain; --no-cleanup).");
+    }
     println!();
 
     let state_path = state_file_path(wallet_path);
     let mut state = MmState::load(&state_path)?;
 
     // If we have existing state for this token, resume monitoring
-    if !state.orders.is_empty() && state.token == config.token {
-        println!(
-            "Resuming with {} existing orders from state file.",
-            state.orders.len()
-        );
-    } else {
+    'init: {
+        if !state.orders.is_empty() && state.token == config.token {
+            println!(
+                "Resuming with {} existing orders from state file.",
+                state.orders.len()
+            );
+            break 'init;
+        }
         // Deploy initial orders
         state.token = config.token.clone();
         state.mid_price_num = config.mid_price_num;
@@ -455,6 +503,9 @@ pub async fn run(
 
         // Deploy buy orders
         for (i, level) in plan.buy_levels.iter().enumerate() {
+            if shutdown.load(Ordering::SeqCst) {
+                break 'init;
+            }
             println!(
                 "Deploying buy L{}: {}/{} ({:.8})...",
                 i + 1,
@@ -494,11 +545,16 @@ pub async fn run(
                 }
             }
             // Small delay between deploys to avoid UTXO contention
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if interruptible_sleep(config.deploy_delay_secs, &shutdown).await {
+                break 'init;
+            }
         }
 
         // Deploy sell orders
         for (i, level) in plan.sell_levels.iter().enumerate() {
+            if shutdown.load(Ordering::SeqCst) {
+                break 'init;
+            }
             println!(
                 "Deploying sell L{}: {}/{} ({:.8})...",
                 i + 1,
@@ -537,7 +593,9 @@ pub async fn run(
                     error!("  FAILED: {}", e);
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            if interruptible_sleep(config.deploy_delay_secs, &shutdown).await {
+                break 'init;
+            }
         }
 
         println!();
@@ -551,8 +609,10 @@ pub async fn run(
     println!();
     println!("Entering monitor loop (interval: {}s)...", config.interval_secs);
 
-    loop {
-        tokio::time::sleep(std::time::Duration::from_secs(config.interval_secs)).await;
+    while !shutdown.load(Ordering::SeqCst) {
+        if interruptible_sleep(config.interval_secs, &shutdown).await {
+            break;
+        }
 
         // Check which orders are still live
         let rpc = match crate::rpc::RpcClient::connect(node_url).await {
@@ -635,6 +695,9 @@ pub async fn run(
 
             // Re-deploy each filled order at the same level
             for order in &filled_orders {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
                 println!(
                     "[MM] Re-deploying {} L{} at {}/{}...",
                     order.side, order.level, order.price_num, order.price_den
@@ -669,13 +732,15 @@ pub async fn run(
                         error!("[MM] Re-deploy FAILED: {}", e);
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                if interruptible_sleep(config.deploy_delay_secs, &shutdown).await {
+                    break;
+                }
             }
 
             state.save(&state_path)?;
         }
 
-        // Check for price drift (requote all)
+        // Check for price drift (atomic requote: deploy new BEFORE canceling old)
         if price_drifted(
             state.mid_price_num,
             state.mid_price_den,
@@ -688,16 +753,132 @@ pub async fn run(
                 state.mid_price_num, state.mid_price_den,
                 config.mid_price_num, config.mid_price_den
             );
-            println!("[MM] Requoting all orders...");
+            println!("[MM] Atomic requote: deploying new orders BEFORE canceling old.");
+            println!("[MM] Note: this temporarily doubles inventory exposure during requote.");
+            println!("[MM]       Ensure wallet has 2x quote balance, or some new deploys will fail.");
 
-            // Cancel all existing orders on-chain before redeploying.
-            // Track which indices were successfully cancelled so we only
-            // remove those from state (failed cancels stay in state).
-            let mut cancelled_indices: Vec<usize> = Vec::new();
-            let mut cancel_failures = 0u32;
-            for (idx, order) in state.orders.iter().enumerate() {
+            let new_plan = build_deploy_plan(config);
+            let old_orders: Vec<MmOrderState> = state.orders.clone();
+
+            // ----- Phase 1: deploy new orders at new prices -----
+            // (old orders are still live on-chain — zero-exposure window eliminated)
+            println!(
+                "[MM] Phase 1: deploying {} new orders at new mid...",
+                new_plan.total_orders
+            );
+            let mut new_tx_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            let mut deploy_failures = 0u32;
+            for (i, level) in new_plan.buy_levels.iter().enumerate() {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
                 println!(
-                    "[MM] Cancelling {} L{} at {}:{}...",
+                    "[MM] Phase 1 deploy buy L{}: {}/{}...",
+                    i + 1, level.price_num, level.price_den
+                );
+                match deploy_order(
+                    wallet_path,
+                    node_url,
+                    &config.token,
+                    "buy",
+                    level.price_num,
+                    level.price_den,
+                    config.min_fill,
+                    config.amount,
+                    config.version,
+                )
+                .await
+                {
+                    Ok((tx_id, p2sh_address)) => {
+                        new_tx_ids.insert(tx_id.clone());
+                        state.add_order(MmOrderState {
+                            tx_id,
+                            index: 0,
+                            side: "buy".to_string(),
+                            level: (i + 1) as u32,
+                            price_num: level.price_num,
+                            price_den: level.price_den,
+                            amount: config.amount,
+                            p2sh_address,
+                        });
+                        // Persist immediately so a crash mid-requote doesn't lose
+                        // newly-deployed orders.
+                        state.save(&state_path)?;
+                    }
+                    Err(e) => {
+                        error!("[MM] Phase 1 buy L{} deploy failed: {}", i + 1, e);
+                        deploy_failures += 1;
+                    }
+                }
+                if interruptible_sleep(config.deploy_delay_secs, &shutdown).await {
+                    break;
+                }
+            }
+            for (i, level) in new_plan.sell_levels.iter().enumerate() {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                println!(
+                    "[MM] Phase 1 deploy sell L{}: {}/{}...",
+                    i + 1, level.price_num, level.price_den
+                );
+                match deploy_order(
+                    wallet_path,
+                    node_url,
+                    &config.token,
+                    "sell",
+                    level.price_num,
+                    level.price_den,
+                    config.min_fill,
+                    config.amount,
+                    config.version,
+                )
+                .await
+                {
+                    Ok((tx_id, p2sh_address)) => {
+                        new_tx_ids.insert(tx_id.clone());
+                        state.add_order(MmOrderState {
+                            tx_id,
+                            index: 0,
+                            side: "sell".to_string(),
+                            level: (i + 1) as u32,
+                            price_num: level.price_num,
+                            price_den: level.price_den,
+                            amount: config.amount,
+                            p2sh_address,
+                        });
+                        state.save(&state_path)?;
+                    }
+                    Err(e) => {
+                        error!("[MM] Phase 1 sell L{} deploy failed: {}", i + 1, e);
+                        deploy_failures += 1;
+                    }
+                }
+                if interruptible_sleep(config.deploy_delay_secs, &shutdown).await {
+                    break;
+                }
+            }
+            if deploy_failures > 0 {
+                warn!(
+                    "[MM] {} new deploys failed in phase 1; canceling old orders anyway to avoid stale quotes",
+                    deploy_failures
+                );
+            }
+
+            // ----- Phase 2: cancel old orders -----
+            println!(
+                "[MM] Phase 2: canceling {} old orders at old mid...",
+                old_orders.len()
+            );
+            let mut cancelled_tx_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            let mut cancel_failures = 0u32;
+            for order in &old_orders {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                println!(
+                    "[MM] Cancelling old {} L{} at {}:{}...",
                     order.side, order.level, order.tx_id, order.index
                 );
                 match cancel_order(
@@ -715,95 +896,41 @@ pub async fn run(
                 .await
                 {
                     Ok(()) => {
-                        println!("[MM] Cancelled {} L{}", order.side, order.level);
-                        cancelled_indices.push(idx);
+                        println!("[MM] Cancelled old {} L{}", order.side, order.level);
+                        cancelled_tx_ids.insert(order.tx_id.clone());
                     }
                     Err(e) => {
                         // Order may already be filled/spent -- log and continue
-                        warn!("[MM] Cancel {} L{} failed (may already be filled): {}",
-                            order.side, order.level, e);
+                        warn!(
+                            "[MM] Cancel old {} L{} failed (may already be filled): {}",
+                            order.side, order.level, e
+                        );
                         cancel_failures += 1;
                     }
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            if cancel_failures > 0 {
-                warn!("[MM] {} cancel(s) failed during requote; those orders remain in state", cancel_failures);
-            }
-
-            // Remove only successfully cancelled orders (iterate in
-            // reverse so that earlier indices remain valid).
-            for &idx in cancelled_indices.iter().rev() {
-                state.orders.remove(idx);
+                if interruptible_sleep(config.deploy_delay_secs, &shutdown).await {
+                    break;
+                }
             }
 
-            // Update mid price and redeploy
+            // ----- Phase 3: prune cancelled old orders, update state mid -----
+            state.orders.retain(|o| !cancelled_tx_ids.contains(&o.tx_id));
             state.mid_price_num = config.mid_price_num;
             state.mid_price_den = config.mid_price_den;
-
-            let new_plan = build_deploy_plan(config);
-            for (i, level) in new_plan.buy_levels.iter().enumerate() {
-                match deploy_order(
-                    wallet_path,
-                    node_url,
-                    &config.token,
-                    "buy",
-                    level.price_num,
-                    level.price_den,
-                    config.min_fill,
-                    config.amount,
-                    config.version,
-                )
-                .await
-                {
-                    Ok((tx_id, p2sh_address)) => {
-                        state.add_order(MmOrderState {
-                            tx_id,
-                            index: 0,
-                            side: "buy".to_string(),
-                            level: (i + 1) as u32,
-                            price_num: level.price_num,
-                            price_den: level.price_den,
-                            amount: config.amount,
-                            p2sh_address,
-                        });
-                    }
-                    Err(e) => error!("[MM] Buy L{} deploy failed: {}", i + 1, e),
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
-            for (i, level) in new_plan.sell_levels.iter().enumerate() {
-                match deploy_order(
-                    wallet_path,
-                    node_url,
-                    &config.token,
-                    "sell",
-                    level.price_num,
-                    level.price_den,
-                    config.min_fill,
-                    config.amount,
-                    config.version,
-                )
-                .await
-                {
-                    Ok((tx_id, p2sh_address)) => {
-                        state.add_order(MmOrderState {
-                            tx_id,
-                            index: 0,
-                            side: "sell".to_string(),
-                            level: (i + 1) as u32,
-                            price_num: level.price_num,
-                            price_den: level.price_den,
-                            amount: config.amount,
-                            p2sh_address,
-                        });
-                    }
-                    Err(e) => error!("[MM] Sell L{} deploy failed: {}", i + 1, e),
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            }
             state.save(&state_path)?;
-            println!("[MM] Requote complete. {} orders active.", state.orders.len());
+
+            if cancel_failures > 0 {
+                warn!(
+                    "[MM] {} cancel(s) failed; those old orders remain in state and will be retried next cycle",
+                    cancel_failures
+                );
+            }
+            println!(
+                "[MM] Atomic requote complete. {} orders active ({} new + {} unsettled old).",
+                state.orders.len(),
+                new_tx_ids.len(),
+                state.orders.len().saturating_sub(new_tx_ids.len())
+            );
         }
 
         println!(
@@ -811,6 +938,66 @@ pub async fn run(
             state.orders.len()
         );
     }
+
+    // ===== C9: shutdown cleanup =====
+    if cleanup_on_shutdown && !state.orders.is_empty() {
+        println!();
+        info!(
+            "[MM] Shutdown cleanup: canceling {} active orders (use --no-cleanup to skip)...",
+            state.orders.len()
+        );
+        let orders_snapshot: Vec<MmOrderState> = state.orders.clone();
+        let mut cleanup_failures = 0u32;
+        for order in &orders_snapshot {
+            match cancel_order(
+                wallet_path,
+                node_url,
+                &config.token,
+                &order.side,
+                order.price_num,
+                order.price_den,
+                config.min_fill,
+                &order.tx_id,
+                order.index,
+                config.version,
+            )
+            .await
+            {
+                Ok(()) => {
+                    println!("  Cancelled {} L{}", order.side, order.level);
+                    state.orders.retain(|o| o.tx_id != order.tx_id);
+                    let _ = state.save(&state_path);
+                }
+                Err(e) => {
+                    warn!(
+                        "  Cancel {} L{} failed (may already be filled): {}",
+                        order.side, order.level, e
+                    );
+                    cleanup_failures += 1;
+                }
+            }
+            // Small delay between cancels to avoid UTXO contention.
+            // Not interruptible: the user already pressed Ctrl+C; a second
+            // press should still terminate the process via the OS default.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        if cleanup_failures > 0 {
+            warn!(
+                "[MM] {} order(s) could not be cancelled during shutdown; remain in state",
+                cleanup_failures
+            );
+        } else {
+            println!("[MM] Cleanup complete. All orders cancelled.");
+        }
+    } else if !cleanup_on_shutdown && !state.orders.is_empty() {
+        println!();
+        info!(
+            "[MM] Shutdown: {} orders left on-chain (--no-cleanup). Run `kob cancel-all` to clean up.",
+            state.orders.len()
+        );
+    }
+
+    Ok(())
 }
 
 /// Deploy a single order via the deploy module logic.
@@ -997,7 +1184,7 @@ async fn cancel_order(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_bytes);
 
-    // Reconstruct the redeem script (v13 only)
+    // Reconstruct the redeem script (v14 only)
     if version != 14 {
         anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }

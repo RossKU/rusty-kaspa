@@ -1,7 +1,7 @@
 //! Smart market order support with trustless-first price discovery.
 //!
 //! Priority order:
-//! 1. **Node fill TX scan** (trustless) — scan recent blocks for v12 fill TXs
+//! 1. **Node fill TX scan** (trustless) — scan recent blocks for v14 fill TXs
 //! 2. **External Matcher API** (trust required) — only if `--matcher-url` is
 //!    explicitly provided AND no fills found on-chain
 //! 3. **Error** — if neither source has price data
@@ -315,7 +315,7 @@ fn gcd(mut a: u64, mut b: u64) -> u64 {
 
 /// Resolve market price using trustless-first fallback chain.
 ///
-/// 1. Scan recent blocks for v12 fill TXs (trustless, from node)
+/// 1. Scan recent blocks for v14 fill TXs (trustless, from node)
 /// 2. Fall back to Matcher API only if `matcher_url` is explicitly provided
 ///    and no on-chain fills were found
 /// 3. Error if neither source has data

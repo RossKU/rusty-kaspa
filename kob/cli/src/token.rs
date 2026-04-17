@@ -157,6 +157,47 @@ pub enum TokenCommand {
         #[arg(long)]
         alias_file: Option<String>,
     },
+
+    /// List all registered token aliases.
+    Aliases {
+        /// Path to alias file (default: tokens.json).
+        #[arg(long)]
+        alias_file: Option<String>,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+/// Print the registered token aliases (sorted by name).
+pub fn list_aliases(alias_file: Option<&Path>, json: bool) -> anyhow::Result<()> {
+    let default_path = Path::new("tokens.json");
+    let path = alias_file.unwrap_or(default_path);
+    let aliases = load_aliases(path)?;
+    let mut rows: Vec<(String, String)> = aliases.into_iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if json {
+        let map: serde_json::Map<String, serde_json::Value> = rows
+            .into_iter()
+            .map(|(k, v)| (k, serde_json::Value::String(v)))
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&serde_json::Value::Object(map))?);
+        return Ok(());
+    }
+
+    if rows.is_empty() {
+        println!("No aliases registered in {}.", path.display());
+        println!("Register one with: kob token alias <NAME> <covenant_id>");
+        return Ok(());
+    }
+    println!("Token aliases ({}):", path.display());
+    let max_name = rows.iter().map(|(n, _)| n.len()).max().unwrap_or(8);
+    for (name, cid) in rows {
+        println!("  {:width$}  {}", name, cid, width = max_name);
+    }
+    Ok(())
 }
 
 /// Deploy a new token_mint covenant UTXO (genesis).

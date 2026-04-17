@@ -160,6 +160,7 @@ pub async fn run(
             counterparty_spk_version: 0,
             min_fill: entry.min_fill,
             oco_path: None,
+            bracket_meta: None,
         });
     }
 
@@ -232,6 +233,7 @@ pub async fn run(
             counterparty_spk_version: 0,
             min_fill: entry.min_fill,
             oco_path: None,
+            bracket_meta: None,
         });
     }
 

@@ -182,7 +182,7 @@ pub fn create_book_order(
     }
 }
 
-/// Build buy_order v12 redeemScript and P2SH.
+/// Build buy_order v14 redeemScript and P2SH.
 pub fn build_buy_order_scripts(
     token_cov_id: &[u8; 32],
     price_num: u64,
@@ -201,7 +201,7 @@ pub fn build_buy_order_scripts(
     (rs_hex, p2sh_hex, spk.version)
 }
 
-/// Build sell_order v12 redeemScript and P2SH.
+/// Build sell_order v14 redeemScript and P2SH.
 pub fn build_sell_order_scripts(
     price_num: u64,
     price_den: u64,

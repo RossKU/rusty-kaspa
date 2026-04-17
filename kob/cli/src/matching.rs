@@ -38,6 +38,39 @@ use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
 use std::path::Path;
 use tracing::info;
 
+/// Adversarial tamper modes for security testing.
+///
+/// These modes deliberately construct invalid match TXs to verify that the
+/// covenant bytecode (enforced at consensus level) rejects them.
+/// ONLY for testing. The node MUST reject every tampered TX.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TamperMode {
+    /// A01-1: Replace seller's KAS output SPK with attacker address.
+    /// Violates F2: output[0].spk.blake2b != sspkh baked in sell redeem script.
+    F2RedirectSeller,
+    /// A01-2: Replace buyer's token output SPK with attacker address.
+    /// Violates F2: output[1].spk.blake2b != bspkh baked in buy redeem script.
+    F2RedirectBuyer,
+    /// A02-1: Remove covenant binding from buyer token output.
+    /// Violates F4: covenant output count check fails.
+    F4RemoveBinding,
+    /// A02-2: Reduce buyer token output value to 1 sompi below expected.
+    /// Violates F4: covenant_output.value < expected_tokens.
+    F4ReduceValue,
+}
+
+impl TamperMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "f2-redirect-seller" => Some(Self::F2RedirectSeller),
+            "f2-redirect-buyer" => Some(Self::F2RedirectBuyer),
+            "f4-remove-binding" => Some(Self::F4RemoveBinding),
+            "f4-reduce-value" => Some(Self::F4ReduceValue),
+            _ => None,
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 pub async fn run(
@@ -66,7 +99,14 @@ pub async fn run(
     fee: u64,
     buy_expiry: u64,
     sell_expiry: u64,
+    tamper: Option<TamperMode>,
 ) -> anyhow::Result<()> {
+    if let Some(ref mode) = tamper {
+        println!("!!! ADVERSARIAL TEST MODE: {:?} !!!", mode);
+        println!("!!! This TX is INTENTIONALLY INVALID and MUST be rejected by the node !!!");
+        println!();
+    }
+
     let wallet = WalletContext::load(wallet_path)?;
     let buy_outpoint = Outpoint::parse(buy_outpoint_str)?;
     let sell_outpoint = Outpoint::parse(sell_outpoint_str)?;
@@ -145,12 +185,11 @@ pub async fn run(
         compute_p2pk_spk_hash(&seller_pubkey)
     };
 
-    // Reconstruct redeemScripts (v13 or v14; the redeem-script layout is shared
-    // so the same builder handles both). max_matcher_fee default matches the
-    // deploy default (10_000_000 sompi). cancel_pending = 0 (active, not pending
-    // cancel).
+    // Reconstruct redeemScripts (v14; the redeem-script layout is shared
+    // with v13). max_matcher_fee default matches the deploy default
+    // (10_000_000 sompi). cancel_pending = 0 (active, not pending cancel).
     if version != 13 && version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Supported: v13, v14.", version);
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }
     let buy_rs = contract::build_buy_redeem_script(
         &tcid,
@@ -463,6 +502,86 @@ pub async fn run(
             tx.outputs[3].value = adj_matcher_change;
         }
 
+        // === ADVERSARIAL TAMPERING (before signing) ===
+        // Tampering happens BEFORE the wallet input is signed so the P2PK
+        // signature covers the tampered outputs (valid sig over invalid TX).
+        // The covenant bytecode must still reject the TX at consensus level.
+        if let Some(ref mode) = tamper {
+            match mode {
+                TamperMode::F2RedirectSeller => {
+                    // Replace output[0] (seller KAS) SPK with a fake P2PK address.
+                    // The sell covenant F2 checks: output[koi].spk.blake2b == sspkh.
+                    // sspkh is baked into the redeem script and matches the real seller.
+                    // This fake SPK will fail that blake2b comparison.
+                    let mut fake_spk = vec![0x20]; // OP_DATA_32
+                    fake_spk.extend_from_slice(&[0xDE; 32]); // fake pubkey
+                    fake_spk.push(0xac); // OP_CHECKSIG
+                    println!("TAMPER [F2-redirect-seller]: Replacing output[0] SPK with attacker address");
+                    println!("  Original SPK: {}", hex::encode(tx.outputs[0].script_bytes()));
+                    tx.outputs[0] = TxOutput::new(tx.outputs[0].value, 0, fake_spk, None);
+                    println!("  Tampered SPK: {}", hex::encode(tx.outputs[0].script_bytes()));
+                }
+                TamperMode::F2RedirectBuyer => {
+                    // Replace output[1] (buyer tokens) SPK with a fake P2PK address.
+                    // The buy covenant F2 checks: output[toi].spk.blake2b == bspkh.
+                    // bspkh is baked into the buy redeem script.
+                    if tx.outputs.len() > 1 {
+                        let mut fake_spk = vec![0x20]; // OP_DATA_32
+                        fake_spk.extend_from_slice(&[0xBE; 32]); // fake pubkey
+                        fake_spk.push(0xac); // OP_CHECKSIG
+                        // Preserve covenant binding from original output
+                        let orig_covenant = tx.outputs[1].covenant.clone();
+                        println!("TAMPER [F2-redirect-buyer]: Replacing output[1] SPK with attacker address");
+                        println!("  Original SPK: {}", hex::encode(tx.outputs[1].script_bytes()));
+                        tx.outputs[1] = TxOutput::new(tx.outputs[1].value, 0, fake_spk, orig_covenant);
+                        println!("  Tampered SPK: {}", hex::encode(tx.outputs[1].script_bytes()));
+                    }
+                }
+                TamperMode::F4RemoveBinding => {
+                    // Remove the covenant binding from output[1] (buyer tokens).
+                    // F4 checks CovOutCount(T) >= 1 — without the binding, the
+                    // covenant output count for this token is 0, violating F4.
+                    if tx.outputs.len() > 1 {
+                        println!("TAMPER [F4-remove-binding]: Removing covenant binding from output[1]");
+                        println!("  Original binding: {:?}", tx.outputs[1].covenant);
+                        tx.outputs[1] = TxOutput::new(
+                            tx.outputs[1].value,
+                            tx.outputs[1].script_version(),
+                            tx.outputs[1].script_bytes().to_vec(),
+                            None, // No covenant binding
+                        );
+                        println!("  Tampered binding: None");
+                    }
+                }
+                TamperMode::F4ReduceValue => {
+                    // Reduce output[1] (buyer tokens) value by 1 sompi.
+                    // F4 full fill checks: covenant_output.value >= expected_tokens.
+                    // Reducing by 1 makes it strictly less than expected.
+                    if tx.outputs.len() > 1 {
+                        let orig_val = tx.outputs[1].value;
+                        let tampered_val = orig_val.saturating_sub(1);
+                        println!("TAMPER [F4-reduce-value]: Reducing output[1] value by 1 sompi");
+                        println!("  Original value: {}", orig_val);
+                        println!("  Tampered value: {}", tampered_val);
+                        tx.outputs[1] = TxOutput::new(
+                            tampered_val,
+                            tx.outputs[1].script_version(),
+                            tx.outputs[1].script_bytes().to_vec(),
+                            tx.outputs[1].covenant.clone(),
+                        );
+                        // Add the stolen sompi to output[0] to keep total balanced
+                        // (otherwise miner fee changes and mass check might fail).
+                        tx.outputs[0] = TxOutput::new(
+                            tx.outputs[0].value + 1,
+                            tx.outputs[0].script_version(),
+                            tx.outputs[0].script_bytes().to_vec(),
+                            tx.outputs[0].covenant.clone(),
+                        );
+                    }
+                }
+            }
+        }
+
         // Sign fee input (index 2) over post-convergence outputs — once.
         let sighash_fee = compute_sighash(&tx, 2)?;
         let sig_fee = signing::schnorr_sign(&privkey, &sighash_fee)?;
@@ -514,6 +633,31 @@ pub async fn run(
     let payload = to_rpc_payload(&tx, &sigscripts);
     println!();
     println!("Submitting match transaction...");
+
+    if tamper.is_some() {
+        // In tamper mode, we EXPECT the node to reject.
+        match rpc.submit_transaction(payload).await {
+            Ok(tx_id) => {
+                // The tampered TX was accepted -- this means the covenant
+                // did NOT catch the tampering. This is a security failure.
+                println!();
+                println!("SECURITY FAILURE: Tampered TX was ACCEPTED!");
+                println!("TXID: {}", tx_id);
+                println!("The covenant did NOT reject the tampered transaction.");
+                anyhow::bail!("ADVERSARIAL_ACCEPTED: tampered TX {} accepted by node", tx_id);
+            }
+            Err(e) => {
+                let err_msg = format!("{}", e);
+                println!();
+                println!("EXPECTED REJECTION: Node rejected the tampered TX.");
+                println!("Error: {}", err_msg);
+                // Output machine-parseable result line for E2E script
+                println!("ADVERSARIAL_REJECTED: {:?}", tamper.unwrap());
+                return Ok(());
+            }
+        }
+    }
+
     let tx_id = rpc.submit_transaction(payload).await?;
 
     println!();
@@ -580,7 +724,7 @@ pub async fn run_cross_pair(
 ) -> anyhow::Result<()> {
     if version != 8 && version != 9 && version != 11 && version != 12 && version != 13 {
         anyhow::bail!("Cross-pair matching requires contract version 8 or later. This order uses v{}. \
-             Redeploy the order with --version 13 or higher.", version);
+             Redeploy the order with --version 14.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;
@@ -660,9 +804,9 @@ pub async fn run_cross_pair(
         compute_p2pk_spk_hash(&seller_pubkey)
     };
 
-    // Reconstruct redeemScripts (v13 or v14; same builder layout).
+    // Reconstruct redeemScripts (v14; same builder layout as v13).
     if version != 13 && version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Supported: v13, v14.", version);
+        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
     }
     let buy_rs = contract::build_buy_redeem_script(
         &buy_tcid,

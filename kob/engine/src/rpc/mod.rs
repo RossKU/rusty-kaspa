@@ -7,7 +7,7 @@ pub use kob_core::rpc_types::{RpcUtxo, RpcOutpoint, RpcUtxoEntry, RpcSpk, parse_
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -93,6 +93,17 @@ pub struct RpcClient {
     spent_outpoints: Arc<Mutex<HashSet<String>>>,
     /// Addresses already subscribed to notifyUtxosChanged (avoid re-subscribing).
     subscribed_addresses: Arc<Mutex<HashSet<String>>>,
+    /// Shutdown flag (C3): when set, reconnect() exits its backoff loop instead
+    /// of looping forever. Initialized to a fresh AtomicBool; the executor swaps
+    /// in its own shared flag via `set_shutdown_flag()` so a single Ctrl+C reaches
+    /// all in-flight reconnect attempts without acquiring the RpcClient mutex.
+    shutdown: Arc<AtomicBool>,
+    /// Notification-drop signal (C4): set by the reader task whenever a
+    /// notification cannot be enqueued because the channel buffer is full.
+    /// The executor polls this and triggers a backfill scan from the last
+    /// known block hash so dropped block notifications do not silently leave
+    /// orders invisible.
+    notification_dropped: Arc<AtomicBool>,
 }
 
 impl RpcClient {
@@ -146,9 +157,14 @@ impl RpcClient {
         let alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         let (write_tx, mut write_rx) = mpsc::channel::<String>(256);
-        let (notif_tx, notif_rx) = mpsc::channel::<serde_json::Value>(512);
+        // C4: bumped from 512 → 4096. Buffer size alone does not fix the
+        // overflow problem (a sufficiently long pause will still fill any
+        // buffer); see notification_dropped + the executor's drop-detect
+        // backfill below for the actual recovery path.
+        let (notif_tx, notif_rx) = mpsc::channel::<serde_json::Value>(4096);
         let spent_outpoints: Arc<Mutex<HashSet<String>>> =
             Arc::new(Mutex::new(HashSet::new()));
+        let notification_dropped = Arc::new(AtomicBool::new(false));
 
         // Split WebSocket into reader and writer
         use futures_util::stream::StreamExt;
@@ -176,6 +192,7 @@ impl RpcClient {
         let alive_r = alive.clone();
         let notif_tx_r = notif_tx.clone();
         let spent_r = spent_outpoints.clone();
+        let notif_dropped_r = notification_dropped.clone();
         tokio::spawn(async move {
             while let Some(msg_result) = ws_reader.next().await {
                 match msg_result {
@@ -241,7 +258,14 @@ impl RpcClient {
                                         notif.insert("params".to_string(), p);
                                     }
                                     if let Err(e) = notif_tx_r.try_send(serde_json::Value::Object(notif)) {
-                                        tracing::warn!("[RPC] Failed to enqueue notification: {}", e);
+                                        // C4: mark the drop so the executor can backfill.
+                                        // Without this flag, a full buffer silently loses
+                                        // blockAdded notifications and leaves orders invisible.
+                                        notif_dropped_r.store(true, AtomicOrdering::SeqCst);
+                                        tracing::warn!(
+                                            "[RPC] Failed to enqueue notification: {} (drop flag set; executor will backfill)",
+                                            e
+                                        );
                                     }
                                 }
                             }
@@ -269,7 +293,27 @@ impl RpcClient {
             notification_tx: notif_tx,
             spent_outpoints,
             subscribed_addresses: Arc::new(Mutex::new(HashSet::new())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            notification_dropped,
         })
+    }
+
+    /// Replace the internal shutdown flag with a caller-provided shared one.
+    ///
+    /// Used by the executor at startup so its single Ctrl+C-driven AtomicBool
+    /// also interrupts any in-flight `reconnect()` backoff sleep without
+    /// requiring the caller to acquire the RpcClient mutex.
+    pub fn set_shutdown_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.shutdown = flag;
+    }
+
+    /// Borrow a shared handle to the notification-dropped flag (C4).
+    ///
+    /// The executor checks (and clears) this each scan cycle; if set, it
+    /// triggers a backfill scan from `last_seen_hash` to recover any block
+    /// notifications dropped due to channel overflow.
+    pub fn notification_dropped_handle(&self) -> Arc<AtomicBool> {
+        self.notification_dropped.clone()
     }
 
     /// Send an RPC call and wait for the response with the default 30s timeout.
@@ -708,16 +752,36 @@ impl RpcClient {
     const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
 
     /// Attempt to re-establish the WebSocket connection with exponential backoff.
+    ///
+    /// C3: respects `self.shutdown` — if the flag is set, returns
+    /// `Err("shutdown")` instead of looping forever. Also polls the flag every
+    /// 200ms during backoff sleep so a Ctrl+C during a 60s backoff does not
+    /// block shutdown for up to a minute.
     pub async fn reconnect(&mut self) -> Result<(), String> {
         let mut backoff_secs: u64 = 1;
 
         loop {
+            if self.shutdown.load(AtomicOrdering::SeqCst) {
+                return Err("shutdown".to_string());
+            }
             tracing::info!(
                 "[RPC RECONNECT] Attempting reconnection to {} (backoff {}s)...",
                 self.url, backoff_secs
             );
 
-            tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+            let sleep_until = std::time::Instant::now()
+                + std::time::Duration::from_secs(backoff_secs);
+            while std::time::Instant::now() < sleep_until {
+                if self.shutdown.load(AtomicOrdering::SeqCst) {
+                    return Err("shutdown".to_string());
+                }
+                let remaining = sleep_until.saturating_duration_since(std::time::Instant::now());
+                let step = remaining.min(std::time::Duration::from_millis(200));
+                if step.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(step).await;
+            }
 
             match Self::connect_with_options(
                 &self.url,
@@ -732,6 +796,35 @@ impl RpcClient {
                     self.alive = new_client.alive;
                     self.notification_tx = new_client.notification_tx;
                     self.notification_rx = new_client.notification_rx;
+                    // M5: Clear spent_outpoints on reconnect.
+                    // The old reader task is dead and its spent entries are stale.
+                    // The new connection starts with a fresh UTXO view.
+                    // Also swap in the new client's spent_outpoints Arc so the
+                    // new reader task populates the same set we query.
+                    {
+                        let old_len = self.spent_outpoints.lock().await.len();
+                        self.spent_outpoints = new_client.spent_outpoints;
+                        if old_len > 0 {
+                            tracing::info!(
+                                "[RPC RECONNECT] Cleared {} stale spent_outpoints (M5)",
+                                old_len
+                            );
+                        }
+                    }
+                    // M6: Clear subscribed_addresses on reconnect.
+                    // The new WS connection has no active subscriptions; keeping
+                    // old entries would prevent re-subscribing via the auto-subscribe
+                    // guard in get_spendable_utxos().
+                    {
+                        let old_len = self.subscribed_addresses.lock().await.len();
+                        self.subscribed_addresses = new_client.subscribed_addresses;
+                        if old_len > 0 {
+                            tracing::info!(
+                                "[RPC RECONNECT] Cleared {} stale subscribed_addresses (M6)",
+                                old_len
+                            );
+                        }
+                    }
                     tracing::info!(
                         "[RPC RECONNECT] Successfully reconnected to {}",
                         self.url

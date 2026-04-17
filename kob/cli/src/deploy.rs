@@ -98,7 +98,33 @@ pub fn parse_decimal_price(s: &str) -> anyhow::Result<(u64, u64)> {
 }
 
 /// SOMPI_PER_KAS: 1 KAS = 100_000_000 sompi.
-const SOMPI_PER_KAS: u64 = 100_000_000;
+pub const SOMPI_PER_KAS: u64 = 100_000_000;
+
+/// Minimum sompi threshold below which a raw `--amount` value is almost
+/// certainly a user mistake (typing KAS instead of sompi).
+///
+/// 100_000 sompi = 0.001 KAS.  Any deploy amount below this is rejected
+/// unless the caller passes `--force`.
+pub const DUST_AMOUNT_THRESHOLD: u64 = 100_000;
+
+/// Reject suspiciously low sompi amounts that likely indicate the user
+/// typed a KAS value into the `--amount` (sompi) field.
+///
+/// Returns `Ok(amount)` when the value is above threshold, or an
+/// informative error otherwise.
+pub fn validate_amount_not_dust(amount: u64, field_name: &str) -> anyhow::Result<u64> {
+    if amount > 0 && amount < DUST_AMOUNT_THRESHOLD {
+        anyhow::bail!(
+            "{field_name} = {amount} sompi is suspiciously low (< 0.001 KAS). \
+             Did you mean {amount} KAS? Use --amount-kas {amount} for KAS denomination, \
+             or pass a value >= {threshold} sompi.",
+            field_name = field_name,
+            amount = amount,
+            threshold = DUST_AMOUNT_THRESHOLD,
+        );
+    }
+    Ok(amount)
+}
 
 /// Parse a KAS amount string (decimal) into sompi.
 ///
@@ -295,7 +321,7 @@ pub async fn deploy_buy(
     mmfee_bps: Option<u64>,
 ) -> anyhow::Result<String> {
     if version != 14 && version != 15 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 and v15 are supported for deployment.", version);
+        anyhow::bail!("Unsupported contract version {}. Only v14 and v15 are supported for buy deployment.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;
@@ -328,6 +354,20 @@ pub async fn deploy_buy(
         );
     }
 
+    // Reject buy orders whose match TX would exceed storage mass limits.
+    // A match creates a BuyerTokens covenant output of value buy_amount*price_num/price_den;
+    // if that value is too small, the covenant's C·p²/v mass blows the budget.
+    if let Err(min_buy) = kob_core::check_buy_match_mass(amount, price_num, price_den) {
+        anyhow::bail!(
+            "Order too small to match on-chain.\n\
+             Buy amount {:.2} KAS at price {}/{} is below the network minimum.\n\
+             Increase buy amount to at least {:.2} KAS ({} sompi).",
+            amount as f64 / 1e8,
+            price_num, price_den,
+            min_buy as f64 / 1e8, min_buy,
+        );
+    }
+
     // Warn about suboptimal UTXO economics for small buy orders.
     const BUY_DEPLOY_MIN_RECOMMENDED: u64 = 500_000_000; // 5 KAS
     if amount < BUY_DEPLOY_MIN_RECOMMENDED {
@@ -347,6 +387,9 @@ pub async fn deploy_buy(
     let token_cov_bytes = hex::decode(token_covenant_id)?;
     if token_cov_bytes.len() != 32 {
         anyhow::bail!("token covenant ID must be 64 hex characters (32 bytes)");
+    }
+    if token_cov_bytes.iter().all(|&b| b == 0) {
+        anyhow::bail!("token covenant ID must not be all zeros");
     }
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_cov_bytes);
@@ -716,6 +759,33 @@ pub async fn deploy_sell(
 
     if token_covenant_id.is_none() {
         anyhow::bail!("--token is required for sell orders. Specify the token covenant ID.");
+    }
+
+    // Reject sell orders whose partial-fill match TX would exceed storage mass.
+    if let Err(min_mf) = kob_core::check_sell_match_mass(amount, min_fill) {
+        anyhow::bail!(
+            "Order too small to match on-chain.\n\
+             min_fill {:.2} KAS is below the network minimum for partial fills.\n\
+             Increase --min-fill to at least {:.2} KAS ({} sompi).",
+            min_fill as f64 / 1e8,
+            min_mf as f64 / 1e8, min_mf,
+        );
+    }
+
+    // Reject sell orders where the full-fill KAS is below min_fill.
+    // The sell contract's F1 check verifies (amount * pnum / pden) >= mfill,
+    // so if the full fill doesn't meet min_fill, the order is unmatchable.
+    let expected_kas = (amount as u128 * price_num as u128 / price_den as u128) as u64;
+    if expected_kas < min_fill {
+        let min_amount = (min_fill as u128 * price_den as u128).div_ceil(price_num as u128) as u64;
+        anyhow::bail!(
+            "Order unmatchable: full-fill KAS ({} sompi, {:.2} KAS) is below min_fill ({} sompi).\n\
+             The sell contract's F1 check requires expected_kas >= min_fill.\n\
+             Increase --amount to at least {} sompi or lower --min-fill.",
+            expected_kas, expected_kas as f64 / 1e8,
+            min_fill,
+            min_amount,
+        );
     }
 
     // Warn about storage mass penalty for small sell orders.

@@ -123,6 +123,7 @@ pub async fn run(
             token_utxo,
             fee_utxo,
         } => {
+            crate::deploy::validate_amount_not_dust(*amount, "--amount")?;
             deploy(
                 wallet_path,
                 node_url,

@@ -100,7 +100,7 @@ pub async fn run(
         default_spk_hash
     };
 
-    // Reconstruct redeemScript (v13 only, cpend=0 -- partial fill only works on active orders)
+    // Reconstruct redeemScript (v14 only, cpend=0 -- partial fill only works on active orders)
     let redeem_script = match side {
         "buy" => contract::build_buy_redeem_script(
             &tcid,

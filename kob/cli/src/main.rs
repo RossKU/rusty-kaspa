@@ -5,11 +5,42 @@ use tracing::{error, info};
 
 use kob_cli::Commands;
 
+const EXAMPLES: &str = "\
+EXAMPLES:
+  Wallet & balance:
+    kob-cli --node ws://127.0.0.1:18210 wallet create
+    kob-cli --node ws://127.0.0.1:18210 balance
+    kob-cli --node ws://127.0.0.1:18210 send --to kaspatest:... --amount-kas 1.5
+
+  Token aliases:
+    kob-cli --node <URL> token alias KUSD <covenant_id_64hex>
+    kob-cli --node <URL> token aliases
+
+  Deploy & cancel:
+    kob-cli --node <URL> deploy buy --token KUSD --price-num 100 --price-den 1 \\
+        --min-fill 10000000 --amount-kas 5
+    kob-cli --node <URL> cancel --outpoint <txid>:0      # resolves rest from cache
+    kob-cli --node <URL> cancel-all --token KUSD --yes
+
+  Market making (with shutdown cleanup):
+    kob-cli --node <URL> mm --token KUSD --mid-price-num 100 --mid-price-den 1 \\
+        --amount 100000000 --levels 3 --interval 10
+
+  Requote (cache-resolved):
+    kob-cli --node <URL> requote --outpoint <old>:0 \\
+        --new-side buy --new-token KUSD --new-price-num 105 --new-price-den 1 \\
+        --new-min-fill 10000000 --new-amount 100000000
+
+ENV:
+  KOB_NODE_URL   default for --node
+  KOB_ENGINE_URL default for --engine-url (routes UTXO queries via engine)
+";
+
 /// KOB CLI -- Kaspa Order Book management tool.
 ///
 /// Deploy, cancel, fill, and match orders on the KOB L1 DEX protocol.
 #[derive(Parser, Debug)]
-#[command(name = "kob-cli", version, about)]
+#[command(name = "kob-cli", version, about, after_help = EXAMPLES)]
 struct Cli {
     /// Kaspa node WebSocket URL (required). Set via --node or KOB_NODE_URL env var.
     #[arg(long, env = "KOB_NODE_URL")]

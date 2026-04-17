@@ -42,16 +42,16 @@ pub struct CachedOrder {
     pub min_fill: u64,
     /// Deployed UTXO value in sompi.
     pub value: u64,
-    /// Contract version (only 13 supported).
+    /// Contract version (only 14 supported).
     #[serde(default = "default_version")]
     pub version: u8,
-    /// Expiry DAA score (v13 only, 0 = GTC).
+    /// Expiry DAA score (v14 only, 0 = GTC).
     #[serde(default)]
     pub expiry_daa: u64,
 }
 
 fn default_version() -> u8 {
-    13
+    14
 }
 
 /// Result of a single cancel operation.
@@ -283,6 +283,19 @@ pub async fn run(
     let mut total_recovered: u64 = 0;
     let mut fee_idx = 0;
 
+    // L13: per-order failures must not abort the whole run. Each order
+    // records a CancelResult; the outer fn returns Err only if every
+    // attempt failed.
+    let record_failure = |results: &mut Vec<CancelResult>, order: &OrderCacheEntry| {
+        results.push(CancelResult {
+            outpoint: order.outpoint.clone(),
+            side: order.side.clone(),
+            token: order.token.clone(),
+            recovered_sompi: 0,
+            tx_id: None,
+        });
+    };
+
     for order in &filtered {
         println!("---");
         println!(
@@ -295,19 +308,38 @@ pub async fn run(
 
         if fee_idx >= fee_utxos.len() {
             println!("  SKIP: No more fee UTXOs available.");
+            record_failure(&mut results, order);
             continue;
         }
 
         let fee_utxo = fee_utxos[fee_idx];
 
-        // Verify the order UTXO still exists on-chain
-        let redeem_script = build_redeem_script_for_order(order, &pubkey)?;
+        let redeem_script = match build_redeem_script_for_order(order, &pubkey) {
+            Ok(rs) => rs,
+            Err(e) => {
+                println!("  SKIP: Cannot reconstruct redeemScript ({}).", e);
+                record_failure(&mut results, order);
+                continue;
+            }
+        };
         let p2sh = build_p2sh(&redeem_script);
         let p2sh_address = crate::cancel::p2sh_to_address(&p2sh.script(), network.address_prefix());
 
         let parts: Vec<&str> = order.outpoint.split(':').collect();
+        if parts.len() != 2 {
+            println!("  SKIP: Malformed outpoint '{}'.", order.outpoint);
+            record_failure(&mut results, order);
+            continue;
+        }
         let order_txid = parts[0];
-        let order_index: u32 = parts[1].parse()?;
+        let order_index: u32 = match parts[1].parse() {
+            Ok(i) => i,
+            Err(e) => {
+                println!("  SKIP: Malformed outpoint index ({}).", e);
+                record_failure(&mut results, order);
+                continue;
+            }
+        };
 
         // Try to verify UTXO on-chain; fall back to cached value on query failure
         let order_value = match rpc.get_utxos_by_addresses(&[&p2sh_address]).await {
@@ -360,7 +392,7 @@ pub async fn run(
                 tx_id: None,
             });
         } else {
-            let (tx, sigscripts, recovered) = build_cancel_tx(
+            let built = build_cancel_tx(
                 order,
                 &pubkey,
                 &privkey,
@@ -370,7 +402,15 @@ pub async fn run(
                 fee_utxo.utxo_entry.amount,
                 fee_utxo.utxo_entry.script_public_key.version,
                 &fee_spk_bytes,
-            )?;
+            );
+            let (tx, sigscripts, recovered) = match built {
+                Ok(v) => v,
+                Err(e) => {
+                    println!("  FAILED: Could not build cancel TX ({}).", e);
+                    record_failure(&mut results, order);
+                    continue;
+                }
+            };
 
             let payload = to_rpc_payload(&tx, &sigscripts);
             match rpc.submit_transaction(payload).await {
@@ -388,13 +428,7 @@ pub async fn run(
                 }
                 Err(e) => {
                     println!("  FAILED: {}", e);
-                    results.push(CancelResult {
-                        outpoint: order.outpoint.clone(),
-                        side: order.side.clone(),
-                        token: order.token.clone(),
-                        recovered_sompi: 0,
-                        tx_id: None,
-                    });
+                    record_failure(&mut results, order);
                 }
             }
         }
@@ -405,11 +439,12 @@ pub async fn run(
     println!("==================");
     println!("Cancel Summary");
     println!("==================");
-    let cancelled = results.iter().filter(|r| r.recovered_sompi > 0).count();
-    let skipped = results.iter().filter(|r| r.recovered_sompi == 0).count();
-    println!("Total orders:    {}", results.len());
-    println!("Cancelled:       {}", cancelled);
-    println!("Skipped/Failed:  {}", skipped);
+    let attempted = filtered.len();
+    let succeeded = results.iter().filter(|r| r.recovered_sompi > 0).count();
+    let failed = results.iter().filter(|r| r.recovered_sompi == 0).count();
+    println!("Attempted:       {}", attempted);
+    println!("Succeeded:       {} / {}", succeeded, attempted);
+    println!("Failed/Skipped:  {}", failed);
     println!(
         "Total recovered: {} sompi ({:.8} KAS)",
         total_recovered,
@@ -418,6 +453,28 @@ pub async fn run(
     if dry_run {
         println!();
         println!("(DRY RUN -- no transactions were submitted)");
+    }
+
+    if failed > 0 {
+        println!();
+        println!("Per-order failures:");
+        for r in results.iter().filter(|r| r.recovered_sompi == 0) {
+            println!(
+                "  - {} ({} {})",
+                r.outpoint,
+                r.side,
+                r.token.as_deref().unwrap_or("KAS"),
+            );
+        }
+    }
+
+    // Dry-run is informational; exit Ok regardless. For live runs, all-fail
+    // is a hard error; partial success returns Ok with the warning above.
+    if !dry_run && attempted > 0 && succeeded == 0 {
+        anyhow::bail!(
+            "cancel-all: 0/{} orders cancelled. See per-order failures above.",
+            attempted
+        );
     }
 
     Ok(())
@@ -478,7 +535,7 @@ mod tests {
         assert_eq!(decoded.outpoint, "abc123:0");
         assert_eq!(decoded.side, "buy");
         assert_eq!(decoded.price_num, 100);
-        assert_eq!(decoded.version, 13);
+        assert_eq!(decoded.version, 14);
     }
 
     #[test]
@@ -493,7 +550,7 @@ mod tests {
             "value": 5000000
         }"#;
         let order: CachedOrder = serde_json::from_str(json).unwrap();
-        assert_eq!(order.version, 13, "default version must be 13");
+        assert_eq!(order.version, 14, "default version must be 14");
     }
 
     #[test]
@@ -537,7 +594,7 @@ mod tests {
         assert_eq!(loaded.len(), 2);
         assert_eq!(loaded[0].side, "buy");
         assert_eq!(loaded[1].side, "sell");
-        assert_eq!(loaded[1].version, 13);
+        assert_eq!(loaded[1].version, 14);
 
         let _ = std::fs::remove_file(path);
     }

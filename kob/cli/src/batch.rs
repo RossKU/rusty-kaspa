@@ -521,6 +521,7 @@ async fn execute_operation(
                 fee,
                 0, // buy_expiry (GTC)
                 0, // sell_expiry (GTC)
+                None, // no tamper mode in batch
             )
             .await?;
             Ok(None)

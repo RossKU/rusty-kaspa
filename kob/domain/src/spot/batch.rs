@@ -53,6 +53,7 @@ use kob_core::contract::spot::order::{
     build_sell_ioc_fill_sigscript,
     build_sell_ioc_fill_sigscript_v15,
 };
+use kob_core::contract::spot::bracket::build_bracket_fill_sigscript;
 
 /// Order type (buy or sell) for batch matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,6 +101,37 @@ pub struct BatchOrder {
     /// and must use the TP (Op1) or SL (Op2) selector instead of the
     /// standard sell fill selector (Op1).
     pub oco_path: Option<kob_core::OcoPath>,
+    /// Bracket entry metadata (v16 only).
+    ///
+    /// Contains the receipt and OCO data extracted from the bracket RS state.
+    /// The batch matcher uses this to construct the bracket-specific TX layout:
+    ///   - input[2] = receipt UTXO (must have matching covenant_id)
+    ///   - output[2] = OCO sell P2SH output
+    pub bracket_meta: Option<BracketMeta>,
+}
+
+/// Metadata extracted from a bracket entry redeemScript (v16).
+///
+/// The bracket contract enforces hardcoded index checks:
+///   - input[2].covenant_id == receipt_cov_id
+///   - input[2].amount >= min_receipt_val
+///   - output[2].spk == oco_spk
+///   - output[2].value >= oco_min_val
+#[derive(Debug, Clone)]
+pub struct BracketMeta {
+    /// Receipt covenant ID (32 bytes). input[2] must have this covenant_id.
+    pub receipt_cov_id: [u8; 32],
+    /// Minimum receipt value (sompi). input[2].amount must be >= this.
+    pub min_receipt_val: u64,
+    /// OCO sell SPK (37 bytes: version u16LE + 35-byte P2SH script).
+    /// output[2] must have this SPK.
+    pub oco_spk: Vec<u8>,
+    /// OCO sell SPK version.
+    pub oco_spk_version: u16,
+    /// Minimum OCO output value (sompi). output[2].value must be >= this.
+    pub oco_min_val: u64,
+    /// Entry type (0 = buy, 1 = sell).
+    pub entry_type: u64,
 }
 
 /// Purpose of a planned output.
@@ -185,7 +217,7 @@ impl std::fmt::Display for BatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BatchError::UnsupportedVersion { outpoint, version } => {
-                write!(f, "Order {} is v{}, unsupported (v14/v15 only)", outpoint, version)
+                write!(f, "Order {} is v{}, unsupported (v14/v15/v16 only)", outpoint, version)
             }
             BatchError::EmptyBatch => write!(f, "No orders in batch"),
             BatchError::OutputBelowMinimum { index, value } => {
@@ -301,6 +333,42 @@ pub struct BatchPlan {
     pub buy_output_idx: Vec<usize>,
     /// Covenant output index for each buy (coi). Length = buys.len() if populated.
     pub buy_coi: Vec<u16>,
+    /// Bracket receipt input (v16 only).
+    ///
+    /// When a bracket buy order is in the batch, the bracket contract checks
+    /// `input[2].covenant_id == receipt_cov_id` and `input[2].amount >= min_receipt_val`.
+    /// This field holds the receipt UTXO info, which `build_tx()` inserts at index 2
+    /// (after sells and buys, before the wallet input).
+    ///
+    /// The receipt input requires `sig_op_count = 1` (receipt v4 always needs
+    /// a recipient signature). The executor must sign this input and build
+    /// `build_receipt_consume_sigscript(sig, pk, receipt_rs)`.
+    pub bracket_receipt: Option<BracketReceiptInput>,
+    /// Bracket OCO sell output (v16 only).
+    ///
+    /// When a bracket buy order is in the batch, the bracket contract checks
+    /// `output[2].spk == oco_spk` and `output[2].value >= oco_min_val`.
+    /// This output is inserted at index 2 in `build_tx()`.
+    pub bracket_oco_output: Option<PlannedOutput>,
+}
+
+/// Receipt input for bracket fill (v16).
+///
+/// The bracket contract hardcodes `input[2]` as the receipt input.
+/// The receipt is a trade_receipt covenant UTXO that proves a prior trade
+/// was executed. The matcher signs the receipt to consume it.
+#[derive(Debug, Clone)]
+pub struct BracketReceiptInput {
+    /// Receipt UTXO outpoint (txid, index).
+    pub outpoint: (String, u32),
+    /// Receipt UTXO value in sompi.
+    pub value: u64,
+    /// Receipt P2SH scriptPublicKey bytes.
+    pub script_public_key: Vec<u8>,
+    /// Receipt SPK version.
+    pub spk_version: u16,
+    /// Receipt redeemScript bytes (needed to build consume sigscript).
+    pub redeem_script: Vec<u8>,
 }
 
 /// Which side of the IOC is the sweeper.
@@ -413,8 +481,14 @@ impl BatchPlan {
 
             // Indices >16 are handled by data-push encoding (no OpN limit).
             let is_v15 = buy.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN;
+            let is_bracket = buy.version == 16;
 
-            let ss = if let Some(&(fill_kas, residual_idx, token_idx)) = self.buy_partial_fills.get(&buy_idx) {
+            let ss = if is_bracket {
+                // Bracket entry (v16): sigscript = [Op1][pushData(RS)] (369B).
+                // No toi/tii/coi — bracket contract uses hardcoded output indices
+                // (output[1] for buy entry token dest, output[0] for sell entry KAS dest).
+                build_bracket_fill_sigscript(&buy.redeem_script)
+            } else if let Some(&(fill_kas, residual_idx, token_idx)) = self.buy_partial_fills.get(&buy_idx) {
                 // Partial fill (Op2 selector): buy D&R with residual continuation.
                 if is_v15 {
                     // V15: [sii] [ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]
@@ -480,6 +554,18 @@ impl BatchPlan {
             });
         }
 
+        // === Build bracket receipt input (v16, index 2) ===
+        // Must come BEFORE the wallet input so it lands at input[2].
+        // The bracket contract hardcodes `Op2 OpTxInputAmount` / `Op2 OpInputCovenantId`.
+        if let Some(ref receipt) = self.bracket_receipt {
+            inputs.push(BatchTxInput {
+                tx_id: receipt.outpoint.0.clone(),
+                index: receipt.outpoint.1,
+                sigscript: Vec::new(), // Needs receipt signing externally (sig_op_count=1)
+                sig_op_count: 1,
+            });
+        }
+
         // === Build wallet input (for fee) ===
         if let Some((ref tx_id, index, _value)) = self.wallet_input {
             inputs.push(BatchTxInput {
@@ -500,6 +586,24 @@ impl BatchPlan {
             });
         }
 
+        // === Insert bracket OCO output at index 2 (v16) ===
+        // The bracket contract hardcodes `Op2 OpTxOutputSpk` / `Op2 OpTxOutputAmount`
+        // to check output[2]. Insert AFTER the first two outputs (seller KAS at 0,
+        // buyer tokens at 1) so the OCO lands at index 2.
+        if let Some(ref oco) = self.bracket_oco_output {
+            let oco_out = BatchTxOutput {
+                value: oco.value,
+                script_public_key: oco.script_public_key.clone(),
+                spk_version: oco.spk_version,
+                purpose: oco.purpose,
+            };
+            if outputs.len() >= 2 {
+                outputs.insert(2, oco_out);
+            } else {
+                outputs.push(oco_out);
+            }
+        }
+
         Ok(BatchTx {
             inputs,
             outputs,
@@ -509,7 +613,7 @@ impl BatchPlan {
 
     /// Validate the plan: all contracts satisfied, fees covered, amounts balanced.
     pub fn validate(&self) -> Result<(), BatchError> {
-        // Check: order versions (v14 or v15 for buys)
+        // Check: order versions (v14 or v15 for buys, v16 for bracket entry)
         for (sell, _) in &self.sells {
             if sell.version != 14 {
                 return Err(BatchError::UnsupportedVersion {
@@ -519,7 +623,7 @@ impl BatchPlan {
             }
         }
         for (buy, _) in &self.buys {
-            if buy.version != 14 && buy.version != 15 {
+            if buy.version != 14 && buy.version != 15 && buy.version != 16 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                     version: buy.version,
@@ -887,7 +991,7 @@ pub fn plan_batch_match(
         }
     }
 
-    // Validate order versions (v14 or v15 for buys)
+    // Validate order versions (v14 or v15 for buys, v16 for bracket entry)
     for sell in sells {
         if sell.version != 14 {
             return Err(BatchError::UnsupportedVersion {
@@ -897,7 +1001,7 @@ pub fn plan_batch_match(
         }
     }
     for buy in buys {
-        if buy.version != 14 && buy.version != 15 {
+        if buy.version != 14 && buy.version != 15 && buy.version != 16 {
             return Err(BatchError::UnsupportedVersion {
                 outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                 version: buy.version,
@@ -977,6 +1081,14 @@ pub fn plan_batch_match(
             return Err(BatchError::OutputBelowMinimum {
                 index: i,
                 value: expected_kas,
+            });
+        }
+        // Min-fill guard: sell contract Op1 path checks expected_kas >= mfill.
+        if expected_kas < sell.min_fill {
+            return Err(BatchError::MinFillViolation {
+                index: i,
+                fill_kas: expected_kas,
+                min_fill: sell.min_fill,
             });
         }
         total_seller_kas += expected_kas;
@@ -1228,6 +1340,8 @@ pub fn plan_batch_match(
         sell_output_idx,
         buy_output_idx,
         buy_coi,
+        bracket_receipt: None,
+        bracket_oco_output: None,
     })
 }
 
@@ -1269,15 +1383,13 @@ pub fn plan_ioc_match(
     // Sweep sells with the buy's KAS
     let buy_kas = buy.utxo_value;
     let mut filled_sells: Vec<&BatchOrder> = Vec::new();
-    let mut total_seller_kas: u64 = 0;
-    let mut total_tokens_bought: u64 = 0;
     let mut kas_remaining = buy_kas;
 
     for sell in sells {
         if sell.price_den == 0 {
             continue; // skip broken orders
         }
-        // How much KAS does this sell require?
+        // Min-fill guard: sell contract Op1 checks expected_kas >= mfill.
         let sell_kas_128 = sell.amount as u128 * sell.price_num as u128
             / sell.price_den as u128;
         if sell_kas_128 > u64::MAX as u128 {
@@ -1287,12 +1399,13 @@ pub fn plan_ioc_match(
         if sell_kas < MIN_UTXO_VALUE {
             continue; // too small
         }
+        if sell_kas < sell.min_fill {
+            continue; // unmatchable: on-chain F1 check would fail
+        }
 
         if kas_remaining >= sell_kas {
             // Full fill this sell
             filled_sells.push(sell);
-            total_seller_kas += sell_kas;
-            total_tokens_bought += sell.amount;
             kas_remaining -= sell_kas;
         } else {
             // Can't afford this sell — stop (IOC: no partial fill for now)
@@ -1301,10 +1414,21 @@ pub fn plan_ioc_match(
     }
 
     if filled_sells.is_empty() {
-        return Err(BatchError::InsufficientFee {
-            needed: sells[0].amount as u64,
-            available: buy_kas,
+        return Err(BatchError::MinFillViolation {
+            index: 0,
+            fill_kas: 0,
+            min_fill: sells.first().map_or(0, |s| s.min_fill),
         });
+    }
+
+    // Compute totals from the filtered filled_sells
+    let mut total_seller_kas: u64 = 0;
+    let mut total_tokens_bought: u64 = 0;
+    for sell in &filled_sells {
+        let sell_kas = (sell.amount as u128 * sell.price_num as u128
+            / sell.price_den as u128) as u64;
+        total_seller_kas += sell_kas;
+        total_tokens_bought += sell.amount;
     }
 
     let n = filled_sells.len();
@@ -1438,6 +1562,8 @@ pub fn plan_ioc_match(
         sell_output_idx: Vec::new(),
         buy_output_idx: Vec::new(),
         buy_coi: Vec::new(),
+        bracket_receipt: None,
+        bracket_oco_output: None,
     })
 }
 
@@ -1522,6 +1648,21 @@ pub fn plan_sell_ioc_match(
             utxo_value: sell.utxo_value,
             filled_tokens: total_tokens_sold,
         });
+    }
+
+    // Min-fill guard: the sell contract's IOC path checks fill_kas >= mfill.
+    // fill_kas = total_tokens_sold * pnum / pden. If this is below min_fill,
+    // the on-chain script will reject the TX.
+    if sell.price_den > 0 {
+        let fill_kas = total_tokens_sold as u128 * sell.price_num as u128
+            / sell.price_den as u128;
+        if (fill_kas as u64) < sell.min_fill {
+            return Err(BatchError::MinFillViolation {
+                index: 0,
+                fill_kas: fill_kas as u64,
+                min_fill: sell.min_fill,
+            });
+        }
     }
 
     let m = filled_buys.len();
@@ -1639,6 +1780,8 @@ pub fn plan_sell_ioc_match(
         sell_output_idx: Vec::new(),
         buy_output_idx: Vec::new(),
         buy_coi: Vec::new(),
+        bracket_receipt: None,
+        bracket_oco_output: None,
     })
 }
 
@@ -1674,6 +1817,7 @@ mod tests {
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
             oco_path: None,
+            bracket_meta: None,
         }
     }
 
@@ -1698,6 +1842,7 @@ mod tests {
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
             oco_path: None,
+            bracket_meta: None,
         }
     }
 
@@ -2200,6 +2345,7 @@ mod tests {
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
             oco_path: None,
+            bracket_meta: None,
         };
         let buy = make_buy(0x20, 10_000_000, 1, 3, TOKEN_A);
 
@@ -2235,6 +2381,7 @@ mod tests {
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
             oco_path: None,
+            bracket_meta: None,
         };
 
         let result = plan_batch_match(

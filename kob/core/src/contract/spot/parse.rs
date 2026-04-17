@@ -50,16 +50,22 @@ pub struct ParsedOrder {
 pub const BUY_STATE_SIZE: usize = 145;
 /// Sell state size: 112B.
 pub const SELL_STATE_SIZE: usize = 112;
+/// Bracket state size: 224B.
+pub const BRACKET_STATE_SIZE: usize = 224;
 
 /// Buy body size (v14: IOC path added, +9B).
 const BUY_BODY_SIZE: usize = 251;
 /// Sell body size (v14: IOC path added, +60B).
 const SELL_BODY_SIZE: usize = 304;
+/// Bracket body size: 141B.
+const BRACKET_BODY_SIZE: usize = 141;
 
 /// Buy RS size: 145 + 251 = 396.
 pub const BUY_RS_SIZE: usize = BUY_STATE_SIZE + BUY_BODY_SIZE;
 /// Sell RS size: 112 + 304 = 416.
 pub const SELL_RS_SIZE: usize = SELL_STATE_SIZE + SELL_BODY_SIZE;
+/// Bracket RS size: 224 + 141 = 365.
+pub const BRACKET_RS_SIZE: usize = BRACKET_STATE_SIZE + BRACKET_BODY_SIZE;
 
 /// Parsed OCO sell order (single-UTXO, two price paths).
 #[derive(Debug, Clone)]
@@ -97,6 +103,17 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
             // Sell: body starts at offset 112, signature 0x58 0x7a (Op8 OpRoll)
             if rs[SELL_STATE_SIZE] == 0x58 && rs[SELL_STATE_SIZE + 1] == 0x7a {
                 return parse_sell_state(rs);
+            }
+            None
+        }
+        BRACKET_RS_SIZE => {
+            // Bracket v4/v6: body starts at offset 224, signature 0xb9 0xc9
+            // (OpTxInputIndex, OpTxInputScriptSigLen — same first two bytes
+            //  as buy, but third byte is 0x02 not 0x76).
+            if rs[BRACKET_STATE_SIZE] == 0xb9 && rs[BRACKET_STATE_SIZE + 1] == 0xc9
+                && rs[BRACKET_STATE_SIZE + 2] == 0x02
+            {
+                return parse_bracket_state(rs);
             }
             None
         }
@@ -247,6 +264,90 @@ fn parse_sell_state(rs: &[u8]) -> Option<ParsedOrder> {
         redeem_script: rs.to_vec(),
         post_only: false,
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
+        ifd_order_b_rs: None,
+    })
+}
+
+/// Parse bracket order state (224B) into a `ParsedOrder`.
+///
+/// The bracket entry leg is a buy (entry_type=0) or sell (entry_type=1) order
+/// from the matcher's perspective. The exit parameters (oco_spk, receipt_cov_id,
+/// etc.) are not needed for order-book matching and are ignored here.
+///
+/// State layout (224B):
+///   [0x08][entry_type 8B]        = bytes 0..9
+///   [0x20][token_cov_id 32B]     = bytes 9..42
+///   [0x08][epnum 8B]             = bytes 42..51
+///   [0x08][epden 8B]             = bytes 51..60
+///   [0x25][oco_spk 37B]          = bytes 60..98
+///   [0x08][oco_min_val 8B]       = bytes 98..107
+///   [0x08][min_fill 8B]          = bytes 107..116
+///   [0x08][min_receipt_val 8B]   = bytes 116..125
+///   [0x20][receipt_cov_id 32B]   = bytes 125..158
+///   [0x20][trade_spk_hash 32B]   = bytes 158..191
+///   [0x20][owner_hash 32B]       = bytes 191..224
+fn parse_bracket_state(rs: &[u8]) -> Option<ParsedOrder> {
+    if rs.len() < BRACKET_STATE_SIZE {
+        return None;
+    }
+
+    // Verify push-size markers
+    if rs[0] != 0x08 { return None; }   // entry_type
+    if rs[9] != 0x20 { return None; }   // token_cov_id
+    if rs[42] != 0x08 { return None; }  // epnum
+    if rs[51] != 0x08 { return None; }  // epden
+    if rs[60] != 0x25 { return None; }  // oco_spk (37 bytes)
+    if rs[98] != 0x08 { return None; }  // oco_min_val
+    if rs[107] != 0x08 { return None; } // min_fill
+    if rs[116] != 0x08 { return None; } // min_receipt_val
+    if rs[125] != 0x20 { return None; } // receipt_cov_id
+    if rs[158] != 0x20 { return None; } // trade_spk_hash
+    if rs[191] != 0x20 { return None; } // owner_hash
+
+    let entry_type = u64::from_le_bytes(rs[1..9].try_into().ok()?);
+
+    let mut tcid = [0u8; 32];
+    tcid.copy_from_slice(&rs[10..42]);
+
+    let pnum = u64::from_le_bytes(rs[43..51].try_into().ok()?);
+    let pden = u64::from_le_bytes(rs[52..60].try_into().ok()?);
+
+    let mfill = u64::from_le_bytes(rs[108..116].try_into().ok()?);
+
+    let mut trade_spk_hash = [0u8; 32];
+    trade_spk_hash.copy_from_slice(&rs[159..191]);
+
+    let mut ohash = [0u8; 32];
+    ohash.copy_from_slice(&rs[192..224]);
+
+    if pnum == 0 || pden == 0 || mfill == 0 {
+        return None;
+    }
+
+    // entry_type 0 = buy, 1 = sell
+    let side = if entry_type == 0 {
+        OrderSide::Buy
+    } else {
+        OrderSide::Sell
+    };
+
+    Some(ParsedOrder {
+        order_type: side,
+        version: 0,
+        // Buy entries carry the token_cov_id; sell entries use [0;32]
+        // (same convention as regular orders).
+        token_cov_id: if side == OrderSide::Buy { tcid } else { [0u8; 32] },
+        price_num: pnum,
+        price_den: pden,
+        min_fill: mfill,
+        owner_hash: ohash,
+        spk_hash: trade_spk_hash,
+        _max_matcher_fee: 0,
+        cpend: 0,
+        requires_zk: has_zk_opcode(rs, BRACKET_STATE_SIZE),
+        redeem_script: rs.to_vec(),
+        post_only: false,
+        expiry_daa: None,
         ifd_order_b_rs: None,
     })
 }
@@ -558,5 +659,60 @@ mod tests {
         fake[139] = 0x58; // sell signature, not OCO sell
         fake[140] = 0x7a;
         assert!(parse_oco_sell_redeem_script(&fake).is_none());
+    }
+
+    #[test]
+    fn roundtrip_bracket_buy() {
+        use crate::contract::spot::bracket::build_bracket_redeem_script;
+        let tcid = [0xAA; 32];
+        let ohash = [0xBB; 32];
+        let tspkh = [0xCC; 32];
+        let oco_spk = [0xDD; 37];
+        let rcid = [0xEE; 32];
+        let rs = build_bracket_redeem_script(
+            0, // buy entry
+            &tcid, 3, 2, &oco_spk, 500_000, 1_000_000, 100, &rcid, &tspkh, &ohash,
+        ).unwrap();
+        assert_eq!(rs.len(), BRACKET_RS_SIZE);
+        let parsed = parse_redeem_script(&rs).expect("should parse bracket buy");
+        assert_eq!(parsed.order_type, OrderSide::Buy);
+        assert_eq!(parsed.token_cov_id, tcid);
+        assert_eq!(parsed.price_num, 3);
+        assert_eq!(parsed.price_den, 2);
+        assert_eq!(parsed.min_fill, 1_000_000);
+        assert_eq!(parsed.owner_hash, ohash);
+        assert_eq!(parsed.spk_hash, tspkh);
+        assert_eq!(parsed._max_matcher_fee, 0);
+        assert_eq!(parsed.cpend, 0);
+        assert_eq!(parsed.expiry_daa, None);
+    }
+
+    #[test]
+    fn roundtrip_bracket_sell() {
+        use crate::contract::spot::bracket::build_bracket_redeem_script;
+        let tcid = [0xAA; 32];
+        let ohash = [0xBB; 32];
+        let tspkh = [0xCC; 32];
+        let oco_spk = [0xDD; 37];
+        let rcid = [0xEE; 32];
+        let rs = build_bracket_redeem_script(
+            1, // sell entry
+            &tcid, 5, 3, &oco_spk, 500_000, 2_000_000, 100, &rcid, &tspkh, &ohash,
+        ).unwrap();
+        assert_eq!(rs.len(), BRACKET_RS_SIZE);
+        let parsed = parse_redeem_script(&rs).expect("should parse bracket sell");
+        assert_eq!(parsed.order_type, OrderSide::Sell);
+        assert_eq!(parsed.token_cov_id, [0u8; 32]); // sell entries have no tcid
+        assert_eq!(parsed.price_num, 5);
+        assert_eq!(parsed.price_den, 3);
+        assert_eq!(parsed.min_fill, 2_000_000);
+        assert_eq!(parsed.owner_hash, ohash);
+        assert_eq!(parsed.spk_hash, tspkh);
+    }
+
+    #[test]
+    fn bracket_wrong_size_returns_none() {
+        assert!(parse_redeem_script(&vec![0x51; 364]).is_none());
+        assert!(parse_redeem_script(&vec![0x51; 366]).is_none());
     }
 }

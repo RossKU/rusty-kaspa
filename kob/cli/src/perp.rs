@@ -1700,6 +1700,7 @@ pub async fn run(
             emergency_daa,
             max_matcher_fee,
         } => {
+            crate::deploy::validate_amount_not_dust(*margin, "--margin")?;
             deploy_perp(
                 wallet_path,
                 node_url,
@@ -1731,6 +1732,7 @@ pub async fn run(
             emergency_daa,
             max_matcher_fee,
         } => {
+            crate::deploy::validate_amount_not_dust(*margin, "--margin")?;
             deploy_perp(
                 wallet_path,
                 node_url,

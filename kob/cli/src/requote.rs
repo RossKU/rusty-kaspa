@@ -14,6 +14,7 @@
 //!   *current* UTXOs (not cancel change). Faster but carries a small risk:
 //!   if the cancel TX is not accepted, the deploy still goes through.
 
+use crate::cancel_all;
 use crate::node::NodeClient;
 use crate::signing;
 use kob_core::contract;
@@ -60,19 +61,19 @@ pub async fn run(
     node_url: &str,
     network: Network,
     outpoint_str: &str,
-    old_side: &str,
+    old_side: Option<&str>,
     old_token: Option<&str>,
-    old_price_num: u64,
-    old_price_den: u64,
-    old_min_fill: u64,
+    old_price_num: Option<u64>,
+    old_price_den: Option<u64>,
+    old_min_fill: Option<u64>,
     old_order_value: Option<u64>,
-    old_version: u8,
-    old_expiry: u64,
+    old_version: Option<u8>,
+    old_expiry: Option<u64>,
     new_params: &NewOrderParams,
     new_expiry: u64,
     no_wait: bool,
     fee_utxo_override: Option<&str>,
-    old_max_matcher_fee: u64,
+    old_max_matcher_fee: Option<u64>,
     new_max_matcher_fee: u64,
 ) -> anyhow::Result<()> {
     let wallet = WalletContext::load(wallet_path)?;
@@ -102,8 +103,71 @@ pub async fn run(
     if new_params.version != 14 {
         anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", new_params.version);
     }
+
+    // Resolve missing old_* params from the orders cache.
+    let needs_cache = old_side.is_none()
+        || old_price_num.is_none()
+        || old_price_den.is_none()
+        || old_min_fill.is_none();
+
+    let cached: Option<crate::order_cache::OrderCacheEntry> = if needs_cache {
+        let cache_path = cancel_all::orders_cache_path(wallet_path);
+        let orders = cancel_all::load_orders_cache(&cache_path)?;
+        orders.into_iter().find(|o| o.outpoint == outpoint_str)
+    } else {
+        None
+    };
+
+    macro_rules! resolve_field {
+        ($cli:expr, $field:ident, $name:expr) => {
+            match $cli {
+                Some(v) => v,
+                None => match &cached {
+                    Some(c) => c.$field,
+                    None => anyhow::bail!(
+                        "Missing --old-{} and outpoint {} not found in orders cache.",
+                        $name, outpoint_str
+                    ),
+                },
+            }
+        };
+    }
+
+    let old_side_owned: String = match old_side {
+        Some(s) => s.to_string(),
+        None => match &cached {
+            Some(c) => c.side.clone(),
+            None => anyhow::bail!(
+                "Missing --old-side and outpoint {} not found in orders cache.",
+                outpoint_str
+            ),
+        },
+    };
+    let old_side: &str = old_side_owned.as_str();
+    let old_price_num = resolve_field!(old_price_num, price_num, "price-num");
+    let old_price_den = resolve_field!(old_price_den, price_den, "price-den");
+    let old_min_fill = resolve_field!(old_min_fill, min_fill, "min-fill");
+    let old_version = old_version.unwrap_or_else(|| cached.as_ref().map_or(14, |c| c.version));
+    let old_expiry = old_expiry.unwrap_or_else(|| cached.as_ref().map_or(0, |c| c.expiry_daa));
+    let old_max_matcher_fee = old_max_matcher_fee.unwrap_or_else(|| {
+        cached.as_ref().map_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE, |c| c.max_matcher_fee)
+    });
+    let old_token_owned: Option<String> = match old_token {
+        Some(t) => Some(t.to_string()),
+        None => cached.as_ref().and_then(|c| c.token.clone()),
+    };
+    let old_token: Option<&str> = old_token_owned.as_deref();
+
     if old_version != 14 {
         anyhow::bail!("Unsupported old contract version {}. Only v14 is supported.", old_version);
+    }
+
+    if needs_cache && cached.is_some() {
+        println!(
+            "Loaded old order from cache: side={}, price={}/{}, min_fill={}",
+            old_side, old_price_num, old_price_den, old_min_fill
+        );
+        println!();
     }
 
     // STEP 1: Build and submit cancel TX

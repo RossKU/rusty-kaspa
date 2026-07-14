@@ -1280,3 +1280,478 @@ pub fn build_sell_ioc_fill_sigscript_v15(
     ss.extend_from_slice(&push_data(redeem_script));
     ss
 }
+
+// ============================================================================
+// V16 BUY CONTRACT — v15 semantics + Phase-0 fix (F6 cross-input authentication)
+// ============================================================================
+//
+// V16 = V15 with one structural change: F6's cross-input price read is bound
+// to the SAME input that the covenant check already authenticates, instead of
+// a free `sii` sigscript parameter.
+//
+// The v15 flaw: F6 read sell_pnum/sell_pden via `OpTxInputScriptSigSubstr` at
+// input index `sii`, a bare sigscript-supplied number never checked against
+// anything. The matcher who assembles the batch tx could set `sii` to a
+// self-controlled decoy input with forged price bytes at the expected offsets,
+// while the REAL trade still settles against the genuine (and pricier)
+// counterparty identified by `tii` (checked via `OpTxInputCovId(tii)==tcid`).
+//
+// The fix (see V16_STATUS.md Phase 0 for the full derivation):
+//   - Fill / IOC-fill: `sii` is deleted from the sigscript. F6 reads the
+//     substr source from `tii` (the SAME value already used, and already
+//     authenticated, by the token-input covenant check a few instructions
+//     earlier) via `OpPick(tii)` instead of a second, free `OpPick(sii)`.
+//   - Partial-fill: the covenant check in this path has always hardcoded the
+//     token input to literal tx-input-index `1` (`Op1 OpTxInputCovId`, both
+//     v14 and v15 — see CLI's `partial_fill.rs` TX layout doc:
+//     input[0]=buy, input[1]=token, input[2]=fee). There is no `tii` stack
+//     variable there to point F6 at, so F6 is fixed the same way the
+//     covenant check already is: the substr source is the hardcoded literal
+//     `1`, not any sigscript-suppliable value.
+//
+// In both cases `sii` disappears from the sigscript entirely (not merely
+// forced equal to `tii` at runtime, which would still cost a check) — since
+// `sii` was always meant to equal the already-authenticated input, there is
+// nothing left to pass as a separate parameter. This makes v16 both smaller
+// and stricter than v15: the fill path is 1 byte shorter (no extra cleanup
+// item to drop) and the partial path is 2 bytes shorter (no `OpPick` needed
+// to fetch a hardcoded constant), and the sigscript itself sheds the `sii`
+// push (saving another 1-2 bytes per spend).
+//
+// State layout: UNCHANGED (145B) — same as v14/v15. mmfee field is BPS
+// (basis points), same interpretation as v15, NOT absolute sompi.
+
+/// V16 buy_order body bytecode (331 bytes).
+///
+/// F6 CROSS-INPUT SURPLUS CAP (applied to fill AND partial paths), fixed:
+///   1. Read sell_pnum from sell_sigscript[7..15) via OpTxInputScriptSigSubstr,
+///      with the input index bound to the already-authenticated token input
+///      (`tii` for fill/IOC-fill; hardcoded literal `1` for partial-fill).
+///   2. Read sell_pden from sell_sigscript[16..24) the same way.
+///   3. tokens = fk_or_kas / buy_pden * buy_pnum  (recompute, div-first overflow-safe)
+///   4. fair_kas = tokens / sell_pden * sell_pnum
+///   5. surplus = fk_or_kas - fair_kas
+///   6. max_surplus = fk_or_kas / 10000 * mmfee_bps
+///   7. Verify: max_surplus >= surplus
+///   (Fill uses kas_in from OpTxInputAmount; partial uses fk from sigscript.)
+///
+/// State (145B): [tcid 32B][pnum 8B][pden 8B][mfill 8B][ohash 32B][bspkh 32B][mmfee_bps 8B][cpend 1B][expiry_daa 8B]
+///
+/// Stack after state push:
+///   expiry(0), cpend(1), mmfee_bps(2), bspkh(3), ohash(4), mfill(5), pden(6), pnum(7), tcid(8)
+///
+/// Dispatch thresholds (RS=476B):
+///   T0 = 481 (expire < 481 < fill)
+///   T1 = 489 (fill < 489 < partial)
+///   T2 = 494 (partial < 494 < cancel)
+///
+/// Fill sigscript: `[toi] [tii] [coi] [Op1/Op5] [pushData(RS)]` (no `sii` — see above)
+///   base=483, max=486 (3 data-push indices)
+/// Partial sigscript: `[ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]` (no `sii`)
+///   base=491, max=493 (2 data-push indices)
+pub const BUY_ORDER_V16_BODY: &[u8] = &[
+    // DISPATCH PREAMBLE (15B) — same structure as v14/v15, updated thresholds
+    0xb9, 0xc9, 0x76,             // OpTxInputIndex, OpTxInputScriptSigLen, OpDup  [3B]
+    0x02, 0xee, 0x01,             // push T2=494                                   [3B]
+    0x9f,                         // OpLessThan (sigLen < T2?)                      [1B]
+    0x63,                         // OpIf (expire/fill/partial)                     [1B]
+    0x76,                         // OpDup (keep sigLen for T0 check)               [1B]
+    0x02, 0xe1, 0x01,             // push T0=481                                   [3B]
+    0x9f,                         // OpLessThan (sigLen < T0?)                      [1B]
+    0x63,                         // OpIf (EXPIRE)                                  [1B]
+    0x75,                         // OpDrop (sigLen, not needed in expire)           [1B]
+
+    // EXPIRE PATH (21B) — identical to v14/v15
+    0x76, 0x69,                   // OpDup OpVerify (expiry != 0 or FAIL)            [2B]
+    0xb0,                         // OpCheckLockTimeVerify                           [1B]
+    0x00, 0xc3, 0xaa,             // Op0 OpTxOutputSpk OpBlake2b                    [3B]
+    0x53, 0x79,                   // Op3 OpPick(bspkh)                              [2B]
+    0x87, 0x69,                   // OpEqual OpVerify                               [2B]
+    0x00, 0xc2,                   // Op0 OpTxOutputAmount                           [2B]
+    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount                 [2B]
+    0xa2, 0x69,                   // OpGTE OpVerify                                 [2B]
+    0x6d, 0x6d, 0x6d, 0x6d, 0x75, // Op2Drop x4 + OpDrop                           [5B]
+
+    // ELSE: FILL OR PARTIAL
+    0x67,                         // OpElse                                         [1B]
+
+    // TIME GATE (12B) — identical to v14/v15
+    0x51, 0x7a,                   // Op1 OpRoll(expiry)                             [2B]
+    0x76, 0x00, 0x9c,             // OpDup Op0 OpNumEqual                           [3B]
+    0x64,                         // OpNotIf                                        [1B]
+    0x76, 0xb5,                   // OpDup OpTxLockTime                             [2B]
+    0xa0, 0x69,                   // OpGreaterThan OpVerify                         [2B]
+    0x68,                         // OpEndIf                                        [1B]
+    0x75,                         // OpDrop (expiry)                                [1B]
+
+    // EXPOSURE DELAY (3B) — identical to v14/v15
+    0x01, 0x32,                   // push(50) MIN_EXPOSURE = 50 DAA                 [2B]
+    0xb1,                         // OpCheckSequenceVerify                          [1B]
+
+    // T1 DISPATCH (5B) — updated threshold
+    0x02, 0xe9, 0x01,             // push T1=489                                    [3B]
+    0x9f,                         // OpLessThan (sigLen < T1?)                       [1B]
+    0x63,                         // OpIf (fill)                                    [1B]
+
+    // ============================================================
+    // FILL PATH (61B v14-identical + 41B F6 + 6B cleanup = 108B)
+    // ============================================================
+    // Stack: cpend(0), mmfee_bps(1), bspkh(2), ohash(3), mfill(4), pden(5),
+    //        pnum(6), tcid(7), 1(8), coi(9), tii(10), toi(11)
+    //
+    // F5: cancel_pending must be 0
+    0x00, 0x87, 0x69,             // Op0 OpEqual OpVerify (cpend==0)                [3B]
+    // Stack: mmfee_bps(0), bspkh(1), ohash(2), mfill(3), pden(4),
+    //        pnum(5), tcid(6), 1(7), coi(8), tii(9), toi(10)
+    //
+    // Price calc — overflow-safe div-first (kas/pden*pnum instead of kas*pnum/pden)
+    0xb9, 0xbe,                   // OpTxInputIndex, OpTxInputAmount -> kas          [2B]
+    0x76,                         // OpDup                                          [1B]
+    0x57, 0x79, 0x95,             // Op7 OpPick(pnum) OpMul -> product              [3B]
+    0x56, 0x79, 0x96,             // Op6 OpPick(pden) OpDiv -> expected_tokens      [3B]
+    0x76,                         // OpDup                                          [1B]
+    0x56, 0x79, 0xa2, 0x69,       // Op6 OpPick(mfill) OpGTE OpVerify              [4B]
+    //
+    // IOC SUB-DISPATCH (9B) — identical to v14/v15
+    0x59, 0x79,                   // Op9 OpPick(selector copy)                      [2B]
+    0x55, 0x87,                   // Op5 OpEqual (selector == 5?)                   [2B]
+    0x63,                         // OpIf (IOC)                                     [1B]
+    0x75,                         // OpDrop (drop exp_tok)                          [1B]
+    0x54, 0x79,                   // Op4 OpPick(mfill)                              [2B]
+    0x68,                         // OpEndIf                                        [1B]
+    //
+    // Token output amount (PARAMETERIZED: toi) — identical to v14/v15
+    0x5c, 0x79, 0xc2,             // Op12 OpPick(toi) OpTxOutputAmount              [3B]
+    0x7c, 0xa2, 0x69,             // OpSwap OpGTE OpVerify                          [3B]
+    // kas(0), mmfee_bps(1), ..., toi(11)
+    //
+    // Token input covenant check (PARAMETERIZED: tii) — identical to v14/v15
+    // This is the authentication F6 below now reuses instead of a free `sii`.
+    0x5a, 0x79, 0xcf,             // Op10 OpPick(tii) OpTxInputCovId               [3B]
+    0x58, 0x79, 0x87, 0x69,       // Op8 OpPick(tcid) OpEqual OpVerify             [4B]
+    // kas(0), mmfee_bps(1), ..., toi(11)
+    //
+    // F2: buyer SPK hash check (PARAMETERIZED: toi) — identical to v14/v15
+    0x5b, 0x79, 0xc3, 0xaa,       // Op11 OpPick(toi) OpTxOutputSpk OpBlake2b      [4B]
+    0x53, 0x79, 0x87, 0x69,       // Op3 OpPick(bspkh) OpEqual OpVerify            [4B]
+    // kas(0), mmfee_bps(1), ..., toi(11)
+    //
+    // F4: token output covenant check (PARAMETERIZED: coi) — identical to v14/v15
+    0x57, 0x79, 0x76,             // Op7 OpPick(tcid) OpDup                        [3B]
+    0xd2, 0x51, 0xa2, 0x69,       // OpCovOutCount(T) Op1 OpGTE OpVerify           [4B]
+    0x5a, 0x79, 0xd3,             // Op10 OpPick(coi) OpCovOutputIdx(T,coi)        [3B]
+    0x5c, 0x79,                   // Op12 OpPick(toi)                              [2B]
+    0x87, 0x69,                   // OpEqual OpVerify                              [2B]
+    // kas(0), mmfee_bps(1), bspkh(2), ohash(3), mfill(4), pden(5),
+    //    pnum(6), tcid(7), 1(8), coi(9), tii(10), toi(11) = 12 items (v14-identical, no sii)
+    //
+    // ============================================================
+    // F6: CROSS-INPUT SURPLUS CAP (41B) — FIXED: reads tii, not free sii
+    // ============================================================
+    // Read sell_pnum from the ALREADY-AUTHENTICATED tii input's sigscript[7..15)
+    // (tii is still on the stack at depth 10, unconsumed by the OpPick above.)
+    0x5a, 0x79,                   // Op10 OpPick(tii)                              [2B]
+    0x57,                         // Op7 (start=7)                                 [1B]
+    0x5f,                         // Op15 (end=15)                                 [1B]
+    0xbc,                         // OpTxInputScriptSigSubstr -> sell_pnum         [1B]
+    // (13): sell_pnum(0), kas(1), mmfee_bps(2), ..., toi(12)
+    //
+    // Read sell_pden from the same tii input's sigscript[16..24)
+    0x5b, 0x79,                   // Op11 OpPick(tii)                              [2B]
+    0x60,                         // Op16 (start=16)                               [1B]
+    0x01, 0x18,                   // push 24 (end=24)                              [2B]
+    0xbc,                         // OpTxInputScriptSigSubstr -> sell_pden         [1B]
+    // (14): sell_pden(0), sell_pnum(1), kas(2), mmfee_bps(3), ...,
+    //       pden_b(7), pnum_b(8), ..., toi(13)
+    //
+    // Recompute: tokens = kas / buy_pden * buy_pnum (div-first, overflow-safe)
+    0x52, 0x79,                   // Op2 OpPick(kas)                               [2B]
+    0x58, 0x79,                   // Op8 OpPick(pden_b)                            [2B]
+    0x96,                         // OpDiv -> kas / buy_pden                       [1B]
+    0x59, 0x79,                   // Op9 OpPick(pnum_b)                            [2B]
+    0x95,                         // OpMul -> tokens                               [1B]
+    //
+    // fair_kas = tokens / sell_pden * sell_pnum (div-first, overflow-safe)
+    0x51, 0x79,                   // Op1 OpPick(sell_pden)                         [2B]
+    0x96,                         // OpDiv -> tokens / sell_pden                   [1B]
+    0x52, 0x79,                   // Op2 OpPick(sell_pnum)                         [2B]
+    0x95,                         // OpMul -> fair_kas                             [1B]
+    //
+    // surplus = kas - fair_kas
+    0x53, 0x79,                   // Op3 OpPick(kas)                               [2B]
+    0x7c,                         // OpSwap                                        [1B]
+    0x94,                         // OpSub -> surplus = kas - fair_kas             [1B]
+    //
+    // max_surplus = kas / 10000 * mmfee_bps (div-first, overflow-safe)
+    0x53, 0x79,                   // Op3 OpPick(kas)                               [2B]
+    0x02, 0x10, 0x27,             // push 10000 (0x2710 LE)                        [3B]
+    0x96,                         // OpDiv -> kas / 10000                          [1B]
+    0x55, 0x79,                   // Op5 OpPick(mmfee_bps)                         [2B]
+    0x95,                         // OpMul -> max_surplus                         [1B]
+    //
+    // Verify: max_surplus >= surplus
+    0xa2, 0x69,                   // OpGTE OpVerify                                [2B]
+    // (14): sell_pden(0), sell_pnum(1), kas(2), mmfee_bps(3), ..., toi(13)
+    //
+    // Drop F6 temporaries (sell_pden + sell_pnum)
+    0x6d,                         // Op2Drop                                       [1B]
+    // (12): kas(0), mmfee_bps(1), ..., toi(11) — restored to pre-F6 state (v14-identical)
+    //
+    // ============================================================
+    // Cleanup: 12 items = Op2Drop x6 (v14-identical, NOT v15's 13-item +OpDrop)
+    0x6d, 0x6d, 0x6d, 0x6d, 0x6d, 0x6d, // Op2Drop x6                              [6B]
+
+    // ============================================================
+    // PARTIAL FILL PATH (1B OpElse + 88B v14-identical + 39B F6 + 6B cleanup = 134B)
+    // ============================================================
+    0x67,                         // OpElse (sigLen >= T1: partial)                 [1B]
+    // Stack: cpend(0), mmfee_bps(1), bspkh(2), ohash(3), mfill(4), pden(5),
+    //        pnum(6), tcid(7), 2(8), fk(9), ti(10), ri(11)
+    // F5
+    0x00, 0x87, 0x69,             // cpend==0                                      [3B]
+    // Stack: mmfee_bps(0), bspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
+    //        tcid(6), 2(7), fk(8), ti(9), ri(10)  [11 items, v14-identical, no sii]
+    // Price calc: fill_tokens = fk / pden * pnum (div-first, overflow-safe)
+    0x58, 0x79,                   // Op8 OpPick(fk)                                [2B]
+    0x76,                         // OpDup                                         [1B]
+    0x56, 0x79, 0x96,             // Op6 OpPick(pden) OpDiv                        [3B]
+    0x57, 0x79, 0x95,             // Op7 OpPick(pnum) OpMul                        [3B]
+    0x76,                         // OpDup                                         [1B]
+    0x56, 0x79, 0xa2, 0x69,       // Op6 OpPick(mfill) OpGTE OpVerify             [4B]
+    0x5b, 0x79, 0xc2,             // Op11 OpPick(ti) OpTxOutputAmount              [3B]
+    0x7c, 0xa2, 0x69,             // OpSwap OpGTE OpVerify                        [3B]
+    0xb9, 0xbe,                   // kas_in                                        [2B]
+    0x51, 0x79, 0xa0, 0x69,       // Op1 OpPick(fk_c) OpGreaterThan OpVerify       [4B]
+    0x5b, 0x79, 0xc3,             // Op11 OpPick(ri) OpTxOutputSpk                 [3B]
+    0xb9, 0xbf,                   // OpTxInputIndex OpTxInputSpk                   [2B]
+    0x87, 0x69,                   // OpEqual OpVerify                              [2B]
+    0xb9, 0xbe,                   // kas_in                                        [2B]
+    0x51, 0x7a, 0x94,             // Op1 OpRoll(fk_c) OpSub                        [3B]
+    0x5b, 0x79, 0xc2,             // Op11 OpPick(ri) OpTxOutputAmount              [3B]
+    0x7c, 0xa2, 0x69,             // OpSwap OpGTE OpVerify                        [3B]
+    0xb9, 0xbe,                   // kas_in                                        [2B]
+    0x59, 0x79, 0x94,             // Op9 OpPick(fk) OpSub                          [3B]
+    0x55, 0x79, 0x96,             // Op5 OpPick(pden) OpDiv                        [3B]
+    0x56, 0x79, 0x95,             // Op6 OpPick(pnum) OpMul                        [3B]
+    0x54, 0x79, 0xa2, 0x69,       // Op4 OpPick(mfill) OpGTE OpVerify             [4B]
+    // Token input check — HARDCODED input index 1 (v14/v15-identical). F6
+    // below authenticates against this exact same literal, not a free `sii`.
+    0x51, 0xcf,                   // Op1 OpTxInputCovId                            [2B]
+    0x57, 0x79, 0x87, 0x69,       // Op7 OpPick(tcid) OpEqual OpVerify             [4B]
+    // F2: buyer SPK hash
+    0x59, 0x79, 0xc3,             // Op9 OpPick(ti) OpTxOutputSpk                  [3B]
+    0xaa,                         // OpBlake2b                                     [1B]
+    0x52, 0x79, 0x87, 0x69,       // Op2 OpPick(bspkh) OpEqual OpVerify            [4B]
+    // F4: token output covenant
+    0x56, 0x79, 0x76,             // Op6 OpPick(tcid) OpDup                        [3B]
+    0xd2, 0x51, 0xa2, 0x69,       // OpCovOutCount(T) Op1 OpGTE OpVerify           [4B]
+    0x00, 0xd3,                   // Op0 OpCovOutputIdx(T,0)                       [2B]
+    0x51,                         // Op1                                           [1B]
+    0x87, 0x69,                   // OpEqual OpVerify                              [2B]
+    // mmfee_bps(0), bspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
+    //   tcid(6), 2(7), fk(8), ti(9), ri(10) = 11 items (v14-identical, no sii)
+    //
+    // ============================================================
+    // F6: CROSS-INPUT SURPLUS CAP (39B) — FIXED: idx hardcoded to literal 1
+    // ============================================================
+    // Read sell_pnum from input[1]'s sigscript[7..15). No OpPick needed: the
+    // index itself is the constant the covenant check above already trusts.
+    0x51,                         // Op1 (idx=1, hardcoded token input)            [1B]
+    0x57,                         // Op7 (start=7)                                 [1B]
+    0x5f,                         // Op15 (end=15)                                 [1B]
+    0xbc,                         // OpTxInputScriptSigSubstr -> sell_pnum         [1B]
+    // Read sell_pden from input[1]'s sigscript[16..24)
+    0x51,                         // Op1 (idx=1, hardcoded)                        [1B]
+    0x60,                         // Op16 (start=16)                               [1B]
+    0x01, 0x18,                   // push 24 (end=24)                              [2B]
+    0xbc,                         // OpTxInputScriptSigSubstr -> sell_pden         [1B]
+    // Recompute: tokens = fk / buy_pden * buy_pnum (div-first, overflow-safe)
+    0x5a, 0x79,                   // Op10 OpPick(fk)                               [2B]
+    0x57, 0x79,                   // Op7 OpPick(pden_b)                            [2B]
+    0x96,                         // OpDiv -> fk / buy_pden                        [1B]
+    0x58, 0x79,                   // Op8 OpPick(pnum_b)                            [2B]
+    0x95,                         // OpMul -> tokens                               [1B]
+    // fair_kas = tokens / sell_pden * sell_pnum (div-first, overflow-safe)
+    0x51, 0x79,                   // Op1 OpPick(sell_pden)                         [2B]
+    0x96,                         // OpDiv -> tokens / sell_pden                   [1B]
+    0x52, 0x79,                   // Op2 OpPick(sell_pnum)                         [2B]
+    0x95,                         // OpMul -> fair_kas                             [1B]
+    // surplus = fk - fair_kas
+    0x5b, 0x79,                   // Op11 OpPick(fk)                               [2B]
+    0x7c,                         // OpSwap                                        [1B]
+    0x94,                         // OpSub -> surplus = fk - fair_kas              [1B]
+    // max_surplus = fk / 10000 * mmfee_bps (div-first, overflow-safe)
+    0x5b, 0x79,                   // Op11 OpPick(fk)                               [2B]
+    0x02, 0x10, 0x27,             // push 10000 (0x2710 LE)                        [3B]
+    0x96,                         // OpDiv -> fk / 10000                           [1B]
+    0x54, 0x79,                   // Op4 OpPick(mmfee_bps)                         [2B]
+    0x95,                         // OpMul -> max_surplus                         [1B]
+    // Verify: max_surplus >= surplus
+    0xa2, 0x69,                   // OpGTE OpVerify                                [2B]
+    // Drop F6 temporaries (sell_pden + sell_pnum)
+    0x6d,                         // Op2Drop                                       [1B]
+    // (11): mmfee_bps(0), ..., ri(10) — restored to pre-F6 state (v14-identical)
+    //
+    // ============================================================
+    // Cleanup: 11 items = Op2Drop x5 + OpDrop (v14-identical, NOT v15's 12-item Op2Drop x6)
+    0x6d, 0x6d, 0x6d, 0x6d, 0x6d, 0x75, // Op2Drop x5 + OpDrop                    [6B]
+
+    // FILL/PARTIAL END
+    0x68,                         // OpEndIf (fill vs partial)                     [1B]
+    0x68,                         // OpEndIf (expire vs fill/partial)              [1B]
+
+    // CANCEL / CANCEL-MARK PATH (28B) — identical to v14/v15
+    0x67,                         // OpElse (sigLen >= T2: cancel)                 [1B]
+    0x75,                         // OpDrop (sigLen)                               [1B]
+    0x75,                         // OpDrop (expiry)                               [1B]
+    0x5a, 0x7a,                   // Op10 OpRoll(selector)                         [2B]
+    0x63,                         // OpIf (cancel-mark)                            [1B]
+    0x00, 0x87, 0x69,             // cpend==0 verify                              [3B]
+    0x67,                         // OpElse (cancel-complete)                      [1B]
+    0x75,                         // OpDrop cpend                                  [1B]
+    0x68,                         // OpEndIf                                       [1B]
+    0x57, 0x79, 0xaa,             // Op7 OpPick(pk) OpBlake2b                      [3B]
+    0x53, 0x79, 0x87, 0x69,       // Op3 OpPick(ohash) OpEqual OpVerify            [4B]
+    0x58, 0x7a,                   // Op8 OpRoll(sig)                               [2B]
+    0x58, 0x7a,                   // Op8 OpRoll(pk)                                [2B]
+    0xad,                         // OpCheckSigVerify                              [1B]
+    0x6d, 0x6d, 0x6d, 0x75,       // Op2Drop x3 + OpDrop                          [4B]
+
+    // CLOSING (2B)
+    0x68,                         // OpEndIf (outer)                               [1B]
+    0x51,                         // Op1 (TRUE)                                    [1B]
+];
+
+/// Expected length of BUY_ORDER_V16_BODY bytecode.
+pub const BUY_ORDER_V16_BODY_EXPECTED_LEN: usize = 331;
+
+/// Expected length of v16 buy_order redeemScript (145B state + 331B body).
+pub const BUY_ORDER_V16_RS_EXPECTED_LEN: usize = 145 + BUY_ORDER_V16_BODY_EXPECTED_LEN;
+
+/// Build v16 buy_order redeemScript (145B state + 331B body = 476B).
+///
+/// Same state layout as v14/v15 (145B). The `max_matcher_fee` field is
+/// interpreted as basis points (BPS), NOT absolute sompi (same as v15).
+///
+/// e.g., max_matcher_fee_bps=30 means 0.30% of trade value.
+pub fn build_buy_v16_redeem_script(
+    token_covenant_id: &[u8; 32],
+    price_num: u64,
+    price_den: u64,
+    min_fill: u64,
+    owner_hash: &[u8; 32],
+    buyer_spk_hash: &[u8; 32],
+    max_matcher_fee_bps: u64,
+    cancel_pending: u8,
+    expiry_daa: u64,
+) -> crate::Result<Vec<u8>> {
+    if price_num <= 0 {
+        return Err(crate::KobError::Contract("price_num must be > 0".into()));
+    }
+    if price_den <= 0 {
+        return Err(crate::KobError::Contract("price_den must be > 0".into()));
+    }
+    if min_fill <= 0 {
+        return Err(crate::KobError::Contract("min_fill must be > 0".into()));
+    }
+    if cancel_pending > 1 {
+        return Err(crate::KobError::Contract("cancel_pending must be 0 or 1".into()));
+    }
+    if max_matcher_fee_bps > 10000 {
+        return Err(crate::KobError::Contract("max_matcher_fee_bps must be <= 10000".into()));
+    }
+    let g = gcd(price_num, price_den);
+    let price_num = if g > 0 { price_num / g } else { price_num };
+    let price_den = if g > 0 { price_den / g } else { price_den };
+    let mut rs = Vec::with_capacity(145 + BUY_ORDER_V16_BODY.len());
+    // State header (145B) — identical layout to v14/v15
+    rs.push(0x20);
+    rs.extend_from_slice(token_covenant_id);
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(price_num));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(price_den));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(min_fill));
+    rs.push(0x20);
+    rs.extend_from_slice(owner_hash);
+    rs.push(0x20);
+    rs.extend_from_slice(buyer_spk_hash);
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(max_matcher_fee_bps));
+    if cancel_pending == 0 {
+        rs.push(0x00);
+    } else {
+        rs.push(0x51);
+    }
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(expiry_daa));
+    // Body
+    rs.extend_from_slice(BUY_ORDER_V16_BODY);
+    Ok(rs)
+}
+
+/// Build v16 buy_order fill sigscript.
+///
+/// Layout: `[toi] [tii] [coi] [Op1] [pushData(RS)]`
+///
+/// No `sii` parameter (Phase-0 fix): F6 reads the sell price directly off the
+/// already-authenticated `tii` input.
+/// All indices use OpN (1 byte) for 0..=16, or data-push `[0x01, val]` (2 bytes) for 17+.
+pub fn build_buy_v16_fill_sigscript(
+    token_output_idx: u16,
+    token_input_idx: u16,
+    cov_output_idx: u16,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    let mut ss = Vec::with_capacity(7 + redeem_script.len() + 3);
+    push_index(&mut ss, token_output_idx);
+    push_index(&mut ss, token_input_idx);
+    push_index(&mut ss, cov_output_idx);
+    ss.push(0x51); // Op1 (selector = fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build v16 buy_order IOC fill sigscript.
+///
+/// Layout: `[toi] [tii] [coi] [Op5] [pushData(RS)]`
+///
+/// Same as fill but with Op5 selector for IOC path (relaxes token check to >= mfill).
+pub fn build_buy_v16_ioc_fill_sigscript(
+    token_output_idx: u16,
+    token_input_idx: u16,
+    cov_output_idx: u16,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    let mut ss = Vec::with_capacity(7 + redeem_script.len() + 3);
+    push_index(&mut ss, token_output_idx);
+    push_index(&mut ss, token_input_idx);
+    push_index(&mut ss, cov_output_idx);
+    ss.push(0x55); // Op5 (selector = IOC fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build v16 buy_order partial fill sigscript.
+///
+/// Layout: `[ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]`
+///
+/// No `sii` parameter: F6's cross-input read uses the hardcoded literal `1`
+/// (matching the pre-existing hardcoded token-input covenant check).
+/// Indices use OpN (1 byte) for 0..=16, or data-push `[0x01, val]` (2 bytes) for 17+.
+pub fn build_buy_v16_partial_fill_sigscript(
+    redeem_script: &[u8],
+    fill_kas: u64,
+    residual_idx: u16,
+    token_idx: u16,
+) -> Vec<u8> {
+    let fk = u64_le(fill_kas);
+    let mut ss = Vec::with_capacity(16 + redeem_script.len() + 3);
+    push_index(&mut ss, residual_idx);
+    push_index(&mut ss, token_idx);
+    ss.extend_from_slice(&push_data(&fk));
+    ss.push(0x52); // Op2 (selector = partial fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}

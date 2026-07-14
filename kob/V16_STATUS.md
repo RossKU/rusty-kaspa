@@ -762,3 +762,113 @@ owner-review-only file per its own header): `kob/OPTIMIZATION_REVIEW.md`.
 `kob/E2E_MATRIX.md` also left untouched — it is a point-in-time audit log
 of past test runs (commit-hash-anchored), not a living status doc; revising
 its historical entries would be revisionist rather than corrective.
+
+---
+
+## Phase 7 — Fix the token-mint blocker (`sig_op_count` inconsistent with tx version 1)
+
+Status: **DONE** (root-caused and fixed; empirical on-chain confirmation
+pending, see Phase 8).
+
+### Root cause
+
+Not a token-mint-specific bug — it's a repo-wide gap against a **new,
+post-Toccata consensus wire-format rule** that arrived in the upstream
+merge (`5a3ce69`, see `KCC20_SYNC_STATUS.md` §1). `kaspa_consensus_core::tx::ComputeCommit`
+(`consensus/core/src/tx.rs:71-97`) defines the rule precisely:
+
+- Transaction **version 0** inputs commit compute cost as `SigopCount(u8)`
+  (the pre-existing model KOB was built against).
+- Transaction **version >= 1** inputs commit compute cost as
+  `ComputeBudget(u16)` instead — a *different* field entirely.
+- The RPC layer enforces this as a hard consistency rule
+  (`rpc/core/src/convert/tx.rs:19-42`): for a version >= 1 input, if
+  `sig_op_count != 0` the submission is rejected with exactly the observed
+  error, `"RpcTransactionInput.sig_op_count is inconsistent with
+  transaction version {version}"`.
+
+KOB's `kob_core::tx::to_rpc_payload` (`kob/core/src/tx.rs`) always emitted
+`"sigOpCount": inp.sig_op_count` unconditionally, regardless of `tx.version`,
+and never emitted `computeBudget` at all. Every KOB flow that builds a
+CovenantBinding — which requires `Transaction::new(1)` — sets a nonzero
+`sig_op_count` on its P2PK/covenant inputs (e.g. `sig_op_count: 1` for the
+funding input), so **any** version-1 KOB transaction submission hit this
+wall, not just `token create`. `token create`/`mint`/`transfer` (`cli/src/token.rs`)
+happened to be the flow that surfaced it because it's the simplest
+CovenantBinding-establishing TX and was the first one actually submitted to
+a live post-Toccata node this project. Confirmed by grep: `Transaction::new(1)`
+(or a variable resolving to 1) is also used by `cli/src/swap.rs`,
+`bracket.rs` (receipt continuation), `dca.rs` (continuation), `stop.rs`,
+`partial_fill.rs`, `matching.rs`, `auto_match.rs`, `requote.rs`,
+`domain/src/spot/batch.rs` (`build_tx` when `has_covenant`),
+`engine/src/chain/deploy.rs`, `engine/src/chain/executor.rs` (3 sighash-tx
+sites), `engine/src/mm/mod.rs` — all of these were equally exposed to the
+same wall and are fixed by the same root-cause change (not separately
+touched — see "why the fix lives in the shared layer" below).
+
+### Why this is safe to fix purely at the RPC-submission boundary
+
+Checked directly against consensus source, not assumed:
+`consensus/core/src/hashing/sighash.rs` (`calc_schnorr_signature_hash` /
+`TransactionSigningInfo` construction, ~line 254-269) guards **both** the
+aggregate `sig_op_counts_hash` field and the per-input reused-values
+sig-op-count byte behind `if tx.version < 1`. For version >= 1
+transactions, the mass-commitment field (sig_op_count OR compute_budget) is
+**not part of the signature preimage at all**. This means: whatever value
+`kob_core::compat::to_kaspa_transaction` uses internally when building the
+sighash (still `inp.sig_op_count`, unchanged — see below) cannot affect
+signature validity for a version-1 tx, so the RPC-payload translation can
+safely differ from what was used for signing without invalidating any
+signature already computed.
+
+### Fix
+
+`kob/core/src/tx.rs::to_rpc_payload` — made version-aware:
+
+- `tx.version` checked via `kaspa_consensus_core::tx::ComputeCommit::version_expects_compute_budget_field`
+  (not a hand-rolled `>= 1`, to stay in sync with upstream's own threshold
+  definition).
+- version 0 (unchanged behavior): emits `sigOpCount: inp.sig_op_count`, no
+  `computeBudget` key (RPC struct has `#[serde(default)]` on
+  `compute_budget`, so an absent key already decodes as 0 — matches
+  pre-fix wire behavior exactly, zero risk of behavior change for the
+  live v14 path).
+- version >= 1 (the fix): emits `sigOpCount: 0` (always, regardless of
+  the KOB-level `TxInput.sig_op_count` value) and `computeBudget: 0`.
+  `0` is correct/sufficient for every KOB script: the free per-input
+  allowance is 9999 script units (`consensus/core/src/mass/units.rs::free_script_units_per_input`,
+  and confirmed empirically in `crypto/txscript/src/lib.rs`'s own test
+  that a 10,000-byte data push costs exactly 10,000 script units, i.e.
+  roughly 1 unit/byte) — KOB's largest redeem/sigscripts are on the order
+  of 500-600 bytes, so even the heaviest KOB contract spend is nowhere
+  close to exhausting the free budget.
+
+**No changes needed anywhere else** — `kob_core::tx::TxInput`'s
+`sig_op_count: u8` field, and all ~60 call sites across cli/engine/domain
+that set it, are untouched. This was deliberately kept to a single-function
+fix rather than plumbing a new `compute_budget` field through every
+`TxInput` construction site in the codebase: `to_rpc_payload` is the one
+shared chokepoint every submission path already goes through, so fixing it
+there fixes token-mint (this phase's ask) and, as a side effect, every
+other version-1 CovenantBinding flow listed above, with no per-call-site
+risk of a missed spot.
+
+### Verification so far
+
+- Two new unit tests in `kob/core/src/tx.rs`:
+  `to_rpc_payload_v0_input_emits_sig_op_count_no_compute_budget` (locks
+  down the unchanged v0 behavior) and
+  `to_rpc_payload_v1_input_zeroes_sig_op_count_and_sets_compute_budget`
+  (the direct regression test for this bug — asserts `sigOpCount: 0` and
+  `computeBudget: 0` in the emitted JSON for a `Transaction::new(1)` input
+  that still carries `TxInput.sig_op_count = 1`, i.e. exactly token.rs's
+  shape).
+- `cargo test -p kob-core --lib` — **816 passed, 0 failed** (814 + 2 new).
+- `cargo check -p kob-domain -p kob-engine -p kob-cli` — clean (same 1
+  pre-existing unrelated warning as before).
+- **Not yet done**: a real `token create` submission against the live
+  testnet-10 node to confirm the RPC no longer rejects the transaction.
+  This is Phase 8 (real E2E) below — the static/sighash-preimage argument
+  above is strong (checked against actual consensus source, not assumed),
+  but this doc will not claim the bug is "fixed" in the on-chain sense
+  until a live TXID confirms it; see Phase 8 for the actual result.

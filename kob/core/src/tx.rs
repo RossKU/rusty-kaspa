@@ -388,26 +388,59 @@ fn estimate_output_values(total_input: u64, amount: u64, fee: u64, num_outputs: 
 }
 
 /// Convert a Transaction to the RPC submission format.
+///
+/// Post-Toccata mass-commitment model (`kaspa_consensus_core::tx::ComputeCommit`):
+/// version 0 transaction inputs commit a `sigOpCount` (u8); version >= 1
+/// inputs commit a `computeBudget` (u16) instead, and the node's RPC layer
+/// rejects a nonzero `sigOpCount` on a version >= 1 input with
+/// `"RpcTransactionInput.sig_op_count is inconsistent with transaction
+/// version N"` (`rpc/core/src/convert/tx.rs`). This function must therefore
+/// emit the field the wire format expects for `tx.version`, not always
+/// `sigOpCount`.
+///
+/// This is safe to do purely at the RPC-submission boundary (no upstream
+/// signing code needs to change): the mass-commitment field is NOT part of
+/// the sighash preimage for version >= 1 transactions
+/// (`consensus/core/src/hashing/sighash.rs` guards both the aggregate
+/// `sig_op_counts_hash` and the per-input reused-values hash behind
+/// `if tx.version < 1`), so translating it here cannot invalidate a
+/// signature already computed for this `tx`.
+///
+/// `computeBudget: 0` is used unconditionally for version >= 1 inputs.
+/// KOB does not track per-script compute-unit costs, but every KOB
+/// redeem/sigscript (largest is ~600B) is far under the free per-input
+/// allowance (9999 script units, roughly 1 unit/byte of pushed data --
+/// see `consensus/core/src/mass/units.rs::free_script_units_per_input`),
+/// so budget 0 is always sufficient in practice.
 pub fn to_rpc_payload(
     tx: &Transaction,
     sigscripts: &[Vec<u8>],
 ) -> serde_json::Value {
     assert_eq!(tx.inputs.len(), sigscripts.len());
 
+    let expects_compute_budget =
+        kaspa_consensus_core::tx::ComputeCommit::version_expects_compute_budget_field(tx.version);
+
     let inputs: Vec<serde_json::Value> = tx
         .inputs
         .iter()
         .zip(sigscripts.iter())
         .map(|(inp, ss)| {
-            serde_json::json!({
+            let mut o = serde_json::json!({
                 "previousOutpoint": {
                     "transactionId": inp.prev_tx_id,
                     "index": inp.prev_index,
                 },
                 "signatureScript": hex::encode(ss),
                 "sequence": inp.sequence,
-                "sigOpCount": inp.sig_op_count,
-            })
+            });
+            if expects_compute_budget {
+                o["sigOpCount"] = serde_json::json!(0);
+                o["computeBudget"] = serde_json::json!(0);
+            } else {
+                o["sigOpCount"] = serde_json::json!(inp.sig_op_count);
+            }
+            o
         })
         .collect();
 
@@ -490,6 +523,51 @@ mod tests {
         let payload = to_rpc_payload(&tx, &[]);
         assert!(payload["transaction"]["version"].as_u64().unwrap() == 0);
         assert!(payload["allowOrphan"].as_bool().unwrap() == false);
+    }
+
+    fn fake_input(sig_op_count: u8) -> TxInput {
+        TxInput {
+            prev_tx_id: "a".repeat(64),
+            prev_index: 0,
+            sequence: 0,
+            sig_op_count,
+            script_version: 0,
+            script_bytes: vec![],
+            value: 100_000_000,
+        }
+    }
+
+    #[test]
+    fn to_rpc_payload_v0_input_emits_sig_op_count_no_compute_budget() {
+        // Legacy (v0) transactions keep the pre-Toccata shape: sigOpCount is
+        // whatever the input declares, and computeBudget is simply absent
+        // (defaults to 0 on decode per RpcTransactionInput's #[serde(default)]).
+        let mut tx = Transaction::new(0);
+        tx.inputs.push(fake_input(1));
+        let payload = to_rpc_payload(&tx, &[vec![0xaa]]);
+        let inp = &payload["transaction"]["inputs"][0];
+        assert_eq!(inp["sigOpCount"].as_u64().unwrap(), 1);
+        assert!(inp.get("computeBudget").is_none());
+    }
+
+    #[test]
+    fn to_rpc_payload_v1_input_zeroes_sig_op_count_and_sets_compute_budget() {
+        // Regression test for "RpcTransactionInput.sig_op_count is
+        // inconsistent with transaction version 1" (KCC20_SYNC_STATUS.md §5,
+        // V16_STATUS.md Phase 5.1 step 6): post-Toccata, version >= 1 inputs
+        // commit a computeBudget (u16), not a sigOpCount (u8); the node's
+        // RPC layer rejects any nonzero sigOpCount on such an input. Even
+        // though the KOB-level `TxInput.sig_op_count` still says 1 here (the
+        // conceptual "this input needs 1 CheckSig" -- used for local
+        // sighash computation, which does not commit this field for
+        // version >= 1 txs, see hashing/sighash.rs), the RPC payload must
+        // report sigOpCount=0 and carry computeBudget instead.
+        let mut tx = Transaction::new(1);
+        tx.inputs.push(fake_input(1));
+        let payload = to_rpc_payload(&tx, &[vec![0xaa]]);
+        let inp = &payload["transaction"]["inputs"][0];
+        assert_eq!(inp["sigOpCount"].as_u64().unwrap(), 0);
+        assert_eq!(inp["computeBudget"].as_u64().unwrap(), 0);
     }
 
 

@@ -187,7 +187,12 @@ after deploying this change.
       `cargo test -p kob-engine --lib`) — compile-checked only so far.
 - [ ] E2E on testnet: mint + transfer with the 38B RS (script executes
       `OpDrop OpCheckSigVerify Op1` — logic unchanged, but on-chain
-      verification of the new layout is untested).
+      verification of the new layout is untested). Was blocked by an
+      unrelated, repo-wide bug (`RpcTransactionInput.sig_op_count is
+      inconsistent with transaction version 1`, hit by every
+      CovenantBinding-establishing TX, not just token create) — root-caused
+      and fixed 2026-07-14 in `kob_core::tx::to_rpc_payload` (post-Toccata
+      `ComputeCommit` wire-format gap); see `V16_STATUS.md` Phase 7/8.
 - [ ] Track the KCC20 thread: virtual/extension state field proposal
       (michaelsutton's Open ICC post) may change the recommended layout for
       extension data (digest-behind-virtual-field instead of trailing plain

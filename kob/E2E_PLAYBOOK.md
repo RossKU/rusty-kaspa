@@ -2,6 +2,14 @@
 
 Copy-paste test patterns. Assumes wallet exists and is funded.
 
+> **2026-07-14 (post-Toccata / KCC20)**: token_unit RS changed 35B → 38B
+> (KCC20 Standard State Header) — token_unit P2SH addresses moved, so any
+> token UTXOs from older binaries are invisible to the new CLI. Always run
+> the Shared Setup (fresh `token create` + `token mint`) on a new binary.
+> Verify the node endpoint runs a post-Toccata (v2.x) build. On-device build
+> notes (exec-capable `CARGO_TARGET_DIR`, Termux clang linker) are in
+> kob/README.md.
+
 ## Critical Notes
 
 - **ENGINE FIRST**: Start engine BEFORE deploying orders. Engine does NOT rescan old UTXOs — it only discovers orders from new blocks after startup.

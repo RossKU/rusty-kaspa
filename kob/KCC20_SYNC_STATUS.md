@@ -42,32 +42,35 @@ Two environment obstacles found and fixed/worked around:
    also stale (rustc 1.92 fingerprint vs current 1.94). Workaround: target
    dir on the rootfs, `CARGO_TARGET_DIR=/root/kob-rust-target4`.
 
-Check results (commands exactly as run):
+Check/test results (2026-07-14, commands exactly as run, all with
+`CARGO_TARGET_DIR=/root/kob-rust-target4` and Termux bin on PATH):
 
-```
-export CARGO_TARGET_DIR=/root/kob-rust-target4
-export PATH=/data/data/com.termux/files/usr/bin:$PATH
-cargo check -p kob-core                      # PASS (1m53s cold)
-cargo check -p kob-core -p kob-cli --tests   # PASS, warnings only (2m15s;
-                                             #   also checks kob-engine as a dep)
-cargo check -p kob-domain --tests            # FAIL — PRE-EXISTING, unrelated:
-    # error[E0063]: missing field `bracket_meta` in initializer of `batch::BatchOrder`
-    #   kob/domain/src/spot/matching.rs:2862  (test-only; from the earlier
-    #   "checkpoint WIP across cli/core/domain/engine" commit)
-```
+| Command | Result |
+|---|---|
+| `cargo check -p kob-core` | PASS (1m53s cold) |
+| `cargo test -p kob-core --lib` | **PASS — 802 passed / 0 failed** (2.5s run after link) |
+| `cargo check -p kob-domain --tests` | PASS (after `bracket_meta` fix, see below) |
+| `cargo test -p kob-domain --lib` | **PASS — 625 passed / 0 failed** (0.9s run) |
+| `cargo check -p kob-cli -p kob-engine --tests` | PASS (after `MmConfig` fix, see below) |
+| `cargo test -p kob-cli / -p kob-engine` (execution) | NOT run — link stage too heavy for this session; run `cargo test -p kob-cli --lib` and `cargo test -p kob-engine --lib` when budget allows |
 
-`cargo test -p kob-core --lib contract::token` was NOT run to completion:
-the test profile recompiles + links the full dep graph, which is heavy on
-this device and was cut short per the light-build budget. The KCC20 unit
-tests compile (covered by `--tests` check above) but their assertions have
-not been executed on this machine. Run when budget allows:
+First on-device test execution surfaced and fixed three issues:
 
-```
-export CARGO_TARGET_DIR=/root/kob-rust-target4
-export PATH=/data/data/com.termux/files/usr/bin:$PATH
-cargo test -p kob-core --lib   # token tests are in kob/core/src/contract/tests.rs
-cargo test -p kob-cli --lib token
-```
+1. **KCC20 header length bug (real bug, caught by the new tests)**: the
+   script-encoded header is `[0x20]+32 + [0x01]+1` = **35** bytes, not 34 as
+   first coded. `SCRIPT_ENCODED_LEN` corrected 34 → 35; token_unit RS is
+   **38B** (not 37B) and transfer sigscript **105B** (not 104B). The 34
+   value also made `Kcc20StateHeader::decode` read one byte past its own
+   bounds check. All sizes/docs/tests re-synced to 38/105.
+2. **`bytecode_stable` pin**: the adversarial test pins blake2b-256 of every
+   contract body; TOKEN_UNIT pin updated `44a029fd…` → `2ae2756e…` for the
+   new 3-byte body `75ad51`.
+3. **Pre-existing WIP test-rot (unrelated to KCC20), fixed**:
+   - `kob/domain/src/spot/matching.rs` — 5 test `BatchOrder` initializers
+     predated the v16 `bracket_meta` field; added `bracket_meta: None`.
+   - `kob/engine/src/mm/mod.rs` — 26 test `MmConfig` initializers predated
+     the H12 `deploy_delay_secs` field; added `deploy_delay_secs: 0`
+     (`validate()` does not constrain it; prod path in engine lib.rs uses 2).
 
 ## 3. Lightweight sustainable build structure (evaluated, documented)
 
@@ -115,15 +118,15 @@ keeps its existing 47B layout.
     delegator_entrypoint_selector, optional_extensions }` +
     `StateField { name, len, in_script }` and the concrete
     `KCC20_TOKEN_UNIT_DESCRIPTOR` / `TOKEN_UNIT_STATE_LAYOUT` instances.
-  - token_unit redeemScript: **35B → 37B**:
+  - token_unit redeemScript: **35B → 38B**:
     old `[0x20][owner_pk 32] [ad 51]`,
     new `[0x20][owner_identifier 32][0x01][identifier_type 1] [75 ad 51]`
-    (body gained one `OpDrop` for identifier_type; sigscript 102B → 104B).
+    (body gained one `OpDrop` for identifier_type; sigscript 102B → 105B).
   - `parse_token_unit_state(script, utxo_value)` — Reader-side decode with
     body verification.
 - `kob/core/src/lib.rs` — re-exports for the new KCC20 items.
 - `kob/core/src/contract/tests.rs` — updated body/RS/sigscript size + layout
-  tests to the new 37B layout; added `kcc20_state_header_decode_roundtrip`,
+  tests to the new 38B layout; added `kcc20_state_header_decode_roundtrip`,
   `kcc20_parse_token_unit_state_rejects_wrong_length`,
   `kcc20_token_unit_descriptor_shape`.
 - `kob/cli/src/token.rs` — updated the two size-asserting unit tests + a
@@ -169,18 +172,20 @@ is future work.
 
 ### Compatibility note
 
-The 35B→37B RS change moves the token_unit P2SH address for a given owner
+The 35B→38B RS change moves the token_unit P2SH address for a given owner
 pubkey. Any token_unit UTXOs minted with the old layout (testnet only) are
 not discoverable/spendable through the new builders — re-mint test tokens
 after deploying this change.
 
 ## 5. TODOs
 
-- [ ] Execute the kob-core/kob-cli token unit tests (`cargo test` commands in §2)
-      when a heavier compile window is acceptable.
-- [ ] Fix pre-existing `bracket_meta` test-compile error in
-      `kob/domain/src/spot/matching.rs:2862` (unrelated to KCC20).
-- [ ] E2E on testnet: mint + transfer with the 37B RS (script executes
+- [x] Execute kob-core unit tests — done 2026-07-14: 802/802 PASS (see §2).
+- [x] Fix pre-existing `bracket_meta` test-compile error — done 2026-07-14;
+      kob-domain now 625/625 PASS. Same-class `MmConfig.deploy_delay_secs`
+      test rot in kob-engine also fixed (check --tests PASS).
+- [ ] Execute kob-cli / kob-engine test binaries (`cargo test -p kob-cli --lib`,
+      `cargo test -p kob-engine --lib`) — compile-checked only so far.
+- [ ] E2E on testnet: mint + transfer with the 38B RS (script executes
       `OpDrop OpCheckSigVerify Op1` — logic unchanged, but on-chain
       verification of the new layout is untested).
 - [ ] Track the KCC20 thread: virtual/extension state field proposal

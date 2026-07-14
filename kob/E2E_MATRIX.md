@@ -22,6 +22,31 @@ must confirm beyond "command accepted".
 ## Reference commit
 - `b9081729` (kob-phase0 tip) — run33 MD + P05/P25 script fixes. Only v14 is live; v15 is feature-gated for the mmfee-bps contract.
 
+## Status update 2026-07-14 (post-Toccata sync + KCC20)
+
+All run history below predates the following changes; the next E2E run must
+account for them:
+
+- **Upstream sync**: branch merged with kaspanet/rusty-kaspa master
+  post-Toccata (mainnet activation 2026-06-30, workspace v2.0.1). No /kob API
+  changes were required; all patterns' contract bytecode is unchanged except
+  the token layer.
+- **KCC20 token_unit layout change (35B → 38B RS)**: `token_unit` now leads
+  with the KCC20 Standard State Header (`owner_identifier` 32B +
+  `identifier_type` 1B script-encoded; `amount` = UTXO sompi value). The
+  token_unit P2SH address for a given pubkey MOVED — token UTXOs minted
+  before this change are not discoverable by the new builders. **Every E2E
+  run on the new binary must re-run `token create` + `token mint` from
+  scratch** (the Shared Setup section of E2E_PLAYBOOK.md already does this).
+  Transfer sigscript is 105B (was 102B); mass/fee deltas are absorbed
+  automatically by `calc_mass_with_sigscripts`.
+- **Node**: the TN12 endpoint used below (`ws://65.108.107.30:18210`) predates
+  Toccata mainnet activation; verify the node is running a post-Toccata
+  (v2.x) build before attributing failures to KOB.
+- **On-device build**: see "Build & Test" in kob/README.md for the
+  Termux/PRoot notes (`CARGO_TARGET_DIR` must be exec-capable; linker pinned
+  to Termux clang in `.cargo/config.toml`).
+
 ---
 
 ## I. Limit orders

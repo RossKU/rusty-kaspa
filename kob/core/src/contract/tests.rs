@@ -82,7 +82,7 @@ mod tests {
 
     #[test]
     fn token_unit_body_length() {
-        assert_eq!(TOKEN_UNIT_BODY.len(), 2, "token_unit body must be 2 bytes");
+        assert_eq!(TOKEN_UNIT_BODY.len(), 3, "token_unit body must be 3 bytes (KCC20 header adds an OpDrop for identifier_type)");
     }
 
     #[test]
@@ -93,7 +93,7 @@ mod tests {
 
     #[test]
     fn token_unit_body_hex_matches_spec() {
-        let expected = "ad51";
+        let expected = "75ad51";
         assert_eq!(hex::encode(TOKEN_UNIT_BODY), expected);
     }
 
@@ -108,7 +108,7 @@ mod tests {
     fn token_unit_redeem_script_length() {
         let pk = [0u8; 32];
         let rs = build_token_unit_redeem_script(&pk);
-        assert_eq!(rs.len(), 35, "token_unit RS must be 35 bytes (33 + 2)");
+        assert_eq!(rs.len(), 37, "token_unit RS must be 37 bytes (34 KCC20 header + 3 body)");
     }
 
     #[test]
@@ -124,9 +124,42 @@ mod tests {
     fn token_unit_state_layout() {
         let pk = [0xBB; 32];
         let rs = build_token_unit_redeem_script(&pk);
-        assert_eq!(rs[0], 0x20, "owner_pk push opcode");
-        assert_eq!(&rs[1..33], &[0xBB; 32], "owner_pubkey");
-        assert_eq!(&rs[33..], TOKEN_UNIT_BODY, "body must match");
+        assert_eq!(rs[0], 0x20, "owner_identifier push opcode");
+        assert_eq!(&rs[1..33], &[0xBB; 32], "owner_identifier (pubkey)");
+        assert_eq!(rs[33], 0x01, "identifier_type push opcode");
+        assert_eq!(rs[34], identifier_type::PUBKEY, "identifier_type == PUBKEY");
+        assert_eq!(&rs[35..], TOKEN_UNIT_BODY, "body must match");
+    }
+
+    #[test]
+    fn kcc20_state_header_decode_roundtrip() {
+        let pk = [0xCC; 32];
+        let rs = build_token_unit_redeem_script(&pk);
+        let header = Kcc20StateHeader::decode(&rs, 12_345_678).expect("decode must succeed");
+        assert_eq!(header.owner_identifier, pk);
+        assert_eq!(header.identifier_type, identifier_type::PUBKEY);
+        assert_eq!(header.amount, 12_345_678, "amount is sourced from utxo_value, not script bytes");
+    }
+
+    #[test]
+    fn kcc20_parse_token_unit_state_rejects_wrong_length() {
+        let pk = [0xDD; 32];
+        let mut rs = build_token_unit_redeem_script(&pk);
+        rs.push(0x00); // corrupt: trailing byte
+        assert!(parse_token_unit_state(&rs, 1).is_none());
+    }
+
+    #[test]
+    fn kcc20_token_unit_descriptor_shape() {
+        assert!(KCC20_TOKEN_UNIT_DESCRIPTOR.prefix.is_empty(), "token_unit has no script bytes before state");
+        assert_eq!(KCC20_TOKEN_UNIT_DESCRIPTOR.suffix, TOKEN_UNIT_BODY);
+        assert_eq!(KCC20_TOKEN_UNIT_DESCRIPTOR.state_layout.len(), 3, "owner_identifier, identifier_type, amount");
+        assert_eq!(KCC20_TOKEN_UNIT_DESCRIPTOR.state_layout[0].name, "owner_identifier");
+        assert_eq!(KCC20_TOKEN_UNIT_DESCRIPTOR.state_layout[1].name, "identifier_type");
+        assert_eq!(KCC20_TOKEN_UNIT_DESCRIPTOR.state_layout[2].name, "amount");
+        assert!(!KCC20_TOKEN_UNIT_DESCRIPTOR.state_layout[2].in_script, "amount is UTXO-value-mapped, not script-encoded");
+        assert_eq!(KCC20_TOKEN_UNIT_DESCRIPTOR.leader_entrypoint_selector, None, "single-entrypoint covenant, no selector byte");
+        assert_eq!(KCC20_TOKEN_UNIT_DESCRIPTOR.delegator_entrypoint_selector, None);
     }
 
     #[test]
@@ -162,12 +195,12 @@ mod tests {
         let rs = build_token_unit_redeem_script(&pk);
         let sig = [0x42u8; 64];
         let ss = build_token_unit_sigscript(&sig, &rs);
-        // [65] [sig 64B] [0x01] [pushData(RS 35B)]
-        // = 66 + 1 + 35 = 102
-        assert_eq!(ss.len(), 102, "token_unit transfer sigscript = 102B");
+        // [65] [sig 64B] [0x01] [pushData(RS 37B)]
+        // = 66 + 1 + 37 = 104
+        assert_eq!(ss.len(), 104, "token_unit transfer sigscript = 104B");
         assert_eq!(ss[0], 65, "first byte = sig length prefix");
         assert_eq!(ss[65], 0x01, "sighash type");
-        assert_eq!(ss[66], 35, "RS push length");
+        assert_eq!(ss[66], 37, "RS push length");
     }
 
     // Zero-fill attack prevention tests (TN12 T79: min_fill=0 vulnerability)

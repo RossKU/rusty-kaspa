@@ -33,8 +33,13 @@ pub use contract::{
     build_buy_cancel_sigscript, build_sell_cancel_sigscript,
     build_token_mint_redeem_script, build_token_unit_redeem_script,
     build_token_mint_sigscript, build_token_burn_sigscript, build_token_unit_sigscript,
+    parse_token_unit_state,
     RECEIPT_BODY, TOKEN_RS,
     TOKEN_MINT_BODY, TOKEN_UNIT_BODY,
+    // KCC20
+    Kcc20StateHeader, StateField, TokenDescriptor,
+    TOKEN_UNIT_STATE_LAYOUT, KCC20_TOKEN_UNIT_DESCRIPTOR,
+    NONCE_EXT_ID, NONCE_EXT_OFFSET, NONCE_EXT_LEN,
     OCO_SELL_BODY, OCO_SELL_RS_SIZE, OCO_SELL_STATE_SIZE, OcoPath,
     build_oco_sell_redeem_script,
     build_oco_sell_tp_fill_sigscript, build_oco_sell_sl_fill_sigscript,

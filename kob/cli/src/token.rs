@@ -462,7 +462,7 @@ pub async fn token_mint(
     let mint_rs = contract::build_token_mint_redeem_script(&pubkey);
     let mint_p2sh = build_p2sh(&mint_rs);
 
-    // Build token_unit redeemScript for the recipient (35 bytes)
+    // Build token_unit redeemScript for the recipient (37 bytes, KCC20 header)
     let unit_rs = contract::build_token_unit_redeem_script(&recipient_pk);
     let unit_p2sh = build_p2sh(&unit_rs);
 
@@ -1347,14 +1347,16 @@ mod tests {
     #[test]
     fn token_transfer_builders_consistent() {
         // Verify that building a token_unit RS and its sigscript produces expected sizes
+        // (37B RS = KCC20 Standard State Header script portion (34B: owner_identifier +
+        // identifier_type) + TOKEN_UNIT_BODY (3B); see kob_core::contract::token).
         let pk = [0x02u8; 32];
         let rs = contract::build_token_unit_redeem_script(&pk);
-        assert_eq!(rs.len(), 35);
+        assert_eq!(rs.len(), 37);
 
         let sig = [0x42u8; 64];
         let ss = contract::build_token_unit_sigscript(&sig, &rs);
-        // [65] [sig 64B] [0x01] [35] [RS 35B] = 66 + 36 = 102
-        assert_eq!(ss.len(), 102);
+        // [65] [sig 64B] [0x01] [37] [RS 37B] = 66 + 38 = 104
+        assert_eq!(ss.len(), 104);
     }
 
     #[test]

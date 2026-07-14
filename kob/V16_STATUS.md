@@ -355,7 +355,46 @@ not be completed on this device.
 
 ## Phase 4 — Tests
 
-Status: see below.
+Status: **DONE**.
+
+| Crate | Command | Result |
+|---|---|---|
+| kob-core | `cargo test -p kob-core --lib` | **814 passed, 0 failed** |
+| kob-domain | `cargo test -p kob-domain --lib` | **628 passed, 0 failed** |
+
+New tests added (all in the two commits above; see their messages for the
+full breakdown):
+
+- `kob/core/src/contract/tests.rs`: v16 body/RS length constants,
+  RS-length distinctness from v14/v15/bracket, dispatch threshold bytes
+  (T0=481/T1=489/T2=494), fill/IOC-fill/partial sigscript shapes and
+  ranges, CLTV/CSV presence, bps validation, `parse_redeem_script`
+  roundtrip, **and the security-critical byte-level adversarial checks**:
+  `buy_v16_fill_f6_reads_same_slot_as_tii_covenant_check` and
+  `buy_v16_partial_f6_uses_hardcoded_literal_matching_covenant_check`
+  assert the v15-vulnerable `OpPick(sii)` byte patterns are entirely
+  absent from the v16 body, and that F6 provably reads from the same
+  stack slot the pre-existing covenant check already authenticates.
+- `kob/domain/src/spot/batch.rs`: `v16_buy_dispatches_to_v16_fill_not_bracket_shape`
+  and `bracket_entry_still_dispatches_to_bracket_shape_after_v16_fix` —
+  end-to-end (`plan_batch_match` -> `build_tx()`) proof that the
+  version-16 collision fix routes v16 buys and bracket entries to their
+  correct, distinct sigscript shapes, with byte-for-byte equality checks
+  against the real builder output (not just length heuristics).
+
+`cargo check` was also run (and passed clean, modulo pre-existing
+unrelated warnings) for all four touched crates individually
+(`kob-core`, `kob-domain`, `kob-engine`, `kob-cli`) before running tests,
+per the "one package at a time" build discipline.
+
+**Environment note for future sessions**: this device's filesystem
+(sdcardfs under Termux/PRoot) does not reliably update file mtimes on
+write. `cargo check`/`cargo test` fingerprinting is mtime-based, so after
+editing files you MUST `touch` them before the next cargo invocation, or
+cargo may silently reuse a stale cached build of a dependency crate and
+report spurious "cannot find value" errors for symbols that really do
+exist in the current source (this happened once during this session on
+the `kob-engine` check and was resolved by `touch`ing the changed files).
 
 ---
 

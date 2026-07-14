@@ -13,3 +13,16 @@ rustflags = [
 # (similar to how we use musl on Linux for portable binaries)
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-feature=+crt-static"]
+
+# Termux/Android (aarch64-linux-android host): Termux ships a rustc/cargo
+# toolchain that is itself built for aarch64-linux-android, but when invoked
+# from inside a glibc proot-distro guest (e.g. a proot-distro Ubuntu/Debian
+# container), the guest's default `cc`/`ld` are glibc tools that cannot link
+# against Termux's bionic-ABI static libs (e.g. libunwind.a expects bionic
+# `__sF`/`__errno`, not glibc's). Symptom: build scripts fail with
+# "cannot find -llog" / "cannot find -lunwind" or bionic symbol errors.
+# Fix: force the linker to Termux's own clang, which is bionic-aware and
+# correctly resolves Android system libs (liblog.so etc. from /system/lib64)
+# and Termux's bionic-ABI static libs together.
+[target.aarch64-linux-android]
+linker = "/data/data/com.termux/files/usr/bin/clang"

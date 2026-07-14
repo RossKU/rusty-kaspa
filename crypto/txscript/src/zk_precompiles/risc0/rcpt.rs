@@ -66,6 +66,9 @@ pub struct SuccinctReceipt {
     /// recursion circuit.
     seal: Vec<u32>,
 
+    /// The control ID of this receipt, identifying the recursion program that was run (e.g. lift,
+    /// join, or resolve).
+    control_id: Digest,
     /// Claim containing information about the computation that this receipt proves.
     ///
     /// The standard claim type is [ReceiptClaim][crate::ReceiptClaim], which represents a RISC-V
@@ -80,8 +83,8 @@ pub struct SuccinctReceipt {
 }
 
 impl SuccinctReceipt {
-    pub fn new(seal: Vec<u32>, claim: Digest, hashfn: HashFnId, control_inclusion_proof: MerkleProof) -> Self {
-        Self { seal, claim, hashfn, control_inclusion_proof }
+    pub fn new(seal: Vec<u32>, control_id: Digest, claim: Digest, hashfn: HashFnId, control_inclusion_proof: MerkleProof) -> Self {
+        Self { seal, control_id, claim, hashfn, control_inclusion_proof }
     }
 
     pub fn claim(&self) -> &Digest {
@@ -104,24 +107,25 @@ impl SuccinctReceipt {
         // to be verified with this proof. We verify that the control id of the receipt verifies
         // as a valid merkle proof.
         let check_code = |_, control_id: &Digest| -> Result<(), VerificationError> {
+            // Ensure that the control_id decoded from the seal matches the one in the
+            // SuccinctReceipt metadata.
+            if *control_id != self.control_id {
+                return Err(VerificationError::ControlVerificationError { control_id: *control_id });
+            }
             self.control_inclusion_proof
                 .verify(control_id, &ALLOWED_CONTROL_ROOT, suite.hashfn.as_ref())
                 .map_err(|_| VerificationError::ControlVerificationError { control_id: *control_id })
         };
 
-        let all: &[BabyBearElem] = bytemuck::checked::try_cast_slice(&self.seal).map_err(|_| R0Error::SealHasInvalidBabyBearElem)?;
-        // Extract the globals from the seal
-        let output_elems: &[BabyBearElem] = &all[..CircuitImpl::OUTPUT_SIZE];
-
         // Verify the receipt itself is correct, and therefore the encoded globals are
         // reliable.
         risc0_zkp::verify::verify(&CIRCUIT, &suite, &self.seal, check_code)?;
 
-        let mut seal_claim = VecDeque::new();
-        for elem in output_elems {
-            // add the output field elements from the encoded globals
-            seal_claim.push_back(elem.as_u32())
-        }
+        // Extract the globals from the seal. The verifier call above has already read
+        // seal[..CircuitImpl::OUTPUT_SIZE + 1] via read_field_elem_slice, so these
+        // output words are valid BabyBear elements.
+        let output_elems = self.seal[..CircuitImpl::OUTPUT_SIZE].iter().copied().map(BabyBearElem::new_raw);
+        let mut seal_claim = VecDeque::from_iter(output_elems.map(|elem| elem.as_u32()));
 
         // Read the Poseidon2 control root digest from the first 16 words of the output.
         // NOTE: Implemented recursion programs have two output slots, each of size 16 elems.

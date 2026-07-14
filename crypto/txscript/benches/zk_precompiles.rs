@@ -14,7 +14,7 @@ use secp256k1::ecdsa::Signature;
 use secp256k1::{Message, PublicKey, Secp256k1, SecretKey};
 
 fn benchmark_zk_precompiles(c: &mut Criterion) {
-    let stark_script = build_stark_script();
+    let stark_script = build_stark_script(false);
     let groth_script = build_groth_script();
 
     let sig_cache = Cache::new(0);
@@ -41,7 +41,7 @@ fn benchmark_r0_batch_parallelism(c: &mut Criterion) {
     use rayon::prelude::*;
 
     const BATCH_SIZE: usize = 50;
-    let stark_script = build_stark_script();
+    let stark_script = build_stark_script(false);
     let proof_batch: Vec<_> = (0..BATCH_SIZE).map(|_| stark_script.clone()).collect();
 
     let mut group = c.benchmark_group("r0_batch_parallelism");
@@ -57,7 +57,7 @@ fn benchmark_r0_batch_parallelism(c: &mut Criterion) {
                             script,
                             &reused_values,
                             &cache,
-                            EngineFlags { covenants_enabled: true },
+                            EngineFlags { covenants_enabled: true, ..Default::default() },
                         );
                         vm.execute().is_ok()
                     })
@@ -71,7 +71,7 @@ fn benchmark_r0_batch_parallelism(c: &mut Criterion) {
 fn benchmark_groth16_prepare_inputs(c: &mut Criterion) {
     use ark_bn254::{Bn254, Fr};
     use ark_groth16::Groth16;
-    use ark_relations::r1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
+    use ark_relations::gr1cs::{ConstraintSynthesizer, ConstraintSystemRef, SynthesisError};
 
     struct Circuit {
         num_public_inputs: usize,
@@ -85,11 +85,11 @@ fn benchmark_groth16_prepare_inputs(c: &mut Criterion) {
                 let input = cs.new_input_variable(|| Ok(Fr::from(i as u64)))?;
                 running_sum += i as u64;
                 let new_sum_var = cs.new_witness_variable(|| Ok(Fr::from(running_sum)))?;
-                let one = ark_relations::r1cs::Variable::One;
-                cs.enforce_constraint(
-                    ark_relations::lc!() + sum_var + input,
-                    ark_relations::lc!() + one,
-                    ark_relations::lc!() + new_sum_var,
+                let one = ark_relations::gr1cs::Variable::One;
+                cs.enforce_r1cs_constraint(
+                    || ark_relations::lc!() + sum_var + input,
+                    || ark_relations::lc!() + one,
+                    || ark_relations::lc!() + new_sum_var,
                 )?;
                 sum_var = new_sum_var;
             }

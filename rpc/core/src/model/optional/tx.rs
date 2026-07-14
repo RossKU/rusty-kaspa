@@ -4,9 +4,8 @@ use kaspa_consensus_core::tx::{
     CovenantBinding, ScriptPublicKey, TransactionId, TransactionIndexType, TransactionInput, TransactionOutpoint, TransactionOutput,
     UtxoEntry,
 };
-use kaspa_utils::{hex::ToHex, serde_bytes_fixed_ref};
+use kaspa_utils::{hex::ToHex, serde_bytes_fixed_ref, serde_bytes_fixed_ref_optional, serde_bytes_optional};
 use serde::{Deserialize, Serialize};
-use serde_nested_with::serde_nested;
 use workflow_serializer::prelude::*;
 
 use crate::{
@@ -153,10 +152,9 @@ impl Deserializer for RpcOptionalUtxoEntryVerboseData {
 
 /// Represents a Kaspa transaction outpoint
 #[derive(Eq, Hash, PartialEq, Debug, Copy, Clone, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
-#[serde_nested]
 #[serde(rename_all = "camelCase")]
 pub struct RpcOptionalTransactionOutpoint {
-    #[serde_nested(sub = "TransactionId", serde(with = "serde_bytes_fixed_ref"))]
+    #[serde(with = "serde_bytes_fixed_ref_optional")]
     pub transaction_id: Option<TransactionId>,
     pub index: Option<TransactionIndexType>,
 }
@@ -216,18 +214,19 @@ impl Deserializer for RpcOptionalTransactionOutpoint {
 
 /// Represents a Kaspa transaction input
 #[derive(Clone, Serialize, Deserialize)]
-#[serde_nested]
 #[serde(rename_all = "camelCase")]
 pub struct RpcOptionalTransactionInput {
     /// Level: High
     pub previous_outpoint: Option<RpcOptionalTransactionOutpoint>,
-    #[serde_nested(sub = "Vec<u8>", serde(with = "hex::serde"))]
+    #[serde(with = "serde_bytes_optional")]
     /// Level: Low
     pub signature_script: Option<Vec<u8>>,
     /// Level: High
     pub sequence: Option<u64>,
     /// Level: High
     pub sig_op_count: Option<u8>,
+    /// Level: High
+    pub compute_budget: Option<u16>,
     pub verbose_data: Option<RpcOptionalTransactionInputVerboseData>,
 }
 
@@ -238,6 +237,7 @@ impl std::fmt::Debug for RpcOptionalTransactionInput {
             .field("signature_script", &self.signature_script.as_ref().map(|v| v.to_hex()))
             .field("sequence", &self.sequence)
             .field("sig_op_count", &self.sig_op_count)
+            .field("compute_budget", &self.compute_budget)
             .field("verbose_data", &self.verbose_data)
             .finish()
     }
@@ -249,7 +249,8 @@ impl From<TransactionInput> for RpcOptionalTransactionInput {
             previous_outpoint: Some(input.previous_outpoint.into()),
             signature_script: Some(input.signature_script),
             sequence: Some(input.sequence),
-            sig_op_count: Some(input.sig_op_count),
+            sig_op_count: Some(input.compute_commit.sig_op_count().unwrap_or(0)),
+            compute_budget: Some(input.compute_commit.compute_budget().unwrap_or(0)),
             verbose_data: None,
         }
     }
@@ -266,18 +267,20 @@ impl RpcOptionalTransactionInput {
             && self.signature_script.is_none()
             && self.sequence.is_none()
             && self.sig_op_count.is_none()
+            && self.compute_budget.is_none()
             && (self.verbose_data.is_none() || self.verbose_data.as_ref().is_some_and(|x| x.is_empty()))
     }
 }
 
 impl Serializer for RpcOptionalTransactionInput {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u8, &1, writer)?;
+        store!(u8, &2, writer)?;
         serialize!(Option<RpcOptionalTransactionOutpoint>, &self.previous_outpoint, writer)?;
         store!(Option<Vec<u8>>, &self.signature_script, writer)?;
         store!(Option<u64>, &self.sequence, writer)?;
         store!(Option<u8>, &self.sig_op_count, writer)?;
         serialize!(Option<RpcOptionalTransactionInputVerboseData>, &self.verbose_data, writer)?;
+        store!(Option<u16>, &self.compute_budget, writer)?;
 
         Ok(())
     }
@@ -285,14 +288,15 @@ impl Serializer for RpcOptionalTransactionInput {
 
 impl Deserializer for RpcOptionalTransactionInput {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u8, reader)?;
+        let version = load!(u8, reader)?;
         let previous_outpoint = deserialize!(Option<RpcOptionalTransactionOutpoint>, reader)?;
         let signature_script = load!(Option<Vec<u8>>, reader)?;
         let sequence = load!(Option<u64>, reader)?;
         let sig_op_count = load!(Option<u8>, reader)?;
         let verbose_data = deserialize!(Option<RpcOptionalTransactionInputVerboseData>, reader)?;
+        let compute_budget = if version > 1 { load!(Option<u16>, reader)? } else { None };
 
-        Ok(Self { previous_outpoint, signature_script, sequence, sig_op_count, verbose_data })
+        Ok(Self { previous_outpoint, signature_script, sequence, sig_op_count, compute_budget, verbose_data })
     }
 }
 
@@ -469,9 +473,7 @@ impl TryFrom<RpcNullableCovenantBinding> for RpcCovenantBinding {
 }
 
 /// Represents a Kaspa transaction
-#[derive(Clone, Serialize, Deserialize)]
-#[serde_nested]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone)]
 pub struct RpcOptionalTransaction {
     /// Level: Full
     pub version: Option<u16>,
@@ -483,12 +485,94 @@ pub struct RpcOptionalTransaction {
     pub subnetwork_id: Option<RpcSubnetworkId>,
     /// Level: Full
     pub gas: Option<u64>,
-    #[serde_nested(sub = "Vec<u8>", serde(with = "hex::serde"))]
     /// Level: High
     pub payload: Option<Vec<u8>>,
     /// Level: High
-    pub mass: Option<u64>,
+    pub storage_mass: Option<u64>,
     pub verbose_data: Option<RpcOptionalTransactionVerboseData>,
+}
+
+// This struct is used only for human-readable serialization of RpcOptionalTransaction, and is not intended to be used directly.
+// It exists to avoid breaking existing clients that rely on the "mass" field in JSON serialization of RpcOptionalTransaction,
+// while allowing us to rename the internal storage mass field to storage_mass for better clarity.
+// Once the "mass" field is removed from RpcOptionalTransaction, this struct and the related code can be removed as well.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcOptionalTransactionHumanReadable {
+    version: Option<u16>,
+    inputs: Vec<RpcOptionalTransactionInput>,
+    outputs: Vec<RpcOptionalTransactionOutput>,
+    lock_time: Option<u64>,
+    subnetwork_id: Option<RpcSubnetworkId>,
+    gas: Option<u64>,
+    #[serde(with = "serde_bytes_optional")]
+    payload: Option<Vec<u8>>,
+    storage_mass: Option<u64>,
+    mass: Option<u64>, // Deprecated field for storage mass to avoid breaking existing clients. Should be removed in the future.
+    verbose_data: Option<RpcOptionalTransactionVerboseData>,
+}
+
+impl<'de> serde::Deserialize<'de> for RpcOptionalTransaction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        if !deserializer.is_human_readable() {
+            return Err(serde::de::Error::custom("RpcOptionalTransaction does not support non-human-readable deserialization"));
+        }
+
+        let value = RpcOptionalTransactionHumanReadable::deserialize(deserializer)?;
+        let storage_mass = match (value.storage_mass, value.mass) {
+            (Some(storage_mass), Some(mass)) if storage_mass != mass => {
+                return Err(serde::de::Error::custom(format!(
+                    "storageMass and mass must match when both are provided: storageMass={storage_mass}, mass={mass}"
+                )));
+            }
+            (Some(storage_mass), _) => Some(storage_mass),
+            (None, mass) => mass,
+        };
+
+        Ok(Self {
+            version: value.version,
+            inputs: value.inputs,
+            outputs: value.outputs,
+            lock_time: value.lock_time,
+            subnetwork_id: value.subnetwork_id,
+            gas: value.gas,
+            payload: value.payload,
+            storage_mass,
+            verbose_data: value.verbose_data,
+        })
+    }
+}
+
+impl Serialize for RpcOptionalTransaction {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        if !serializer.is_human_readable() {
+            return Err(serde::ser::Error::custom("RpcOptionalTransaction does not support non-human-readable serialization"));
+        }
+
+        // We use this destructuring so any change in the fields of RpcOptionalTransaction will cause a compile error here, reminding us to update the serialization code of RpcOptionalTransactionHumanReadable accordingly.
+        let Self { version, inputs, outputs, lock_time, subnetwork_id, gas, payload, storage_mass, verbose_data } = self;
+
+        let hr = RpcOptionalTransactionHumanReadable {
+            version: *version,
+            inputs: inputs.clone(),
+            outputs: outputs.clone(),
+            lock_time: *lock_time,
+            subnetwork_id: *subnetwork_id,
+            gas: *gas,
+            payload: payload.clone(),
+            storage_mass: *storage_mass,
+            #[allow(deprecated)]
+            mass: *storage_mass,
+            verbose_data: verbose_data.clone(),
+        };
+        hr.serialize(serializer)
+    }
 }
 
 impl RpcOptionalTransaction {
@@ -500,20 +584,20 @@ impl RpcOptionalTransaction {
             && self.subnetwork_id.is_none()
             && self.gas.is_none()
             && self.payload.is_none()
-            && self.mass.is_none()
+            && self.storage_mass.is_none()
             && (self.verbose_data.is_none() || self.verbose_data.as_ref().is_some_and(|x| x.is_empty()))
     }
 }
 
 impl std::fmt::Debug for RpcOptionalTransaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RpcTransaction")
+        f.debug_struct("RpcOptionalTransaction")
             .field("version", &self.version)
             .field("lock_time", &self.lock_time)
             .field("subnetwork_id", &self.subnetwork_id)
             .field("gas", &self.gas)
             .field("payload", &self.payload.as_ref().map(|v|v.to_hex()))
-            .field("mass", &self.mass)
+            .field("storage_mass", &self.storage_mass)
             .field("inputs", &self.inputs) // Inputs and outputs are placed purposely at the end for better debug visibility
             .field("outputs", &self.outputs)
             .field("verbose_data", &self.verbose_data)
@@ -531,7 +615,7 @@ impl Serializer for RpcOptionalTransaction {
         store!(Option<RpcSubnetworkId>, &self.subnetwork_id, writer)?;
         store!(Option<u64>, &self.gas, writer)?;
         store!(Option<Vec<u8>>, &self.payload, writer)?;
-        store!(Option<u64>, &self.mass, writer)?;
+        store!(Option<u64>, &self.storage_mass, writer)?;
         serialize!(Option<RpcOptionalTransactionVerboseData>, &self.verbose_data, writer)?;
 
         Ok(())
@@ -549,27 +633,26 @@ impl Deserializer for RpcOptionalTransaction {
         let subnetwork_id = load!(Option<RpcSubnetworkId>, reader)?;
         let gas = load!(Option<u64>, reader)?;
         let payload = load!(Option<Vec<u8>>, reader)?;
-        let mass = load!(Option<u64>, reader)?;
+        let storage_mass = load!(Option<u64>, reader)?;
         let verbose_data = deserialize!(Option<RpcOptionalTransactionVerboseData>, reader)?;
 
-        Ok(Self { version, inputs, outputs, lock_time, subnetwork_id, gas, payload, mass, verbose_data })
+        Ok(Self { version, inputs, outputs, lock_time, subnetwork_id, gas, payload, storage_mass, verbose_data })
     }
 }
 
 /// Represent Kaspa transaction verbose data
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde_nested]
 #[serde(rename_all = "camelCase")]
 pub struct RpcOptionalTransactionVerboseData {
-    #[serde_nested(sub = "RpcTransactionId", serde(with = "serde_bytes_fixed_ref"))]
+    #[serde(with = "serde_bytes_fixed_ref_optional")]
     /// Level: Low
     pub transaction_id: Option<RpcTransactionId>,
-    #[serde_nested(sub = "RpcHash", serde(with = "serde_bytes_fixed_ref"))]
+    #[serde(with = "serde_bytes_fixed_ref_optional")]
     /// Level: Low
     pub hash: Option<RpcHash>,
     /// Level: High
     pub compute_mass: Option<u64>,
-    #[serde_nested(sub = "RpcHash", serde(with = "serde_bytes_fixed_ref"))]
+    #[serde(with = "serde_bytes_fixed_ref_optional")]
     /// Level: Low
     pub block_hash: Option<RpcHash>,
     /// Level: Low

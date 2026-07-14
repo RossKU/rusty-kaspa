@@ -1,8 +1,9 @@
 const { PrivateKey, RpcClient, ScriptBuilder, Opcodes,
     payToScriptHashScript, addressFromScriptPublicKey,
-    createTransaction, signTransaction } = require('./kaspa');
+    createTransaction, signTransaction,
+    Encoding} = require('./kaspa');
 
-// Configuration  
+// Configuration
 const NETWORK_ID = 'devnet';
 const RPC_URL = 'ws://127.0.0.1:17610';
 const PRIVATE_KEY = 'b99d75736a0fd0ae2da658959813d680474f5a740a9c970a7da867141596178f';
@@ -23,11 +24,11 @@ const PUBLIC_INPUTS = [
     'c07a65145c3cb48b6101962ea607a4dd93c753bb26975cb47feb00d3666e4404'
 ];
 
-async function groth16Verify() {
+async function groth16VerifyNoBuilder() {
     const privateKey = new PrivateKey(PRIVATE_KEY);
     const keypair = privateKey.toKeypair();
     const sourceAddress = keypair.toAddress(NETWORK_ID);
-    
+
     // Parse proof data
     const unpreparedVk = Buffer.from(UNPREPARED_VK_HEX, 'hex');
     const proof = Buffer.from(PROOF_HEX, 'hex');
@@ -35,26 +36,27 @@ async function groth16Verify() {
     const numInputs = PUBLIC_INPUTS.length;
 
     console.log(`Verifying Groth16 proof with:`);
-    console.log(`  - Verifying key: ${unpreparedVk.length} bytes`);
-    console.log(`  - Proof: ${proof.length} bytes`);
-    console.log(`  - Public inputs: ${numInputs} field elements`);
+
+    console.log(`Verifying key: ${unpreparedVk.length} bytes`);
+    console.log(`Proof: ${proof.length} bytes`);
+    console.log(`Public inputs: ${numInputs} field elements`);
 
     const rpc = new RpcClient({
         url: RPC_URL,
-        encoding: 'borsh',
+        encoding: Encoding.Borsh,
         networkId: NETWORK_ID
     });
 
     await rpc.connect();
-    
+
     try {
         // Get UTXOs and wait for maturity
         console.log('Fetching UTXOs...');
         let response = await rpc.getUtxosByAddresses([sourceAddress]);
-        
+
         const info = await rpc.getBlockDagInfo();
         const currentDaaScore = info.virtualDaaScore;
-        
+
         const matureUtxos = response.entries.filter(entry => {
             if (!entry.entry.isCoinbase) return true;
             return (currentDaaScore - entry.entry.blockDaaScore) >= 100n;
@@ -73,24 +75,28 @@ async function groth16Verify() {
         // 2. Redeem script pushes: tag (0x20)
         // 3. OpZkPrecompile pops in order: tag, vk, proof, num_inputs, input0...input4
         const redeemScriptBuilder = new ScriptBuilder();
-        
+
         // The signature script will push all the proof data
         // The redeem script only needs to push the tag and call the opcode
         redeemScriptBuilder.addData(Buffer.from([ZK_VERIFIER_TAG])); // Push tag (0x20)
         redeemScriptBuilder.addOp(Opcodes.OpZkPrecompile);            // Execute ZK verification
-        
+
         const redeemScript = redeemScriptBuilder.drain();
         const lockingScript = payToScriptHashScript(redeemScript);
-        
+
         console.log(`Redeem script (hex): ${redeemScript}`);
 
         // Convert the P2SH script to an address
         const p2shAddress = addressFromScriptPublicKey(lockingScript, NETWORK_ID);
         console.log(`P2SH address: ${p2shAddress}`);
 
+        if(!p2shAddress) {
+            console.error('Failed to derive P2SH address from redeem script');
+            return;
+        }
         // Create COMMIT transaction
         const utxoToSpend = matureUtxos[0];
-        const commitAmount = utxoToSpend.amount - 10000n;
+        const commitAmount = utxoToSpend.amount - 163500n;
 
         const utxoEntries = [{
             address: sourceAddress,
@@ -121,7 +127,7 @@ async function groth16Verify() {
         console.log('Commit transaction signed');
 
         const submitResult = await rpc.submitTransaction({ transaction: signedCommitTx });
-        const commitTxId = submitResult.transactionId || submitResult;
+        const commitTxId = submitResult.transactionId;
         console.log(`Commit transaction submitted: ${commitTxId}`);
 
         // Wait for commit transaction confirmation
@@ -134,26 +140,23 @@ async function groth16Verify() {
         // Build signature script with proof data
         // Stack order (bottom to top): vk, proof, num_inputs, input0, input1, input2, input3, input4
         const signatureScriptBuilder = new ScriptBuilder();
-        
-        
-        
-        
+
+
+
+
         // Push public inputs in order (input0 first, pushed last so it's on top)
         for (let i = publicInputs.length - 1; i >= 0; i--) {
             signatureScriptBuilder.addData(publicInputs[i]);
         }
         signatureScriptBuilder.addI64(BigInt(numInputs));
 
-        // Push verifying key
-        // Push proof
         signatureScriptBuilder.addData(proof);
-        // Push number of inputs (little-endian u16)
-        
-                signatureScriptBuilder.addData(unpreparedVk);
+
+        signatureScriptBuilder.addData(unpreparedVk);
 
         // Push redeem script (P2SH requirement)
         signatureScriptBuilder.addData(Buffer.from(redeemScript, 'hex'));
-        
+
         const signatureScript = signatureScriptBuilder.drain();
 
         console.log(`Signature script length: ${Buffer.from(signatureScript, 'hex').length} bytes`);
@@ -183,15 +186,17 @@ async function groth16Verify() {
             [p2shUtxoEntry],
             [{
                 address: sourceAddress,
-                amount: commitAmount - 142000n
+                amount: commitAmount - 16128700n
             }],
             0n,
             '',
-            104
+            0
         );
 
-        // Set the signature script
+        // Set the signature script & compute budget
         redeemTx.inputs[0].signatureScript = signatureScript;
+        redeemTx.inputs[0].computeBudget = 1600;
+        redeemTx.version=1;
 
         console.log('Redeem transaction created');
         console.log('Submitting redeem transaction with Groth16 proof verification...');
@@ -199,17 +204,16 @@ async function groth16Verify() {
         // Submit redeem transaction
         const redeemResult = await rpc.submitTransaction({ transaction: redeemTx });
         const redeemTxId = redeemResult.transactionId || redeemResult;
-        console.log(`✓ Redeem transaction submitted: ${redeemTxId}`);
-        console.log('✓ Groth16 proof verification successful!');
+        console.log(`Redeem transaction submitted: ${redeemTxId}`);
+        console.log('Groth16 proof verification successful!');
 
     } catch (error) {
         console.error('Error:', error);
-        if (error.stack) {
-            console.error('Stack:', error.stack);
-        }
+
     } finally {
         await rpc.disconnect();
     }
+
 }
 
-groth16Verify().catch(console.error);
+groth16VerifyNoBuilder().catch(console.error);

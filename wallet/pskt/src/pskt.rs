@@ -15,12 +15,12 @@ pub use crate::input::{Input, InputBuilder};
 pub use crate::output::{Output, OutputBuilder};
 pub use crate::role::{Combiner, Constructor, Creator, Extractor, Finalizer, Signer, Updater};
 use kaspa_consensus_core::config::params::Params;
-use kaspa_consensus_core::constants::TX_VERSION_POST_COV_HF;
+use kaspa_consensus_core::constants::TX_VERSION_TOCCATA;
 use kaspa_consensus_core::mass::{MassCalculator, NonContextualMasses};
 use kaspa_consensus_core::{
     hashing::sighash_type::SigHashType,
     subnets::SUBNETWORK_ID_NATIVE,
-    tx::{MutableTransaction, SignableTransaction, Transaction, TransactionId, TransactionInput, TransactionOutput},
+    tx::{ComputeCommit, MutableTransaction, SignableTransaction, Transaction, TransactionId, TransactionInput, TransactionOutput},
 };
 use kaspa_txscript::{TxScriptEngine, caches::Cache};
 
@@ -144,7 +144,7 @@ impl<R> PSKT<R> {
                     previous_outpoint: *previous_outpoint,
                     signature_script: vec![],
                     sequence: sequence.unwrap_or(u64::MAX),
-                    sig_op_count: sig_op_count.unwrap_or(0),
+                    compute_commit: ComputeCommit::SigopCount(sig_op_count.unwrap_or(0).into()), // TODO: Add support for v1 transactions with ComputeCommit::ComputeBudget
                 })
                 .collect(),
             self.outputs
@@ -247,7 +247,7 @@ impl PSKT<Constructor> {
     /// Adds an output to the PSKT.
     pub fn output(mut self, output: Output) -> Result<Self, Error> {
         if output.covenant.is_some()
-            && (self.inner_pskt.global.version < Version::Two || self.inner_pskt.global.tx_version < TX_VERSION_POST_COV_HF)
+            && (self.inner_pskt.global.version < Version::Two || self.inner_pskt.global.tx_version < TX_VERSION_TOCCATA)
         {
             return Err(Error::Covenant);
         }
@@ -397,7 +397,7 @@ impl<R> std::ops::Add<PSKT<R>> for PSKT<Combiner> {
         self.inner_pskt.inputs = combine!(self.inner_pskt.inputs, rhs.inner_pskt.inputs, crate::input::CombineError);
         self.inner_pskt.outputs = combine!(self.inner_pskt.outputs, rhs.inner_pskt.outputs, crate::output::CombineError);
         if self.outputs.iter().any(|output| output.covenant.is_some())
-            && (self.global.version < Version::Two || self.global.tx_version < TX_VERSION_POST_COV_HF)
+            && (self.global.version < Version::Two || self.global.tx_version < TX_VERSION_TOCCATA)
         {
             return Err(CombineError::Covenant);
         }
@@ -477,7 +477,7 @@ impl PSKT<Extractor> {
         let storage_mass = calculator.calc_contextual_masses(&tx.as_verifiable()).map(|mass| mass.storage_mass).unwrap_or_default();
         let NonContextualMasses { compute_mass, transient_mass } = calculator.calc_non_contextual_masses(&tx.tx);
         let mass = storage_mass.max(compute_mass).max(transient_mass);
-        tx.tx.set_mass(mass);
+        tx.tx.set_storage_mass(mass);
         Ok(tx)
     }
 

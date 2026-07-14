@@ -90,11 +90,16 @@ impl PruningProofManager {
 
         // Topologically sort every level in the proof
         expanded_proof.iter_mut().for_each(|level_proof| {
-            level_proof.sort_by(|a, b| a.blue_work.cmp(&b.blue_work));
+            level_proof.sort_by_key(|a| a.blue_work);
         });
 
         // Build selected-parent mapping for the PP chain segment
-        let chain_segment_map = self.verify_and_build_chain_segment_map(pruning_point, &pruning_point_header, &trusted_header_map)?;
+        let chain_segment_map = self.verify_and_build_chain_segment_map(
+            pruning_point,
+            &pruning_point_header,
+            &trusted_header_map,
+            header_only_chain_segment,
+        )?;
 
         // Populate headers/reachability (using the PP chain segment mapping)
         self.populate_reachability_and_headers(&expanded_proof, header_only_chain_segment, &chain_segment_map)?;
@@ -289,37 +294,51 @@ impl PruningProofManager {
 
     /// Verify and build a map from pruning-point chain blocks to their selected parent for reachability seeding.
     ///
-    /// The map is populated only for covenants-activated pruning points and only within the seqcommit
+    /// The map is populated only for Toccata-activated pruning points and only within the seqcommit
     /// threshold range; it relies on the chain-qualification rule (first direct parent is the selected parent).
     fn verify_and_build_chain_segment_map(
         &self,
         pruning_point: Hash,
         pruning_point_header: &Arc<Header>,
         trusted_header_map: &BlockHashMap<Arc<Header>>,
+        header_only_chain_segment: &[Arc<Header>],
     ) -> PruningImportResult<BlockHashMap<Hash>> {
         let mut chain_segment_map: BlockHashMap<Hash> = BlockHashMap::new();
+        let mut expected_chain_segment_hashes = BlockHashSet::new();
 
-        if self.covenants_activation.is_active(pruning_point_header.daa_score) {
-            let pruning_point_blue_score = pruning_point_header.blue_score;
+        if self.toccata_activation.is_active(pruning_point_header.daa_score) {
+            // Pruning point txs are validated with the pruning point selected parent as seqcommit context.
+            // The selected-parent context carries the full threshold range needed for both
+            // seqcommit access and the inactivity shortcut anchor.
+            let sp = pruning_point_header.direct_parents().first().copied().unwrap_or(pruning_point); // In case of genesis, we fall back to genesis itself
+            let context_blue_score =
+                trusted_header_map.get(&sp).ok_or(PruningImportError::MissingPruningPointChainSegment(sp))?.blue_score;
+
             let threshold = self.finality_depth;
             let mut current = pruning_point;
             loop {
+                expected_chain_segment_hashes.insert(current);
                 let current_header =
                     trusted_header_map.get(&current).ok_or(PruningImportError::MissingPruningPointChainSegment(current))?;
 
-                if !seq_commit_within_threshold(pruning_point_blue_score, current_header.blue_score, threshold) {
+                // pp.sp.bs context: a block failing the check satisfies `current.bs + F <= pp.sp.bs`,
+                // and chain qualification gives pp.sp.bs = pp.bs - 1, so `current.bs <= pp.bs - F - 1`.
+                // `pp.inactivity_shortcut` is defined as the highest chain block with that property
+                // (see `compute_inactivity_shortcut_block`), so its bs is at least the break block's bs
+                // and is reached by the iteration before (or at) the break.
+                if !seq_commit_within_threshold(context_blue_score, current_header.blue_score, threshold) {
                     break;
                 }
 
-                if !self.covenants_activation.is_active(current_header.daa_score) {
-                    // We cannot demand chain-qualification for blocks below the covenants activation
+                if !self.toccata_activation.is_active(current_header.daa_score) {
+                    // We cannot demand chain-qualification for blocks below the Toccata activation
                     // See the chain-qualification check in the utxo validation code for details as well as
                     // code in SeqCommitAccessor
                     break;
                 }
 
                 // Walk the selected-parent chain until we cross the threshold or hit genesis.
-                // Relies on the covenants-activated chain-qualification rule: the first direct parent is the selected parent.
+                // Relies on the Toccata-activated chain-qualification rule: the first direct parent is the selected parent.
                 match current_header.direct_parents().first().copied() {
                     Some(selected_parent) => {
                         chain_segment_map.insert(current, selected_parent);
@@ -332,6 +351,12 @@ impl PruningProofManager {
                         return Err(PruningImportError::MissingPruningPointChainSegment(current));
                     }
                 }
+            }
+        }
+
+        for header in header_only_chain_segment {
+            if !expected_chain_segment_hashes.contains(&header.hash) {
+                return Err(PruningImportError::UnexpectedPruningPointChainSegmentBlock(header.hash));
             }
         }
 

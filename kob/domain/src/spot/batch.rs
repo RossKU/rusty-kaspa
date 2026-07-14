@@ -43,17 +43,22 @@ use kob_core::contract::spot::oco::{
 };
 use kob_core::contract::spot::order::{
     BUY_ORDER_V15_RS_EXPECTED_LEN,
+    BUY_ORDER_V16_RS_EXPECTED_LEN,
     build_buy_fill_sigscript,
     build_buy_ioc_fill_sigscript,
     build_buy_v15_fill_sigscript,
     build_buy_v15_ioc_fill_sigscript,
     build_buy_v15_partial_fill_sigscript,
+    build_buy_v16_fill_sigscript,
+    build_buy_v16_ioc_fill_sigscript,
+    build_buy_v16_partial_fill_sigscript,
     build_sell_fill_sigscript,
     build_sell_fill_sigscript_v15,
     build_sell_ioc_fill_sigscript,
     build_sell_ioc_fill_sigscript_v15,
 };
 use kob_core::contract::spot::bracket::build_bracket_fill_sigscript;
+use kob_core::contract::spot::parse::BRACKET_RS_SIZE;
 
 /// Order type (buy or sell) for batch matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,10 +391,17 @@ impl BatchPlan {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
 
-        // V15 detection: if any buy in the batch uses the v15 contract (479B RS),
-        // all sells must use v15 sigscript format (fixed 2-byte koi push) so the
-        // v15 buy can read sell's pnum/pden at fixed offsets via OpTxInputScriptSigSubstr.
-        let has_v15_buy = self.buys.iter().any(|(b, _)| b.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN);
+        // V15/V16 detection: if any buy in the batch uses the v15 or v16
+        // contract (both read the counterparty sell's pnum/pden via
+        // OpTxInputScriptSigSubstr at fixed sigscript offsets), all sells
+        // must use the fixed-offset sigscript format (fixed 2-byte koi push)
+        // so those offsets land where F6 expects them. V16 is byte-compatible
+        // with v15's sell-side convention (same fixed offsets [7..15)/[16..24));
+        // only the buy side's F6 authentication differs (see order.rs).
+        let has_v15_buy = self.buys.iter().any(|(b, _)| {
+            let len = b.redeem_script.len();
+            len == BUY_ORDER_V15_RS_EXPECTED_LEN || len == BUY_ORDER_V16_RS_EXPECTED_LEN
+        });
 
         // === Build sell inputs ===
         for (i, (sell, input_idx)) in self.sells.iter().enumerate() {
@@ -480,17 +492,37 @@ impl BatchPlan {
             };
 
             // Indices >16 are handled by data-push encoding (no OpN limit).
+            //
+            // NOTE on `is_bracket`: this MUST be keyed off RS length, not the
+            // bare `buy.version` number. Bracket entries and v16 buy orders
+            // (this file's F6-fix contract) both report `version == 16` --
+            // that number is an engine-layer convenience label, not a unique
+            // contract identifier (see V16_STATUS.md Phase 0, "version number
+            // 16 is already taken"). RS length is the only thing that
+            // actually distinguishes them, and it already does everywhere
+            // else in this codebase (`is_v15` below uses the same pattern).
             let is_v15 = buy.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN;
-            let is_bracket = buy.version == 16;
+            let is_v16 = buy.redeem_script.len() == BUY_ORDER_V16_RS_EXPECTED_LEN;
+            let is_bracket = buy.redeem_script.len() == BRACKET_RS_SIZE;
 
             let ss = if is_bracket {
-                // Bracket entry (v16): sigscript = [Op1][pushData(RS)] (369B).
+                // Bracket entry: sigscript = [Op1][pushData(RS)] (365B RS).
                 // No toi/tii/coi — bracket contract uses hardcoded output indices
                 // (output[1] for buy entry token dest, output[0] for sell entry KAS dest).
                 build_bracket_fill_sigscript(&buy.redeem_script)
             } else if let Some(&(fill_kas, residual_idx, token_idx)) = self.buy_partial_fills.get(&buy_idx) {
                 // Partial fill (Op2 selector): buy D&R with residual continuation.
-                if is_v15 {
+                if is_v16 {
+                    // V16: [ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]
+                    // No sii (Phase-0 fix): F6 authenticates against the
+                    // hardcoded literal token-input index (see order.rs).
+                    build_buy_v16_partial_fill_sigscript(
+                        &buy.redeem_script,
+                        fill_kas,
+                        residual_idx,
+                        token_idx,
+                    )
+                } else if is_v15 {
                     // V15: [sii] [ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]
                     build_buy_v15_partial_fill_sigscript(
                         *tii as u16,
@@ -509,7 +541,16 @@ impl BatchPlan {
                     )
                 }
             } else if self.ioc_mode == Some(IocSide::Buy) {
-                if is_v15 {
+                if is_v16 {
+                    // V16 buy IOC: [toi] [tii] [coi] [Op5] [pushData(RS)]
+                    // No sii: F6 reads tii directly (already authenticated).
+                    build_buy_v16_ioc_fill_sigscript(
+                        toi as u16,
+                        *tii as u16,
+                        coi,
+                        &buy.redeem_script,
+                    )
+                } else if is_v15 {
                     // V15 buy IOC: [sii] [toi] [tii] [coi] [Op5] [pushData(RS)]
                     // sii = sell input index (= tii, the sell carrying this buy's token covenant)
                     build_buy_v15_ioc_fill_sigscript(
@@ -528,6 +569,16 @@ impl BatchPlan {
                         &buy.redeem_script,
                     )
                 }
+            } else if is_v16 {
+                // V16 buy fill: [toi] [tii] [coi] [Op1] [pushData(RS)]
+                // No sii (Phase-0 fix): F6 reads tii directly instead of a
+                // free, unauthenticated sigscript index.
+                build_buy_v16_fill_sigscript(
+                    toi as u16,
+                    *tii as u16,
+                    coi,
+                    &buy.redeem_script,
+                )
             } else if is_v15 {
                 // V15 buy fill: [sii] [toi] [tii] [coi] [Op1] [pushData(RS)]
                 // sii = sell input index (= tii, the sell carrying this buy's token covenant)

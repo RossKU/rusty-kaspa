@@ -489,8 +489,8 @@ pub fn build_redeem_script_for_order(
     let spk_hash = compute_p2pk_spk_hash(pubkey);
 
 
-    if order.version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", order.version);
+    if order.version != 14 && order.version != 16 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 and v16 are supported.", order.version);
     }
 
     match order.side.as_str() {
@@ -500,9 +500,15 @@ pub fn build_redeem_script_for_order(
             let token_bytes = hex::decode(token_hex)?;
             let mut tcid = [0u8; 32];
             tcid.copy_from_slice(&token_bytes);
-            Ok(contract::build_buy_redeem_script(
-                &tcid, order.price_num, order.price_den, order.min_fill,
-                &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+            if order.version == 16 {
+                Ok(contract::build_buy_v16_redeem_script(
+                    &tcid, order.price_num, order.price_den, order.min_fill,
+                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+            } else {
+                Ok(contract::build_buy_redeem_script(
+                    &tcid, order.price_num, order.price_den, order.min_fill,
+                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+            }
         }
         "sell" => {
             Ok(contract::build_sell_redeem_script(

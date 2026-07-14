@@ -135,10 +135,11 @@ pub async fn run(
 
     // Reconstruct the redeemScript using the specified contract version.
     // cancel_pending: 0 for normal orders, 1 after cancel-mark transition.
-    if version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
+    if version != 14 && version != 16 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 and v16 are supported.", version);
     }
     // Resolve max_matcher_fee: CLI override > cache > default.
+    // For v16 buys this is BPS (basis points), same semantics as v15.
     let max_matcher_fee = max_matcher_fee_override.unwrap_or_else(|| {
         cached.as_ref().map_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE, |c| c.max_matcher_fee)
     });
@@ -146,7 +147,11 @@ pub async fn run(
     let redeem_script = match side {
         "buy" => {
             let tcid = parse_token_cov_id(token_cov_id_resolved.as_deref())?;
-            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
+            if version == 16 {
+                contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
+            } else {
+                contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
+            }
         }
         "sell" => {
             contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?

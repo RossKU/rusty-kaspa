@@ -100,8 +100,8 @@ pub async fn run(
             new_params.min_fill
         );
     }
-    if new_params.version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", new_params.version);
+    if new_params.version != 14 && new_params.version != 16 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 and v16 are supported.", new_params.version);
     }
 
     // Resolve missing old_* params from the orders cache.
@@ -158,8 +158,8 @@ pub async fn run(
     };
     let old_token: Option<&str> = old_token_owned.as_deref();
 
-    if old_version != 14 {
-        anyhow::bail!("Unsupported old contract version {}. Only v14 is supported.", old_version);
+    if old_version != 14 && old_version != 16 {
+        anyhow::bail!("Unsupported old contract version {}. Only v14 and v16 are supported.", old_version);
     }
 
     if needs_cache && cached.is_some() {
@@ -175,9 +175,15 @@ pub async fn run(
     let old_redeem_script = match old_side {
         "buy" => {
             let tcid = parse_old_token(old_token)?;
-            contract::build_buy_redeem_script(
-                &tcid, old_price_num, old_price_den, old_min_fill,
-                &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
+            if old_version == 16 {
+                contract::build_buy_v16_redeem_script(
+                    &tcid, old_price_num, old_price_den, old_min_fill,
+                    &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
+            } else {
+                contract::build_buy_redeem_script(
+                    &tcid, old_price_num, old_price_den, old_min_fill,
+                    &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
+            }
         }
         "sell" => {
             contract::build_sell_redeem_script(
@@ -406,6 +412,9 @@ pub async fn run(
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
     let new_redeem_script = match new_params.side.as_str() {
+        "buy" if new_params.version == 16 => contract::build_buy_v16_redeem_script(
+            &token_cov_id, new_params.price_num, new_params.price_den,
+            new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         "buy" => contract::build_buy_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
             new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,

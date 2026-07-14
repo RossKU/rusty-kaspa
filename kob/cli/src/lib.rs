@@ -1764,13 +1764,13 @@ pub async fn dispatch(
                 max_matcher_fee,
                 mmfee_bps,
             } => {
-                // v15 is the default when --mmfee-bps is set; otherwise
-                // respect the user's --version flag (default=14).
-                // v14 is needed for cross-pair swap fills because the
-                // v15 F6 surplus cap check reads the counterparty sell's
-                // price, which is incompatible when buy and sell are for
-                // different tokens.
-                let version = if mmfee_bps.is_some() { 15 } else { version };
+                // v15 is the default when --mmfee-bps is set and --version
+                // was left at its default (14); an explicit --version 15 or
+                // --version 16 is always respected as-is. v14 is needed for
+                // cross-pair swap fills because the v15/v16 F6 surplus cap
+                // check reads the counterparty sell's price, which is
+                // incompatible when buy and sell are for different tokens.
+                let version = if mmfee_bps.is_some() && version == 14 { 15 } else { version };
 
                 // Resolve token alias
                 let token = token::resolve_token(&token, None)?;

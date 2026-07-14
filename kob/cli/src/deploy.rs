@@ -320,8 +320,8 @@ pub async fn deploy_buy(
     max_matcher_fee: u64,
     mmfee_bps: Option<u64>,
 ) -> anyhow::Result<String> {
-    if version != 14 && version != 15 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 and v15 are supported for buy deployment.", version);
+    if version != 14 && version != 15 && version != 16 {
+        anyhow::bail!("Unsupported contract version {}. Only v14, v15, and v16 are supported for buy deployment.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;
@@ -397,7 +397,20 @@ pub async fn deploy_buy(
     let owner_hash = blake2b_256(&pubkey);
     let buyer_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
-    let redeem_script = if version == 15 {
+    let redeem_script = if version == 16 {
+        let bps = mmfee_bps.unwrap_or(30); // default 0.3% for v16 (same semantics as v15)
+        contract::build_buy_v16_redeem_script(
+            &token_cov_id,
+            price_num,
+            price_den,
+            min_fill,
+            &owner_hash,
+            &buyer_spk_hash,
+            bps,
+            0, // cancel_pending = 0 (active order)
+            expiry_daa.unwrap_or(0),
+        )?
+    } else if version == 15 {
         let bps = mmfee_bps.unwrap_or(30); // default 0.3% for v15
         contract::build_buy_v15_redeem_script(
             &token_cov_id,
@@ -441,7 +454,7 @@ pub async fn deploy_buy(
         amount,
         amount as f64 / 1e8
     );
-    if version == 15 {
+    if version == 15 || version == 16 {
         let bps = mmfee_bps.unwrap_or(30);
         println!("Max Matcher Fee: {} bps ({}%)", bps, bps as f64 / 100.0);
     } else {
@@ -688,7 +701,7 @@ pub async fn deploy_buy(
         token: Some(token_covenant_id.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
-        max_matcher_fee: if version == 15 { mmfee_bps.unwrap_or(30) } else { max_matcher_fee },
+        max_matcher_fee: if version == 15 || version == 16 { mmfee_bps.unwrap_or(30) } else { max_matcher_fee },
     };
     let mut cache = OrderCache::load(&cache_path);
     cache.orders.push(entry);

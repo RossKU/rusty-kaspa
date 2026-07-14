@@ -73,15 +73,19 @@ pub async fn run(
         Ok(tcid)
     };
 
-    if version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
+    if version != 14 && version != 16 {
+        anyhow::bail!("Unsupported contract version {}. Only v14 and v16 are supported.", version);
     }
 
     // Reconstruct the current redeemScript (cpend=0, the active order)
     let current_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
+            if version == 16 {
+                contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
+            } else {
+                contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
+            }
         }
         "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?,
         _ => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", side),
@@ -91,7 +95,11 @@ pub async fn run(
     let target_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
+            if version == 16 {
+                contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
+            } else {
+                contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
+            }
         }
         "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?,
         _ => unreachable!(),

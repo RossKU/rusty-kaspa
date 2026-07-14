@@ -155,6 +155,14 @@ pub fn detect_fill_from_sigscript(sigscript: &[u8]) -> Option<(String, u64, u64,
             return None;
         }
         Some(off)
+    } else if len == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
+        // V16 buy (F6-fix contract). V15 is intentionally NOT recognized here
+        // -- it never got CLI wiring (gated, deploy-only); v16 does.
+        let off = len - kob_core::contract::spot::order::BUY_ORDER_V16_BODY.len();
+        if last_push[off..] != *kob_core::contract::spot::order::BUY_ORDER_V16_BODY {
+            return None;
+        }
+        Some(off)
     } else if len == SELL_RS_SIZE {
         let off = len - kob_core::SELL_ORDER_BODY.len();
         if last_push[off..] != *kob_core::SELL_ORDER_BODY {

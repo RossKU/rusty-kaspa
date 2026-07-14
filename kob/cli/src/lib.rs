@@ -1840,7 +1840,7 @@ pub async fn dispatch(
                     if bps > 10000 {
                         anyhow::bail!("--mmfee-bps must be 0..=10000 (basis points). Got {}.", bps);
                     }
-                    println!("V15 buy order: mmfee_bps = {} ({}%)", bps, bps as f64 / 100.0);
+                    println!("V{} buy order: mmfee_bps = {} ({}%)", version, bps, bps as f64 / 100.0);
                 }
                 let min_fill = min_fill.unwrap_or_else(kob_core::minimum_sell_min_fill);
                 let deploy_txid = deploy::deploy_buy(

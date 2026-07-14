@@ -323,9 +323,20 @@ pub async fn run(
 
     println!("Cancel SigScript: {} bytes", cancel_sigscript.len());
     if side == "buy" {
+        // T2 (the sigLen threshold that routes to the cancel/cancel-mark
+        // path) differs per buy contract version; pick the real one instead
+        // of a stale hardcoded constant left over from an older version.
+        let t2 = if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
+            494
+        } else if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
+            501
+        } else {
+            415 // v14
+        };
         println!(
-            "  (>= T2=367 triggers cancel path: {})",
-            if cancel_sigscript.len() >= 367 { "YES" } else { "NO -- ERROR" }
+            "  (>= T2={} triggers cancel path: {})",
+            t2,
+            if cancel_sigscript.len() >= t2 { "YES" } else { "NO -- ERROR" }
         );
     } else {
         println!("  (selector Op0 at position triggers cancel path via Op5 OpRoll)");

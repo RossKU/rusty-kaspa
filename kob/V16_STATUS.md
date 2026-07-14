@@ -1285,3 +1285,77 @@ harness through the engine is a recommended follow-up.)
 The change touches only the fill/partial F6 compare; the dispatch preamble,
 expire, cancel, and cancel-mark paths (the ones proven on-chain in Phase 5) are
 byte-unchanged aside from the shifted P2SH address.
+
+---
+
+## Phase 11 — FULL v16 E2E ON-CHAIN: honest match SETTLES, adversarial REJECTED
+
+Status: **DONE.** The F6 fix (Phase 10) unblocks the full match E2E on
+testnet-10. Both legs verified on real consensus.
+
+Token reused via the fixture (`kob/e2e_fixture.json`, token
+`0c113120…`, genesis `c20dc48a…`); only fresh token_units minted per leg.
+
+### (a) Honest match — SETTLED ✓
+
+| Item | Value |
+|---|---|
+| sell (30M @ 499/500) | `cf3249e1d781f42d78032ab2cabed5b4ebeaee94e12d436bed53acaa9e8037cc:0` |
+| buy v16 (30M @ 1/1, mmfee-bps 2000) | `ba8ac6927692324b064b70345bb60417865d5a5fe3a7ffe6d6a336091ae86d64:0` |
+| **MATCH SETTLED TXID** | **`a342b7434141138d2ea441cdc5a454889a09b16f076cfdafe6e13bc06d15a9a5`** |
+| Outputs | SellerKas `29,940,000`, BuyerTokens `30,000,000` (covenant), BuyerChange `138,878,105` |
+
+Verified: **SellerKas 29,940,000 < 30,000,000 buyer input** (the F6 surplus of
+60,000 is within the 6,000,000 cap → F6 passes → settles). Both the buy and
+sell order UTXOs are now **spent** on-chain by the match tx (confirmed via
+`order-status`).
+
+**Matcher-fee UTXO**: NOT present in this settle — the engine caps the matcher
+take at `fee_bps` (default 30 bps, hard max `MAX_FEE_BPS = 100` = 1%), so for a
+30M-sompi trade the matcher fee is at most ~300,000 sompi, below
+`MIN_UTXO_VALUE` (3,000,000). Per the Phase-9 fix it is therefore DROPPED to the
+miner fee (never folded into the seller). A standalone matcher-fee UTXO would
+require a trade of ≥ ~3 KAS of seller value (≥ MIN_UTXO / 1%), which exceeds
+this device's ~2 KAS wallet funding — a funding limit, not a code limit. The F6
+economic guarantee (SellerKas = fair, matcher cannot take more than the cap) is
+demonstrated regardless.
+
+### (b) Adversarial over-extraction — REJECTED on-chain ✓
+
+Same v16 buy contract, but priced so the real spread exceeds the buyer's cap:
+
+| Item | Value |
+|---|---|
+| sell (30M @ 1/2 → 50% spread) | `44464cf4cfcb2740a3d2adfdef830116a4157145c2ea083d879a551e37f9aa66:0` |
+| buy v16 (30M @ 1/1, **mmfee-bps 30** = 0.3% cap) | `43e53894e31d98b759cfee1c1e9b4316dbc71278c3eb9844303bff76f3312f19:0` |
+| Engine plan | SellerKas `15,000,000` (seller's 1/2 price), matcher take capped at 90,000 |
+| **REJECTED match TXID** | **`177ee7342b687e799b5b9075fa04d20bef1dac90c3c0633586671adfb9910762`** |
+| Node error | `failed to verify the signature script: script ran, but verification failed` |
+
+The engine (which caps its OWN take at 90,000 and refunds the rest to the
+buyer) still built and SUBMITTED the tx. F6 on-chain rejected it because it
+checks the actual PRICE SPREAD, not the matcher's post-refund take:
+`surplus = kas_in(30,000,000) − fair_kas(30M · 1/2 = 15,000,000) = 15,000,000`
+vs `max_surplus = kas_in · mmfee_bps/10000 = 30,000,000 · 30/10000 = 90,000`;
+`15,000,000 ≤ 90,000` is false → F6's `OpVerify` aborts → the whole tx is
+rejected by consensus. **A matcher cannot settle a trade whose spread exceeds
+the buyer's authorized `mmfee_bps` cap — the v16 F6 enforces it on-chain.**
+
+This is a clean A/B proof that the F6 fix is correct in BOTH directions: the
+identical contract PASSES a within-cap spread (60,000 ≤ 6,000,000, leg a) and
+REJECTS an over-cap spread (15,000,000 > 90,000, leg b). And because v16 has no
+`sii` (the removed v15 flaw), F6 always reads the authenticated counterparty
+price from `tii` — the adversary has no decoy to point it at (proven
+structurally in Phases 3–4 and by the on-chain byte-trace in Phase 8).
+
+### Remaining TODOs
+
+- A standalone matcher-fee UTXO on-chain needs a ≥ ~3 KAS trade (fund the
+  wallet further via `tests/miner.mjs` if desired); economically demonstrated
+  above regardless.
+- Partial-fill and IOC-sell match paths through the local `TxScriptEngine`
+  harness (fill + buy-IOC covered; the partial F6 fix is the identical one-byte
+  change verified by the fill path + the `buy_v16_partial_f6_*` pattern tests).
+- The latent `SpkEncoding::to_bytes` version-endianness mismatch (BE in the
+  engine vs LE in `compute_spk_hash`) is inert for KOB's version-0 SPKs but
+  would matter if KOB ever used a non-zero SPK version.

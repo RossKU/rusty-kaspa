@@ -134,7 +134,7 @@ pub enum Commands {
         #[arg(long)]
         order_value: Option<u64>,
 
-        /// Contract version (only 14 is supported). Must match the version used to deploy the order.
+        /// Contract version (14 or 16). Must match the version used to deploy the order.
         #[arg(long)]
         version: Option<u8>,
 
@@ -202,7 +202,7 @@ pub enum Commands {
         #[arg(long)]
         order_value: Option<u64>,
 
-        /// Contract version (only 14 is supported). Must match the version used to deploy the order.
+        /// Contract version (14 or 16). Must match the version used to deploy the order.
         #[arg(long, default_value_t = 14)]
         version: u8,
 
@@ -658,11 +658,11 @@ pub enum Commands {
         #[arg(long)]
         new_amount: u64,
 
-        /// Contract version of the old order. Resolved from orders cache if omitted (defaults to 14).
+        /// Contract version of the old order (14 or 16). Resolved from orders cache if omitted (defaults to 14).
         #[arg(long)]
         old_version: Option<u8>,
 
-        /// Contract version for new order (only 14 is supported).
+        /// Contract version for new order (14 or 16).
         #[arg(long, default_value = "14")]
         new_version: u8,
 
@@ -942,7 +942,7 @@ pub enum DeployCommands {
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version (only 14 is supported).
+        /// Contract version (14, 15, or 16). v15/v16 use --mmfee-bps instead of --max-matcher-fee (see V16_STATUS.md).
         #[arg(long, default_value = "14")]
         version: u8,
 

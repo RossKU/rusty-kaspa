@@ -982,11 +982,13 @@ pub(crate) fn pair_to_batch_orders(
     }
     if buy_rs.len() != BUY_RS_SIZE
         && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN
+        && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
         && buy_rs.len() != BRACKET_RS_SIZE
     {
-        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v15={}, bracket={})",
+        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v15={}, v16={}, bracket={})",
             label, buy_rs.len(), BUY_RS_SIZE,
             kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN,
+            kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN,
             BRACKET_RS_SIZE);
         return None;
     }
@@ -1025,6 +1027,15 @@ pub(crate) fn pair_to_batch_orders(
 
     let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
         15u8
+    } else if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
+        // NOTE: v16 (F6-fix buy contract) and bracket entries both report
+        // version 16 here -- that number alone does not distinguish the two
+        // contracts. `BatchOrder.version` is downstream engine/domain
+        // metadata only; the actual sigscript-building dispatch in
+        // `BatchPlan::build_tx` is keyed off RS length (BRACKET_RS_SIZE vs
+        // BUY_ORDER_V16_RS_EXPECTED_LEN), not this field. See
+        // V16_STATUS.md Phase 0 for the full collision writeup.
+        16u8
     } else if buy_rs.len() == BRACKET_RS_SIZE {
         16u8
     } else {
@@ -1088,6 +1099,7 @@ pub(crate) fn book_order_to_batch_order(
         crate::matcher::order_book::OrderSide::Buy => {
             if rs.len() != BUY_RS_SIZE
                 && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN
+                && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
                 && rs.len() != BRACKET_RS_SIZE
             {
                 warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
@@ -1111,6 +1123,10 @@ pub(crate) fn book_order_to_batch_order(
 
     let version = if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
         15u8
+    } else if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
+        // See buy_version comment above: v16-buy and bracket share the
+        // numeric label 16, disambiguated downstream by RS length.
+        16u8
     } else if rs.len() == BRACKET_RS_SIZE {
         16u8
     } else {

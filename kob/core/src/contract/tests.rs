@@ -108,7 +108,7 @@ mod tests {
     fn token_unit_redeem_script_length() {
         let pk = [0u8; 32];
         let rs = build_token_unit_redeem_script(&pk);
-        assert_eq!(rs.len(), 37, "token_unit RS must be 37 bytes (34 KCC20 header + 3 body)");
+        assert_eq!(rs.len(), 38, "token_unit RS must be 38 bytes (35 KCC20 header + 3 body)");
     }
 
     #[test]
@@ -195,12 +195,12 @@ mod tests {
         let rs = build_token_unit_redeem_script(&pk);
         let sig = [0x42u8; 64];
         let ss = build_token_unit_sigscript(&sig, &rs);
-        // [65] [sig 64B] [0x01] [pushData(RS 37B)]
-        // = 66 + 1 + 37 = 104
-        assert_eq!(ss.len(), 104, "token_unit transfer sigscript = 104B");
+        // [65] [sig 64B] [0x01] [pushData(RS 38B)]
+        // = 66 + 1 + 38 = 105
+        assert_eq!(ss.len(), 105, "token_unit transfer sigscript = 105B");
         assert_eq!(ss[0], 65, "first byte = sig length prefix");
         assert_eq!(ss[65], 0x01, "sighash type");
-        assert_eq!(ss[66], 37, "RS push length");
+        assert_eq!(ss[66], 38, "RS push length");
     }
 
     // Zero-fill attack prevention tests (TN12 T79: min_fill=0 vulnerability)
@@ -1769,7 +1769,7 @@ mod adversarial_tests {
             ("TOKEN_MINT", TOKEN_MINT_BODY,
              "27ce3bcda48b1084d84b16b61ca93c2fec28cddf748afeec73585cda3d211211"),
             ("TOKEN_UNIT", TOKEN_UNIT_BODY,
-             "44a029fde5f5eefd307b64e4189fd375ee1b4f19ffb122fde6b4880565bc4cc5"),
+             "2ae2756e8bc2825cb9940dc63e9c7fdab52b07f40673f6f741bec0b323f922b2"),
             ("RECEIPT", RECEIPT_BODY,
              "a526f6ea62bfc1cc305953a71c029afc334b96b199e1a7edf0ae9d912a904cd3"),
             ("BUY_ORDER", BUY_ORDER_BODY,

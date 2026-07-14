@@ -62,9 +62,9 @@ pub struct Kcc20StateHeader {
 impl Kcc20StateHeader {
     /// Size, in bytes, of the script-encoded portion of the header --
     /// `owner_identifier` + `identifier_type` (push opcodes included):
-    /// `[0x20]+32 + [0x01]+1` = 34 bytes. `amount` is not part of this
+    /// `[0x20]+32 + [0x01]+1` = 35 bytes. `amount` is not part of this
     /// count (see module-level decision note).
-    pub const SCRIPT_ENCODED_LEN: usize = 34;
+    pub const SCRIPT_ENCODED_LEN: usize = 35;
 
     pub fn new(owner_identifier: [u8; 32], identifier_type: u8, amount: u64) -> Self {
         Self { owner_identifier, identifier_type, amount }
@@ -258,7 +258,7 @@ pub fn build_token_burn_sigscript(signature: &[u8; 64], redeem_script: &[u8]) ->
 /// token_unit body bytecode (3 bytes) -- KCC20-conformant.
 ///
 /// State section is the script-encoded portion of the KCC20 Standard State
-/// Header (34B, see `Kcc20StateHeader`): owner_identifier, identifier_type.
+/// Header (35B, see `Kcc20StateHeader`): owner_identifier, identifier_type.
 /// Only `identifier_type == identifier_type::PUBKEY` is currently
 /// supported by this body (owner_identifier is checked directly as a
 /// Schnorr pubkey); other identifier types are reserved by the spec but
@@ -270,10 +270,10 @@ pub fn build_token_burn_sigscript(signature: &[u8; 64], redeem_script: &[u8]) ->
 /// body drops the header field not needed by this simple owner-signature
 /// check (identifier_type) and then verifies ownership.
 ///
-/// State (34B): script-encoded KCC20 Standard State Header
-/// Total redeemScript: 34 (state) + 3 (body) = 37 bytes
+/// State (35B): script-encoded KCC20 Standard State Header
+/// Total redeemScript: 35 (state) + 3 (body) = 38 bytes
 ///
-/// Sigscript (transfer): [41 <sig 64B> 01] [pushData(RS 37B)]   = 104B
+/// Sigscript (transfer): [41 <sig 64B> 01] [pushData(RS 38B)]   = 105B
 pub const TOKEN_UNIT_BODY: &[u8] = &[
     0x75,             // OpDrop (identifier_type)
     0xad,             // OpCheckSigVerify (owner_identifier as pubkey)
@@ -298,9 +298,9 @@ pub const NONCE_EXT_ID: &str = "kcc20_nonce_v1";
 pub const NONCE_EXT_OFFSET: usize = Kcc20StateHeader::SCRIPT_ENCODED_LEN;
 pub const NONCE_EXT_LEN: usize = 8;
 
-/// Build a KCC20-conformant token_unit redeemScript (37 bytes).
+/// Build a KCC20-conformant token_unit redeemScript (38 bytes).
 ///
-/// State (34B): script-encoded KCC20 Standard State Header --
+/// State (35B): script-encoded KCC20 Standard State Header --
 /// owner_identifier (32B), identifier_type (1B, always
 /// `identifier_type::PUBKEY` for this body).
 /// Body (3B): TOKEN_UNIT_BODY
@@ -311,7 +311,7 @@ pub const NONCE_EXT_LEN: usize = 8;
 /// hence the P2SH address, a pure function of `owner_pubkey` alone, which
 /// the rest of KOB relies on for UTXO discovery).
 pub fn build_token_unit_redeem_script(owner_pubkey: &[u8; 32]) -> Vec<u8> {
-    let mut rs = Vec::with_capacity(37);
+    let mut rs = Vec::with_capacity(38);
     rs.extend_from_slice(&Kcc20StateHeader::new(*owner_pubkey, identifier_type::PUBKEY, 0).encode_script());
     rs.extend_from_slice(TOKEN_UNIT_BODY);
     rs

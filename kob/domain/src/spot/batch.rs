@@ -3307,4 +3307,123 @@ mod tests {
         assert!(last_ok_n >= 3, "should support at least 3 buyers (E2E proved)");
     }
 
+    // ── V16 tests ──────────────────────────────────────────────────────
+    //
+    // Regression coverage for the Phase-0 "version 16 is already taken"
+    // collision: BatchOrder.version == 16 means EITHER a bracket entry
+    // (365B RS) or a v16 buy order (476B RS, the F6-fix contract). Dispatch
+    // in build_tx() must key off RS length, not the bare version number.
+
+    /// Create a fake v16 buy order for testing (mirrors `make_buy`, but uses
+    /// the v16 F6-fix contract and carries a BPS matcher-fee cap like v15).
+    fn make_buy_v16(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32], mmfee_bps: u64) -> BatchOrder {
+        let tx_id = hex::encode(&[id_byte; 32]);
+        let owner = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        let rs = kob_core::contract::spot::order::build_buy_v16_redeem_script(
+            &token, price_num, price_den, 1_000_000, &owner, &bspkh, mmfee_bps, 0, 0,).unwrap();
+        BatchOrder {
+            outpoint: (tx_id, 0),
+            order_type: OrderType::Buy,
+            version: 16,
+            token_cov_id: token,
+            price_num,
+            price_den,
+            amount,
+            redeem_script: rs,
+            utxo_value: amount,
+            counterparty_spk: vec![0xEE; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: None,
+            bracket_meta: None,
+        }
+    }
+
+    #[test]
+    fn v16_buy_rs_len_distinct_from_bracket_and_v15() {
+        // The whole collision-fix relies on these three lengths being
+        // pairwise distinct. If a future edit ever makes two of them equal
+        // again, RS-length-based dispatch silently breaks -- catch it here
+        // before it becomes a build_tx() misrouting bug.
+        use kob_core::contract::spot::order::{BUY_ORDER_V15_RS_EXPECTED_LEN, BUY_ORDER_V16_RS_EXPECTED_LEN};
+        use kob_core::contract::spot::parse::BUY_RS_SIZE as BUY_RS_SIZE_V14;
+        assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BRACKET_RS_SIZE);
+        assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_V15_RS_EXPECTED_LEN);
+        assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_RS_SIZE_V14);
+    }
+
+    #[test]
+    fn v16_buy_dispatches_to_v16_fill_not_bracket_shape() {
+        // A v16 buy order in a batch must produce the v16 fill sigscript
+        // ([toi][tii][coi][Op1][pushData(RS)]), never the bracket shape
+        // ([Op1][pushData(RS)], no toi/tii/coi) that a version==16 bare-number
+        // check would have wrongly selected pre-fix.
+        let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
+        let buy = make_buy_v16(0x20, 10_000_000, 1, 3, TOKEN_A, 30);
+
+        let plan = plan_batch_match(&[sell], &[buy], None, &matcher_spk(), 0, None)
+            .expect("plan should succeed");
+        let tx = plan.build_tx().expect("build_tx should succeed");
+
+        assert_eq!(tx.inputs.len(), 2, "1 sell + 1 buy");
+        let buy_ss = &tx.inputs[1].sigscript;
+
+        // Recompute the exact expected sigscript from the plan's own
+        // resolved indices and compare byte-for-byte -- this is stronger
+        // than checking a length/shape heuristic.
+        let tii = *plan.token_input_map.get(&hex::encode(TOKEN_A)).unwrap() as u16;
+        let toi = plan.buy_output_idx[0] as u16;
+        let coi = plan.buy_coi[0];
+        let buy_rs = &plan.buys[0].0.redeem_script;
+        let expected = kob_core::contract::spot::order::build_buy_v16_fill_sigscript(toi, tii, coi, buy_rs);
+        assert_eq!(buy_ss, &expected, "v16 buy input must carry the v16 (no-sii) fill sigscript");
+
+        // And make sure it's definitely not bracket-shaped: bracket's
+        // sigscript is exactly [Op1][pushData(RS)] with a 365B RS, which
+        // can never equal a sigscript carrying a 476B RS.
+        let bracket_shaped = kob_core::contract::spot::bracket::build_bracket_fill_sigscript(buy_rs);
+        assert_ne!(buy_ss, &bracket_shaped);
+    }
+
+    #[test]
+    fn bracket_entry_still_dispatches_to_bracket_shape_after_v16_fix() {
+        // Regression guard: fixing the v16/bracket collision must not break
+        // genuine bracket entries, which also report version==16.
+        let oco_spk = [0x07u8; 37];
+        let receipt_cov = [0x09u8; 32];
+        let trade_spk_hash = [0x0Au8; 32];
+        let owner_hash = [0x0Bu8; 32];
+        let bracket_rs = kob_core::contract::spot::bracket::build_bracket_redeem_script(
+            0, &TOKEN_A, 1, 2, &oco_spk, 1_000_000, 1_000_000, 1_000_000,
+            &receipt_cov, &trade_spk_hash, &owner_hash,
+        ).unwrap();
+        assert_eq!(bracket_rs.len(), BRACKET_RS_SIZE);
+
+        let sell = make_sell(0x10, 10_000_000, 1, 2, TOKEN_A);
+        let bracket_buy = BatchOrder {
+            outpoint: (hex::encode(&[0x30u8; 32]), 0),
+            order_type: OrderType::Buy,
+            version: 16,
+            token_cov_id: TOKEN_A,
+            price_num: 1,
+            price_den: 2,
+            amount: 10_000_000,
+            redeem_script: bracket_rs.clone(),
+            utxo_value: 10_000_000,
+            counterparty_spk: vec![0xEE; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: None,
+            bracket_meta: None,
+        };
+
+        let plan = plan_batch_match(&[sell], &[bracket_buy], None, &matcher_spk(), 0, None)
+            .expect("plan should succeed");
+        let tx = plan.build_tx().expect("build_tx should succeed");
+        let buy_ss = &tx.inputs[1].sigscript;
+
+        let expected = kob_core::contract::spot::bracket::build_bracket_fill_sigscript(&bracket_rs);
+        assert_eq!(buy_ss, &expected, "bracket entry must still get the bracket sigscript shape");
+    }
 }

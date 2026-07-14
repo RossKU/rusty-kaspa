@@ -85,7 +85,7 @@ instructed, without colliding with bracket): make bracket detection in
 `batch.rs` keyed off **RS length** (`BRACKET_RS_SIZE`, 365B) instead of the
 bare version number — mirroring how `is_v15` is already computed
 (`buy.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN`). Since the new
-v16 buy RS (478B) is a different length from both bracket (365B) and v15
+v16 buy RS (476B) is a different length from both bracket (365B) and v15
 (479B), the collision is fully resolved: `BatchOrder.version == 16` can mean
 either "bracket" or "buy v16 (F6 fix)" and the two are disambiguated by RS
 length everywhere it matters for tx construction. `extract_bracket_meta()`
@@ -106,8 +106,8 @@ already safe to call (just wasteful) with a v16 buy RS.
 Status: **DONE**.
 
 Files changed:
-- `kob/core/src/contract/spot/order.rs` — added `BUY_ORDER_V16_BODY` (333B),
-  `BUY_ORDER_V16_BODY_EXPECTED_LEN`, `BUY_ORDER_V16_RS_EXPECTED_LEN` (478B),
+- `kob/core/src/contract/spot/order.rs` — added `BUY_ORDER_V16_BODY` (331B),
+  `BUY_ORDER_V16_BODY_EXPECTED_LEN`, `BUY_ORDER_V16_RS_EXPECTED_LEN` (476B),
   `build_buy_v16_redeem_script`, `build_buy_v16_fill_sigscript`,
   `build_buy_v16_ioc_fill_sigscript`, `build_buy_v16_partial_fill_sigscript`.
   v14 (`BUY_ORDER_BODY`) and v15 (`BUY_ORDER_V15_BODY`) are untouched.
@@ -125,7 +125,7 @@ Files changed:
   RS-length dispatch sites now add a v16-buy-RS-length branch alongside the
   existing v15/bracket branches.
 
-Dispatch thresholds (RS=478B): T0=484, T1=490, T2=497 (see Phase 3 for the
+Dispatch thresholds (RS=476B): T0=481, T1=489, T2=494 (see Phase 3 for the
 derivation and verification of these).
 
 v14 stays canonical and fully intact. v15 stays exactly as it was (gated,
@@ -400,4 +400,145 @@ the `kob-engine` check and was resolved by `touch`ing the changed files).
 
 ## Phase 5 — E2E (testnet-10)
 
-Status: see below.
+Status: **IN PROGRESS / partially blocked on-device — see resumable TODOs below.**
+Updated live as this phase proceeds; this section is the authoritative
+record of exactly what was tried and what state things are in.
+
+### 5.1 Environment findings
+
+- **Node reachability**: `65.108.107.30:18210` TCP port is OPEN and
+  reachable from this device (verified with a raw TCP probe, since `ws`
+  wasn't importable from an ad-hoc script — kob-cli's own websocket client
+  is what actually matters and gets exercised once the binary is built).
+- **No wallet exists yet** in this checkout (`kob/` has no `wallet*.json`).
+  Must be created fresh via `kob-cli wallet create --legacy` once the
+  binary is built.
+- **No local miner** exists in the `kob` tree (Phase 5's brief pointed at
+  `tests/miner.mjs`, which does not live in this repo — it's from the
+  sibling `kaspa-file-storage-v2` project, referenced from memory as the
+  proven SDK-native funding method for testnet-10). Plan: reuse that
+  script pointed at a freshly-exported kob wallet private key, using that
+  sibling project's already-built (post-Toccata, dated 2026-06-29) wasm
+  Node.js bindings (`kaspa-file-storage-v2/kaspa-core.js` +
+  `kaspa-core_bg.wasm`) as `NJS`, since building kob-phase0's own
+  `wasm/` crate from scratch would require installing the `wasm32`
+  target + `wasm-pack` (neither present on this device) and a further
+  long build — not justified when a working, version-appropriate
+  artifact already exists from prior work on this same testnet.
+- **Build cost**: `cargo build --release -p kob-cli` was launched in the
+  background (long timeout) as the first, unavoidable prerequisite —
+  release-mode linking on this Termux/PRoot device is exactly the
+  heavy/risky step flagged in the task brief.
+
+### 5.2 Resumable command sequence
+
+Recorded here in full so this can be picked up/re-run from a clean
+session without re-deriving anything.
+
+```sh
+# 0. Env (every cargo/build command in this repo)
+export CARGO_TARGET_DIR=/root/kob-rust-target4
+cd /storage/emulated/0/Download/ClaudeCLI/kob-phase0
+
+# NOTE (sdcardfs mtime quirk): after any source edit, `touch` the changed
+# files before the next cargo invocation, or cargo may reuse a stale
+# cached dependency build. See Phase 4 note above.
+
+# 1. Build binaries (one package at a time, background, long timeout)
+cargo build --release -p kob-cli
+cargo build --release -p kob-engine
+BIN=/root/kob-rust-target4/release
+
+# 2. Wallet
+$BIN/kob-cli wallet create --legacy --network testnet-10
+# -> capture the printed address + private key hex. Save privkey as
+#    64 hex chars to a keyfile for the miner, e.g.:
+#    echo -n "<privkey_hex>" > /tmp/kob_e2e_key.txt
+
+# 3. Fund via SDK-native miner (reusing the sibling project's proven
+#    post-Toccata wasm build -- do NOT use the GPU OpenCL miner, its
+#    script is lost/unusable per standing project rule).
+cd /storage/emulated/0/Download/ClaudeCLI/kaspa-file-storage-v2
+NJS=/storage/emulated/0/Download/ClaudeCLI/kaspa-file-storage-v2/kaspa-core.js \
+KEYFILE=/tmp/kob_e2e_key.txt \
+TARGET_KAS=14 MAX_BLOCKS=8 \
+node --experimental-websocket tests/miner.mjs
+# Expect ~7.46 KAS/block per memory of prior runs on this same testnet;
+# TARGET_KAS=14 should need roughly 2 blocks, but testnet-10 difficulty
+# may have moved since -- watch the log, raise MAX_BLOCKS if needed.
+# This step is real wall-clock mining time and was NOT run to completion
+# in this session (see 5.3).
+
+# 4. E2E config + engine
+cd /storage/emulated/0/Download/ClaudeCLI/kob-phase0/kob
+cat > /tmp/e2e_config.json <<'JSON'
+{"node":"ws://65.108.107.30:18210"}
+JSON
+NODE="ws://65.108.107.30:18210"
+$BIN/kob-engine --node "$NODE" --wallet <wallet.json path> \
+  --config /tmp/e2e_config.json --allow-self-trade \
+  --orderbook /tmp/ob_v16.json --mode continuous --interval 3000 \
+  2>&1 | tee /tmp/v16_e2e.log &
+ENGINE_PID=$!
+sleep 5   # wait for "Deploy orders AFTER this message"
+
+# 5. Token setup (Shared Setup pattern from E2E_PLAYBOOK.md)
+KOB="$BIN/kob-cli --node $NODE"
+CREATE_OUT=$($KOB token create --ticker V16E2E --supply 1000000 --decimals 8 --amount 1000000000)
+# ... token mint x2 per playbook ...
+
+# 6. Deploy a v16 buy + a matching v14 sell, let the engine match them.
+#    v16 is buy-only (the F6 fix is entirely on the buy side); sells stay
+#    v14 (batch.rs already requires the fixed-offset sell sigscript
+#    convention for ANY v15/v16 buy in the batch -- build_tx() handles
+#    this automatically, no extra sell-side flag needed).
+$KOB deploy buy --token "$TOKEN" --version 16 --mmfee-bps 30 \
+  --price-num 1 --price-den 10 --min-fill 1000000 --amount 1000000000
+$KOB deploy sell --token "$TOKEN" --price-num 1 --price-den 20 \
+  --min-fill 1000000 --amount 200000000 --token-utxo "$TOKEN_UTXO"
+sleep 15
+grep "BATCH.*SUCCESS" /tmp/v16_e2e.log
+
+# 7. Adversarial check: confirm F6 holds AND an adversarial matcher
+#    over-extraction attempt fails. Since the v16 sigscript builders have
+#    no sii parameter at all (Phase 0/3 fix), the engine's normal matcher
+#    code path CANNOT construct the v15 attack shape -- there is no
+#    "adversarial matcher" code path to exercise via the CLI/engine as
+#    shipped. To exercise this on-chain would require hand-crafting a raw
+#    sigscript (bypassing kob-cli/kob-engine entirely) that mimics the
+#    v15 attack shape against a live v16 order and submitting it directly
+#    via RPC, expecting rejection (either at F6 -- unreachable, since
+#    there's no sii to forge -- or, if an extra decoy item is injected
+#    into the sigscript to simulate one, at Kaspa's clean-stack check;
+#    see Phase 3.6 for the full reasoning). This raw-RPC harness was not
+#    built in this session; it is the concrete next step if/when funding
+#    completes.
+kill $ENGINE_PID 2>/dev/null
+```
+
+### 5.3 What was actually completed vs. not, this session
+
+- [x] Node TCP reachability verified.
+- [~] `cargo build --release -p kob-cli` — launched; result recorded
+      below once it finishes.
+- [ ] `kob-engine` release build — not started (sequenced after kob-cli).
+- [ ] Wallet creation — not started (needs the binary).
+- [ ] Funding via miner — not started (needs the wallet; is real
+      wall-clock mining time, not guaranteed to finish quickly on
+      testnet-10's current difficulty).
+- [ ] Token create/mint, v16 buy deploy, matching v14 sell deploy,
+      engine match — not started.
+- [ ] Live adversarial-forgery attempt against a deployed v16 order —
+      not started; would need a small standalone raw-sigscript/RPC
+      harness (not part of kob-cli's normal command surface, by design,
+      since the fix removes the vulnerable parameter from the SDK
+      entirely -- see 5.2 step 7).
+
+**Honest summary**: Phase 5 was attempted but not completed end-to-end in
+this session. The blocking chain is: heavy release build (real time cost
+on this device) -> wallet creation -> real-time mining for funding ->
+actual deploy/match. None of these steps have a hard technical blocker
+identified so far (node is reachable, the build was progressing
+normally), but completing all of them sequentially exceeded the time
+available in this session. No results are fabricated here — every
+checkbox above reflects exactly what ran.

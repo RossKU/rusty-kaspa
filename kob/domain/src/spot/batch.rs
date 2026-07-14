@@ -710,9 +710,16 @@ impl BatchPlan {
         tx: &kob_core::tx::Transaction,
         sigscripts: &[Vec<u8>],
     ) -> (u64, u64) {
-        let exact_mass = kob_core::mass::calc_mass_with_sigscripts(tx, sigscripts);
-        let delta = self.total_fee.saturating_sub(exact_mass);
-        (exact_mass, delta)
+        // The exact fee is the post-Toccata minimum relay fee for the tx's
+        // exact compute mass (`mass * MIN_RELAY_FEE_PER_GRAM`), NOT the raw
+        // mass. `self.total_fee` (the Phase-1 estimate) is set with the same
+        // rate in `plan_batch_match`, so `delta = est - exact >= 0` and the
+        // recovery invariant holds.
+        let exact_fee = kob_core::mass::min_relay_fee(
+            kob_core::mass::calc_mass_with_sigscripts(tx, sigscripts),
+        );
+        let delta = self.total_fee.saturating_sub(exact_fee);
+        (exact_fee, delta)
     }
 
     /// Convert this plan into a `kob_core::tx::Transaction` suitable for
@@ -779,13 +786,19 @@ impl BatchPlan {
             });
         }
 
-        // Outputs
+        // Outputs. Covenant bindings are left None here and set by the caller
+        // (CLI match_batch / engine executor) which owns the token covenant
+        // hashes; both set the real binding on BuyerTokens/SellRemainder
+        // outputs BEFORE computing sighash or calling `converge_fee_exact`, so
+        // the post-Toccata covenant-byte mass (counted by
+        // `calc_mass_with_sigscripts` when `covenant.is_some()`) is accounted
+        // for with the real bindings, not a placeholder.
         for planned in &self.outputs {
             tx.outputs.push(TxOutput::new(
                 planned.value,
                 planned.spk_version,
                 planned.script_public_key.clone(),
-                None, // Covenant bindings set by CLI
+                None,
             ));
         }
 
@@ -1201,12 +1214,16 @@ pub fn plan_batch_match(
     let total_buyer_tokens: u64 = total_buyer_tokens_by_cov.values().sum();
     let total_planned_out: u64 = total_seller_kas + total_buyer_tokens;
 
-    // Estimate miner fee
+    // Estimate miner fee. Post-Toccata the network requires
+    // `mass * MIN_RELAY_FEE_PER_GRAM` (100 sompi/gram); the exact fee at
+    // convergence uses the same rate, keeping `delta = est - exact >= 0`.
     let num_inputs = buys.len() + sells.len()
         + if wallet_utxo.is_some() { 1 } else { 0 };
     // +1 for matcher fee, +1 for potential sell remainder
     let num_outputs = sells.len() + buys.len() + 2;
-    let total_fee = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
+    let total_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
+    );
 
     if total_kas_in < total_planned_out + total_fee {
         return Err(BatchError::InsufficientFee {
@@ -1486,10 +1503,12 @@ pub fn plan_ioc_match(
         });
     }
 
-    // Estimate miner fee
+    // Estimate miner fee (post-Toccata min relay rate; see the 1:1 path above).
     let num_inputs = n + 1 + if wallet_utxo.is_some() { 1 } else { 0 };
     let num_outputs = n + 3; // sellers + buyer_tokens + buyer_change + matcher_fee
-    let total_fee = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
+    let total_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
+    );
 
     // Total KAS in
     let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
@@ -2121,8 +2140,11 @@ mod tests {
         ).expect("plan should succeed");
 
         // Fee is computed from mass: 1 sell + 1 buy = 2 inputs,
-        // 1 seller + 1 buyer + potential sell_remainder + matcher_fee = 4 outputs
-        let expected_fee = kob_core::mass::estimate_compute_mass(2, 4, 0);
+        // 1 seller + 1 buyer + potential sell_remainder + matcher_fee = 4 outputs,
+        // scaled by the post-Toccata min relay rate (100 sompi/gram).
+        let expected_fee = kob_core::mass::min_relay_fee(
+            kob_core::mass::estimate_compute_mass(2, 4, 0),
+        );
         assert_eq!(plan.total_fee, expected_fee, "fee should match mass-based estimate");
 
         // KAS surplus = buy(10M) - seller_kas(5M) - fee

@@ -434,6 +434,28 @@ pub const MASS_PER_TX_BYTE: u64 = 1;
 pub const MASS_PER_SCRIPT_PUB_KEY_BYTE: u64 = 10;
 pub const MASS_PER_SIG_OP: u64 = 1000;
 
+/// Post-Toccata minimum relay fee rate, in sompi per gram of transaction mass.
+///
+/// Kaspad's `DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE` is 100_000 sompi per 1000
+/// grams (1kg) of mass (`mining/src/mempool/config.rs`), i.e. 100 sompi/gram.
+/// This replaced the pre-Toccata `LEGACY_MINIMUM_RELAY_TRANSACTION_FEE` of
+/// 1000 sompi/1kg = 1 sompi/gram, which is the rate KOB's `calc_compute_mass`
+/// (fee == mass) was originally written against. A transaction whose fee is
+/// below `mass * MIN_RELAY_FEE_PER_GRAM` is rejected by the node as
+/// non-standard ("has N fees which is under the required amount ...").
+pub const MIN_RELAY_FEE_PER_GRAM: u64 = 100;
+
+/// Minimum relay fee (sompi) the network requires for a transaction whose
+/// compute mass is `compute_mass_grams` grams.
+///
+/// This is the post-Toccata floor every submitted KOB transaction must meet;
+/// callers use it either directly (autonomous fee computation, e.g. token
+/// mint and the engine batch matcher) or as a floor combined with an explicit
+/// operator `--fee-rate` override.
+pub fn min_relay_fee(compute_mass_grams: u64) -> u64 {
+    compute_mass_grams.saturating_mul(MIN_RELAY_FEE_PER_GRAM)
+}
+
 /// Hash size (Blake2b-256) used in TX serialization estimates.
 const HASH_SIZE: u64 = 32;
 /// Subnetwork ID size in bytes.
@@ -455,12 +477,33 @@ fn estimate_input_serialized_size(input: &crate::tx::TxInput) -> u64 {
     outpoint_size + 8 + sig_script_estimate + 8 // + sig_script_len + sequence
 }
 
+/// Extra serialized bytes a CovenantBinding adds to a v1 output.
+///
+/// Matches Kaspad's `transaction_output_estimated_serialized_size`:
+/// `authorizing_input` (u16) + `covenant_id` (32B) = 34 bytes. (There is no
+/// covenant-presence bool byte in the *estimated* serialized size — that byte
+/// only appears in the hashing serialization, not the mass estimate.)
+const COVENANT_BINDING_SERIALIZED_SIZE: u64 = 2 + HASH_SIZE;
+
+/// Extra serialized bytes each input carries in a version >= 1 transaction:
+/// the `compute_budget` field (u16). Matches Kaspad's
+/// `transaction_input_estimated_serialized_size` `if version >= 1 { size += 2 }`.
+const V1_INPUT_COMPUTE_BUDGET_SIZE: u64 = 2;
+
 /// Estimate the serialized byte size of a single output.
 ///
 /// Matches Kaspad's `transaction_output_estimated_serialized_size`:
 ///   8 value + 2 spk_version + 8 spk_len + spk_bytes
+///   + 34 (authorizing_input + covenant_id) when the output carries a covenant.
+///
+/// The covenant term is what makes post-Toccata (v1) token/DEX transactions'
+/// mass match the node's: every CovenantBinding-bearing output (BuyerTokens,
+/// token mint/continuation, etc.) adds 34 bytes the pre-Toccata estimate
+/// omitted, which — undercounted — produced a fee below the node's min-relay
+/// floor and got the tx rejected as non-standard.
 fn estimate_output_serialized_size(output: &crate::tx::TxOutput) -> u64 {
-    8 + 2 + 8 + output.script_bytes().len() as u64
+    let covenant_size = if output.covenant.is_some() { COVENANT_BINDING_SERIALIZED_SIZE } else { 0 };
+    8 + 2 + 8 + output.script_bytes().len() as u64 + covenant_size
 }
 
 /// Estimate the total serialized byte size of a transaction.
@@ -473,6 +516,10 @@ pub fn estimate_tx_serialized_size(tx: &crate::tx::Transaction) -> u64 {
     size += 2; // version (u16)
     size += 8; // num_inputs (u64)
     size += tx.inputs.iter().map(estimate_input_serialized_size).sum::<u64>();
+    if crate::tx::tx_expects_compute_budget(tx.version) {
+        // v1 inputs each carry a compute_budget (u16) field.
+        size += V1_INPUT_COMPUTE_BUDGET_SIZE * tx.inputs.len() as u64;
+    }
     size += 8; // num_outputs (u64)
     size += tx.outputs.iter().map(estimate_output_serialized_size).sum::<u64>();
     size += 8; // lock_time (u64)
@@ -584,10 +631,16 @@ pub fn calc_mass_with_sigscripts(
     let mut size: u64 = 0;
     size += 2; // version (u16)
     size += 8; // num_inputs (u64)
+    let v1_input_overhead = if crate::tx::tx_expects_compute_budget(tx.version) {
+        V1_INPUT_COMPUTE_BUDGET_SIZE
+    } else {
+        0
+    };
     for (_input, ss) in tx.inputs.iter().zip(sigscripts.iter()) {
         let outpoint_size = HASH_SIZE + 4; // tx_id + index
         let sig_script_len = ss.len() as u64;
-        size += outpoint_size + 8 + sig_script_len + 8; // outpoint + len_field + sig_script + sequence
+        // outpoint + len_field + sig_script + sequence (+ v1 compute_budget)
+        size += outpoint_size + 8 + sig_script_len + 8 + v1_input_overhead;
     }
     size += 8; // num_outputs (u64)
     size += tx.outputs.iter().map(estimate_output_serialized_size).sum::<u64>();
@@ -1301,5 +1354,46 @@ mod tests {
         assert!(exact < estimated);
         // Difference should be (100-66)*2 = 68 bytes of size mass (1 mass/byte)
         assert_eq!(estimated - exact, (100 - 66) * 2);
+    }
+
+    #[test]
+    fn v1_covenant_tx_mass_includes_toccata_overhead() {
+        // Regression for the token-create fee rejection: a v1 tx with one
+        // covenant output must count the +2 (per-input compute_budget) and
+        // +34 (per-covenant-output authorizing_input + covenant_id) bytes the
+        // node charges, or the min-relay fee lands below the node's floor.
+        use crate::tx::{Transaction, TxInput, TxOutput};
+        let cov = Some(crate::tx::CovenantBinding::new(0, kaspa_hashes::Hash::from_bytes([7u8; 32])));
+
+        let make = |version: u16, with_cov: bool| {
+            let mut tx = Transaction::new(version);
+            tx.inputs.push(TxInput {
+                prev_tx_id: "a".repeat(64), prev_index: 0, sequence: 0,
+                sig_op_count: 1, script_version: 0, script_bytes: vec![0u8; 35], value: 345_778_289,
+            });
+            tx.outputs.push(TxOutput::new(100_000_000, 0, vec![0u8; 35],
+                if with_cov { cov } else { None }));
+            tx.outputs.push(TxOutput::new(245_000_000, 0, vec![0u8; 34], None)); // change, no covenant
+            tx
+        };
+
+        let ss = vec![vec![0u8; 66]]; // one P2PK sigscript
+        let v0 = calc_mass_with_sigscripts(&make(0, false), &ss);
+        let v1 = calc_mass_with_sigscripts(&make(1, true), &ss);
+        // +2 for the single input's compute_budget, +34 for the covenant output.
+        assert_eq!(v1 - v0, 2 + 34, "v1 covenant tx must add Toccata serialization overhead");
+    }
+
+    #[test]
+    fn min_relay_fee_is_hundred_sompi_per_gram() {
+        // Post-Toccata min relay = DEFAULT_MINIMUM_RELAY_TRANSACTION_FEE
+        // (100_000 sompi per 1000 grams) = 100 sompi/gram.
+        assert_eq!(MIN_RELAY_FEE_PER_GRAM, 100);
+        assert_eq!(min_relay_fee(0), 0);
+        assert_eq!(min_relay_fee(1), 100);
+        assert_eq!(min_relay_fee(2083), 208_300); // the exact value the node
+                                                   // required for token create
+        // Never underflows/panics on large mass.
+        assert_eq!(min_relay_fee(u64::MAX), u64::MAX);
     }
 }

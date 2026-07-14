@@ -387,6 +387,40 @@ fn estimate_output_values(total_input: u64, amount: u64, fee: u64, num_outputs: 
     }
 }
 
+/// Whether a transaction of the given version commits a per-input
+/// `compute_budget` (u16) field instead of a `sig_op_count` (u8).
+///
+/// Post-Toccata this is `version >= 1` (see
+/// `kaspa_consensus_core::tx::ComputeCommit`). Wraps the consensus predicate
+/// so other kob-core modules (e.g. `mass`) can ask without depending on the
+/// consensus crate directly.
+pub fn tx_expects_compute_budget(version: u16) -> bool {
+    kaspa_consensus_core::tx::ComputeCommit::version_expects_compute_budget_field(version)
+}
+
+/// Compute-budget units needed to cover one executed signature operation.
+///
+/// One signature op costs `MASS_PER_SIG_OP` (1000) grams. In the post-Toccata
+/// script-units model that is `1000 grams * 100 script_units/gram = 100_000`
+/// script units, and one compute-budget unit buys
+/// `GRAMS_PER_COMPUTE_BUDGET_UNIT (100) * SCRIPT_UNITS_PER_GRAM (100) = 10_000`
+/// script units, so a single sig op needs `100_000 / 10_000 = 10` budget units.
+/// (See `consensus/core/src/mass/units.rs`.)
+pub const COMPUTE_BUDGET_UNITS_PER_SIG_OP: u16 = 10;
+
+/// Derive the per-input `computeBudget` (u16) a version >= 1 transaction input
+/// must commit, from the number of signature operations its script executes.
+///
+/// `budget = sig_op_count * 10`. The node additionally grants a free per-input
+/// allowance of 9999 script units, which absorbs each input's non-signature
+/// work (covenant introspection, stack pushes, SPK hashing) — so covenant fill
+/// inputs (`sig_op_count = 0`) correctly get budget 0 and still execute within
+/// the free allowance, while signature-bearing inputs (P2PK spends, token-mint
+/// authority, order cancel) get exactly enough to cover their sig ops.
+pub fn compute_budget_for_sig_ops(sig_op_count: u8) -> u16 {
+    (sig_op_count as u16).saturating_mul(COMPUTE_BUDGET_UNITS_PER_SIG_OP)
+}
+
 /// Convert a Transaction to the RPC submission format.
 ///
 /// Post-Toccata mass-commitment model (`kaspa_consensus_core::tx::ComputeCommit`):
@@ -406,12 +440,19 @@ fn estimate_output_values(total_input: u64, amount: u64, fee: u64, num_outputs: 
 /// `if tx.version < 1`), so translating it here cannot invalidate a
 /// signature already computed for this `tx`.
 ///
-/// `computeBudget: 0` is used unconditionally for version >= 1 inputs.
-/// KOB does not track per-script compute-unit costs, but every KOB
-/// redeem/sigscript (largest is ~600B) is far under the free per-input
-/// allowance (9999 script units, roughly 1 unit/byte of pushed data --
-/// see `consensus/core/src/mass/units.rs::free_script_units_per_input`),
-/// so budget 0 is always sufficient in practice.
+/// The committed `computeBudget` for a version >= 1 input is derived from
+/// the input's own `sig_op_count` via `compute_budget_for_sig_ops`. Each
+/// executed signature op costs `MASS_PER_SIG_OP` (1000) grams = 100,000
+/// script units, and one compute-budget unit buys 10,000 script units, so
+/// `sig_op_count` signature ops need `10 * sig_op_count` budget units. The
+/// node's free per-input allowance (9999 script units, see
+/// `consensus/core/src/mass/units.rs::free_script_units_per_input`) then
+/// covers each input's remaining, non-signature work (introspection /
+/// stack pushes / a couple of Blake2b hashes on ~34-byte SPKs), which for
+/// every KOB script is comfortably under 9999 units -- covenant fill inputs
+/// carry `sig_op_count = 0` and rely entirely on this free allowance. This
+/// matches the reference wallet/rothschild mapping (`SigopCount(1)` <->
+/// `ComputeBudget(10)`, `rothschild/src/main.rs`).
 pub fn to_rpc_payload(
     tx: &Transaction,
     sigscripts: &[Vec<u8>],
@@ -436,7 +477,7 @@ pub fn to_rpc_payload(
             });
             if expects_compute_budget {
                 o["sigOpCount"] = serde_json::json!(0);
-                o["computeBudget"] = serde_json::json!(0);
+                o["computeBudget"] = serde_json::json!(compute_budget_for_sig_ops(inp.sig_op_count));
             } else {
                 o["sigOpCount"] = serde_json::json!(inp.sig_op_count);
             }
@@ -551,23 +592,45 @@ mod tests {
     }
 
     #[test]
-    fn to_rpc_payload_v1_input_zeroes_sig_op_count_and_sets_compute_budget() {
+    fn to_rpc_payload_v1_signature_input_sets_budget_from_sig_ops() {
         // Regression test for "RpcTransactionInput.sig_op_count is
         // inconsistent with transaction version 1" (KCC20_SYNC_STATUS.md §5,
-        // V16_STATUS.md Phase 5.1 step 6): post-Toccata, version >= 1 inputs
-        // commit a computeBudget (u16), not a sigOpCount (u8); the node's
-        // RPC layer rejects any nonzero sigOpCount on such an input. Even
-        // though the KOB-level `TxInput.sig_op_count` still says 1 here (the
-        // conceptual "this input needs 1 CheckSig" -- used for local
-        // sighash computation, which does not commit this field for
-        // version >= 1 txs, see hashing/sighash.rs), the RPC payload must
-        // report sigOpCount=0 and carry computeBudget instead.
+        // V16_STATUS.md Phase 5.1 step 6) AND the follow-on "script units
+        // exceeded the amount committed in the input: used=100000,
+        // limit=9999" (Phase 8): post-Toccata, version >= 1 inputs commit a
+        // computeBudget (u16), not a sigOpCount (u8), and that budget must
+        // actually cover the input's executed sig ops. A signature-bearing
+        // input (P2PK / token-mint authority / cancel; sig_op_count = 1)
+        // executes one CheckSig = 100,000 script units, which needs budget
+        // 10 (10 * 10,000 + 9999 free = 109,999 >= 100,000). The RPC payload
+        // must report sigOpCount = 0 and computeBudget = 10.
         let mut tx = Transaction::new(1);
         tx.inputs.push(fake_input(1));
         let payload = to_rpc_payload(&tx, &[vec![0xaa]]);
         let inp = &payload["transaction"]["inputs"][0];
         assert_eq!(inp["sigOpCount"].as_u64().unwrap(), 0);
+        assert_eq!(inp["computeBudget"].as_u64().unwrap(), 10);
+    }
+
+    #[test]
+    fn to_rpc_payload_v1_covenant_fill_input_gets_zero_budget() {
+        // Covenant fill inputs (spot buy/sell order UTXOs settled by the
+        // matcher) run a covenant script with NO signature op, so
+        // sig_op_count = 0. Their bounded introspection/hash work fits in the
+        // node's 9999-unit free per-input allowance, so budget 0 is correct.
+        let mut tx = Transaction::new(1);
+        tx.inputs.push(fake_input(0));
+        let payload = to_rpc_payload(&tx, &[vec![0xaa]]);
+        let inp = &payload["transaction"]["inputs"][0];
+        assert_eq!(inp["sigOpCount"].as_u64().unwrap(), 0);
         assert_eq!(inp["computeBudget"].as_u64().unwrap(), 0);
+    }
+
+    #[test]
+    fn compute_budget_for_sig_ops_maps_ten_per_sig_op() {
+        assert_eq!(compute_budget_for_sig_ops(0), 0);
+        assert_eq!(compute_budget_for_sig_ops(1), 10);
+        assert_eq!(compute_budget_for_sig_ops(2), 20);
     }
 
 

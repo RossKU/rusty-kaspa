@@ -11,12 +11,35 @@ use crate::matcher::matching;
 use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
 use crate::rpc::RpcClient;
 
+/// Rewrite already-built RPC input JSON so its compute-cost commitment matches
+/// the transaction's version, mirroring `kob_core::tx::to_rpc_payload`.
+///
+/// Post-Toccata, version >= 1 transaction inputs commit a `computeBudget`
+/// (u16), not a `sigOpCount` (u8); the node rejects a nonzero `sigOpCount` on
+/// such an input ("RpcTransactionInput.sig_op_count is inconsistent with
+/// transaction version N"). The engine's input builders emit `sigOpCount`
+/// unconditionally, so this pass converts each input to `sigOpCount: 0` +
+/// `computeBudget = sig_ops * 10` when the tx is version >= 1 (a no-op for
+/// version 0). Applied centrally here so every `build_submit_payload*` caller
+/// (batch match, swap fill, single settle, expire) is covered at once.
+fn finalize_inputs_for_version(inputs: &mut [serde_json::Value], version: u16) {
+    if !kob_core::tx::tx_expects_compute_budget(version) {
+        return;
+    }
+    for inp in inputs.iter_mut() {
+        let sig_ops = inp.get("sigOpCount").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+        inp["sigOpCount"] = serde_json::json!(0);
+        inp["computeBudget"] = serde_json::json!(kob_core::tx::compute_budget_for_sig_ops(sig_ops));
+    }
+}
+
 /// Build the RPC transaction JSON for submitting.
 pub fn build_submit_payload(
     version: u16,
-    inputs: Vec<serde_json::Value>,
+    mut inputs: Vec<serde_json::Value>,
     outputs: Vec<serde_json::Value>,
 ) -> serde_json::Value {
+    finalize_inputs_for_version(&mut inputs, version);
     serde_json::json!({
         "transaction": {
             "version": version,
@@ -38,11 +61,12 @@ pub fn build_submit_payload(
 /// discovers the contingent order B deployed by the fill.
 pub fn build_submit_payload_with_tx_payload(
     version: u16,
-    inputs: Vec<serde_json::Value>,
+    mut inputs: Vec<serde_json::Value>,
     outputs: Vec<serde_json::Value>,
     tx_payload_hex: &str,
     lock_time: u64,
 ) -> serde_json::Value {
+    finalize_inputs_for_version(&mut inputs, version);
     serde_json::json!({
         "transaction": {
             "version": version,
@@ -63,10 +87,11 @@ pub fn build_submit_payload_with_tx_payload(
 /// Used by expire TXs where lockTime must be >= expiry_daa for CLTV to pass.
 pub fn build_submit_payload_with_lock_time(
     version: u16,
-    inputs: Vec<serde_json::Value>,
+    mut inputs: Vec<serde_json::Value>,
     outputs: Vec<serde_json::Value>,
     lock_time: u64,
 ) -> serde_json::Value {
+    finalize_inputs_for_version(&mut inputs, version);
     serde_json::json!({
         "transaction": {
             "version": version,
@@ -769,4 +794,38 @@ pub async fn run_deploy_test_multi(
 
     info!("Available UTXOs (>= {}): {}", MIN_UTXO_VALUE, utxos.len());
     warn!("Multi-pair deploy-test not yet implemented. Use --mode deploy-test for single pair.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v0_payload_keeps_sig_op_count_no_compute_budget() {
+        let inputs = vec![build_rpc_input("aa", 0, "ff", 1)];
+        let payload = build_submit_payload(0, inputs, vec![]);
+        let inp = &payload["transaction"]["inputs"][0];
+        assert_eq!(inp["sigOpCount"].as_u64().unwrap(), 1);
+        assert!(inp.get("computeBudget").is_none());
+    }
+
+    #[test]
+    fn v1_payload_translates_sig_op_count_to_compute_budget() {
+        // Regression for the engine batch-match rejection: a version-1 tx must
+        // commit computeBudget (= sig_ops * 10), not sigOpCount, or the node
+        // rejects it ("sig_op_count is inconsistent with transaction version").
+        // Covenant fill inputs (sigOpCount 0) -> budget 0; the wallet input
+        // (sigOpCount 1) -> budget 10.
+        let inputs = vec![
+            build_rpc_input("cov", 0, "aa", 0),  // covenant fill input
+            build_rpc_input("wal", 1, "bb", 1),  // wallet P2PK input
+        ];
+        let payload = build_submit_payload_with_lock_time(1, inputs, vec![], 50);
+        let cov = &payload["transaction"]["inputs"][0];
+        let wal = &payload["transaction"]["inputs"][1];
+        assert_eq!(cov["sigOpCount"].as_u64().unwrap(), 0);
+        assert_eq!(cov["computeBudget"].as_u64().unwrap(), 0);
+        assert_eq!(wal["sigOpCount"].as_u64().unwrap(), 0);
+        assert_eq!(wal["computeBudget"].as_u64().unwrap(), 10);
+    }
 }

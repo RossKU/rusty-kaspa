@@ -156,7 +156,200 @@ interpretation exactly like `version==15` does).
 
 ## Phase 3 — Bytecode trace
 
-Status: see below (filled in as this phase completes).
+Status: **DONE** (analytical/structural trace + worked numeric example;
+methodology follows `KOB_DEPRECATED_DO_NOT_USE/security/trace-sell-v4.md`,
+adapted to what actually changed rather than re-tracing the whole 476B RS).
+
+### 3.1 Length verification
+
+Programmatically counted from the literal byte array actually committed to
+`order.rs` (not hand-arithmetic — see scratch script used during
+development, reproduced here for the record):
+
+```
+BUY_ORDER_V16_BODY:             331 bytes  (verified: re-parsed the const from the
+                                             committed file and counted 0x?? tokens)
+BUY_ORDER_V16_BODY_EXPECTED_LEN: 331  -- matches
+BUY_ORDER_V16_RS_EXPECTED_LEN:   476  (145 state + 331 body)
+```
+
+Fill path: 61B (byte-identical to v14's fill path through F4) + 41B (F6) +
+6B (cleanup, Op2Drop x6 — v14-identical, NOT v15's 7B) = 108B.
+Partial path: 1B (OpElse) + 88B (byte-identical to v14's partial path
+through F4) + 39B (F6, 2 bytes shorter than v15's 41B because the hardcoded
+literal `1` needs no `OpPick`) + 6B (cleanup, Op2Drop x5 + OpDrop —
+v14-identical) = 134B.
+
+### 3.2 Dispatch preamble decode (the only other bytes that change vs v15)
+
+```
+offset  hex           opcode                  meaning
+0       b9            OpTxInputIndex
+1       c9            OpTxInputScriptSigLen
+2       76            OpDup
+3-5     02 ee 01       push T2=494 (0x01ee LE)
+6       9f            OpLessThan            sigLen < 494 ?
+7       63            OpIf                  (expire/fill/partial)
+8       76            OpDup
+9-11    02 e1 01       push T0=481 (0x01e1 LE)
+12      9f            OpLessThan            sigLen < 481 ?
+13      63            OpIf                  (EXPIRE)
+14      75            OpDrop
+```
+
+... and further in, after the time-gate + exposure-delay (unchanged from
+v14/v15):
+
+```
+02 e9 01   push T1=489 (0x01e9 LE)
+9f         OpLessThan   sigLen < 489 ?
+63         OpIf         (fill, else partial)
+```
+
+Sigscript length ranges actually produced by the v16 builders (computed
+from the real `push_index`/`push_data` encoders, not assumed):
+
+| Path | Sigscript shape | Length (idx ≤16, 1B each) | Length (idx 17-127, 2B each) |
+|------|------------------|---------------------------:|------------------------------:|
+| Expire | `[Op4][pushData(RS)]` | 480 (fixed) | 480 (fixed) |
+| Fill / IOC-fill | `[toi][tii][coi][Op1/5][pushData(RS)]` | 483 | 486 |
+| Partial | `[ri][ti][pushData(fk)][Op2][pushData(RS)]` | 491 | 493 |
+| Cancel / cancel-mark | `[Op0/1][sig 65B][pk 32B][pushData(RS)]` | 579 (fixed) | 579 (fixed) |
+
+`480 < T0(481) ≤ 483`, `486 < T1(489) ≤ 491`, `493 < T2(494) ≤ 579` — every
+gap strictly separates the path below it from the path above it, for both
+the 1-byte and 2-byte index encodings. Dispatch is unambiguous.
+
+### 3.3 F6 fill-path decode (the security-critical change)
+
+```
+offset(rel)  hex               opcode                          meaning
+0            5a 79             Op10 OpPick(tii)                copy tii (already
+                                                                 authenticated a few
+                                                                 instructions earlier
+                                                                 by OpTxInputCovId)
+2            57                Op7  (start=7)
+3            5f                Op15 (end=15)
+4            bc                OpTxInputScriptSigSubstr         -> sell_pnum, reads
+                                                                    input[tii].sigscript[7..15)
+5            5b 79             Op11 OpPick(tii)                 copy tii again
+7            60                Op16 (start=16)
+8            01 18             push 24 (end=24)
+10           bc                OpTxInputScriptSigSubstr         -> sell_pden, reads
+                                                                    input[tii].sigscript[16..24)
+11           52 79             Op2 OpPick(kas)
+13           58 79             Op8 OpPick(pden_b)
+15           96                OpDiv                            kas / buy_pden
+16           59 79             Op9 OpPick(pnum_b)
+18           95                OpMul                            -> tokens
+19           51 79             Op1 OpPick(sell_pden)
+21           96                OpDiv                            tokens / sell_pden
+22           52 79             Op2 OpPick(sell_pnum)
+24           95                OpMul                            -> fair_kas
+25           53 79             Op3 OpPick(kas)
+27           7c                OpSwap
+28           94                OpSub                            surplus = kas - fair_kas
+29           53 79             Op3 OpPick(kas)
+31           02 10 27          push 10000
+34           96                OpDiv                            kas / 10000
+35           55 79             Op5 OpPick(mmfee_bps)
+37           95                OpMul                            -> max_surplus
+38           a2 69             OpGTE OpVerify                    max_surplus >= surplus, or ABORT
+39           6d                Op2Drop                           drop sell_pden, sell_pnum
+```
+
+**The load-bearing line is offset 0 and offset 5**: both read the input
+index from `Op10`/`Op11 OpPick`, i.e. the tx-input-index value that is
+already sitting on the stack at the SAME depth the token-input covenant
+check (`Op10 OpPick(tii) OpTxInputCovId` ... `OpEqual OpVerify`, a few
+instructions earlier in the same fill path) reads and validates against
+`tcid`. There is no second, independent stack slot for a matcher-chosen
+index anywhere in this bytecode — compare to v15 where offset 0 was
+`0x5c,0x79` (`Op12 OpPick(sii)`), a *different* stack depth holding a
+*second*, unauthenticated number.
+
+### 3.4 F6 partial-path decode (hardcoded literal, no `OpPick` at all)
+
+```
+offset(rel)  hex          opcode                       meaning
+0            51           Op1 (literal 1)               tx-input-index constant
+1            57           Op7  (start=7)
+2            5f           Op15 (end=15)
+3            bc           OpTxInputScriptSigSubstr       -> sell_pnum, reads
+                                                             input[1].sigscript[7..15)
+4            51           Op1 (literal 1)               same constant again
+5            60           Op16 (start=16)
+6            01 18        push 24 (end=24)
+8            bc           OpTxInputScriptSigSubstr       -> sell_pden, reads
+                                                             input[1].sigscript[16..24)
+...          (identical arithmetic to the fill path, using fk instead of kas)
+```
+
+`0x51` (`Op1`, the literal number 1) is not a stack reference at all — it is
+a constant baked into the P2SH-committed body bytecode, identical to the
+`Op1 OpTxInputCovId` the covenant check a few instructions earlier already
+uses to authenticate "the token input is at index 1". A matcher cannot make
+F6 read from anywhere else without changing the redeem script itself, which
+would change the P2SH address and stop matching the deployed order.
+
+### 3.5 Worked numeric example (verifies the arithmetic, not just the opcodes)
+
+Buyer's own limit price 1:1 (`buy_pnum=1, buy_pden=1`), `kas_in = 1,000,000`
+sompi, `mmfee_bps = 30` (0.30%):
+
+| Scenario | seller's real price | `tokens` | `fair_kas` | `surplus` | `max_surplus` | F6 result |
+|---|---|---:|---:|---:|---:|---|
+| Honest, tight spread | 997/1000 | 1,000,000 | 997,000 | 3,000 | 3,000 | **PASS** (boundary) |
+| Honest, real spread that exceeds the cap | 1/2 | 1,000,000 | 500,000 | 500,000 | 3,000 | **FAIL** (correctly rejected) |
+| **v15 attack**: matcher forges a decoy claiming the seller's price is 1/1 (no spread), while the REAL counterparty (at `tii`) is actually priced 1/2 | forged: 1/1 | 1,000,000 | 1,000,000 | 0 | 3,000 | **v15: PASS** (exploit succeeds — matcher pockets the 497,000-sompi difference between what F6 "sees" and what the real trade settles at) |
+
+The third row is the actual v15 vulnerability quantified: by pointing `sii`
+at a decoy input whose forged sigscript bytes decode to `sell_pnum=1,
+sell_pden=1`, F6 computes `surplus=0` and passes, even though the real
+sell order at `tii` is priced 1:2 and the trade actually settles at the
+worse 500,000-surplus rate. **In v16 this row is unreachable**: there is no
+`sii` to forge — F6 can only ever read from `tii` (fill) or the hardcoded
+literal `1` (partial), both already required to be genuine covenant inputs
+by the pre-existing covenant checks.
+
+### 3.6 Adversarial verdict: does a forged/decoy index now fail?
+
+**Yes — categorically, by construction, not merely "in practice".** Two
+independent, stacked defenses:
+
+1. **No opcode reads a free index.** The v16 body bytecode (P2SH-committed,
+   unchangeable by whoever spends the UTXO) contains no `OpPick`/`OpRoll`
+   instruction that consumes a matcher-suppliable "which input do I read
+   the sell price from" value for F6. The only values it can possibly use
+   are `tii` (already authenticated by `OpTxInputCovId(tii)==tcid`) or the
+   literal `1` (matching the covenant check's own hardcoded index). There is
+   no way to "point `sii` at a decoy" because `sii` does not exist as a
+   concept in this bytecode — not as an unenforced parameter, but as
+   nothing at all. The sigscript builder functions
+   (`build_buy_v16_fill_sigscript`, `..._ioc_fill_sigscript`,
+   `..._partial_fill_sigscript`) don't even have a parameter for it, so this
+   is enforced at the Rust API level too, not just on-chain.
+2. **Clean-stack is defense-in-depth against append/prepend tampering.**
+   Suppose an attacker hand-crafts a raw sigscript (bypassing the builder
+   entirely) that pushes an extra, unused decoy item — attempting to mimic
+   v15's shape. `kaspa-txscript`'s engine enforces clean-stack: the script
+   must finish with **exactly one** item on the data stack
+   (`crypto/txscript/src/lib.rs`, `TxScriptError::CleanStack` when
+   `dstack.len() > 1` at the end). v16's cleanup (`Op2Drop` x N) drops
+   exactly the number of items the honest 3-index (fill) or 2-index
+   (partial) layout produces — a stray extra item is never referenced by
+   any instruction (nothing in the fixed bytecode points at it) and is
+   therefore never dropped, so it survives to the end of execution and the
+   whole transaction is rejected by consensus, independent of whether every
+   internal `OpVerify` happened to pass. (This mirrors Finding 6.6 in the
+   deprecated `trace-sell-v4.md` audit for an analogous scenario.)
+
+Both of these are structural/bytecode-level proofs, verified against the
+actual committed bytes and the actual `kaspa-txscript` engine source (not
+assumed). What Phase 3 does **not** provide is a live on-chain execution of
+the adversarial transaction — that requires a running node and funded
+wallet, which is Phase 5's job; see that section for what could and could
+not be completed on this device.
 
 ---
 

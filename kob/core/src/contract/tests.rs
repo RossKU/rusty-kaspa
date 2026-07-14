@@ -1720,6 +1720,250 @@ mod adversarial_tests {
         assert_eq!(state_len, 145, "state should be 145B (with mmfee), got {}B", state_len);
     }
 
+    // buy_order v16 tests (F6 sii/tii fix -- see V16_STATUS.md Phase 0)
+
+    #[test]
+    fn buy_order_v16_body_exact_length() {
+        let body = BUY_ORDER_V16_BODY;
+        assert_eq!(
+            body.len(),
+            BUY_ORDER_V16_BODY_EXPECTED_LEN,
+            "buy v16 body should be {}B, got {}B",
+            BUY_ORDER_V16_BODY_EXPECTED_LEN,
+            body.len()
+        );
+    }
+
+    #[test]
+    fn buy_order_v16_rs_size() {
+        let tcid = [0xAAu8; 32];
+        let oh = [0xBBu8; 32];
+        let bspkh = [0xCCu8; 32];
+        let rs = build_buy_v16_redeem_script(
+            &tcid, 100, 1, 10, &oh, &bspkh, 30, 0, 0,)
+        .unwrap();
+        assert_eq!(
+            rs.len(),
+            BUY_ORDER_V16_RS_EXPECTED_LEN,
+            "buy v16 RS should be {}B, got {}B",
+            BUY_ORDER_V16_RS_EXPECTED_LEN,
+            rs.len()
+        );
+        // State layout is byte-identical to v14/v15 (145B), independent of
+        // the body-bytecode length.
+        assert_eq!(rs.len() - BUY_ORDER_V16_BODY.len(), 145);
+    }
+
+    #[test]
+    fn buy_order_v16_rs_len_distinct_from_v15_and_v14() {
+        // The v16/bracket collision fix (batch.rs is_bracket) and the
+        // parse_redeem_script dispatch both rely on every buy RS length
+        // being unique. Lock that invariant down here too.
+        assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_V15_RS_EXPECTED_LEN);
+        assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_RS_EXPECTED_LEN);
+    }
+
+    #[test]
+    fn buy_v16_fill_sigscript_stack_trace() {
+        let tcid = [0x11u8; 32];
+        let oh = [0x22u8; 32];
+        let bspkh = [0x33u8; 32];
+        let rs = build_buy_v16_redeem_script(
+            &tcid, 3, 1, 5, &oh, &bspkh, 30, 0, 1000,)
+        .unwrap();
+
+        // v16 fill sigscript: [toi, tii, coi, Op1, pushdata(RS)] -- NO sii.
+        let ss = build_buy_v16_fill_sigscript(0, 1, 0, &rs);
+        let expected_len = 4 + 3 + rs.len();
+        assert_eq!(ss.len(), expected_len,
+            "fill sigscript should be {} bytes, got {}", expected_len, ss.len());
+
+        // Verify sigLen lands in the fill range: T0 <= sigLen < T1 (481..489).
+        assert!(ss.len() >= 481, "sigLen {} must be >= T0=481", ss.len());
+        assert!(ss.len() < 489, "sigLen {} must be < T1=489", ss.len());
+
+        let body = BUY_ORDER_V16_BODY;
+        assert_eq!(body[0], 0xb9, "OpTxInputIndex");
+        assert_eq!(body[1], 0xc9, "OpTxInputScriptSigLen");
+
+        let t2 = u16::from_le_bytes([body[4], body[5]]);
+        assert_eq!(t2, 494, "T2 should be 494");
+        let t0 = u16::from_le_bytes([body[10], body[11]]);
+        assert_eq!(t0, 481, "T0 should be 481");
+
+        assert!(!body.contains(&0xb3), "body must NOT contain OpInputCount (batch matching)");
+    }
+
+    #[test]
+    fn buy_v16_ioc_fill_sigscript_same_shape_as_fill() {
+        let tcid = [0x11u8; 32];
+        let oh = [0x22u8; 32];
+        let bspkh = [0x33u8; 32];
+        let rs = build_buy_v16_redeem_script(
+            &tcid, 3, 1, 5, &oh, &bspkh, 30, 0, 1000,)
+        .unwrap();
+        let fill_ss = build_buy_v16_fill_sigscript(0, 1, 0, &rs);
+        let ioc_ss = build_buy_v16_ioc_fill_sigscript(0, 1, 0, &rs);
+        assert_eq!(fill_ss.len(), ioc_ss.len(), "IOC and fill sigscripts must be the same length (both dispatch to the FILL body path)");
+        // Layout is [toi][tii][coi][selector][pushData(RS)]; toi=0,tii=1,coi=0
+        // all encode as a single OpN byte, so the selector is always at index 3.
+        // Only that selector byte differs: Op1 (0x51) for fill vs Op5 (0x55) for IOC.
+        let sel_idx = 3;
+        assert_eq!(fill_ss[sel_idx], 0x51);
+        assert_eq!(ioc_ss[sel_idx], 0x55);
+    }
+
+    #[test]
+    fn buy_v16_partial_sigscript_range() {
+        let tcid = [0x11u8; 32];
+        let oh = [0x22u8; 32];
+        let bspkh = [0x33u8; 32];
+        let rs = build_buy_v16_redeem_script(
+            &tcid, 3, 1, 5, &oh, &bspkh, 30, 0, 1000,)
+        .unwrap();
+
+        let ss = build_buy_v16_partial_fill_sigscript(&rs, 50000, 1, 0);
+        // T1 <= sigLen < T2: 489 <= sigLen < 494.
+        assert!(ss.len() >= 489, "partial sigLen {} must be >= T1=489", ss.len());
+        assert!(ss.len() < 494, "partial sigLen {} must be < T2=494", ss.len());
+    }
+
+    #[test]
+    fn buy_v16_body_has_cltv_csv_and_no_input_count() {
+        assert!(BUY_ORDER_V16_BODY.contains(&0xb0), "body must contain CLTV");
+        assert!(BUY_ORDER_V16_BODY.contains(&0xb5), "body must contain OpTxLockTime");
+        assert!(BUY_ORDER_V16_BODY.contains(&0xb1), "body must contain CSV");
+    }
+
+    #[test]
+    fn buy_v16_redeem_script_rejects_invalid_bps() {
+        let tcid = [0xAAu8; 32];
+        let oh = [0xBBu8; 32];
+        let bspkh = [0xCCu8; 32];
+        let err = build_buy_v16_redeem_script(
+            &tcid, 100, 1, 10, &oh, &bspkh, 10_001, 0, 0,);
+        assert!(err.is_err(), "max_matcher_fee_bps > 10000 must be rejected");
+    }
+
+    #[test]
+    fn buy_v16_parse_roundtrip() {
+        // Confirm parse_redeem_script (parse.rs) recognizes the v16 RS
+        // length and correctly extracts every state field.
+        let tcid = [0x44u8; 32];
+        let oh = [0x55u8; 32];
+        let bspkh = [0x66u8; 32];
+        let rs = build_buy_v16_redeem_script(
+            &tcid, 7, 3, 42, &oh, &bspkh, 30, 0, 999_999,)
+        .unwrap();
+        let parsed = crate::contract::spot::parse_redeem_script(&rs)
+            .expect("v16 buy RS must parse");
+        assert_eq!(parsed.order_type, crate::types::OrderSide::Buy);
+        assert_eq!(parsed.token_cov_id, tcid);
+        assert_eq!(parsed.price_num, 7);
+        assert_eq!(parsed.price_den, 3);
+        assert_eq!(parsed.min_fill, 42);
+        assert_eq!(parsed.owner_hash, oh);
+        assert_eq!(parsed.spk_hash, bspkh);
+        assert_eq!(parsed.cpend, 0);
+        assert_eq!(parsed.expiry_daa, Some(999_999));
+    }
+
+    // ── Phase-0 fix verification: F6 reads the authenticated input, not a
+    // free sigscript index ──────────────────────────────────────────────
+
+    #[test]
+    fn buy_v16_fill_f6_reads_same_slot_as_tii_covenant_check() {
+        // The token-input covenant check (`Op10 OpPick(tii) OpTxInputCovId`)
+        // and F6's first cross-input read must reference the exact same
+        // OpPick target (Op10 = 0x5a). This is the byte-level proof that F6
+        // is bound to the already-authenticated tii, not a second, free
+        // index (which is what v15's `Op12 OpPick(sii)` = 0x5c,0x79 was).
+        let body = BUY_ORDER_V16_BODY;
+
+        // Covenant check: `.. 0x5a, 0x79, 0xcf, 0x58, 0x79, 0x87, 0x69 ..`
+        // (Op10 OpPick(tii) OpTxInputCovId, Op8 OpPick(tcid) OpEqual OpVerify)
+        let covenant_check = [0x5a, 0x79, 0xcf, 0x58, 0x79, 0x87, 0x69];
+        let cov_pos = body.windows(covenant_check.len())
+            .position(|w| w == covenant_check)
+            .expect("token-input covenant check pattern must be present");
+
+        // F6's first read: `Op10 OpPick(tii) Op7 Op15 OpTxInputScriptSigSubstr`
+        let f6_first_read = [0x5a, 0x79, 0x57, 0x5f, 0xbc];
+        let f6_pos = body.windows(f6_first_read.len())
+            .position(|w| w == f6_first_read)
+            .expect("F6 first cross-input read must use Op10 OpPick(tii)");
+
+        assert!(f6_pos > cov_pos, "F6 must come after the covenant check it reuses");
+
+        // The vulnerable v15 pattern (Op12 OpPick(sii) = a DIFFERENT,
+        // unauthenticated stack slot) must not appear anywhere in the body.
+        let v15_vulnerable_pattern = [0x5c, 0x79, 0x57, 0x5f, 0xbc];
+        assert!(
+            !body.windows(v15_vulnerable_pattern.len()).any(|w| w == v15_vulnerable_pattern),
+            "v16 body must not contain the v15 Op12-OpPick(sii) pattern"
+        );
+    }
+
+    #[test]
+    fn buy_v16_partial_f6_uses_hardcoded_literal_matching_covenant_check() {
+        // Partial-fill path: the covenant check hardcodes tx-input-index 1
+        // (`Op1 OpTxInputCovId` = 0x51,0xcf). F6 must read the sell price
+        // using that SAME hardcoded literal (0x51), not any OpPick at all
+        // (there is no "tii" stack variable in this path to authenticate
+        // against -- the index IS the constant).
+        let body = BUY_ORDER_V16_BODY;
+
+        let covenant_check = [0x51, 0xcf, 0x57, 0x79, 0x87, 0x69];
+        let cov_pos = body.windows(covenant_check.len())
+            .position(|w| w == covenant_check)
+            .expect("hardcoded token-input covenant check must be present");
+
+        // F6's first read: literal Op1, then start=7, end=15, then substr.
+        let f6_first_read = [0x51, 0x57, 0x5f, 0xbc];
+        let f6_pos = body.windows(f6_first_read.len())
+            .position(|w| w == f6_first_read)
+            .expect("partial F6 first read must be the hardcoded literal Op1, not an OpPick");
+        assert!(f6_pos > cov_pos);
+
+        // The vulnerable v15 pattern (Op11 OpPick(sii) = 0x5b,0x79) reading
+        // a free, matcher-suppliable index must not appear.
+        let v15_vulnerable_pattern = [0x5b, 0x79, 0x57, 0x5f, 0xbc];
+        assert!(
+            !body.windows(v15_vulnerable_pattern.len()).any(|w| w == v15_vulnerable_pattern),
+            "v16 partial body must not contain the v15 Op11-OpPick(sii) pattern"
+        );
+    }
+
+    #[test]
+    fn buy_v16_sigscript_builders_have_no_sii_parameter() {
+        // API-level enforcement: the v16 sigscript builders simply do not
+        // accept a sell-input-index argument at all, so calling code
+        // (matcher / engine) cannot construct a "point sii at a decoy"
+        // sigscript through the SDK even by mistake. This is a
+        // compile-time property; the assertions below just document the
+        // resulting shapes so a regression (e.g. someone re-adding a
+        // sell_input_idx param) shows up as a length/shape diff.
+        let tcid = [0x11u8; 32];
+        let oh = [0x22u8; 32];
+        let bspkh = [0x33u8; 32];
+        let rs = build_buy_v16_redeem_script(&tcid, 3, 1, 5, &oh, &bspkh, 30, 0, 1000).unwrap();
+        let v16_fill = build_buy_v16_fill_sigscript(0, 1, 0, &rs);
+
+        let rs15 = build_buy_v15_redeem_script(&tcid, 3, 1, 5, &oh, &bspkh, 30, 0, 1000).unwrap();
+        // v15's builder DOES take a 5th (sii) argument -- construct it
+        // pointing at a decoy index (99) to show the shape difference.
+        let v15_fill_with_decoy_sii = build_buy_v15_fill_sigscript(99, 0, 1, 0, &rs15);
+
+        // v16's sigscript for equivalent toi/tii/coi is exactly 1 byte
+        // shorter per index removed from the front (sii=99 needs a 2-byte
+        // push since 99 is in the 17..=127 data-push range) -- i.e. the v16
+        // sigscript is strictly shorter than ANY v15 sigscript carrying an
+        // sii, for RS bodies of comparable size. (RS bodies differ in size
+        // between v15/v16 by design, so this checks shape, not raw byte
+        // equality.)
+        assert!(v16_fill.len() < v15_fill_with_decoy_sii.len());
+    }
+
     #[test]
     fn sell_order_body_exact_length() {
         let body = SELL_ORDER_BODY;

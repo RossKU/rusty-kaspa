@@ -1,0 +1,9 @@
+{
+  "network": "testnet-10",
+  "node": "ws://65.108.107.30:18210",
+  "ticker": "V16E2E",
+  "token_covenant_id": "0c113120cb56668a5aa984752496f8cc4ac65e9044f2fa85d64e7bbcb5fc6039",
+  "token_genesis_txid": "c20dc48acf266f94582884eeab8222de729b167bc317abdb6eddceb5c2da8376",
+  "mint_authority_outpoint": "a5b8e060ce0fc7320291f4e32aa0eca5250a6110ac0973985ac3979bbf841442:0",
+  "note": "Reusable v16 E2E token. Do NOT re-deploy the token genesis on every run. Mint fresh token_units from mint_authority_outpoint (cheap); after each mint, update mint_authority_outpoint to the new continuation ':0'. Only deploy a fresh genesis (kob-cli token create) if this file is missing or mint_authority_outpoint is spent. token_units are minted per-run because a cancelled sell unlocks its tokens back to KAS (KOB model), so they are not long-lived UTXOs to persist."
+}

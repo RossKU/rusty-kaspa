@@ -807,9 +807,17 @@ impl BatchPlan {
 
     /// Re-adjust plan outputs after Phase 2 fee convergence.
     ///
-    /// Distributes the fee delta (= estimated_fee - exact_fee) back to the
-    /// matcher fee output (if present) or to the first seller KAS output.
-    /// Updates `self.total_fee` and `self.matcher_surplus` accordingly.
+    /// Recovers the over-estimated fee (`delta = estimated_fee - exact_fee`)
+    /// back to the matcher fee output, up to the bps cap. Any portion that the
+    /// matcher cannot absorb (no MatcherFee output, or the output is already at
+    /// the cap) is NOT folded into the seller output — it is left as miner fee.
+    ///
+    /// Folding the recovered delta (or a dust matcher surplus) into the seller
+    /// made SellerKas exceed the buyer's KAS input, which the covenant rejects
+    /// at settlement. Leaving it as miner fee only ever reduces the matcher
+    /// take, so F6's surplus cap is untouched and settlement stays valid.
+    /// `self.total_fee` is reduced only by what was actually recovered to the
+    /// matcher. See V16_STATUS.md Phase 8/9.
     ///
     /// # Arguments
     /// * `exact_fee` - The exact miner fee computed from `converge_fee_exact`.
@@ -827,37 +835,23 @@ impl BatchPlan {
             u64::MAX // no cap
         };
 
-        // Find matcher fee output index
-        let matcher_idx = self.outputs.iter()
-            .position(|o| o.purpose == OutputPurpose::MatcherFee);
-
-        if let Some(idx) = matcher_idx {
-            // How much can matcher absorb without exceeding bps cap?
-            let current = self.outputs[idx].value;
-            let room = max_matcher.saturating_sub(current);
+        // Recover to the matcher fee output only, up to the bps cap. Never the
+        // seller — the un-recoverable remainder is kept as miner fee.
+        let recovered = if let Some(idx) = self.outputs.iter()
+            .position(|o| o.purpose == OutputPurpose::MatcherFee)
+        {
+            let room = max_matcher.saturating_sub(self.outputs[idx].value);
             let to_matcher = delta.min(room);
-            let to_seller = delta - to_matcher;
-
             if to_matcher > 0 {
                 self.outputs[idx].value += to_matcher;
                 self.matcher_surplus += to_matcher;
             }
-            if to_seller > 0 {
-                // Overflow goes to first SellerKas output
-                let seller_idx = self.outputs.iter()
-                    .position(|o| o.purpose == OutputPurpose::SellerKas)
-                    .expect("batch plan must have at least one SellerKas output");
-                self.outputs[seller_idx].value += to_seller;
-            }
+            to_matcher
         } else {
-            // No matcher fee output — give delta to first SellerKas output
-            let seller_idx = self.outputs.iter()
-                .position(|o| o.purpose == OutputPurpose::SellerKas)
-                .expect("batch plan must have at least one SellerKas output");
-            self.outputs[seller_idx].value += delta;
-        }
+            0
+        };
 
-        self.total_fee = exact_fee;
+        self.total_fee = self.total_fee.saturating_sub(recovered);
     }
 }
 
@@ -893,17 +887,22 @@ fn apply_bps_cap(matcher_kas: u64, total_seller_kas: u64, fee_bps: Option<u16>) 
     }
 }
 
-/// Emit a MatcherFee output if `capped_kas` >= MIN_UTXO_VALUE, otherwise
-/// add dust to the first existing output.
+/// Emit a MatcherFee output if `capped_kas` >= MIN_UTXO_VALUE, otherwise drop
+/// the dust to the miner fee.
 ///
-/// Returns the value actually emitted as a separate MatcherFee output
-/// (0 when dust was folded into an existing output).
+/// Returns `(matcher_surplus, dropped_to_fee)`:
+/// - `matcher_surplus`: value emitted as a separate MatcherFee output (0 when
+///   the surplus was dust and dropped).
+/// - `dropped_to_fee`: the dust amount that was NOT emitted as an output; the
+///   caller MUST add this to `total_fee` so the plan's amount check stays
+///   balanced (`inputs == outputs + total_fee`) — the dropped value becomes
+///   the on-chain miner fee.
 fn emit_matcher_fee(
     outputs: &mut Vec<PlannedOutput>,
     capped_kas: u64,
     matcher_spk: &[u8],
     matcher_spk_version: u16,
-) -> u64 {
+) -> (u64, u64) {
     if capped_kas >= MIN_UTXO_VALUE {
         outputs.push(PlannedOutput {
             value: capped_kas,
@@ -911,12 +910,19 @@ fn emit_matcher_fee(
             spk_version: matcher_spk_version,
             purpose: OutputPurpose::MatcherFee,
         });
-        capped_kas
+        (capped_kas, 0)
     } else {
-        if capped_kas > 0 && !outputs.is_empty() {
-            outputs[0].value += capped_kas;
-        }
-        0
+        // A sub-MIN_UTXO_VALUE surplus cannot be its own spendable UTXO. It is
+        // DROPPED to the miner fee (not emitted as an output; the caller folds
+        // it into `total_fee`), rather than folded into the seller (outputs[0])
+        // as before.
+        //
+        // Folding it into the seller made SellerKas exceed the buyer's KAS
+        // input, which the buy/sell covenant correctly rejects at settlement
+        // ("script ran, but verification failed"). Dropping to the miner fee
+        // only ever REDUCES the matcher take, so F6's surplus cap is untouched
+        // and settlement stays valid. See V16_STATUS.md Phase 8/9.
+        (0, capped_kas)
     }
 }
 
@@ -1221,7 +1227,7 @@ pub fn plan_batch_match(
         + if wallet_utxo.is_some() { 1 } else { 0 };
     // +1 for matcher fee, +1 for potential sell remainder
     let num_outputs = sells.len() + buys.len() + 2;
-    let total_fee = kob_core::mass::min_relay_fee(
+    let mut total_fee = kob_core::mass::min_relay_fee(
         kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
     );
 
@@ -1318,7 +1324,10 @@ pub fn plan_batch_match(
         distribute_buyer_refund(&mut outputs, buyer_refund, &buy_refs, total_buy_kas, n, Some(&buy_output_idx));
     }
 
-    let matcher_surplus = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    let (matcher_surplus, dropped_to_fee) = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    // A dust matcher surplus is dropped to the miner fee; keep the plan's
+    // amount check balanced (inputs == outputs + total_fee).
+    total_fee += dropped_to_fee;
 
     // Build buy-to-sell mapping for soi (round-robin across matching sells)
     let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();
@@ -1506,7 +1515,7 @@ pub fn plan_ioc_match(
     // Estimate miner fee (post-Toccata min relay rate; see the 1:1 path above).
     let num_inputs = n + 1 + if wallet_utxo.is_some() { 1 } else { 0 };
     let num_outputs = n + 3; // sellers + buyer_tokens + buyer_change + matcher_fee
-    let total_fee = kob_core::mass::min_relay_fee(
+    let mut total_fee = kob_core::mass::min_relay_fee(
         kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
     );
 
@@ -1572,7 +1581,8 @@ pub fn plan_ioc_match(
     }
 
     // Matcher fee output
-    let matcher_surplus = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    let (matcher_surplus, dropped_to_fee) = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    total_fee += dropped_to_fee;
 
     // Buy-to-sell mapping (buy maps to first sell with matching token)
     let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();
@@ -1751,7 +1761,7 @@ pub fn plan_sell_ioc_match(
     // Estimate miner fee
     let num_inputs = 1 + m + if wallet_utxo.is_some() { 1 } else { 0 };
     let num_outputs = outputs.len() + 1; // + matcher fee
-    let total_fee = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
+    let mut total_fee = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
 
     // Total value in
     let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
@@ -1779,11 +1789,11 @@ pub fn plan_sell_ioc_match(
         distribute_buyer_refund(&mut outputs, buyer_refund_from_bps, &filled_buys, total_buy_value, 1, None);
     }
 
-    // sell_ioc: matcher_surplus = full capped amount (even dust)
-    let matcher_surplus = capped_matcher_kas;
-
-    // Matcher fee output (emit_matcher_fee handles dust folding into outputs[0])
-    emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    // Matcher fee output: a dust surplus is dropped to the miner fee (added to
+    // total_fee) rather than folded into an output; matcher_surplus reflects
+    // only what was actually emitted as a MatcherFee output.
+    let (matcher_surplus, dropped_to_fee) = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    total_fee += dropped_to_fee;
 
     // Buy-to-sell mapping (all buys map to the single sell at index 0)
     let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();
@@ -2517,17 +2527,54 @@ mod tests {
         let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
         assert!(delta > 0, "Phase 2 should recover some fee");
 
-        // Apply — matcher surplus must NOT exceed bps cap
+        // Apply — matcher surplus must NOT exceed bps cap.
         plan.apply_exact_fee(exact_fee);
         assert_eq!(plan.matcher_surplus, max_fee_bps,
-            "Phase 2 must not push surplus above bps cap (delta={} went to seller)", delta);
+            "Phase 2 must not push surplus above bps cap");
 
-        // Delta should have gone to seller output[0] instead
+        // With the matcher output already at its bps cap, the recovered delta
+        // has nowhere to go on the matcher side. It must NOT be folded into the
+        // seller (that made SellerKas exceed the buyer input and the covenant
+        // rejected settlement) — it stays as miner fee instead.
         let seller_out = &plan.outputs[0];
         assert_eq!(seller_out.purpose, OutputPurpose::SellerKas);
-        // Seller gets original expected_kas + delta overflow
-        assert!(seller_out.value > 50_000_000,
-            "seller should receive delta overflow: {}", seller_out.value);
+        assert_eq!(seller_out.value, 50_000_000,
+            "seller output must stay at its fair value (delta not folded in): {}", seller_out.value);
+        // total_fee is unchanged (nothing recovered) — the delta is miner fee.
+        assert_eq!(plan.total_fee, _est_fee,
+            "un-recoverable delta stays as miner fee, so total_fee is unchanged");
+    }
+
+    #[test]
+    fn emit_matcher_fee_drops_dust_instead_of_folding_into_seller() {
+        // Regression for the engine match settlement failure (V16_STATUS Phase
+        // 8): a sub-MIN_UTXO matcher surplus must NOT be added to outputs[0]
+        // (the seller) — that inflated SellerKas past the buyer's KAS input and
+        // the covenant rejected settlement ("script ran, but verification
+        // failed"). It is dropped to the miner fee (no output emitted).
+        let mk_seller = || vec![PlannedOutput {
+            value: 29_940_000, // seller fair KAS
+            script_public_key: vec![0u8; 34],
+            spk_version: 0,
+            purpose: OutputPurpose::SellerKas,
+        }];
+
+        let mut outputs = mk_seller();
+        let dust = MIN_UTXO_VALUE - 1;
+        let (surplus, dropped) = emit_matcher_fee(&mut outputs, dust, &[0u8; 34], 0);
+        assert_eq!(surplus, 0, "dust surplus reported as 0 matcher take");
+        assert_eq!(dropped, dust, "dust amount reported as dropped-to-fee so the caller balances total_fee");
+        assert_eq!(outputs.len(), 1, "no MatcherFee output emitted for dust");
+        assert_eq!(outputs[0].value, 29_940_000, "seller output must NOT be inflated by dust");
+
+        // At/above the threshold it IS a clean MatcherFee output; seller stays.
+        let mut outputs2 = mk_seller();
+        let (clean, dropped2) = emit_matcher_fee(&mut outputs2, MIN_UTXO_VALUE, &[9u8; 34], 0);
+        assert_eq!(clean, MIN_UTXO_VALUE);
+        assert_eq!(dropped2, 0, "nothing dropped when the matcher fee is a real UTXO");
+        assert_eq!(outputs2.len(), 2);
+        assert_eq!(outputs2[1].purpose, OutputPurpose::MatcherFee);
+        assert_eq!(outputs2[0].value, 29_940_000, "seller unchanged when matcher fee is its own output");
     }
 
     #[test]

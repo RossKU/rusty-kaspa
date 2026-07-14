@@ -1061,3 +1061,149 @@ KOB="$BIN/kob-cli --node $NODE --wallet $WALLET --fee-rate 400000"   # --fee-rat
 #   order discovery is racy — deploy orders only AFTER the engine's scan loop
 #   is live, or add a startup rescan.
 ```
+
+---
+
+## Phase 9 — Fix the engine settlement blocker + close the E2E
+
+Status: **fix implemented; on-chain settle pending final rebuild + run.**
+
+### The bug (from Phase 8)
+
+The engine batch plan folded a sub-`MIN_UTXO_VALUE` (3,000,000) matcher
+surplus into the seller output (`outputs[0]`), making `SellerKas` exceed the
+buyer's KAS input. The buy/sell covenant correctly rejects that at settlement
+(`"script ran, but verification failed"`). Two code paths did the folding:
+
+- `emit_matcher_fee` (plan time): `if capped_kas < MIN_UTXO { outputs[0].value += capped_kas }`.
+- `apply_exact_fee` (fee-convergence time): the recovered fee delta, when the
+  matcher output was absent or already at its bps cap, was added to the seller
+  output.
+
+### Fix (design choice: drop to miner fee, never inflate the seller)
+
+Chosen because it is the *safe* direction — it only ever REDUCES the matcher
+take, so F6's surplus cap is structurally untouched and settlement stays valid
+(a dropped/withheld amount simply becomes the on-chain miner fee via the
+input−output difference; it can never make the seller receive more than the
+buyer paid).
+
+- `emit_matcher_fee`: a sub-MIN_UTXO surplus is now DROPPED (no output emitted,
+  nothing added to the seller) → it becomes miner fee.
+- `apply_exact_fee`: recovers the fee delta ONLY to the matcher fee output (up
+  to the bps cap); any un-recoverable remainder is left as miner fee, never
+  folded into the seller. `total_fee` is reduced only by what was actually
+  recovered.
+
+Regression tests added in `kob/domain/src/spot/batch.rs`:
+`emit_matcher_fee_drops_dust_instead_of_folding_into_seller`, and
+`converge_fee_exact_respects_bps_cap` updated to assert the seller output is
+NOT inflated and the delta stays as miner fee. kob-domain: **629 passed**.
+
+### Happy-path E2E sizing (avoid the dust path entirely)
+
+The dust path is only hit when the *capped* matcher fee < MIN_UTXO. For a
+clean settle we size the test orders so the capped fee is a real UTXO:
+buy 30M KAS @ 1/1 with **--mmfee-bps 2000** (cap = 30M·2000/10000 = 6M ≥ 3M),
+sell 30M tokens @ 499/500 (tight spread → F6 surplus = 30M − 30M·499/500 =
+60,000 ≪ cap 6M). With the fix, `SellerKas` = fair 29,940,000 < 30,000,000
+buy input, and F6 passes.
+
+### Crossing heuristic + discovery
+
+- Crossing (`sell price ≤ buy price`) is satisfied by the sized config (same
+  prices as the Phase-8 pair that DID cross), so no change was needed there.
+  The Phase-8 "No crossing" was the `surplus == cap` exact-boundary wide-spread
+  config, which the sized happy-path config avoids.
+- Discovery remains block-scan-based (the engine cannot UTXO-rescan without
+  knowing per-order P2SH addresses). Mitigation for the E2E: start the engine,
+  wait for its "ready / listening for new blocks" line, THEN deploy, and
+  poll/retry. A durable fix (a `--scan-lookback N` flag to rewind the startup
+  catch-up, or an operator-seeded orderbook) is left as a follow-up TODO.
+
+### On-chain settle attempt (fix verified; deeper blocker found)
+
+With the seller-overpay + accounting fix and covenant-first deploy ordering,
+a real v16 match was driven end-to-end on testnet-10:
+
+- mint `a5b8e060…:1`, sell `16832c1a…:0` (30M @499/500, discovered → Asks:1,
+  taught covenant `0c113120`), buy `06ed45af…:0` (30M @1/1 mmfee 2000,
+  discovered → Bids:1). Engine matched (`surplus=60000`), built + SUBMITTED
+  the batch tx `d7065377…`.
+- **The seller-overpay fix is confirmed on-chain**: the engine's own DEBUG
+  dump shows `PLAN_OUT[0] SellerKas = 29,940,000` — exactly fair, and **<
+  30,000,000 buyer input** (was 30,204,320 pre-fix). The `Amount mismatch`
+  the accounting fix targeted is gone (the tx passes `validate()` and is
+  submitted). Both fixes work as intended.
+- **BUT the match still does NOT settle**: the node rejects `d7065377…` with
+  `"failed to verify the signature script: script ran, but verification
+  failed"`. This is a txscript **OpVerify / clean-stack failure**, proven
+  (against the merged consensus source) to be a *different* failure than the
+  three things this phase addressed:
+  - NOT the seller overpay — SellerKas is now fair and it still fails.
+  - NOT CSV/maturity — `OpCheckSequenceVerify` with `input.sequence=50` passes
+    the opcode (`SEQUENCE_LOCK_TIME_DISABLED = 1<<63`, uncollided; `50 ≤ 50`),
+    and an *immature* relative-lock spend produces the consensus error
+    `SequenceLockConditionsAreNotMet`, NOT a script error (confirmed in
+    `consensus/src/processes/transaction_validator/tx_validation_in_utxo_context.rs`).
+    Retries well past 50-DAA maturity (~1 BPS on this node) still fail
+    identically.
+  - NOT amount mismatch — `validate()` passes.
+
+### Diagnosis: pre-existing covenant-fill script issue (post-Toccata, untested)
+
+Hand-tracing BOTH contracts against the real submitted values shows every
+OpVerify should pass: v16 buy fill F1 (`OpTxInputCovId(tii=0)==tcid`), F2
+(`Blake2b(OpTxOutputSpk(toi=1))==bspkh`), F4 (`OpCovOutCount≥1`,
+`OpCovOutputIdx(T,0)==1`), F6 (`surplus 60000 ≤ cap 6,000,000`); and v14 sell
+fill (price `expected_kas=29,940,000`, `OpTxOutputAmount(koi=0) ≥ expected`,
+seller-SPK, token-conservation `OpTxOutputAmount(covout)≥OpTxInputAmount`).
+Yet the node's script engine rejects it. The fill path is the ONLY path never
+exercised on-chain since the post-Toccata upstream merge (deploy and cancel
+BOTH succeed on-chain — see Phase 5 — so P2SH, dispatch, sig-check, and
+covenant *binding* all work; only the introspection-heavy FILL fails). The
+most likely cause is a post-Toccata semantic/stack change in one of the
+fill-only covenant-introspection opcodes (`OpInputCovenantId`/`OpTxInputCovId`,
+`OpCovOutCount`, `OpCovOutputIdx`, `OpTxOutputSpk`, `OpTxInputScriptSigSubstr`)
+or a resulting clean-stack mismatch — i.e. a **pre-existing bug in the v14/v16
+covenant fill bytecode or its engine construction, exposed for the first time
+now that the token-mint blocker is fixed**, and orthogonal to the v15 removal
+/ token-mint / seller-overpay work of this task.
+
+**This means the seller-overpay was NOT (the sole) settlement blocker** — an
+important correction to the Phase-8 hypothesis. Fixing it was necessary
+(SellerKas is now correct and the tx is well-formed) but not sufficient.
+
+### Resumable next step to actually settle
+
+The node's RPC only returns a generic "verification failed"; the exact failing
+opcode must be found by running the built match tx through the in-tree
+`kaspa-txscript` `TxScriptEngine` locally (per input), which reports the
+precise `TxScriptError`. Concretely: add a debug pre-submit pass in
+`kob/engine/src/chain/executor.rs` (the crate can pull `kaspa-txscript` from
+the workspace) that calls `TxScriptEngine::from_transaction_input(...).execute()`
+for each input of the batch tx and logs the error, OR write a standalone test
+under `crypto/txscript/` that reconstructs the exact tx + UTXO entries
+(covenant bindings included) and executes it. Once the failing opcode is
+named, fix the fill bytecode or the engine's tx construction. A second useful
+signal: run the match with the buyer and seller on **distinct wallets**
+(non-self-trade; all three outputs currently share one P2PK SPK) to rule out a
+same-address interaction — this is also required for the adversarial leg.
+
+### Adversarial over-extraction
+
+Still structurally proven (no `sii`; unit tests + the on-chain byte-trace
+above showing F6 reads the authenticated `tii=0` with `surplus=60000` correct)
+but NOT demonstrated on-chain: it requires a settling honest match first (the
+honest match's covenant rejection cannot be distinguished from an
+over-extraction rejection until honest settles).
+
+### E2E harness (reusable token) — committed
+
+`kob/e2e_fixture.json` (token identity `0c113120…` + genesis `c20dc48a…` +
+current mint-authority outpoint) and `kob/scripts/e2e_v16.sh` (loads the
+fixture, reuses the token, mints fresh token_units per run, advances the
+authority pointer) so reruns don't redeploy the token genesis. NOTE: `jq` is
+not installed on this device — the harness's fixture reads use `jq`; either
+install `jq` or replace those reads with `grep`/`sed`/`python3` (the manual
+runs this session used `grep`/`sed`).

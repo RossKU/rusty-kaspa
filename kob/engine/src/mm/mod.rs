@@ -1684,6 +1684,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_ok());
     }
@@ -1702,6 +1703,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -1720,6 +1722,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -1738,6 +1741,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -1756,6 +1760,7 @@ mod tests {
             version: 7,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -1774,6 +1779,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -1792,6 +1798,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -1810,6 +1817,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -1830,6 +1838,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         let plan = build_deploy_plan(&config);
         assert_eq!(plan.buy_levels.len(), 5);
@@ -1854,6 +1863,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         let plan = build_deploy_plan(&config);
         // Level 1: 70%, Level 2: 40%, Level 3: 10%, Level 4: -20% (skip), Level 5: -50% (skip)
@@ -1875,6 +1885,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         let plan = build_deploy_plan(&config);
         assert_eq!(plan.total_orders, 4); // 2 buy + 2 sell
@@ -2191,6 +2202,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -2209,6 +2221,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -2227,6 +2240,7 @@ mod tests {
             version: 14,
             min_fill: 0,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -2245,6 +2259,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_ok());
     }
@@ -2264,6 +2279,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -2283,6 +2299,7 @@ mod tests {
                 version: v,
                 min_fill: 1_000_000,
                 requote_threshold_bps: 500,
+                deploy_delay_secs: 0,
             };
             assert!(config.validate().is_ok(), "Version {} should be valid", v);
         }
@@ -2304,6 +2321,7 @@ mod tests {
                 version: v,
                 min_fill: 1_000_000,
                 requote_threshold_bps: 500,
+                deploy_delay_secs: 0,
             };
             assert!(config.validate().is_err(), "Version {} should be invalid", v);
         }
@@ -2323,6 +2341,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_err());
     }
@@ -2341,6 +2360,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_ok());
     }
@@ -2650,6 +2670,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         let plan = build_deploy_plan(&config);
         assert_eq!(plan.buy_levels.len(), 1);
@@ -2673,6 +2694,7 @@ mod tests {
             version: 14,
             min_fill: 5_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         let plan = build_deploy_plan(&config);
         assert_eq!(plan.amount_per_order, 50_000_000);
@@ -2693,6 +2715,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         let plan = build_deploy_plan(&config);
         assert_eq!(plan.buy_levels.len(), plan.sell_levels.len());
@@ -2720,6 +2743,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         let plan = build_deploy_plan(&config);
         assert!(plan.buy_levels.is_empty());
@@ -2946,6 +2970,7 @@ mod tests {
             version: 14,
             min_fill: 100_000,
             requote_threshold_bps: 500,
+            deploy_delay_secs: 0,
         };
         let plan = build_deploy_plan(&config);
         assert_eq!(plan.buy_levels.len(), 100);
@@ -3012,6 +3037,7 @@ mod tests {
             version: 14,
             min_fill: 1_000_000,
             requote_threshold_bps: 0,
+            deploy_delay_secs: 0,
         };
         assert!(config.validate().is_ok());
     }

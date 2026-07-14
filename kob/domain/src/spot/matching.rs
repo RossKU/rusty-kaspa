@@ -2771,6 +2771,7 @@ mod tests {
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
             oco_path: Some(kob_core::OcoPath::StopLoss),
+            bracket_meta: None,
         };
 
         // Two buys that don't absorb the full 200M tokens.
@@ -2797,6 +2798,7 @@ mod tests {
                 counterparty_spk_version: 0,
                 min_fill: 1_000_000,
                 oco_path: None,
+                bracket_meta: None,
             },
             BatchOrder {
                 outpoint: ("a7".repeat(32), 0),
@@ -2812,6 +2814,7 @@ mod tests {
                 counterparty_spk_version: 0,
                 min_fill: 1_000_000,
                 oco_path: None,
+                bracket_meta: None,
             },
         ];
 
@@ -2857,6 +2860,7 @@ mod tests {
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
             oco_path: Some(kob_core::OcoPath::StopLoss),
+            bracket_meta: None,
         };
 
         let buys = vec![BatchOrder {
@@ -2875,6 +2879,7 @@ mod tests {
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
             oco_path: None,
+            bracket_meta: None,
         }];
 
         let result = plan_batch_match(

@@ -627,3 +627,138 @@ match the design exactly. What did **not** complete is the fill/F6/
 adversarial leg of the E2E, blocked by a concrete, pre-existing,
 already-documented, unrelated bug in the token-mint path — not a vague
 resource limit, and not something fabricated or skipped over.
+
+---
+
+## Phase 6 — Delete v15 (v14 and v16 kept fully intact)
+
+Status: **DONE**.
+
+Now that v16 is deploy/cancel-proven on testnet-10 (Phase 5) and fixes the
+same F6 flaw v15 attempted to fix, v15 has no remaining purpose: it was
+never wired into CLI order-management (`OPTIMIZATION_REVIEW.md` §4 —
+cancel/cancel_mark/requote/cancel_all/watch were all already hardcoded to
+v14, v15 was deploy-only and feature-gated), and it carries the exact
+cross-input-authentication flaw v16 was built to fix. Per instructions, it
+is deleted outright rather than kept feature-gated.
+
+### What was removed
+
+- `kob/core/src/contract/spot/order.rs`: the entire "V15 BUY CONTRACT"
+  block — `BUY_ORDER_V15_BODY` (334B bytecode), `BUY_ORDER_V15_BODY_EXPECTED_LEN`,
+  `BUY_ORDER_V15_RS_EXPECTED_LEN`, `build_buy_v15_redeem_script`,
+  `build_buy_v15_fill_sigscript`, `build_buy_v15_ioc_fill_sigscript`,
+  `build_buy_v15_partial_fill_sigscript` (lines 763–1237 pre-deletion).
+  **Kept** (not v15-specific despite the old name): the two sell-side
+  "fixed-offset sigscript" builders v16 also depends on for its F6 read —
+  renamed `build_sell_fill_sigscript_v15` → `build_sell_fill_sigscript_fixed_offset`
+  and `build_sell_ioc_fill_sigscript_v15` → `build_sell_ioc_fill_sigscript_fixed_offset`
+  (mechanical rename only; byte-construction logic untouched — confirmed via
+  `git diff`, only doc-comments/assert-messages/fn names changed).
+- `kob/core/src/contract/spot/parse.rs`: `BUY_ORDER_V15_RS_EXPECTED_LEN`
+  removed from the `parse_redeem_script` RS-length match arm (now
+  `BUY_RS_SIZE | BUY_ORDER_V16_RS_EXPECTED_LEN` only).
+- `kob/core/src/contract/tests.rs`: v15 comparison logic removed from
+  `buy_order_v16_rs_len_distinct_from_v15_and_v14` (renamed, v14-only now)
+  and `buy_v16_sigscript_builders_have_no_sii_parameter` (rewritten to
+  assert the v16 fill sigscript's shape directly instead of diffing against
+  a constructed v15 sigscript). The two byte-level adversarial regression
+  tests (`buy_v16_fill_f6_reads_same_slot_as_tii_covenant_check`,
+  `buy_v16_partial_f6_uses_hardcoded_literal_matching_covenant_check`) are
+  **unchanged** — their "v15 vulnerable pattern" arrays are inline byte
+  literals (`[0x5c, 0x79, ...]`), not references to any deleted symbol, so
+  they still compile and still guard the same regression.
+- `kob/domain/src/spot/batch.rs`: the `has_v15_buy` sell-side detection
+  became `has_v16_buy` (v16 alone now needs the fixed-offset sell
+  convention); the `is_v15` buy-side branches in the partial/IOC/fill
+  sigscript dispatch (`build_tx()`) were deleted outright (v16 and v14
+  branches untouched); both `validate()` (method) and `plan_batch_match()`
+  (free fn) version gates changed from `buy.version != 14 && != 15 && != 16`
+  to `!= 14 && != 16`; imports of the four `build_buy_v15_*`/`BUY_ORDER_V15_RS_EXPECTED_LEN`
+  symbols removed, imports of the two sell builders updated to their new
+  names.
+- `kob/engine/src/chain/executor.rs`: both RS-size acceptance tables
+  (`sell_and_buy_orders_to_batch_orders_pair`, `book_order_to_batch_order`)
+  and their `buy_version`/`version` length-dispatch `if` chains dropped the
+  `BUY_ORDER_V15_RS_EXPECTED_LEN` arm (`15u8` case removed; only v16/bracket/
+  v14 remain).
+- `kob/engine/src/chain/scanner.rs`: the `max_matcher_fee` BPS-vs-sompi
+  conversion in `BookOrder` construction now checks only
+  `BUY_ORDER_V16_RS_EXPECTED_LEN` (was `v15 || v16`).
+- `kob/cli/src/deploy.rs`: `deploy_buy`'s version gate now only accepts
+  14/16 (was 14/15/16); the `version == 15` branch building
+  `build_buy_v15_redeem_script` deleted; the `version == 15 || 16` BPS
+  print/cache-field checks became `version == 16`;
+  `DEFAULT_MAX_MATCHER_FEE_BPS` doc-comment updated.
+- `kob/cli/src/cancel.rs`: version gate was already 14/16-only (v15 was
+  never accepted here); removed the one dead diagnostic branch printing a
+  v15-specific T2 threshold (unreachable, since the gate already excludes
+  v15 — was stale/dead code referencing the now-deleted constant).
+- `kob/cli/src/lib.rs`: clap help text for `--version`/`--max-matcher-fee`/
+  `--mmfee-bps` updated (14/16 only, "v16" not "v15/v16"); the
+  `--mmfee-bps`-implies-a-BPS-contract auto-version-selection logic
+  (`mmfee_bps.is_some() && version == 14 { 15 } else { version }`) now
+  selects **16**, not 15 (this was the one CLI code path where a user could
+  actually end up deploying a v15 order — `--mmfee-bps` without an explicit
+  `--version` — now redirected to v16, the fixed contract).
+- `kob/cli/src/watch.rs`: trimmed a stale comment explaining why v15
+  wasn't recognized (moot — v15 no longer exists to explain).
+- `kob/cli/src/cancel_mark.rs`, `requote.rs`, `cancel_all.rs`: **no changes
+  needed** — confirmed by grep that none of these ever had a v15 branch or
+  accepted version 15 in their gates (`OPTIMIZATION_REVIEW.md` §4 already
+  documented this: v15 was deploy-only, never wired into order management).
+- `kob/README.md`: the Spot product-status line no longer claims "v15
+  mmfee-bps feature-gated"; now reflects v16's real, on-chain-proven status.
+
+### One deliberate behavior change beyond pure deletion
+
+`kob/engine/src/chain/executor.rs`'s `execute_swap_fill`: previously only
+v15 buys were excluded from cross-pair swap fills (`BUY_ORDER_V15_RS_EXPECTED_LEN`
+check, "v15 buy not supported in cross-pair swap"). v16 has the *same*
+structural incompatibility with cross-pair swaps as v15 did (F6 reads the
+counterparty sell's price via a fixed-offset sigscript read, which only
+makes sense when buy and sell share a token — already documented in
+`cli/src/lib.rs`'s comment on the `--mmfee-bps` auto-version-select logic:
+"v14 is needed for cross-pair swap fills because the v15/v16 F6 surplus cap
+check ... is incompatible when buy and sell are for different tokens").
+The v15-only exclusion check is now a v16-only exclusion check (not
+deleted, not left silently broken) — this is a completion of the v15→v16
+migration for this one path, not scope creep: without it, a v16 buy would
+have been allowed into cross-pair-swap construction and then fail on-chain
+at F6 anyway, which is strictly worse (wasted broadcast/mass) than the
+early skip this restores. No unit test exercised this specific branch
+(grepped — none found), so this could not have been "protected" by
+existing test coverage either way.
+
+### Verification
+
+- `git diff` on `order.rs`/`parse.rs` confirms **zero byte/logic changes**
+  to the v14 sections (`BUY_ORDER_BODY`, `SELL_ORDER_BODY`,
+  `build_buy_redeem_script`, etc. — all strictly before the deleted v15
+  block) and **zero changes at all** to the v16 body bytecode
+  (`BUY_ORDER_V16_BODY`) or any v16 builder function — the only lines
+  touched in the v16 region are the two renamed sell-side helper functions'
+  doc-comments/names (their byte-emitting logic is byte-for-byte identical,
+  confirmed line-by-line in the diff).
+- `cargo check -p kob-core` — clean.
+- `cargo check -p kob-domain --tests` — clean.
+- `cargo check -p kob-engine` — clean.
+- `cargo check -p kob-cli` — clean (1 pre-existing, unrelated warning in
+  `deploy.rs:1376`, not touched by this phase).
+- `cargo test -p kob-core --lib` — **814 passed, 0 failed** (same count as
+  before this phase — no tests were deleted, only their v15-referencing
+  internals rewritten to test v16 directly).
+- `cargo test -p kob-domain --lib` — **628 passed, 0 failed** (same count
+  as before this phase, same reasoning).
+- Full repo grep (`grep -rni "v15" kob/ --include="*.rs"`) after this phase
+  turns up **zero remaining references to any v15 symbol or code branch** —
+  only prose comments in `order.rs`'s V16 section and `contract/tests.rs`
+  explaining bytecode provenance / historical vulnerability shape (e.g. "the
+  vulnerable v15 pattern was `Op12 OpPick(sii)`"), which reference no
+  deleted symbol and are accurate, valuable regression-test documentation.
+
+Not committed as part of this phase (pre-existing, unrelated,
+owner-review-only file per its own header): `kob/OPTIMIZATION_REVIEW.md`.
+`kob/E2E_MATRIX.md` also left untouched — it is a point-in-time audit log
+of past test runs (commit-hash-anchored), not a living status doc; revising
+its historical entries would be revisionist rather than corrective.

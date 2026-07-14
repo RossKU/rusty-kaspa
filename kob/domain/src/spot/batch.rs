@@ -42,20 +42,16 @@ use kob_core::contract::spot::oco::{
     build_oco_sell_tp_fill_sigscript,
 };
 use kob_core::contract::spot::order::{
-    BUY_ORDER_V15_RS_EXPECTED_LEN,
     BUY_ORDER_V16_RS_EXPECTED_LEN,
     build_buy_fill_sigscript,
     build_buy_ioc_fill_sigscript,
-    build_buy_v15_fill_sigscript,
-    build_buy_v15_ioc_fill_sigscript,
-    build_buy_v15_partial_fill_sigscript,
     build_buy_v16_fill_sigscript,
     build_buy_v16_ioc_fill_sigscript,
     build_buy_v16_partial_fill_sigscript,
     build_sell_fill_sigscript,
-    build_sell_fill_sigscript_v15,
+    build_sell_fill_sigscript_fixed_offset,
     build_sell_ioc_fill_sigscript,
-    build_sell_ioc_fill_sigscript_v15,
+    build_sell_ioc_fill_sigscript_fixed_offset,
 };
 use kob_core::contract::spot::bracket::build_bracket_fill_sigscript;
 use kob_core::contract::spot::parse::BRACKET_RS_SIZE;
@@ -222,7 +218,7 @@ impl std::fmt::Display for BatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BatchError::UnsupportedVersion { outpoint, version } => {
-                write!(f, "Order {} is v{}, unsupported (v14/v15/v16 only)", outpoint, version)
+                write!(f, "Order {} is v{}, unsupported (v14/v16 only)", outpoint, version)
             }
             BatchError::EmptyBatch => write!(f, "No orders in batch"),
             BatchError::OutputBelowMinimum { index, value } => {
@@ -391,16 +387,13 @@ impl BatchPlan {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
 
-        // V15/V16 detection: if any buy in the batch uses the v15 or v16
-        // contract (both read the counterparty sell's pnum/pden via
+        // V16 detection: if any buy in the batch uses the v16 contract (it
+        // reads the counterparty sell's pnum/pden via
         // OpTxInputScriptSigSubstr at fixed sigscript offsets), all sells
         // must use the fixed-offset sigscript format (fixed 2-byte koi push)
-        // so those offsets land where F6 expects them. V16 is byte-compatible
-        // with v15's sell-side convention (same fixed offsets [7..15)/[16..24));
-        // only the buy side's F6 authentication differs (see order.rs).
-        let has_v15_buy = self.buys.iter().any(|(b, _)| {
-            let len = b.redeem_script.len();
-            len == BUY_ORDER_V15_RS_EXPECTED_LEN || len == BUY_ORDER_V16_RS_EXPECTED_LEN
+        // so those offsets land where F6 expects them (see order.rs).
+        let has_v16_buy = self.buys.iter().any(|(b, _)| {
+            b.redeem_script.len() == BUY_ORDER_V16_RS_EXPECTED_LEN
         });
 
         // === Build sell inputs ===
@@ -425,8 +418,8 @@ impl BatchPlan {
                     // OCO sell with remainder: use IOC fill (Op5 + fta) instead
                     // of TP/SL full-fill path to avoid F4 value check failure.
                     let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
-                    if has_v15_buy {
-                        build_sell_ioc_fill_sigscript_v15(koi as u16, fta, &sell.redeem_script)
+                    if has_v16_buy {
+                        build_sell_ioc_fill_sigscript_fixed_offset(koi as u16, fta, &sell.redeem_script)
                     } else {
                         build_sell_ioc_fill_sigscript(koi as u16, fta, &sell.redeem_script)
                     }
@@ -444,13 +437,13 @@ impl BatchPlan {
             } else if (self.ioc_mode == Some(IocSide::Sell) || has_remainder) && !self.sell_fill_amounts.is_empty() {
                 // Sell IOC or sell with remainder: use fta-based sigscript
                 let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
-                if has_v15_buy {
-                    build_sell_ioc_fill_sigscript_v15(koi as u16, fta, &sell.redeem_script)
+                if has_v16_buy {
+                    build_sell_ioc_fill_sigscript_fixed_offset(koi as u16, fta, &sell.redeem_script)
                 } else {
                     build_sell_ioc_fill_sigscript(koi as u16, fta, &sell.redeem_script)
                 }
-            } else if has_v15_buy {
-                build_sell_fill_sigscript_v15(koi as u16, &sell.redeem_script)
+            } else if has_v16_buy {
+                build_sell_fill_sigscript_fixed_offset(koi as u16, &sell.redeem_script)
             } else {
                 build_sell_fill_sigscript(koi as u16, &sell.redeem_script)
             };
@@ -500,8 +493,7 @@ impl BatchPlan {
             // contract identifier (see V16_STATUS.md Phase 0, "version number
             // 16 is already taken"). RS length is the only thing that
             // actually distinguishes them, and it already does everywhere
-            // else in this codebase (`is_v15` below uses the same pattern).
-            let is_v15 = buy.redeem_script.len() == BUY_ORDER_V15_RS_EXPECTED_LEN;
+            // else in this codebase (`is_v16` below uses the same pattern).
             let is_v16 = buy.redeem_script.len() == BUY_ORDER_V16_RS_EXPECTED_LEN;
             let is_bracket = buy.redeem_script.len() == BRACKET_RS_SIZE;
 
@@ -517,15 +509,6 @@ impl BatchPlan {
                     // No sii (Phase-0 fix): F6 authenticates against the
                     // hardcoded literal token-input index (see order.rs).
                     build_buy_v16_partial_fill_sigscript(
-                        &buy.redeem_script,
-                        fill_kas,
-                        residual_idx,
-                        token_idx,
-                    )
-                } else if is_v15 {
-                    // V15: [sii] [ri] [ti] [pushData(fk 8B)] [Op2] [pushData(RS)]
-                    build_buy_v15_partial_fill_sigscript(
-                        *tii as u16,
                         &buy.redeem_script,
                         fill_kas,
                         residual_idx,
@@ -550,16 +533,6 @@ impl BatchPlan {
                         coi,
                         &buy.redeem_script,
                     )
-                } else if is_v15 {
-                    // V15 buy IOC: [sii] [toi] [tii] [coi] [Op5] [pushData(RS)]
-                    // sii = sell input index (= tii, the sell carrying this buy's token covenant)
-                    build_buy_v15_ioc_fill_sigscript(
-                        *tii as u16,
-                        toi as u16,
-                        *tii as u16,
-                        coi,
-                        &buy.redeem_script,
-                    )
                 } else {
                     // V14 buy IOC: use Op5 selector
                     build_buy_ioc_fill_sigscript(
@@ -574,16 +547,6 @@ impl BatchPlan {
                 // No sii (Phase-0 fix): F6 reads tii directly instead of a
                 // free, unauthenticated sigscript index.
                 build_buy_v16_fill_sigscript(
-                    toi as u16,
-                    *tii as u16,
-                    coi,
-                    &buy.redeem_script,
-                )
-            } else if is_v15 {
-                // V15 buy fill: [sii] [toi] [tii] [coi] [Op1] [pushData(RS)]
-                // sii = sell input index (= tii, the sell carrying this buy's token covenant)
-                build_buy_v15_fill_sigscript(
-                    *tii as u16,
                     toi as u16,
                     *tii as u16,
                     coi,
@@ -664,7 +627,7 @@ impl BatchPlan {
 
     /// Validate the plan: all contracts satisfied, fees covered, amounts balanced.
     pub fn validate(&self) -> Result<(), BatchError> {
-        // Check: order versions (v14 or v15 for buys, v16 for bracket entry)
+        // Check: order versions (v14 for buys/sells, v16 for buy (F6-fix) or bracket entry)
         for (sell, _) in &self.sells {
             if sell.version != 14 {
                 return Err(BatchError::UnsupportedVersion {
@@ -674,7 +637,7 @@ impl BatchPlan {
             }
         }
         for (buy, _) in &self.buys {
-            if buy.version != 14 && buy.version != 15 && buy.version != 16 {
+            if buy.version != 14 && buy.version != 16 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                     version: buy.version,
@@ -1042,7 +1005,7 @@ pub fn plan_batch_match(
         }
     }
 
-    // Validate order versions (v14 or v15 for buys, v16 for bracket entry)
+    // Validate order versions (v14 for buys/sells, v16 for buy (F6-fix) or bracket entry)
     for sell in sells {
         if sell.version != 14 {
             return Err(BatchError::UnsupportedVersion {
@@ -1052,7 +1015,7 @@ pub fn plan_batch_match(
         }
     }
     for buy in buys {
-        if buy.version != 14 && buy.version != 15 && buy.version != 16 {
+        if buy.version != 14 && buy.version != 16 {
             return Err(BatchError::UnsupportedVersion {
                 outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                 version: buy.version,
@@ -3315,7 +3278,7 @@ mod tests {
     // in build_tx() must key off RS length, not the bare version number.
 
     /// Create a fake v16 buy order for testing (mirrors `make_buy`, but uses
-    /// the v16 F6-fix contract and carries a BPS matcher-fee cap like v15).
+    /// the v16 F6-fix contract and carries a BPS matcher-fee cap).
     fn make_buy_v16(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32], mmfee_bps: u64) -> BatchOrder {
         let tx_id = hex::encode(&[id_byte; 32]);
         let owner = [0xBB; 32];
@@ -3341,15 +3304,14 @@ mod tests {
     }
 
     #[test]
-    fn v16_buy_rs_len_distinct_from_bracket_and_v15() {
-        // The whole collision-fix relies on these three lengths being
-        // pairwise distinct. If a future edit ever makes two of them equal
-        // again, RS-length-based dispatch silently breaks -- catch it here
-        // before it becomes a build_tx() misrouting bug.
-        use kob_core::contract::spot::order::{BUY_ORDER_V15_RS_EXPECTED_LEN, BUY_ORDER_V16_RS_EXPECTED_LEN};
+    fn v16_buy_rs_len_distinct_from_bracket_and_v14() {
+        // The whole collision-fix relies on these lengths being pairwise
+        // distinct. If a future edit ever makes two of them equal again,
+        // RS-length-based dispatch silently breaks -- catch it here before
+        // it becomes a build_tx() misrouting bug.
+        use kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN;
         use kob_core::contract::spot::parse::BUY_RS_SIZE as BUY_RS_SIZE_V14;
         assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BRACKET_RS_SIZE);
-        assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_V15_RS_EXPECTED_LEN);
         assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_RS_SIZE_V14);
     }
 

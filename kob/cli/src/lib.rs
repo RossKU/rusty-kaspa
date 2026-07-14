@@ -942,7 +942,7 @@ pub enum DeployCommands {
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version (14, 15, or 16). v15/v16 use --mmfee-bps instead of --max-matcher-fee (see V16_STATUS.md).
+        /// Contract version (14 or 16). v16 uses --mmfee-bps instead of --max-matcher-fee (see V16_STATUS.md).
         #[arg(long, default_value = "14")]
         version: u8,
 
@@ -980,12 +980,12 @@ pub enum DeployCommands {
         /// Maximum fee (in sompi) the matcher may extract per fill (v14).
         /// The on-chain F6 check enforces `kas_in - out[0].value <= mmfee`.
         /// mmfee=0 makes partial fills impossible. Default: 10_000_000 (0.1 KAS).
-        /// Ignored when --mmfee-bps is set (v15).
+        /// Ignored when --mmfee-bps is set (v16).
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
 
-        /// Maximum matcher fee in basis points (v15 contract).
-        /// Sets --version to 15 automatically.
+        /// Maximum matcher fee in basis points (v16 contract).
+        /// Sets --version to 16 automatically.
         /// E.g., 30 = 0.30% of trade value. Range: 0..=10000.
         /// When set, --max-matcher-fee is ignored.
         #[arg(long)]
@@ -1764,13 +1764,13 @@ pub async fn dispatch(
                 max_matcher_fee,
                 mmfee_bps,
             } => {
-                // v15 is the default when --mmfee-bps is set and --version
-                // was left at its default (14); an explicit --version 15 or
-                // --version 16 is always respected as-is. v14 is needed for
-                // cross-pair swap fills because the v15/v16 F6 surplus cap
-                // check reads the counterparty sell's price, which is
-                // incompatible when buy and sell are for different tokens.
-                let version = if mmfee_bps.is_some() && version == 14 { 15 } else { version };
+                // v16 is the default when --mmfee-bps is set and --version
+                // was left at its default (14); an explicit --version 16 is
+                // always respected as-is. v14 is needed for cross-pair swap
+                // fills because the v16 F6 surplus cap check reads the
+                // counterparty sell's price, which is incompatible when buy
+                // and sell are for different tokens.
+                let version = if mmfee_bps.is_some() && version == 14 { 16 } else { version };
 
                 // Resolve token alias
                 let token = token::resolve_token(&token, None)?;

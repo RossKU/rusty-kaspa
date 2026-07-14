@@ -328,8 +328,6 @@ pub async fn run(
         // of a stale hardcoded constant left over from an older version.
         let t2 = if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
             494
-        } else if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V15_RS_EXPECTED_LEN {
-            501
         } else {
             415 // v14
         };

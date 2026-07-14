@@ -1755,11 +1755,10 @@ mod adversarial_tests {
     }
 
     #[test]
-    fn buy_order_v16_rs_len_distinct_from_v15_and_v14() {
+    fn buy_order_v16_rs_len_distinct_from_v14() {
         // The v16/bracket collision fix (batch.rs is_bracket) and the
         // parse_redeem_script dispatch both rely on every buy RS length
         // being unique. Lock that invariant down here too.
-        assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_V15_RS_EXPECTED_LEN);
         assert_ne!(BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_RS_EXPECTED_LEN);
     }
 
@@ -1940,28 +1939,20 @@ mod adversarial_tests {
         // accept a sell-input-index argument at all, so calling code
         // (matcher / engine) cannot construct a "point sii at a decoy"
         // sigscript through the SDK even by mistake. This is a
-        // compile-time property; the assertions below just document the
-        // resulting shapes so a regression (e.g. someone re-adding a
-        // sell_input_idx param) shows up as a length/shape diff.
+        // compile-time property (the builder's fixed 4-argument signature
+        // below -- toi, tii, coi, redeem_script -- IS the enforcement; if
+        // someone re-adds a sell_input_idx param this call site stops
+        // compiling with the old arg count).
         let tcid = [0x11u8; 32];
         let oh = [0x22u8; 32];
         let bspkh = [0x33u8; 32];
         let rs = build_buy_v16_redeem_script(&tcid, 3, 1, 5, &oh, &bspkh, 30, 0, 1000).unwrap();
         let v16_fill = build_buy_v16_fill_sigscript(0, 1, 0, &rs);
 
-        let rs15 = build_buy_v15_redeem_script(&tcid, 3, 1, 5, &oh, &bspkh, 30, 0, 1000).unwrap();
-        // v15's builder DOES take a 5th (sii) argument -- construct it
-        // pointing at a decoy index (99) to show the shape difference.
-        let v15_fill_with_decoy_sii = build_buy_v15_fill_sigscript(99, 0, 1, 0, &rs15);
-
-        // v16's sigscript for equivalent toi/tii/coi is exactly 1 byte
-        // shorter per index removed from the front (sii=99 needs a 2-byte
-        // push since 99 is in the 17..=127 data-push range) -- i.e. the v16
-        // sigscript is strictly shorter than ANY v15 sigscript carrying an
-        // sii, for RS bodies of comparable size. (RS bodies differ in size
-        // between v15/v16 by design, so this checks shape, not raw byte
-        // equality.)
-        assert!(v16_fill.len() < v15_fill_with_decoy_sii.len());
+        // Shape check: [toi][tii][coi][selector][pushData(RS)] with all three
+        // indices in the 0..=16 OpN (1-byte) range = 4 fixed bytes + pushData.
+        let expected_len = 4 + push_data(&rs).len();
+        assert_eq!(v16_fill.len(), expected_len);
     }
 
     #[test]

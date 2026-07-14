@@ -24,3 +24,7 @@ kaspa-consensus-core = { workspace = true }
 kaspa-hashes = { workspace = true }
 
 [dev-dependencies]
+# Local (off-chain) covenant-script verification harness: run KOB fill/match
+# bytecode through the real node script engine to pinpoint post-Toccata
+# discrepancies without an on-chain round-trip. See tests/toccata_fill_repro.rs.
+kaspa-txscript = { workspace = true }

@@ -1207,3 +1207,81 @@ authority pointer) so reruns don't redeploy the token genesis. NOTE: `jq` is
 not installed on this device — the harness's fixture reads use `jq`; either
 install `jq` or replace those reads with `grep`/`sed`/`python3` (the manual
 runs this session used `grep`/`sed`).
+
+---
+
+## Phase 10 — Named the covenant-fill blocker + fixed it (local script-engine loop)
+
+Status: **DONE (off-chain).** Both fill scripts pass in the real post-Toccata
+`kaspa-txscript` engine. On-chain E2E re-run pending the combined rebuild.
+
+### The failing opcode (found without any rebuild / on-chain round-trip)
+
+Added `kob/core/tests/toccata_fill_repro.rs` (with `kaspa-txscript` as a
+dev-dependency): it reconstructs the exact v16 match tx (v16 buy fill + v14
+sell fill + covenant-bound UTXO entries) and runs each covenant input's script
+through `TxScriptEngine` with `covenants_enabled = true`, using the engine's
+`with_opcode_execution_log_buffer` to trace opcode-by-opcode.
+
+Result:
+- **v14 sell fill script: OK.**
+- **v16 buy fill script: FAILED → `VerifyError`**, at F6's final `OpVerify`.
+
+The opcode trace showed the F6 stack `[surplus=60000, max_surplus=6000000]`
+(max_surplus on top) feeding `OpGreaterThanOrEqual`. That opcode pops
+`[a, b]` with **a = the deeper element, b = the top**, and computes `a >= b`
+— i.e. `surplus >= max_surplus` = `60000 >= 6000000` = **false**. The intent
+is the inverse, `max_surplus >= surplus`.
+
+### Root cause: pre-existing F6 bytecode bug (NOT a Toccata opcode change)
+
+F6 computes `surplus` first (leaving it deeper) then `max_surplus` (on top),
+and needed an `OpSwap` before the compare — exactly as every OTHER "computed
+value on top vs earlier value" check in the same scripts does (e.g. the token-
+output check `... OpTxOutputAmount OpSwap OpGTE`, and bracket/OCO's output
+checks). F6 was **missing that `OpSwap`**. It is a pre-existing logic bug that
+had never executed on-chain before: v14 has no fill-path F6, v15's F6 was
+unreachable (broken `sii`, never live with funds), and v16's F6 was reached for
+the first time this session once the token-mint blocker was fixed. It is **not**
+a post-Toccata opcode-semantics change — proof: the covenant/introspection
+opcodes (`OpInputCovenantId 0xcf`, `OpCovOutputCount 0xd2`, `OpCovOutputIdx
+0xd3`, `OpTxOutputSpk 0xc3`, `OpTxInputScriptSigSubstr 0xbc`, `OpCheckSequenceVerify`)
+all executed correctly, the v14 sell fill passed unchanged, and every other
+`OpGreaterThanOrEqual` in the same scripts evaluated correctly.
+
+### Fix (1-byte value change, no length/threshold impact)
+
+At both v16 F6 sites (fill path and partial-fill path) in `order.rs`, changed
+`OpGreaterThanOrEqual` (0xa2) → `OpLessThanOrEqual` (0xa1): with the stack
+`[surplus, max_surplus]`, `OpLTE` computes `surplus <= max_surplus` — the
+intended cap. 0xa1 and 0xa2 are the same length, so `BUY_ORDER_V16_BODY`
+stays 331 B, the RS stays 476 B, and all dispatch thresholds / sigscript
+ranges are unchanged (the P2SH address does change, as expected for any
+bytecode edit — redeploy fresh v16 orders).
+
+### Comprehensive covenant-path audit
+
+- `max_surplus` / cross-input surplus cap exists in exactly ONE place —
+  `order.rs`'s v16 buy body (grep-verified) — so the inversion was isolated to
+  the v16 buy fill + partial paths; both fixed.
+- All other value comparisons across v14 buy, v14 sell, v16 buy (non-F6),
+  bracket, and OCO correctly use `OpSwap`-before-compare or are covenant-count
+  checks (`OpCovOutputCount ... Op1 OpGTE`) — inspected + the sell fill and the
+  buy IOC path both pass in the engine.
+
+### Local engine coverage now in-tree (off-chain regression net)
+
+`kob/core/tests/toccata_fill_repro.rs`:
+- `v16_full_fill_match_scripts_pass` — v16 buy fill + v14 sell fill (E2E path). PASS.
+- `v16_buy_ioc_match_scripts_pass` — v16 buy IOC (Op5) + v14 sell fill. PASS.
+Both run against the real `TxScriptEngine` with `covenants_enabled = true`, so
+future covenant-fill/match bytecode edits are validated off-chain without an
+on-chain round-trip. (Partial-fill covered by the identical F6 one-byte fix +
+the existing `buy_v16_partial_f6_*` pattern tests; a full partial/IOC-sell match
+harness through the engine is a recommended follow-up.)
+
+### Deploy + cancel unaffected
+
+The change touches only the fill/partial F6 compare; the dispatch preamble,
+expire, cancel, and cancel-mark paths (the ones proven on-chain in Phase 5) are
+byte-unchanged aside from the shifted P2SH address.

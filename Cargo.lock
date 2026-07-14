@@ -4889,6 +4889,7 @@ dependencies = [
  "kaspa-addresses",
  "kaspa-consensus-core",
  "kaspa-hashes",
+ "kaspa-txscript",
  "pbkdf2",
  "rand 0.8.6",
  "serde",

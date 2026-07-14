@@ -1021,8 +1021,14 @@ pub const BUY_ORDER_V16_BODY: &[u8] = &[
     0x55, 0x79,                   // Op5 OpPick(mmfee_bps)                         [2B]
     0x95,                         // OpMul -> max_surplus                         [1B]
     //
-    // Verify: max_surplus >= surplus
-    0xa2, 0x69,                   // OpGTE OpVerify                                [2B]
+    // Verify: max_surplus >= surplus. Stack is [surplus, max_surplus] (max_surplus
+    // on top), and OpGTE/OpLTE pop [a=deeper, b=top], so OpGTE would compute the
+    // INVERTED `surplus >= max_surplus` (rejecting every within-cap trade). Use
+    // OpLTE instead: `surplus <= max_surplus` == the intended cap. (This F6 body
+    // was never exercised on-chain before — v14 has no fill F6, v15 was broken —
+    // so this off-by-swap surfaced only when the first real v16 match was run
+    // through the script engine; see V16_STATUS.md Phase 10.)
+    0xa1, 0x69,                   // OpLTE OpVerify (surplus <= max_surplus)        [2B]
     // (14): sell_pden(0), sell_pnum(1), kas(2), mmfee_bps(3), ..., toi(13)
     //
     // Drop F6 temporaries (sell_pden + sell_pnum)
@@ -1118,8 +1124,9 @@ pub const BUY_ORDER_V16_BODY: &[u8] = &[
     0x96,                         // OpDiv -> fk / 10000                           [1B]
     0x54, 0x79,                   // Op4 OpPick(mmfee_bps)                         [2B]
     0x95,                         // OpMul -> max_surplus                         [1B]
-    // Verify: max_surplus >= surplus
-    0xa2, 0x69,                   // OpGTE OpVerify                                [2B]
+    // Verify: max_surplus >= surplus. Same inverted-OpGTE fix as the fill path
+    // above: stack is [surplus, max_surplus]; use OpLTE for `surplus <= max_surplus`.
+    0xa1, 0x69,                   // OpLTE OpVerify (surplus <= max_surplus)        [2B]
     // Drop F6 temporaries (sell_pden + sell_pnum)
     0x6d,                         // Op2Drop                                       [1B]
     // (11): mmfee_bps(0), ..., ri(10) — restored to pre-F6 state (v14-identical)

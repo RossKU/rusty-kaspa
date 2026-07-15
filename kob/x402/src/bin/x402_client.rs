@@ -433,6 +433,10 @@ mod kcc20 {
         out: Option<String>,
         replay_out: Option<String>,
         replay_recipient: Option<String>,
+        // Request-binding is mandatory (Phase 2): the fingerprint is embedded
+        // in the tx payload AND set in requirements.extra.fingerprint.
+        fingerprint: Option<String>,
+        nonce: String,
     }
 
     fn parse(raw: &[String]) -> anyhow::Result<Args> {
@@ -449,6 +453,8 @@ mod kcc20 {
             out: None,
             replay_out: None,
             replay_recipient: None,
+            fingerprint: None,
+            nonce: "kob-kcc20".to_string(),
         };
         let mut it = raw.to_vec().into_iter();
         while let Some(k) = it.next() {
@@ -465,6 +471,8 @@ mod kcc20 {
                 "--out" => a.out = Some(it.next().unwrap_or_default()),
                 "--replay-out" => a.replay_out = Some(it.next().unwrap_or_default()),
                 "--replay-recipient" => a.replay_recipient = Some(it.next().unwrap_or_default()),
+                "--fingerprint" => a.fingerprint = Some(it.next().unwrap_or_default()),
+                "--nonce" => a.nonce = it.next().unwrap_or_default(),
                 other => eprintln!("[kcc20] ignoring unknown arg: {}", other),
             }
         }
@@ -509,6 +517,7 @@ mod kcc20 {
         wallet_spk_version: u16,
         wallet_spk: &[u8],
         asset: &str,
+        fingerprint_hex: &str,
         privkey: &[u8; 32],
     ) -> anyhow::Result<serde_json::Value> {
         let payer_rs = build_token_unit_redeem_script(payer_pk);
@@ -524,6 +533,11 @@ mod kcc20 {
         }
 
         let mut tx = Transaction::new(1);
+        // Bind the request: embed X402:<fingerprint> in the tx payload so the
+        // verifier's mandatory fingerprint check (Phase 2) matches
+        // requirements.extra.fingerprint. Set before signing/mass so the fee
+        // covers the payload bytes.
+        tx.payload = fingerprint::embed_fingerprint(fingerprint_hex);
         // Input 0: token_unit P2SH.
         tx.inputs.push(TxInput {
             prev_tx_id: token_txid.to_string(),
@@ -598,10 +612,10 @@ mod kcc20 {
         Ok(to_rpc_payload(&tx, &final_ss))
     }
 
-    fn kcc20_request(net: &str, tx: serde_json::Value, from: &str, pay_to: &str, asset: &str, require: u64) -> serde_json::Value {
-        // Fingerprint binding is scheme-agnostic and unit-proven; omitted for the
-        // KCC20 live run to keep the covenant transaction's payload empty
-        // (standard). No extra.fingerprint -> the verifier skips that check.
+    #[allow(clippy::too_many_arguments)]
+    fn kcc20_request(net: &str, tx: serde_json::Value, from: &str, pay_to: &str, asset: &str, require: u64, fingerprint_hex: &str) -> serde_json::Value {
+        // Request-binding is mandatory (Phase 2): extra.fingerprint MUST be
+        // present and match the X402:<fp> memo embedded in the tx payload.
         let requirements = PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: net.to_string(),
@@ -609,7 +623,7 @@ mod kcc20 {
             asset: ASSET_KAS.to_string(),
             pay_to: pay_to.to_string(),
             max_timeout_seconds: 60,
-            extra: serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset }),
+            extra: serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset, "fingerprint": fingerprint_hex }),
         };
         let payload = PaymentPayload {
             x402_version: X402_VERSION,
@@ -684,13 +698,19 @@ mod kcc20 {
             fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index,
         );
 
+        // Request-binding is mandatory: derive (or accept) the fingerprint,
+        // embed it in the tx payload, and set it in requirements.extra.
+        let fingerprint_hex = a.fingerprint.clone().unwrap_or_else(|| {
+            fingerprint::compute_fingerprint("KCC20", &a.asset, &a.pay_to, &a.require.to_string(), &a.nonce)
+        });
+
         // Primary artifact: pays the tx-recipient's token_unit P2SH.
         let tx_recipient_pk = pubkey_from_p2pk(&a.tx_recipient)?;
         let tx = build_transfer(
             &token_txid, token_index, token_value, &payer_pk, &tx_recipient_pk, a.amount,
-            &fee_utxo, wallet_spk_version, &wallet_spk, &a.asset, &privkey,
+            &fee_utxo, wallet_spk_version, &wallet_spk, &a.asset, &fingerprint_hex, &privkey,
         )?;
-        let req = kcc20_request(&a.network, tx, &wallet.address, &a.pay_to, &a.asset, a.require);
+        let req = kcc20_request(&a.network, tx, &wallet.address, &a.pay_to, &a.asset, a.require, &fingerprint_hex);
         write_out(&a.out, &req)?;
 
         // Replay partner: a second artifact over the SAME token + fee inputs,
@@ -705,12 +725,16 @@ mod kcc20 {
                 pk[0] ^= 0x01;
                 pk
             };
+            let alt_addr = kob_settle::wallet::pubkey_to_address(&alt_pk, net);
+            // The partner artifact pays a DIFFERENT recipient, so it carries
+            // its own fingerprint (bound to alt_addr) — both remain valid,
+            // distinct bindings.
+            let alt_fp = fingerprint::compute_fingerprint("KCC20", &a.asset, &alt_addr, &a.amount.to_string(), &a.nonce);
             let tx2 = build_transfer(
                 &token_txid, token_index, token_value, &payer_pk, &alt_pk, a.amount,
-                &fee_utxo, wallet_spk_version, &wallet_spk, &a.asset, &privkey,
+                &fee_utxo, wallet_spk_version, &wallet_spk, &a.asset, &alt_fp, &privkey,
             )?;
-            let alt_addr = kob_settle::wallet::pubkey_to_address(&alt_pk, net);
-            let req2 = kcc20_request(&a.network, tx2, &wallet.address, &alt_addr, &a.asset, a.amount);
+            let req2 = kcc20_request(&a.network, tx2, &wallet.address, &alt_addr, &a.asset, a.amount, &alt_fp);
             write_out(&Some(replay_path.clone()), &req2)?;
             eprintln!("[kcc20] replay-partner written to {}", replay_path);
         }
@@ -733,10 +757,13 @@ mod exact {
         requirements_file: String,
         scenario: String,
         out: Option<String>,
+        // Request-binding is mandatory (Phase 2): the reservation binds a
+        // requestHash and the payload MUST echo the same value.
+        request_hash: Option<String>,
     }
 
     fn parse(raw: &[String]) -> Args {
-        let mut a = Args { node: String::new(), wallet: String::new(), requirements_file: String::new(), scenario: "happy".into(), out: None };
+        let mut a = Args { node: String::new(), wallet: String::new(), requirements_file: String::new(), scenario: "happy".into(), out: None, request_hash: None };
         let mut it = raw.to_vec().into_iter();
         while let Some(k) = it.next() {
             match k.as_str() {
@@ -745,6 +772,7 @@ mod exact {
                 "--requirements-file" => a.requirements_file = it.next().unwrap_or_default(),
                 "--scenario" => a.scenario = it.next().unwrap_or_default(),
                 "--out" => a.out = Some(it.next().unwrap_or_default()),
+                "--request-hash" => a.request_hash = Some(it.next().unwrap_or_default()),
                 other => eprintln!("[exact] ignoring unknown arg: {}", other),
             }
         }
@@ -845,13 +873,26 @@ mod exact {
         let envelope = to_rpc_payload(&tx, &final_ss);
         let encoded = serde_json::to_string(&envelope)?;
 
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "type": "exact-transaction",
             "payerAddress": wallet.address,
             "transaction": encoded,
             "transactionEncoding": TX_ENCODING_SAFE_JSON,
             "paymentOutputIndex": 0
         });
+        // Request-binding is mandatory: echo the requestHash the reservation
+        // was bound to (the `wrong-request-hash` scenario perturbs it to prove
+        // the binding is enforced).
+        if let Some(rh) = &a.request_hash {
+            let rh = if a.scenario == "wrong-request-hash" {
+                let mut b = rh.clone();
+                b.replace_range(0..2, if rh.starts_with("00") { "11" } else { "00" });
+                b
+            } else {
+                rh.clone()
+            };
+            payload["requestHash"] = serde_json::json!(rh);
+        }
         let facreq = serde_json::json!({
             "x402Version": X402_VERSION,
             "paymentPayload": { "x402Version": X402_VERSION, "accepted": req, "payload": payload },

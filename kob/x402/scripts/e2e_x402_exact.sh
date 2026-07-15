@@ -23,6 +23,9 @@ RESULTS="${WORK}/E2E_X402_EXACT_TXIDS.txt"
 AMOUNT="${AMOUNT:-5000000}"
 BORROW="${BORROW:-10000000}"
 THRESHOLD="${THRESHOLD:-3000000}"
+# Request-binding is mandatory (Phase 2): the reservation binds this hash and
+# the client payload must echo it. 64-hex.
+REQHASH="${REQHASH:-abababababababababababababababababababababababababababababababab}"
 
 mkdir -p "$WORK"; rm -f "$REPLAY_LOG"; : > "$RESULTS"
 log()  { echo "[exact-e2e] $*"; }
@@ -55,7 +58,7 @@ curl -sf "$FAC_URL/health" >/dev/null 2>&1 || { echo "facilitator down"; tail -2
 
 # ---- 2. reserve ----
 log "reserving ..."
-RESREQ="{\"payTo\":\"$PAYTO\",\"amount\":\"$AMOUNT\",\"borrowTxid\":\"$BORROW_TXID\",\"borrowIndex\":0,\"borrowAmount\":\"$BORROW\",\"additiveThresholdSompi\":\"$THRESHOLD\",\"paymentOutputIndex\":0,\"resourceUrl\":\"https://api.example.test/file\"}"
+RESREQ="{\"payTo\":\"$PAYTO\",\"amount\":\"$AMOUNT\",\"borrowTxid\":\"$BORROW_TXID\",\"borrowIndex\":0,\"borrowAmount\":\"$BORROW\",\"additiveThresholdSompi\":\"$THRESHOLD\",\"paymentOutputIndex\":0,\"resourceUrl\":\"https://api.example.test/file\",\"requestHash\":\"$REQHASH\"}"
 curl -s -X POST "$FAC_URL/reserve" -H 'content-type: application/json' --data-binary "$RESREQ" > "$WORK/reserve.json"
 log "reserve -> $(cat "$WORK/reserve.json" | head -c 300)"
 # extract accepts[0] into requirements.json (strip the outer PaymentRequired).
@@ -71,7 +74,7 @@ sleep 3
 
 PASS=0; FAIL=0
 check() { if [ "$2" = "$3" ]; then echo "  PASS: $1"; PASS=$((PASS+1)); else echo "  FAIL: $1 (want $2 got $3)"; FAIL=$((FAIL+1)); fi; }
-build_exact() { "$BIN/x402-client" exact --node "$NODE" --wallet "$WALLET" --requirements-file "$WORK/requirements.json" --scenario "$1" --out "$2" 2>>"$WORK/client.log"; }
+build_exact() { "$BIN/x402-client" exact --node "$NODE" --wallet "$WALLET" --requirements-file "$WORK/requirements.json" --scenario "$1" --request-hash "$REQHASH" --out "$2" 2>>"$WORK/client.log"; }
 post() { curl -s -X POST "$FAC_URL/$1" -H 'content-type: application/json' --data-binary @"$2"; }
 
 # =====================================================================
@@ -94,6 +97,12 @@ build_exact wrong-recipient "$WORK/req_wrongrcpt.json"
 V=$(post verify "$WORK/req_wrongrcpt.json"); log "verify -> $V"
 check "wrong-recipient refused" "false" "$(echo "$V" | field isValid)"
 check "wrong-recipient code" "invalid_payment_requirements" "$(echo "$V" | field invalidReason)"
+
+log "CASE R5: wrong request hash (mandatory binding must be enforced)"
+build_exact wrong-request-hash "$WORK/req_wrongrh.json"
+V=$(post verify "$WORK/req_wrongrh.json"); log "verify -> $V"
+check "wrong-request-hash refused" "false" "$(echo "$V" | field isValid)"
+check "wrong-request-hash code" "invalid_payload" "$(echo "$V" | field invalidReason)"
 
 # =====================================================================
 # CASE 1 — HAPPY: verify -> settle -> confirm -> authorize

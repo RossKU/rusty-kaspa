@@ -736,12 +736,13 @@ impl TransactionData {
                         // Older nodes return it as {"version": N, "scriptPublicKey": "<hex>"}.
                         let (script_version, script) = if let Some(flat) = spk.as_str() {
                             // Flat hex string: first 4 hex chars = version, rest = script
-                            if flat.len() >= 4 {
-                                let ver = u16::from_str_radix(&flat[..4], 16).unwrap_or(0);
-                                let scr = hex::decode(&flat[4..]).unwrap_or_default();
-                                (ver, scr)
-                            } else {
-                                (0u16, hex::decode(flat).unwrap_or_default())
+                            match kob_core::rpc_types::split_flat_spk_hex(flat) {
+                                Some((ver_hex, script_hex)) => {
+                                    let ver = u16::from_str_radix(ver_hex, 16).unwrap_or(0);
+                                    let scr = hex::decode(script_hex).unwrap_or_default();
+                                    (ver, scr)
+                                }
+                                None => (0u16, hex::decode(flat).unwrap_or_default()),
                             }
                         } else {
                             let script_version = spk
@@ -2700,5 +2701,28 @@ mod tests {
 
         let td = TransactionData::from_rpc_json(&json).unwrap();
         assert_eq!(td.outputs[0].value, 9_999_999);
+    }
+
+    #[test]
+    fn test_from_rpc_json_rejects_non_boundary_multibyte_spk_cleanly() {
+        // DoS regression: a flat scriptPublicKey string with a multibyte
+        // UTF-8 char straddling byte offset 4 used to panic ("byte index 4 is
+        // not a char boundary") even though its byte length is >= 4.
+        // Reachable from untrusted node RPC block/tx data. Now: degrades to
+        // an empty script (no match), no panic.
+        let json = serde_json::json!({
+            "verboseData": {"transactionId": "e".repeat(64)},
+            "version": 0,
+            "inputs": [],
+            "outputs": [{
+                "value": 1_234u64,
+                "scriptPublicKey": "ab\u{20AC}cd",
+            }],
+            "payload": "",
+        });
+
+        let td = TransactionData::from_rpc_json(&json).expect("still parses, no panic");
+        assert_eq!(td.outputs[0].script_version, 0);
+        assert!(td.outputs[0].script.is_empty(), "malformed spk decodes to no bytes, not a panic");
     }
 }

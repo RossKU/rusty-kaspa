@@ -315,13 +315,16 @@ fn translate_wrpc_tx_to_rest(
                         // older nodes return {"version": N, "scriptPublicKey"/"script": "hex"}.
                         if let Some(flat) = spk.as_str() {
                             // Flat hex string: first 4 hex chars = version
-                            if flat.len() >= 4 {
-                                let version = u16::from_str_radix(&flat[..4], 16).unwrap_or(0);
-                                spk_obj.insert("version".to_string(), serde_json::json!(version));
-                                spk_obj.insert("scriptPublicKey".to_string(), serde_json::json!(&flat[4..]));
-                            } else {
-                                spk_obj.insert("version".to_string(), serde_json::json!(0));
-                                spk_obj.insert("scriptPublicKey".to_string(), serde_json::json!(flat));
+                            match crate::rpc_types::split_flat_spk_hex(flat) {
+                                Some((ver_hex, script_hex)) => {
+                                    let version = u16::from_str_radix(ver_hex, 16).unwrap_or(0);
+                                    spk_obj.insert("version".to_string(), serde_json::json!(version));
+                                    spk_obj.insert("scriptPublicKey".to_string(), serde_json::json!(script_hex));
+                                }
+                                None => {
+                                    spk_obj.insert("version".to_string(), serde_json::json!(0));
+                                    spk_obj.insert("scriptPublicKey".to_string(), serde_json::json!(flat));
+                                }
                             }
                         } else {
                             let version = spk
@@ -438,6 +441,32 @@ mod tests {
         assert!(tx.get("gas").is_none());
         assert_eq!(tx["payload"], "4b4f42");
         assert_eq!(rest["allowOrphan"], false);
+    }
+
+    #[test]
+    fn test_translate_wrpc_tx_rejects_non_boundary_multibyte_spk_cleanly() {
+        // DoS regression: a flat scriptPublicKey string with a multibyte
+        // UTF-8 char straddling byte offset 4 used to panic even though its
+        // byte length is >= 4. Now: falls back to version 0 / raw string,
+        // no panic.
+        let wrpc = serde_json::json!({
+            "transaction": {
+                "version": "0",
+                "inputs": [],
+                "outputs": [{
+                    "value": "5000",
+                    "scriptPublicKey": "ab\u{20AC}cd",
+                }],
+                "lockTime": "0",
+                "subnetworkId": "0000000000000000000000000000000000000000",
+                "payload": ""
+            }
+        });
+
+        let rest = translate_wrpc_tx_to_rest(&wrpc).unwrap();
+        let tx = rest.get("transaction").unwrap();
+        assert_eq!(tx["outputs"][0]["scriptPublicKey"]["version"], 0);
+        assert_eq!(tx["outputs"][0]["scriptPublicKey"]["scriptPublicKey"], "ab\u{20AC}cd");
     }
 
     #[test]

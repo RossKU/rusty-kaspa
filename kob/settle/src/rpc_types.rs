@@ -42,6 +42,20 @@ pub struct RpcUtxoEntry {
     pub covenant_id: Option<String>,
 }
 
+/// Split a flat hex `scriptPublicKey` string into `(version_hex, script_hex)`.
+///
+/// The field is always ASCII hex on the wire, but the string arrives from
+/// untrusted sources (client JSON, node RPC data) and is not guaranteed to
+/// be. `str::len()` counts BYTES, while `&s[..4]` / `&s[4..]` slice at a BYTE
+/// index — Rust panics if that index doesn't land on a UTF-8 char boundary,
+/// which a multibyte character straddling offset 4 can trigger even when
+/// `s.len() >= 4` holds. `str::get` is the checked, non-panicking
+/// equivalent: it returns `None` on an out-of-bounds OR non-boundary index,
+/// so this never panics regardless of input.
+pub fn split_flat_spk_hex(s: &str) -> Option<(&str, &str)> {
+    Some((s.get(..4)?, s.get(4..)?))
+}
+
 /// scriptPublicKey — handles both flat hex string and `{version, script}` object.
 ///
 /// TN12 nodes return scriptPublicKey as a flat hex string; mainnet/newer nodes
@@ -70,15 +84,15 @@ impl<'de> serde::Deserialize<'de> for RpcSpk {
 
             /// Plain hex string: first 4 hex chars = version (u16 LE), rest = script hex.
             fn visit_str<E: de::Error>(self, v: &str) -> Result<RpcSpk, E> {
-                if v.len() < 4 {
-                    return Err(E::custom(format!(
-                        "scriptPublicKey string too short: '{}'", v
-                    )));
-                }
-                let version = u16::from_str_radix(&v[..4], 16).map_err(E::custom)?;
+                let (ver_hex, script_hex) = split_flat_spk_hex(v).ok_or_else(|| {
+                    E::custom(format!(
+                        "scriptPublicKey string too short or malformed: '{}'", v
+                    ))
+                })?;
+                let version = u16::from_str_radix(ver_hex, 16).map_err(E::custom)?;
                 Ok(RpcSpk {
                     version,
-                    script: v[4..].to_string(),
+                    script: script_hex.to_string(),
                 })
             }
 
@@ -151,20 +165,16 @@ impl RpcUtxo {
 /// Parse a REST API scriptPublicKey value (string or object) into RpcSpk.
 pub fn parse_rest_spk(v: &serde_json::Value) -> RpcSpk {
     match v {
-        serde_json::Value::String(s) => {
-            if s.len() >= 4 {
-                let version = u16::from_str_radix(&s[..4], 16).unwrap_or(0);
-                RpcSpk {
-                    version,
-                    script: s[4..].to_string(),
-                }
-            } else {
-                RpcSpk {
-                    version: 0,
-                    script: s.clone(),
-                }
-            }
-        }
+        serde_json::Value::String(s) => match split_flat_spk_hex(s) {
+            Some((ver_hex, script_hex)) => RpcSpk {
+                version: u16::from_str_radix(ver_hex, 16).unwrap_or(0),
+                script: script_hex.to_string(),
+            },
+            None => RpcSpk {
+                version: 0,
+                script: s.clone(),
+            },
+        },
         serde_json::Value::Object(obj) => {
             let version = obj
                 .get("version")
@@ -295,5 +305,41 @@ mod tests {
         let spk = parse_rest_spk(&v);
         assert_eq!(spk.version, 0);
         assert_eq!(spk.script, "aa20abcd87");
+    }
+
+    // --- DoS regression: a multibyte UTF-8 char straddling byte offset 4 used
+    // to panic `&s[..4]`/`&s[4..]` (byte-index string slicing) even though
+    // `s.len() >= 4` (byte count) looked safe, because that byte offset lands
+    // mid-character. Reachable from untrusted client JSON / node RPC data.
+
+    /// "a", "b", then a 3-byte '€' spanning byte offsets 2..5 — offset 4 is
+    /// the LAST byte of '€', not a char boundary.
+    const NON_BOUNDARY_AT_4: &str = "ab\u{20AC}cd";
+
+    #[test]
+    fn split_flat_spk_hex_rejects_non_boundary_multibyte() {
+        assert_eq!(split_flat_spk_hex(NON_BOUNDARY_AT_4), None);
+        // Sanity: this used to be exactly the panic trigger (len counts
+        // bytes, so this passed the old `len() >= 4` guard).
+        assert!(NON_BOUNDARY_AT_4.len() >= 4);
+    }
+
+    #[test]
+    fn rpc_spk_deserialize_rejects_non_boundary_multibyte_cleanly() {
+        // Previously: panic ("byte index 4 is not a char boundary"). Now: a
+        // clean deserialize error, no panic.
+        let json = serde_json::to_string(NON_BOUNDARY_AT_4).unwrap();
+        let res: Result<RpcSpk, _> = serde_json::from_str(&json);
+        assert!(res.is_err());
+    }
+
+    #[test]
+    fn parse_rest_spk_handles_non_boundary_multibyte_cleanly() {
+        // Previously: panic. Now: falls back to version 0 / whole string as
+        // script (same degrade path as an under-length string), no panic.
+        let v = serde_json::json!(NON_BOUNDARY_AT_4);
+        let spk = parse_rest_spk(&v);
+        assert_eq!(spk.version, 0);
+        assert_eq!(spk.script, NON_BOUNDARY_AT_4);
     }
 }

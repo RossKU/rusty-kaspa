@@ -89,12 +89,13 @@ impl ObservedOutput {
 
         let spk = out.get("scriptPublicKey")?;
         let (spk_version, spk_script) = if let Some(flat) = spk.as_str() {
-            if flat.len() >= 4 {
-                let ver = u16::from_str_radix(&flat[..4], 16).unwrap_or(0);
-                let scr = hex::decode(&flat[4..]).unwrap_or_default();
-                (ver, scr)
-            } else {
-                (0u16, hex::decode(flat).unwrap_or_default())
+            match crate::rpc_types::split_flat_spk_hex(flat) {
+                Some((ver_hex, script_hex)) => {
+                    let ver = u16::from_str_radix(ver_hex, 16).unwrap_or(0);
+                    let scr = hex::decode(script_hex).unwrap_or_default();
+                    (ver, scr)
+                }
+                None => (0u16, hex::decode(flat).unwrap_or_default()),
             }
         } else {
             let ver = spk.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
@@ -445,5 +446,21 @@ mod tests {
         assert!(ok.confirmed);
         let no = obs.confirm_finality(&FakeFinality { confirmed: false }, &event, None).await;
         assert!(!no.confirmed);
+    }
+
+    #[test]
+    fn from_rpc_json_rejects_non_boundary_multibyte_spk_cleanly() {
+        // DoS regression: a flat scriptPublicKey string with a multibyte
+        // UTF-8 char straddling byte offset 4 used to panic ("byte index 4 is
+        // not a char boundary") even though its byte length is >= 4. Reachable
+        // from untrusted node RPC data (mempool/UTXO scans feed this path).
+        // Now: degrades to an empty (non-matching) script, no panic.
+        let json = serde_json::json!({
+            "value": 100_000_000u64,
+            "scriptPublicKey": "ab\u{20AC}cd",
+        });
+        let out = ObservedOutput::from_rpc_json(&json).expect("value present -> Some");
+        assert_eq!(out.spk_version, 0);
+        assert!(out.spk_script.is_empty(), "malformed spk decodes to no bytes, not a panic");
     }
 }

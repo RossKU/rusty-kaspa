@@ -45,6 +45,13 @@ pub struct PredictionTxOutput {
     pub script_version: u16,
     /// ScriptPublicKey bytes.
     pub script: Vec<u8>,
+    /// Wire-level covenant binding `(authorizing_input, covenant_id)`, if
+    /// this output is a covenant genesis or continuation. Distinct from the
+    /// P2SH script hash: this is what `OpInputCovenantId`/`OpCovInputCount`/
+    /// `OpCovOutputCount` actually track on-chain (see
+    /// `kob_core::compute_covenant_id`); most prediction outputs (change,
+    /// receipts, non-covenant payouts) leave this `None`.
+    pub covenant: Option<(u16, [u8; 32])>,
 }
 
 /// Error type for TX construction failures.
@@ -127,6 +134,35 @@ pub struct CreateMarketParams {
     pub change_script: Vec<u8>,
 }
 
+/// Compute the shared BallotBox covenant ID.
+///
+/// YES and NO BallotBox are the SAME covenant (identical redeemScript --
+/// `build_ballot_box_redeem_script` is called with identical params for
+/// both), distinguished only by output position and UTXO value, so they
+/// share ONE wire-level `covenant_id` rather than having two distinct ones
+/// (confirmed by `build_redemption_redeem_script` taking a single
+/// `ballot_cid` state field consumed by BOTH sides' `OpCovInputIdx` lookups
+/// in the receipt/token redeem paths). That id is `hashing::covenant_id`
+/// over the funding input's outpoint plus BOTH ballot box outputs together
+/// (a 2-output genesis auth group) -- see `kob_core::compute_covenant_id`.
+/// Callable independently at any later step (vote, settle, redemption
+/// deploy) since it only needs public, already-known data: no wallet or
+/// signing required.
+pub fn compute_ballot_cid(
+    funding_tx_id: &str,
+    funding_index: u32,
+    yes_p2sh_script: &[u8],
+    no_p2sh_script: &[u8],
+    ballot_box_value: u64,
+) -> Result<[u8; 32], PredictionTxError> {
+    let auth_outputs = [
+        kob_core::tx::AuthOutput { index: 0, value: ballot_box_value, spk_version: 0, spk_script: yes_p2sh_script.to_vec() },
+        kob_core::tx::AuthOutput { index: 1, value: ballot_box_value, spk_version: 0, spk_script: no_p2sh_script.to_vec() },
+    ];
+    kob_core::compute_covenant_id(funding_tx_id, funding_index, &auth_outputs)
+        .map_err(|e| PredictionTxError::MissingData(format!("compute_ballot_cid: {e}")))
+}
+
 /// Build a market creation TX (step 1 of 2-step deployment).
 ///
 /// Step 1 deploys BallotBoxes + SplitMerge:
@@ -134,6 +170,14 @@ pub struct CreateMarketParams {
 ///   Output[1]: NO BallotBox (v5)
 ///   Output[2]: SplitMerge (v2)
 ///   Output[3]: Change (if sufficient)
+///
+/// Both BallotBox outputs carry a genesis `CovenantBinding` sharing ONE
+/// covenant id (`compute_ballot_cid`), authorized by input[0] (the funding
+/// input). Without this, `OpInputCovenantId` reads `None` on the funding
+/// UtxoEntry once these UTXOs are later spent, and every covenant-count
+/// check in the vote/settle paths (V0/V0b in `BALLOT_BOX_BODY`) fails closed
+/// -- confirmed against the real engine
+/// (`kob/core/tests/prediction_vote_repro.rs`).
 ///
 /// After this TX is confirmed, the caller extracts the BallotBox covenant IDs
 /// and calls `build_deploy_redemption_tx()` for step 2.
@@ -196,6 +240,15 @@ pub fn build_create_market_tx(
     let no_p2sh = kob_core::build_p2sh(&no_ballot_rs);
     let sm_p2sh = kob_core::build_p2sh(&sm_rs);
 
+    // Shared BallotBox covenant id (genesis, authorized by input[0]).
+    let ballot_cid = compute_ballot_cid(
+        &params.funding_tx_id,
+        params.funding_index,
+        yes_p2sh.script(),
+        no_p2sh.script(),
+        params.ballot_box_initial_value,
+    )?;
+
     // P-F05 fix: Redemption is NOT deployed in step 1.
     // BallotBox covenant IDs are derived from the deploy TX hash, so they
     // are unknown until step 1 is confirmed on-chain. Redemption (which
@@ -234,16 +287,19 @@ pub fn build_create_market_tx(
         PredictionTxOutput {
             value: params.ballot_box_initial_value,
             script_version: 0,
+            covenant: Some((0, ballot_cid)),
             script: yes_p2sh.script().to_vec(),
         },
         PredictionTxOutput {
             value: params.ballot_box_initial_value,
             script_version: 0,
+            covenant: Some((0, ballot_cid)),
             script: no_p2sh.script().to_vec(),
         },
         PredictionTxOutput {
             value: params.split_merge_initial_value,
             script_version: 0,
+            covenant: None,
             script: sm_p2sh.script().to_vec(),
         },
     ];
@@ -252,6 +308,7 @@ pub fn build_create_market_tx(
         outputs.push(PredictionTxOutput {
             value: change,
             script_version: 0,
+            covenant: None,
             script: params.change_script.clone(),
         });
     }
@@ -380,6 +437,7 @@ pub fn build_deploy_redemption_tx(
         PredictionTxOutput {
             value: params.redemption_initial_value,
             script_version: 0,
+            covenant: None,
             script: redemption_p2sh.script().to_vec(),
         },
     ];
@@ -388,6 +446,7 @@ pub fn build_deploy_redemption_tx(
         outputs.push(PredictionTxOutput {
             value: change,
             script_version: 0,
+            covenant: None,
             script: params.change_script.clone(),
         });
     }
@@ -406,13 +465,21 @@ pub fn build_deploy_redemption_tx(
     })
 }
 
-// 2. Vote TX (BallotBox v5)
+// 2. Vote TX (BallotBox VoteReceipt-enabled -- 3-in/4-out)
 
 /// Parameters for a vote transaction.
 #[derive(Debug, Clone)]
 pub struct VoteParams {
-    /// BallotBox being voted on.
+    /// BallotBox being voted on (its value decreases by `reward_per_vote`).
     pub ballot_box: BallotBoxEntry,
+    /// The OTHER side's BallotBox (read-only co-input; self-continues
+    /// unchanged). Required by the deployed contract's V0/V0b covenant-count
+    /// checks (exactly 2 co-inputs / 2 continuations sharing `ballot_cid`).
+    pub other_box: BallotBoxEntry,
+    /// Shared BallotBox covenant id (see `compute_ballot_cid`). YES and NO
+    /// BallotBox are one covenant, distinguished only by position/value, so
+    /// this is the SAME value for both sides.
+    pub ballot_cid: [u8; 32],
     /// Miner's UTXO TX ID (hex).
     pub miner_tx_id: String,
     /// Miner's UTXO output index.
@@ -425,28 +492,59 @@ pub struct VoteParams {
     pub miner_sig_op_count: u8,
     /// Miner's change output script.
     pub miner_change_script: Vec<u8>,
-    /// Current DAA score (for CLTV start gate validation).
+    /// Current DAA score (for CLTV start/end gate validation).
     pub current_daa: u64,
 }
 
-/// Build a vote TX for BallotBox v4.
+/// Build a vote TX for the deployed VoteReceipt-enabled BallotBox.
 ///
-/// Vote TX template (fee == 0):
-///   Input[0]: BallotBox UTXO (value V)
-///   Input[1]: Miner's UTXO (value D)
-///   Output[0]: BallotBox continuation (value V - reward_per_vote)
-///   Output[1]: Miner change (value D + reward_per_vote)
+/// The deployed `BALLOT_BOX_BODY` vote path requires exactly 3 inputs / 4
+/// outputs (V5/V7), with BOTH BallotBox inputs at positions 0/1 (V0: exactly
+/// 2 co-inputs sharing `ballot_cid`) and their self-continuations at
+/// `output[input_idx + 1]` (V2/V3/V4 read `output[myidx+1]`, NOT
+/// `output[myidx]` -- the top-of-file doc comment in `ballot_box.rs`
+/// describing `Output[0]: BallotBox A continuation` is stale/misleading;
+/// trust the bytecode). `Output[3]` is a fixed absolute index (V8) reserved
+/// for the VoteReceipt. This layout is derived and confirmed against the
+/// real engine in `kob/core/tests/prediction_vote_repro.rs`:
 ///
-/// Fee is exactly 0 (proves miner constructed this TX).
+///   Input[0]: BallotBox being voted (value decreases by reward_per_vote)
+///   Input[1]: Other side's BallotBox (read-only witness, unchanged)
+///   Input[2]: Miner's UTXO
+///   Output[0]: Miner change
+///   Output[1]: BallotBox[0] continuation (== input[0].spk)
+///   Output[2]: BallotBox[1] continuation (== input[1].spk, unchanged value)
+///   Output[3]: VoteReceipt (P2SH, bearer; value >= RECEIPT_DUST_FLOOR)
+///
+/// Fee == 0 (V6): `in[0]+in[1]+in[2] == out[0]+out[1]+out[2]+out[3]`. Since
+/// only the voted box's value changes and the witness box is unchanged, the
+/// miner's own in/out delta must absorb BOTH the reward gain and the new
+/// receipt's cost: `miner_change = miner_value + reward_per_vote -
+/// RECEIPT_DUST_FLOOR` (can be negative-in-effect if `reward_per_vote <
+/// RECEIPT_DUST_FLOOR`, in which case the miner fronts the difference from
+/// their own `miner_value` -- the receipt is a bearer token they can
+/// immediately re-spend, so nothing is actually lost, just relocated).
 pub fn build_vote_tx(params: &VoteParams) -> Result<PredictionTxBlueprint, PredictionTxError> {
     let bb = &params.ballot_box;
+    let other = &params.other_box;
 
-    // Validate voting has started
+    // Validate voting window: start_daa <= current_daa < end_daa.
     if params.current_daa < bb.start_daa {
         return Err(PredictionTxError::InvalidState(format!(
             "voting not started: current_daa {} < start_daa {}",
             params.current_daa, bb.start_daa
         )));
+    }
+    if params.current_daa >= bb.end_daa {
+        return Err(PredictionTxError::InvalidState(format!(
+            "voting ended: current_daa {} >= end_daa {}",
+            params.current_daa, bb.end_daa
+        )));
+    }
+    if other.side == bb.side {
+        return Err(PredictionTxError::InvalidState(
+            "other_box must be the OPPOSITE side of the box being voted".to_string(),
+        ));
     }
 
     // Validate BallotBox has enough value for one more vote
@@ -458,42 +556,74 @@ pub fn build_vote_tx(params: &VoteParams) -> Result<PredictionTxBlueprint, Predi
 
     if new_box_value < MIN_UTXO_VALUE {
         return Err(PredictionTxError::OutputBelowMinimum {
-            output_idx: 0,
+            output_idx: 1,
             value: new_box_value,
         });
     }
+    if other.value < MIN_UTXO_VALUE {
+        return Err(PredictionTxError::OutputBelowMinimum {
+            output_idx: 2,
+            value: other.value,
+        });
+    }
 
-    // Miner change = miner_value + reward_per_vote (fee == 0)
+    let receipt_value = kob_core::prediction::RECEIPT_DUST_FLOOR;
+
+    // Miner change = miner_value + reward_per_vote - receipt_value (fee == 0)
     let miner_change = params.miner_value
         .checked_add(bb.reward_per_vote)
-        .ok_or_else(|| PredictionTxError::Overflow("miner_value + reward".to_string()))?;
+        .and_then(|v| v.checked_sub(receipt_value))
+        .ok_or_else(|| PredictionTxError::Overflow("miner_value + reward - receipt".to_string()))?;
 
     if miner_change < MIN_UTXO_VALUE {
         return Err(PredictionTxError::OutputBelowMinimum {
-            output_idx: 1,
+            output_idx: 0,
             value: miner_change,
         });
     }
 
-    // Build BallotBox v5 vote sigscript
+    // Both BallotBox inputs dispatch into the vote path (selector=1),
+    // including the read-only witness -- it independently runs the same
+    // V0..V8 checks (trivially satisfied: its own decrease is 0).
     let vote_sig = kob_core::prediction::build_ballot_box_vote_sigscript(&bb.redeem_script);
+    let other_vote_sig = kob_core::prediction::build_ballot_box_vote_sigscript(&other.redeem_script);
 
-    // Outputs: fee == 0 (total_in == total_out)
+    let vote_side: u8 = match bb.side {
+        BallotSide::Yes => 1,
+        BallotSide::No => 0,
+    };
+    let receipt_rs = kob_core::prediction::build_vote_receipt_redeem_script(&params.ballot_cid, vote_side);
+    let receipt_p2sh = kob_core::build_p2sh(&receipt_rs);
+
     let outputs = vec![
-        PredictionTxOutput {
-            value: new_box_value,
-            script_version: 0,
-            script: bb.p2sh_script.clone(),
-        },
         PredictionTxOutput {
             value: miner_change,
             script_version: 0,
+            covenant: None,
             script: params.miner_change_script.clone(),
+        },
+        PredictionTxOutput {
+            value: new_box_value,
+            script_version: 0,
+            covenant: Some((0, params.ballot_cid)),
+            script: bb.p2sh_script.clone(),
+        },
+        PredictionTxOutput {
+            value: other.value,
+            script_version: 0,
+            covenant: Some((1, params.ballot_cid)),
+            script: other.p2sh_script.clone(),
+        },
+        PredictionTxOutput {
+            value: receipt_value,
+            script_version: 0,
+            covenant: None,
+            script: receipt_p2sh.script().to_vec(),
         },
     ];
 
-    // Parse BallotBox outpoint
     let (bb_tx_id, bb_index) = parse_outpoint(&bb.outpoint)?;
+    let (other_tx_id, other_index) = parse_outpoint(&other.outpoint)?;
 
     Ok(PredictionTxBlueprint {
         inputs: vec![
@@ -501,6 +631,12 @@ pub fn build_vote_tx(params: &VoteParams) -> Result<PredictionTxBlueprint, Predi
                 prev_tx_id: bb_tx_id,
                 prev_index: bb_index,
                 sig_script: vote_sig,
+                sequence: 0,
+            },
+            PredictionTxInput {
+                prev_tx_id: other_tx_id,
+                prev_index: other_index,
+                sig_script: other_vote_sig,
                 sequence: 0,
             },
             PredictionTxInput {
@@ -512,8 +648,8 @@ pub fn build_vote_tx(params: &VoteParams) -> Result<PredictionTxBlueprint, Predi
         ],
         outputs,
         payload: Vec::new(),
-        lock_time: params.current_daa, // Must be >= start_daa for CLTV
-        sig_op_counts: vec![0, params.miner_sig_op_count],
+        lock_time: params.current_daa, // Must be in [start_daa, end_daa) for CLTV
+        sig_op_counts: vec![0, 0, params.miner_sig_op_count],
     })
 }
 
@@ -606,16 +742,19 @@ pub fn build_split_tx(params: &SplitParams) -> Result<PredictionTxBlueprint, Pre
         PredictionTxOutput {
             value: params.token_value,
             script_version: 0,
+            covenant: None,
             script: params.yes_token_script.clone(),
         },
         PredictionTxOutput {
             value: params.token_value,
             script_version: 0,
+            covenant: None,
             script: params.no_token_script.clone(),
         },
         PredictionTxOutput {
             value: continuation_value,
             script_version: 0,
+            covenant: None,
             script: sm.p2sh_script.clone(),
         },
     ];
@@ -624,6 +763,7 @@ pub fn build_split_tx(params: &SplitParams) -> Result<PredictionTxBlueprint, Pre
         outputs.push(PredictionTxOutput {
             value: change,
             script_version: 0,
+            covenant: None,
             script: params.change_script.clone(),
         });
     }
@@ -742,11 +882,13 @@ pub fn build_merge_tx(params: &MergeParams) -> Result<PredictionTxBlueprint, Pre
         PredictionTxOutput {
             value: sm.unit_value,
             script_version: 0,
+            covenant: None,
             script: params.user_output_script.clone(),
         },
         PredictionTxOutput {
             value: continuation_value,
             script_version: 0,
+            covenant: None,
             script: sm.p2sh_script.clone(),
         },
     ];
@@ -879,22 +1021,26 @@ pub fn build_settle_tx(params: &SettleParams) -> Result<PredictionTxBlueprint, P
         PredictionTxOutput {
             value: r.payout_per_token,
             script_version: 0,
+            covenant: None,
             script: params.payout_script.clone(),
         },
         PredictionTxOutput {
             value: continuation_value,
             script_version: 0,
+            covenant: None,
             script: r.p2sh_script.clone(),
         },
         // BallotBox continuations (value preserved) — P-F02/P-F03 fix
         PredictionTxOutput {
             value: params.yes_box.value,
             script_version: 0,
+            covenant: None,
             script: params.yes_box.p2sh_script.clone(),
         },
         PredictionTxOutput {
             value: params.no_box.value,
             script_version: 0,
+            covenant: None,
             script: params.no_box.p2sh_script.clone(),
         },
     ];
@@ -1045,6 +1191,7 @@ pub fn build_expire_ballot_tx(
         outputs: vec![PredictionTxOutput {
             value: payout,
             script_version: 0,
+            covenant: None,
             script: params.creator_script.clone(),
         }],
         payload: Vec::new(),
@@ -1118,6 +1265,7 @@ pub fn build_refund_split_merge_tx(
         outputs: vec![PredictionTxOutput {
             value: payout,
             script_version: 0,
+            covenant: None,
             script: params.creator_script.clone(),
         }],
         payload: Vec::new(),
@@ -1191,6 +1339,7 @@ pub fn build_refund_redemption_tx(
         outputs: vec![PredictionTxOutput {
             value: payout,
             script_version: 0,
+            covenant: None,
             script: params.creator_script.clone(),
         }],
         payload: Vec::new(),
@@ -1314,11 +1463,14 @@ mod tests {
     #[test]
     fn build_vote_tx_basic() {
         let bb = dummy_ballot_box(BallotSide::Yes, 50_000_000);
+        let other = dummy_ballot_box(BallotSide::No, 80_000_000);
         let params = VoteParams {
             ballot_box: bb,
+            other_box: other,
+            ballot_cid: [0xee; 32],
             miner_tx_id: "miner_tx".to_string(),
             miner_index: 0,
-            miner_value: 5_000_000,
+            miner_value: 10_000_000,
             miner_sig_script: vec![0x01],
             miner_sig_op_count: 1,
             miner_change_script: vec![0x02],
@@ -1327,10 +1479,10 @@ mod tests {
         let result = build_vote_tx(&params);
         assert!(result.is_ok());
         let bp = result.unwrap();
-        assert_eq!(bp.inputs.len(), 2);
-        assert_eq!(bp.outputs.len(), 2);
+        assert_eq!(bp.inputs.len(), 3);
+        assert_eq!(bp.outputs.len(), 4);
         // Fee == 0: total_in == total_out
-        let total_in = 50_000_000u64 + 5_000_000;
+        let total_in = 50_000_000u64 + 80_000_000 + 10_000_000;
         let total_out: u64 = bp.outputs.iter().map(|o| o.value).sum();
         assert_eq!(total_in, total_out);
     }
@@ -1338,11 +1490,14 @@ mod tests {
     #[test]
     fn vote_tx_before_start_daa() {
         let bb = dummy_ballot_box(BallotSide::Yes, 50_000_000);
+        let other = dummy_ballot_box(BallotSide::No, 80_000_000);
         let params = VoteParams {
             ballot_box: bb,
+            other_box: other,
+            ballot_cid: [0xee; 32],
             miner_tx_id: "miner_tx".to_string(),
             miner_index: 0,
-            miner_value: 5_000_000,
+            miner_value: 10_000_000,
             miner_sig_script: vec![],
             miner_sig_op_count: 0,
             miner_change_script: vec![0x02],
@@ -1357,13 +1512,60 @@ mod tests {
     }
 
     #[test]
-    fn vote_tx_box_value_too_low() {
-        let bb = dummy_ballot_box(BallotSide::Yes, MIN_UTXO_VALUE + 50_000);
+    fn vote_tx_after_end_daa() {
+        let bb = dummy_ballot_box(BallotSide::Yes, 50_000_000);
+        let other = dummy_ballot_box(BallotSide::No, 80_000_000);
         let params = VoteParams {
             ballot_box: bb,
+            other_box: other,
+            ballot_cid: [0xee; 32],
             miner_tx_id: "miner_tx".to_string(),
             miner_index: 0,
-            miner_value: 5_000_000,
+            miner_value: 10_000_000,
+            miner_sig_script: vec![],
+            miner_sig_op_count: 0,
+            miner_change_script: vec![0x02],
+            current_daa: 60_000, // >= end_daa=50_000
+        };
+        let result = build_vote_tx(&params);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            PredictionTxError::InvalidState(msg) => assert!(msg.contains("ended")),
+            other => panic!("unexpected error: {other}"),
+        }
+    }
+
+    #[test]
+    fn vote_tx_rejects_same_side_witness() {
+        let bb = dummy_ballot_box(BallotSide::Yes, 50_000_000);
+        let other = dummy_ballot_box(BallotSide::Yes, 80_000_000); // wrong: same side
+        let params = VoteParams {
+            ballot_box: bb,
+            other_box: other,
+            ballot_cid: [0xee; 32],
+            miner_tx_id: "miner_tx".to_string(),
+            miner_index: 0,
+            miner_value: 10_000_000,
+            miner_sig_script: vec![],
+            miner_sig_op_count: 0,
+            miner_change_script: vec![0x02],
+            current_daa: 2000,
+        };
+        let result = build_vote_tx(&params);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn vote_tx_box_value_too_low() {
+        let bb = dummy_ballot_box(BallotSide::Yes, MIN_UTXO_VALUE + 50_000);
+        let other = dummy_ballot_box(BallotSide::No, 80_000_000);
+        let params = VoteParams {
+            ballot_box: bb,
+            other_box: other,
+            ballot_cid: [0xee; 32],
+            miner_tx_id: "miner_tx".to_string(),
+            miner_index: 0,
+            miner_value: 10_000_000,
             miner_sig_script: vec![],
             miner_sig_op_count: 0,
             miner_change_script: vec![0x02],
@@ -1376,29 +1578,42 @@ mod tests {
     #[test]
     fn vote_tx_output_values_correct() {
         let bb = dummy_ballot_box(BallotSide::No, 80_000_000);
+        let other = dummy_ballot_box(BallotSide::Yes, 90_000_000);
         let params = VoteParams {
             ballot_box: bb.clone(),
+            other_box: other,
+            ballot_cid: [0xee; 32],
             miner_tx_id: "miner_tx".to_string(),
             miner_index: 0,
-            miner_value: 5_000_000,
+            miner_value: 10_000_000,
             miner_sig_script: vec![],
             miner_sig_op_count: 0,
             miner_change_script: vec![0x02],
             current_daa: 2000,
         };
         let bp = build_vote_tx(&params).unwrap();
-        assert_eq!(bp.outputs[0].value, 80_000_000 - 100_000); // box - reward
-        assert_eq!(bp.outputs[1].value, 5_000_000 + 100_000);  // miner + reward
+        let receipt_floor = kob_core::prediction::RECEIPT_DUST_FLOOR;
+        assert_eq!(bp.outputs[0].value, 10_000_000 + 100_000 - receipt_floor); // miner + reward - receipt
+        assert_eq!(bp.outputs[1].value, 80_000_000 - 100_000); // voted box - reward
+        assert_eq!(bp.outputs[2].value, 90_000_000); // witness box unchanged
+        assert_eq!(bp.outputs[3].value, receipt_floor); // receipt
+        assert_eq!(bp.outputs[1].covenant, Some((0, [0xee; 32])));
+        assert_eq!(bp.outputs[2].covenant, Some((1, [0xee; 32])));
+        assert_eq!(bp.outputs[0].covenant, None);
+        assert_eq!(bp.outputs[3].covenant, None);
     }
 
     #[test]
     fn vote_tx_lock_time_set() {
         let bb = dummy_ballot_box(BallotSide::Yes, 50_000_000);
+        let other = dummy_ballot_box(BallotSide::No, 80_000_000);
         let params = VoteParams {
             ballot_box: bb,
+            other_box: other,
+            ballot_cid: [0xee; 32],
             miner_tx_id: "m:0".to_string(),
             miner_index: 0,
-            miner_value: 5_000_000,
+            miner_value: 10_000_000,
             miner_sig_script: vec![],
             miner_sig_op_count: 0,
             miner_change_script: vec![],
@@ -1766,7 +1981,7 @@ mod tests {
             ballot_box_initial_value: 100_000_000,
             split_merge_initial_value: 100_000_000,
             redemption_initial_value: 500_000_000,
-            funding_tx_id: "fund_tx".to_string(),
+            funding_tx_id: "aa".repeat(32),
             funding_index: 0,
             funding_value: 1_000_000_000,
             funding_sig_script: vec![0x01],
@@ -1800,7 +2015,7 @@ mod tests {
             ballot_box_initial_value: 100_000_000,
             split_merge_initial_value: 100_000_000,
             redemption_initial_value: 500_000_000,
-            funding_tx_id: "fund_tx".to_string(),
+            funding_tx_id: "aa".repeat(32),
             funding_index: 0,
             funding_value: 100_000, // way too little
             funding_sig_script: vec![],
@@ -1828,7 +2043,7 @@ mod tests {
             ballot_box_initial_value: 1000, // below minimum
             split_merge_initial_value: 100_000_000,
             redemption_initial_value: 500_000_000,
-            funding_tx_id: "fund_tx".to_string(),
+            funding_tx_id: "aa".repeat(32),
             funding_index: 0,
             funding_value: 1_000_000_000,
             funding_sig_script: vec![],
@@ -1869,18 +2084,21 @@ mod tests {
     #[test]
     fn vote_tx_sig_op_counts() {
         let bb = dummy_ballot_box(BallotSide::Yes, 50_000_000);
+        let other = dummy_ballot_box(BallotSide::No, 80_000_000);
         let params = VoteParams {
             ballot_box: bb,
+            other_box: other,
+            ballot_cid: [0xee; 32],
             miner_tx_id: "m".to_string(),
             miner_index: 0,
-            miner_value: 5_000_000,
+            miner_value: 10_000_000,
             miner_sig_script: vec![],
             miner_sig_op_count: 1,
             miner_change_script: vec![],
             current_daa: 2000,
         };
         let bp = build_vote_tx(&params).unwrap();
-        assert_eq!(bp.sig_op_counts, vec![0, 1]);
+        assert_eq!(bp.sig_op_counts, vec![0, 0, 1]);
     }
 
     #[test]

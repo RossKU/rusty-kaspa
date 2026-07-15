@@ -16,7 +16,7 @@ use crate::signing;
 use clap::Subcommand;
 use kob_core::p2sh::{blake2b_256, build_p2sh};
 use kob_core::sighash::compute_sighash;
-use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
+use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
 use kob_core::wallet::WalletContext;
 use kob_core::mass::estimate_compute_mass;
@@ -31,9 +31,9 @@ use kob_engine::matcher::prediction_executor::{
     build_create_market_tx, build_deploy_redemption_tx, build_expire_ballot_tx,
     build_merge_tx, build_redeem_tx, build_refund_redemption_tx,
     build_refund_split_merge_tx, build_settle_tx, build_split_tx, build_vote_tx,
-    CreateMarketParams, DeployRedemptionParams, ExpireBallotParams, MergeParams,
-    PredictionTxBlueprint, RedeemParams, RefundRedemptionParams, RefundSplitMergeParams,
-    SettleParams, SplitParams, VoteParams,
+    compute_ballot_cid, CreateMarketParams, DeployRedemptionParams, ExpireBallotParams,
+    MergeParams, PredictionTxBlueprint, RedeemParams, RefundRedemptionParams,
+    RefundSplitMergeParams, SettleParams, SplitParams, VoteParams,
 };
 
 /// SOMPI_PER_KAS: 1 KAS = 100_000_000 sompi.
@@ -111,9 +111,25 @@ pub enum PredictionCommand {
         #[arg(long)]
         ballot_initial_value: u64,
 
-        /// BallotBox redeemScript (hex).
+        /// BallotBox redeemScript (hex). Shared by both YES and NO (same
+        /// covenant); also used as the OTHER side's redeemScript.
         #[arg(long)]
         ballot_rs: String,
+
+        /// Shared BallotBox covenant ID (hex, 64 chars) -- printed by
+        /// `create` step 2 ("BallotBox CID (shared by YES+NO)").
+        #[arg(long)]
+        ballot_cid: String,
+
+        /// The OTHER side's BallotBox outpoint (txid:index). The deployed
+        /// contract requires both BallotBoxes as co-inputs (one voted, one
+        /// read-only witness) -- see kob/SECURITY_FIXES.md / E2E_LIVE_RESULTS.md.
+        #[arg(long)]
+        other_ballot_outpoint: String,
+
+        /// The OTHER side's BallotBox current value in sompi.
+        #[arg(long)]
+        other_ballot_value: u64,
 
         /// Reward per vote in sompi.
         #[arg(long, default_value = "2")]
@@ -573,6 +589,9 @@ pub async fn run(
             ballot_value,
             ballot_initial_value,
             ballot_rs,
+            ballot_cid,
+            other_ballot_outpoint,
+            other_ballot_value,
             reward_per_vote,
             start_daa,
             end_daa,
@@ -589,6 +608,9 @@ pub async fn run(
                 *ballot_value,
                 *ballot_initial_value,
                 ballot_rs,
+                ballot_cid,
+                other_ballot_outpoint,
+                *other_ballot_value,
                 *reward_per_vote,
                 *start_daa,
                 *end_daa,
@@ -920,7 +942,10 @@ fn blueprint_to_tx(bp: &PredictionTxBlueprint) -> Transaction {
         });
     }
     for output in &bp.outputs {
-        tx.outputs.push(TxOutput::new(output.value, output.script_version, output.script.clone(), None));
+        let covenant = output.covenant.map(|(authorizing_input, cid)| {
+            CovenantBinding::new(authorizing_input, kob_core::compat::parse_hash(&hex::encode(cid)).expect("32-byte covenant id"))
+        });
+        tx.outputs.push(TxOutput::new(output.value, output.script_version, output.script.clone(), covenant));
     }
     tx
 }
@@ -1123,12 +1148,22 @@ async fn create_market(
     )?;
     let yes_ballot_p2sh = build_p2sh(&yes_ballot_rs);
     let no_ballot_p2sh = build_p2sh(&no_ballot_rs);
-    let yes_ballot_cid = blake2b_256(&yes_ballot_p2sh.script());
-    let no_ballot_cid = blake2b_256(&no_ballot_p2sh.script());
+    // YES and NO BallotBox are ONE covenant (identical redeemScript, shared
+    // wire-level covenant id) authorized together by step 1's single funding
+    // input -- NOT `blake2b(p2sh_script)` (that's the P2SH SPK hash, a
+    // different value the engine never reads for OpInputCovenantId/
+    // OpCovInputCount/OpCovOutputCount). See `compute_ballot_cid`.
+    let ballot_cid = compute_ballot_cid(
+        &funding.outpoint.transaction_id,
+        funding.outpoint.index,
+        yes_ballot_p2sh.script(),
+        no_ballot_p2sh.script(),
+        ballot_box_value,
+    ).map_err(|e| anyhow::anyhow!("compute_ballot_cid failed: {}", e))?;
+    let (yes_ballot_cid, no_ballot_cid) = (ballot_cid, ballot_cid);
 
-    println!("Step 2: Deploying Redemption with real BallotBox CIDs...");
-    println!("  YES ballot CID: {}", hex::encode(yes_ballot_cid));
-    println!("  NO ballot CID:  {}", hex::encode(no_ballot_cid));
+    println!("Step 2: Deploying Redemption with real BallotBox CID...");
+    println!("  BallotBox CID (shared by YES+NO): {}", hex::encode(ballot_cid));
 
     // Verify step 1 outputs exist in the UTXO set before proceeding.
     // Query the P2SH address of the YES BallotBox (output 0) as confirmation.
@@ -1229,6 +1264,7 @@ async fn create_market(
 // 2. Vote
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 async fn vote(
     wallet_path: &Path,
     node_url: &str,
@@ -1239,6 +1275,9 @@ async fn vote(
     ballot_value: u64,
     ballot_initial_value: u64,
     ballot_rs_hex: &str,
+    ballot_cid_hex: &str,
+    other_ballot_outpoint: &str,
+    other_ballot_value: u64,
     reward_per_vote: u64,
     start_daa: u64,
     end_daa: u64,
@@ -1246,6 +1285,11 @@ async fn vote(
     miner_utxo_str: Option<&str>,
 ) -> anyhow::Result<()> {
     let _side = parse_side(side)?;
+    let other_side = match _side {
+        BallotSide::Yes => BallotSide::No,
+        BallotSide::No => BallotSide::Yes,
+    };
+    let ballot_cid = parse_hex32(ballot_cid_hex, "ballot_cid")?;
     let redeem_script = hex::decode(ballot_rs_hex)?;
     let p2sh = build_p2sh(&redeem_script);
 
@@ -1264,9 +1308,9 @@ async fn vote(
             current_daa, start_daa, start_daa - current_daa
         );
     }
-    if current_daa > end_daa {
+    if current_daa >= end_daa {
         anyhow::bail!(
-            "Voting period has ended. Current DAA {} > end DAA {}. The ballot box is closed.",
+            "Voting period has ended. Current DAA {} >= end DAA {}. The ballot box is closed.",
             current_daa, end_daa
         );
     }
@@ -1289,6 +1333,8 @@ async fn vote(
 
     let miner_change_script = build_owner_spk(&pubkey);
 
+    // Both BallotBoxes share the SAME redeemScript/P2SH (one covenant,
+    // distinguished only by outpoint/value) -- see `compute_ballot_cid`.
     let bb_entry = BallotBoxEntry {
         outpoint: ballot_outpoint.to_string(),
         value: ballot_value,
@@ -1301,9 +1347,23 @@ async fn vote(
         expiry_daa,
         initial_value: ballot_initial_value,
     };
+    let other_entry = BallotBoxEntry {
+        outpoint: other_ballot_outpoint.to_string(),
+        value: other_ballot_value,
+        side: other_side,
+        redeem_script: redeem_script.clone(),
+        p2sh_script: p2sh.script().to_vec(),
+        reward_per_vote,
+        start_daa,
+        end_daa,
+        expiry_daa,
+        initial_value: ballot_initial_value,
+    };
 
     let params = VoteParams {
         ballot_box: bb_entry,
+        other_box: other_entry,
+        ballot_cid,
         miner_tx_id: miner_tx_id.clone(),
         miner_index,
         miner_value,
@@ -1320,6 +1380,7 @@ async fn vote(
     println!("Side:         {}", _side);
     println!("BallotBox:    {}", ballot_outpoint);
     println!("Box value:    {}", fmt_sompi(ballot_value));
+    println!("Other side:   {} ({})", other_ballot_outpoint, fmt_sompi(other_ballot_value));
     println!("Reward:       {} sompi", reward_per_vote);
     println!("Current DAA:  {}", current_daa);
     println!("Miner UTXO:   {}:{} ({})", miner_tx_id, miner_index, fmt_sompi(miner_value));
@@ -1328,13 +1389,18 @@ async fn vote(
     let bp = build_vote_tx(&params)
         .map_err(|e| anyhow::anyhow!("build_vote_tx failed: {}", e))?;
 
-    // Vote TX: input[0] = BallotBox (covenant, no user sig), input[1] = miner (needs P2PK sig)
-    let tx_id = submit_blueprint(&rpc, &bp, 1, &miner_spk, miner_value, &privkey).await?;
+    // Vote TX: input[0] = voted BallotBox, input[1] = other BallotBox
+    // (read-only witness), input[2] = miner (needs P2PK sig). Outputs:
+    // [0] miner change, [1] voted box continuation, [2] other box
+    // continuation, [3] VoteReceipt.
+    let tx_id = submit_blueprint(&rpc, &bp, 2, &miner_spk, miner_value, &privkey).await?;
 
     println!("SUCCESS! Vote submitted.");
-    println!("TXID:     {}", tx_id);
-    println!("New box:  {}:0 ({})", tx_id, fmt_sompi(ballot_value - reward_per_vote));
-    println!("Reward:   {} sompi -> miner", reward_per_vote);
+    println!("TXID:         {}", tx_id);
+    println!("New box:      {}:1 ({})", tx_id, fmt_sompi(ballot_value - reward_per_vote));
+    println!("Other box:    {}:2 ({})", tx_id, fmt_sompi(other_ballot_value));
+    println!("VoteReceipt:  {}:3", tx_id);
+    println!("Reward:       {} sompi -> miner (net of the receipt's dust-floor cost)", reward_per_vote);
 
     Ok(())
 }

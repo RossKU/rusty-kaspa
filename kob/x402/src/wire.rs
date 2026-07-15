@@ -120,6 +120,17 @@ pub struct FacilitatorRequest {
     pub payment_requirements: PaymentRequirements,
 }
 
+/// Facilitator `/await` (pull mode) request body. The merchant/resource server
+/// asks the facilitator to DISCOVER a payment matching these requirements — the
+/// client broadcasts the payment itself, so no `paymentPayload` is supplied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AwaitRequest {
+    #[serde(rename = "x402Version", default)]
+    pub x402_version: u32,
+    #[serde(rename = "paymentRequirements")]
+    pub payment_requirements: PaymentRequirements,
+}
+
 /// Facilitator `/verify` response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyResponse {

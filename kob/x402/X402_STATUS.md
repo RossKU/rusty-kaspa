@@ -355,6 +355,52 @@ refinement is to key the reservation on the canonical Kaspa txid computed
 pre-broadcast (deferred — depends on covenant/compute-budget tx-hash
 serialization).
 
+## PULL mode (receive-and-detect) — Phase 5c
+
+Distinct from the push mode (client hands the facilitator a signed artifact,
+facilitator broadcasts). In PULL mode the client broadcasts a plain native-KAS
+payment to the merchant's `payTo` ITSELF; the facilitator does NOT broadcast —
+it DISCOVERS the arriving payment by scanning, binds the fingerprint from the
+tx payload memo, confirms finality, and authorizes. Exercises the Phase-2
+`PaymentObserver` block/UTXO-scan discovery path live.
+
+How detection is wired:
+- New facilitator endpoint `POST /await` (body = `{x402Version,
+  paymentRequirements}`, no paymentPayload). Handler `Facilitator::await_payment`.
+- New `ChainBackend::discover_incoming(address)` — impl'd for `RpcClient` via
+  `getMempoolEntriesByAddresses` (`entries[].receiving[].transaction`), which
+  carries each incoming tx's full **payload** (the `X402:<fp>` memo) even
+  before confirmation. Default impl returns none (so the trait stays
+  cheap for other backends).
+- Discovery loop (poll 700ms until `maxTimeoutSeconds`): (1) cache incoming-tx
+  payloads from the mempool (for the fingerprint memo); (2) scan `payTo`'s
+  UTXO set via `PaymentObserver::scan_utxos` — a UTXO present in the set is
+  confirmed/final. For each discovered event: dedupe against the replay store
+  (by the payTo-output outpoint), bind the fingerprint from the cached
+  payload, then amount-check. `value >= required` -> record + authorize
+  (returns the discovered txid); `value < required` (fingerprint-matched) ->
+  reject underpayment; already-credited -> refuse (no double-credit);
+  timeout with nothing matching -> not authorized. The facilitator never
+  calls `submit` in pull mode.
+- Client: `x402-client --broadcast --fingerprint <hex> ...` builds the signed
+  native payment (fingerprint memo in the tx payload) and broadcasts it
+  itself, printing the txid. The merchant issues the fingerprint (passed via
+  `--fingerprint`); pull mode does not go through the facilitator to send.
+
+Unit tests: 4 new `await_*` facilitator tests (discover+authorize,
+underpayment reject, timeout, no-double-credit) with a mock chain that seeds
+mempool `receiving` + confirmed UTXOs.
+
+One fix during the live run: the already-credited dedupe must be
+fingerprint-scoped — a fresh request for a NEW payment was wrongly told
+"already credited" because some OTHER credited UTXO sat at the merchant
+address. Now dedupe only counts a credited payment as "this request's" when
+its stored fingerprint matches the request's (so CASE 3 correctly reports "no
+matching payment" instead).
+
+Live E2E: `kob/x402/scripts/e2e_x402_pull.sh` — 6/6 checks passed
+(2026-07-15). See the E2E TXID log below.
+
 ## Build handoff log
 
 (Most recent first. Always check exit status + `cargo check` output before
@@ -437,6 +483,37 @@ Harness: `kob/x402/scripts/e2e_x402.sh`; results file
   payer` — CASE 1 genuinely spent it on-chain, so the on-chain check fired;
   the replay-store OutpointReused guard is the backstop when the input is
   still in the UTXO set pre-confirmation); NO broadcast.
+
+### PULL mode (receive-and-detect), native-KAS — testnet-10, 2026-07-15 (6/6) — DONE
+
+Client broadcasts the payment ITSELF; facilitator discovers it by scanning
+the merchant address (never given the txid). Harness
+`kob/x402/scripts/e2e_x402_pull.sh`; results
+`/tmp/kob_e2e/x402_pull/E2E_X402_PULL_TXIDS.txt`. Fresh merchant address per
+run: `kaspatest:qrt7yzygwyjfs4gwfnn6tvfxpe5uedhxcpul2hp8fewsjq0elgxx7v9dpsy6z`.
+
+- CASE 1 HAPPY (client broadcasts 5M KAS to merchant with an X402 fingerprint
+  memo; facilitator `/await` DISCOVERS it by scanning): discovery evidence —
+  `/await` returned `transaction:
+  fbcb0d130777259c4045e7943658c80d67d37e5a1a9171a616d3ccfb4d08cabf`, the exact
+  txid the client printed from its OWN broadcast, which the facilitator was
+  never handed (it only got `{payTo, maxAmountRequired, fingerprint}`).
+  Independently re-confirmed on-chain: `fbcb0d13...:0` (5,000,000 sompi) is in
+  the merchant's UTXO set (raw `getUtxosByAddresses`). Durable log:
+  Submitted -> Confirmed, fingerprint-bound.
+- CASE 2 UNDERPAYMENT (client broadcasts 3M, requirement 5M): discovered
+  (txid `40f84df24f0a9d40792d6c72a63e5d9ce661dd09a3b26bce3c4a118785dbd68c`)
+  and rejected — `underpayment discovered ... paid 3000000 < required
+  5000000`.
+- CASE 3 NO-PAYMENT/TIMEOUT (nothing broadcast, fresh fingerprint): not
+  authorized — `no matching payment discovered at <merchant> within 6s` (and
+  NOT fooled into "already credited" by the CASE 1/2 UTXOs sitting at the
+  merchant — the fingerprint-scoped dedupe fix).
+- CASE 4 REPLAY/DOUBLE-CREDIT (re-`/await` the already-credited CASE 1
+  payment): refused — `matching payment already credited (not
+  double-crediting)`. No second credit recorded.
+
+The facilitator never called `submit` in any pull case — it only observed.
 
 ### KCC20 token scheme — testnet-10, 2026-07-15 (7/7 checks passed) — DONE
 

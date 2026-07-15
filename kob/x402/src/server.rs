@@ -18,8 +18,8 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::facilitator::{ChainBackend, Facilitator};
 use crate::wire::{
-    FacilitatorRequest, SettleResponse, SupportedKind, SupportedResponse, VerifyResponse,
-    SCHEME_EXACT, X402_VERSION,
+    AwaitRequest, FacilitatorRequest, SettleResponse, SupportedKind, SupportedResponse,
+    VerifyResponse, SCHEME_EXACT, X402_VERSION,
 };
 
 /// Build the router for a facilitator over any chain backend.
@@ -27,6 +27,7 @@ pub fn router<B: ChainBackend + 'static>(fac: Arc<Facilitator<B>>) -> Router {
     Router::new()
         .route("/verify", post(verify_handler::<B>))
         .route("/settle", post(settle_handler::<B>))
+        .route("/await", post(await_handler::<B>))
         .route("/supported", get(supported_handler::<B>))
         .route("/health", get(|| async { "ok" }))
         .layer(
@@ -50,6 +51,14 @@ async fn settle_handler<B: ChainBackend + 'static>(
     Json(req): Json<FacilitatorRequest>,
 ) -> Json<SettleResponse> {
     Json(fac.settle(&req).await)
+}
+
+/// Pull mode: discover a client-broadcast payment and authorize it.
+async fn await_handler<B: ChainBackend + 'static>(
+    State(fac): State<Arc<Facilitator<B>>>,
+    Json(req): Json<AwaitRequest>,
+) -> Json<SettleResponse> {
+    Json(fac.await_payment(&req).await)
 }
 
 async fn supported_handler<B: ChainBackend + 'static>(

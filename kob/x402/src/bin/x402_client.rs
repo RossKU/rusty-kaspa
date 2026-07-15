@@ -46,6 +46,11 @@ struct Args {
     nonce: String,
     out: Option<String>,
     replay_out: Option<String>,
+    /// PULL mode: broadcast the payment ourselves (facilitator only discovers).
+    broadcast: bool,
+    /// Explicit fingerprint hex (pull mode: the merchant issues it; the client
+    /// embeds it). When set, overrides the computed fingerprint.
+    fingerprint: Option<String>,
 }
 
 fn arg_val(it: &mut std::vec::IntoIter<String>) -> String {
@@ -67,6 +72,8 @@ fn parse_args() -> Args {
         nonce: "nonce".to_string(),
         out: None,
         replay_out: None,
+        broadcast: false,
+        fingerprint: None,
     };
     let mut it = std::env::args().skip(1).collect::<Vec<_>>().into_iter();
     while let Some(k) = it.next() {
@@ -84,6 +91,8 @@ fn parse_args() -> Args {
             "--nonce" => a.nonce = arg_val(&mut it),
             "--out" => a.out = Some(arg_val(&mut it)),
             "--replay-out" => a.replay_out = Some(arg_val(&mut it)),
+            "--broadcast" => a.broadcast = true,
+            "--fingerprint" => a.fingerprint = Some(arg_val(&mut it)),
             other => eprintln!("[client] ignoring unknown arg: {}", other),
         }
     }
@@ -257,13 +266,11 @@ async fn main() -> anyhow::Result<()> {
     let privkey = *wallet.privkey_bytes();
 
     let require = args.require.unwrap_or(args.amount);
-    let fingerprint_hex = fingerprint::compute_fingerprint(
-        &args.method,
-        &args.path,
-        &args.pay_to,
-        &require.to_string(),
-        &args.nonce,
-    );
+    // Pull mode: the merchant issues the fingerprint (passed via --fingerprint);
+    // otherwise compute it from the request context (push mode / self-issued).
+    let fingerprint_hex = args.fingerprint.clone().unwrap_or_else(|| {
+        fingerprint::compute_fingerprint(&args.method, &args.path, &args.pay_to, &require.to_string(), &args.nonce)
+    });
     let payload_bytes = fingerprint::embed_fingerprint(&fingerprint_hex);
 
     // The address the tx actually pays (wrong-recipient case overrides it).
@@ -324,6 +331,20 @@ async fn main() -> anyhow::Result<()> {
         &payload_bytes,
         &privkey,
     )?;
+
+    // PULL mode: the client broadcasts the payment ITSELF (the facilitator only
+    // discovers it). Prints the txid; does not emit a facilitator artifact.
+    if args.broadcast {
+        // `tx` is already a `{transaction, allowOrphan}` submit envelope.
+        let res = rpc.submit_transaction(tx).await.map_err(|e| anyhow::anyhow!("broadcast: {}", e))?;
+        if !res.ok {
+            anyhow::bail!("broadcast rejected: {}", res.error.unwrap_or_default());
+        }
+        let txid = res.tx_id.unwrap_or_default();
+        eprintln!("[client] PULL broadcast txid={} (fingerprint={})", txid, fingerprint_hex);
+        println!("{}", txid);
+        return Ok(());
+    }
 
     let req = facilitator_request(
         &args.network,

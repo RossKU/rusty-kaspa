@@ -22,9 +22,9 @@ pub mod scheme_native;
 pub mod server;
 pub mod wire;
 
-pub use facilitator::{ChainBackend, Facilitator, FacilitatorConfig};
+pub use facilitator::{ChainBackend, DiscoveredTx, Facilitator, FacilitatorConfig};
 pub use wire::{
-    FacilitatorRequest, PaymentPayload, PaymentRequirements, PaymentRequiredResponse,
+    AwaitRequest, FacilitatorRequest, PaymentPayload, PaymentRequirements, PaymentRequiredResponse,
     SettleResponse, SupportedResponse, VerifyResponse,
     ASSET_NATIVE_KAS, NETWORK_MAINNET, NETWORK_TESTNET10, SCHEME_EXACT, X402_VERSION,
 };

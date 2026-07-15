@@ -5,21 +5,35 @@
 //! logic unit-tests without a live node (production impl is `RpcClient`). This
 //! is the same seam style as `MempoolProbe`/`FinalityChecker` in `kob-settle`.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 
-use kob_settle::observe::{PaymentRecord, ReplayCheck, ReplayStore};
+use kob_settle::observe::{ObservedOutput, PaymentObserver, PaymentRecord, ReplayCheck, ReplayStore};
 use kob_settle::rpc::{ConfirmConfig, RpcClient, RpcUtxo};
 
 use crate::scheme_kcc20;
 use crate::scheme_native;
+use crate::fingerprint;
 use crate::wire::{
-    ASSET_NATIVE_KAS, FacilitatorRequest, SCHEME_EXACT, SettleResponse, VerifyResponse,
+    ASSET_NATIVE_KAS, AwaitRequest, FacilitatorRequest, SCHEME_EXACT, SettleResponse, VerifyResponse,
 };
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+/// An incoming transaction discovered at a watched address (pull mode). Carries
+/// enough to match it to `PaymentRequirements`: the outputs (for recipient +
+/// amount) and the tx payload (for the request-fingerprint memo).
+#[derive(Debug, Clone)]
+pub struct DiscoveredTx {
+    pub txid: String,
+    pub outputs: Vec<ObservedOutput>,
+    /// TX payload bytes (may carry an `X402:<fingerprint>` memo).
+    pub payload: Vec<u8>,
+}
 
 /// Minimal chain operations the facilitator needs.
 pub trait ChainBackend: Send + Sync {
@@ -35,6 +49,13 @@ pub trait ChainBackend: Send + Sync {
         address: &'a str,
         cfg: Option<ConfirmConfig>,
     ) -> BoxFuture<'a, bool>;
+    /// Discover incoming transactions paying `address` — from the mempool
+    /// (`getMempoolEntriesByAddresses` `receiving`), which carries each tx's
+    /// full payload for fingerprint binding. Used by pull-mode discovery, so a
+    /// payment's memo can be read before it is confirmed. Default: none.
+    fn discover_incoming<'a>(&'a self, _address: &'a str) -> BoxFuture<'a, Result<Vec<DiscoveredTx>, String>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
 }
 
 impl ChainBackend for RpcClient {
@@ -61,6 +82,50 @@ impl ChainBackend for RpcClient {
         cfg: Option<ConfirmConfig>,
     ) -> BoxFuture<'a, bool> {
         Box::pin(async move { self.confirm_tx_output(txid, output_idx, address, cfg).await.confirmed })
+    }
+
+    fn discover_incoming<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Vec<DiscoveredTx>, String>> {
+        Box::pin(async move {
+            let resp = self
+                .call(
+                    "getMempoolEntriesByAddresses",
+                    serde_json::json!({
+                        "addresses": [address],
+                        "includeOrphanPool": true,
+                        "filterTransactionPool": false,
+                    }),
+                )
+                .await?;
+            let mut out = Vec::new();
+            if let Some(entries) = resp.get("entries").and_then(|v| v.as_array()) {
+                for entry in entries {
+                    // `receiving`: txs that create outputs paying `address`.
+                    if let Some(recv) = entry.get("receiving").and_then(|v| v.as_array()) {
+                        for e in recv {
+                            let Some(tx) = e.get("transaction") else { continue };
+                            let txid = tx
+                                .get("verboseData")
+                                .and_then(|v| v.get("transactionId"))
+                                .and_then(|v| v.as_str())
+                                .or_else(|| tx.get("transactionId").and_then(|v| v.as_str()));
+                            let Some(txid) = txid else { continue };
+                            let outputs: Vec<ObservedOutput> = tx
+                                .get("outputs")
+                                .and_then(|v| v.as_array())
+                                .map(|arr| arr.iter().filter_map(ObservedOutput::from_rpc_json).collect())
+                                .unwrap_or_default();
+                            let payload = tx
+                                .get("payload")
+                                .and_then(|v| v.as_str())
+                                .and_then(|s| if s.is_empty() { Some(vec![]) } else { hex::decode(s).ok() })
+                                .unwrap_or_default();
+                            out.push(DiscoveredTx { txid: txid.to_string(), outputs, payload });
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -341,6 +406,129 @@ impl<B: ChainBackend> Facilitator<B> {
         self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, Some(payer)).await
     }
 
+    /// `/await` (PULL mode): the client broadcasts the payment ITSELF; the
+    /// facilitator does NOT broadcast. It watches `payTo`, DISCOVERS the
+    /// arriving payment by scanning (mempool for the payload/memo + the UTXO
+    /// set for confirmed finality) — never by a known txid — binds the
+    /// request fingerprint from the tx payload, and authorizes.
+    ///
+    /// - happy: a payment >= required with a matching fingerprint appears and
+    ///   confirms -> authorized (returns the discovered on-chain txid).
+    /// - underpayment: a fingerprint-matched payment < required is discovered
+    ///   -> rejected.
+    /// - timeout: nothing matching appears -> not authorized.
+    /// - replay/double-credit: a payment already credited is not credited
+    ///   again (deduped by its payTo-output outpoint in the replay store).
+    pub async fn await_payment(&self, req: &AwaitRequest) -> SettleResponse {
+        let net = self.config.network.clone();
+        let requirements = &req.payment_requirements;
+
+        if requirements.scheme != SCHEME_EXACT {
+            return SettleResponse::failed(net, format!("unsupported scheme (only '{}')", SCHEME_EXACT));
+        }
+        if requirements.network != self.config.network {
+            return SettleResponse::failed(net, format!("network mismatch: facilitator settles '{}'", self.config.network));
+        }
+        if !requirements.asset.is_empty() && requirements.asset != ASSET_NATIVE_KAS {
+            return SettleResponse::failed(net, "pull mode currently supports native-KAS only".to_string());
+        }
+        let required = match requirements.max_amount_sompi() {
+            Ok(r) => r,
+            Err(e) => return SettleResponse::failed(net, e),
+        };
+        let pay_to = requirements.pay_to.clone();
+        let expected_fp = requirements.fingerprint().map(|s| s.to_string());
+        let timeout_secs = if requirements.max_timeout_seconds == 0 { 30 } else { requirements.max_timeout_seconds };
+
+        let mut observer = PaymentObserver::new();
+        if let Err(e) = observer.watch(&pay_to) {
+            return SettleResponse::failed(net, format!("bad payTo address: {}", e));
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
+        // txid -> tx payload, cached from the mempool so the fingerprint memo is
+        // available even after the tx leaves the mempool (confirmed).
+        let mut payloads: HashMap<String, Vec<u8>> = HashMap::new();
+        let mut saw_already_credited = false;
+
+        loop {
+            // (1) Cache incoming-tx payloads from the mempool (carries the memo).
+            if let Ok(dtxs) = self.backend.discover_incoming(&pay_to).await {
+                for d in dtxs {
+                    payloads.entry(d.txid).or_insert(d.payload);
+                }
+            }
+
+            // (2) Scan payTo's UTXO set (confirmed => final) to DISCOVER an
+            //     arriving payment — by address, not by a known txid.
+            let utxos = self.backend.get_address_utxos(&pay_to).await.unwrap_or_default();
+            let events = observer.scan_utxos(&utxos);
+            for ev in &events {
+                let outpoint = format!("{}:{}", ev.txid, ev.output_index);
+
+                // Already credited? Never re-credit. It only counts as "OUR
+                // request's payment, already credited" (vs. an unrelated prior
+                // payment sitting at this merchant address) when it was
+                // credited for THIS request's fingerprint — so a fresh request
+                // for a NEW payment is not fooled into "already credited" by
+                // some other credited UTXO at the same address.
+                {
+                    let store = self.replay.lock().await;
+                    if let Some(rec) = store.get(&ev.txid) {
+                        if rec.fingerprint == expected_fp {
+                            saw_already_credited = true;
+                        }
+                        continue;
+                    }
+                }
+
+                // Fingerprint binding: read the memo from the mempool-cached
+                // payload. If the request carries a fingerprint, only a payment
+                // whose payload carries the matching memo is "this" payment.
+                if let Some(exp) = &expected_fp {
+                    match payloads.get(&ev.txid).and_then(|p| fingerprint::extract_fingerprint(p)) {
+                        Some(got) if &got == exp => {}
+                        _ => continue, // not our payment yet (or payload not seen) — keep watching
+                    }
+                }
+
+                // Amount check. (Only reached for our request's payment.)
+                if ev.value < required {
+                    return SettleResponse::failed(net, format!(
+                        "underpayment discovered at {}: paid {} < required {} (txid {})",
+                        pay_to, ev.value, required, ev.txid
+                    ));
+                }
+
+                // Discovered + confirmed (present in the UTXO set) +
+                // fingerprint-bound => authorize and record for dedupe.
+                let mut record = PaymentRecord::submitted(ev.txid.clone(), vec![outpoint.clone()])
+                    .with_chain_txid(ev.txid.clone())
+                    .with_parties(None, Some(pay_to.clone()), ev.value);
+                if let Some(fp) = &expected_fp {
+                    record = record.with_fingerprint(fp.clone());
+                }
+                {
+                    let mut store = self.replay.lock().await;
+                    let _ = store.record(record);
+                    let _ = store.mark_confirmed(&ev.txid);
+                }
+                return SettleResponse::ok(net, ev.txid.clone(), None);
+            }
+
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+
+        if saw_already_credited {
+            SettleResponse::failed(net, "matching payment already credited (not double-crediting)".to_string())
+        } else {
+            SettleResponse::failed(net, format!("no matching payment discovered at {} within {}s", pay_to, timeout_secs))
+        }
+    }
+
     /// Confirm finality for a broadcast payment and record the outcome.
     async fn finalize(
         &self,
@@ -381,7 +569,7 @@ mod tests {
     use kob_settle::rpc::{RpcOutpoint, RpcUtxo};
     use kob_settle::rpc_types::{RpcSpk, RpcUtxoEntry};
 
-    use crate::fingerprint;
+    // `fingerprint` comes from `super::*` (the parent module imports it).
     use crate::wire::{
         NativeExactPayload, PaymentPayload, PaymentRequirements, NETWORK_TESTNET10, X402_VERSION,
     };
@@ -400,6 +588,7 @@ mod tests {
         submitted: StdMutex<Vec<serde_json::Value>>,
         confirm_ok: bool,
         next_txid: StdMutex<u64>,
+        incoming: Vec<DiscoveredTx>,
     }
 
     impl MockChain {
@@ -409,7 +598,24 @@ mod tests {
                 submitted: StdMutex::new(Vec::new()),
                 confirm_ok,
                 next_txid: StdMutex::new(1),
+                incoming: Vec::new(),
             }
+        }
+        /// Seed a discovered incoming payment (mempool) + its confirmed UTXO at
+        /// `address`, with `payload` carrying the memo. Models a client-broadcast
+        /// pull payment that the facilitator must discover.
+        fn with_incoming(mut self, address: &str, txid: &str, out_idx: u32, amount: u64, payload: Vec<u8>) -> Self {
+            self.incoming.push(DiscoveredTx {
+                txid: txid.to_string(),
+                outputs: vec![ObservedOutput {
+                    value: amount,
+                    spk_version: 0,
+                    spk_script: kob_settle::bech32::address_to_spk(address).unwrap(),
+                    covenant_id: None,
+                }],
+                payload,
+            });
+            self.with_utxo(address, txid, out_idx, amount)
         }
         fn with_utxo(mut self, address: &str, txid: &str, index: u32, amount: u64) -> Self {
             let u = RpcUtxo {
@@ -475,6 +681,17 @@ mod tests {
         ) -> BoxFuture<'a, bool> {
             let ok = self.confirm_ok;
             Box::pin(async move { ok })
+        }
+        fn discover_incoming<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Vec<DiscoveredTx>, String>> {
+            // Return incoming txs that pay `address` (match by output SPK).
+            let want = kob_settle::bech32::address_to_spk(address).ok();
+            let v: Vec<DiscoveredTx> = self
+                .incoming
+                .iter()
+                .filter(|d| want.as_ref().is_some_and(|w| d.outputs.iter().any(|o| &o.spk_script == w)))
+                .cloned()
+                .collect();
+            Box::pin(async move { Ok(v) })
         }
     }
 
@@ -857,5 +1074,90 @@ mod tests {
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
         assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    // --- PULL mode (/await): client broadcasts, facilitator DISCOVERS ---
+
+    fn await_req(pay_to: &str, required: u64, fp: Option<&str>, timeout: u64) -> AwaitRequest {
+        AwaitRequest {
+            x402_version: X402_VERSION,
+            payment_requirements: PaymentRequirements {
+                scheme: SCHEME_EXACT.to_string(),
+                network: NETWORK_TESTNET10.to_string(),
+                max_amount_required: required.to_string(),
+                resource: "https://ex/pull".to_string(),
+                description: String::new(),
+                mime_type: String::new(),
+                pay_to: pay_to.to_string(),
+                max_timeout_seconds: timeout,
+                asset: crate::wire::ASSET_NATIVE_KAS.to_string(),
+                extra: match fp {
+                    Some(f) => serde_json::json!({ "fingerprint": f }),
+                    None => serde_json::Value::Null,
+                },
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn await_discovers_payment_and_authorizes() {
+        let merchant = addr(5);
+        let fp = fingerprint::compute_fingerprint("GET", "/r", &merchant, "40000000", "n");
+        let pay_txid = "5a".repeat(32);
+        // A confirmed payment paying the merchant 40M, with the fingerprint memo.
+        let chain = MockChain::new(true).with_incoming(
+            &merchant, &pay_txid, 0, 40_000_000, fingerprint::embed_fingerprint(&fp),
+        );
+        let fac = Facilitator::new(chain, tmp_store("pull_happy"), config());
+        let s = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 5)).await;
+        assert!(s.success, "await should authorize: {:?}", s.error_reason);
+        assert_eq!(s.transaction.as_deref(), Some(pay_txid.as_str()), "returns the discovered txid");
+        // The facilitator never broadcast anything (pull mode).
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn await_rejects_underpayment() {
+        let merchant = addr(5);
+        let fp = fingerprint::compute_fingerprint("GET", "/r", &merchant, "40000000", "n");
+        let pay_txid = "5b".repeat(32);
+        // Discovered payment carries the right memo but pays too little.
+        let chain = MockChain::new(true).with_incoming(
+            &merchant, &pay_txid, 0, 20_000_000, fingerprint::embed_fingerprint(&fp),
+        );
+        let fac = Facilitator::new(chain, tmp_store("pull_under"), config());
+        let s = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 5)).await;
+        assert!(!s.success);
+        assert!(s.error_reason.unwrap().contains("underpayment"));
+    }
+
+    #[tokio::test]
+    async fn await_times_out_with_no_payment() {
+        let merchant = addr(5);
+        let fp = fingerprint::compute_fingerprint("GET", "/r", &merchant, "40000000", "n");
+        // No incoming payment at all.
+        let chain = MockChain::new(true);
+        let fac = Facilitator::new(chain, tmp_store("pull_timeout"), config());
+        let s = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 1)).await;
+        assert!(!s.success);
+        assert!(s.error_reason.unwrap().contains("no matching payment"));
+    }
+
+    #[tokio::test]
+    async fn await_does_not_double_credit() {
+        let merchant = addr(5);
+        let fp = fingerprint::compute_fingerprint("GET", "/r", &merchant, "40000000", "n");
+        let pay_txid = "5c".repeat(32);
+        let chain = MockChain::new(true).with_incoming(
+            &merchant, &pay_txid, 0, 40_000_000, fingerprint::embed_fingerprint(&fp),
+        );
+        let fac = Facilitator::new(chain, tmp_store("pull_replay"), config());
+        // First: credited.
+        let s1 = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 5)).await;
+        assert!(s1.success);
+        // Second: same payment still in the UTXO set, already credited -> refused.
+        let s2 = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 1)).await;
+        assert!(!s2.success);
+        assert!(s2.error_reason.unwrap().contains("already credited"));
     }
 }

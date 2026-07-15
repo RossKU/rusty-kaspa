@@ -21,6 +21,7 @@ pub mod scheme_kcc20;
 pub mod scheme_native;
 pub mod server;
 pub mod wire;
+pub mod wire_v2;
 
 pub use facilitator::{ChainBackend, DiscoveredTx, Facilitator, FacilitatorConfig};
 pub use wire::{

@@ -435,8 +435,38 @@ exactly `amount` to `payTo` at `paymentOutputIndex`, and satisfies the
 additive rule + requestHash binding. Facilitator verifies -> broadcasts ->
 confirms -> authorizes via the real settlement engine.
 
-Phase status: B0 (PLAN.md v2 delta) — see kob/x402/PLAN.md. B1/B2/B3 — see
-below.
+Phase status: B0 DONE (committed c9b095c — PLAN.md v2 delta + vendored
+schemas). B1 IN PROGRESS.
+
+### B1 — v2 wire types (first slice, non-breaking)
+`kob/x402/src/wire_v2.rs`: the full v2 canonical types + header codecs +
+closed error enum, as a NEW module so the working+live-proven native/pull +
+KCC20 (v1 `wire` module) keep compiling and running unchanged. Types:
+`PaymentRequired{x402Version,resource,accepts[],error?,extensions?}`,
+`PaymentRequirements{scheme,network,amount,asset,payTo,maxTimeoutSeconds,extra}`
+(+ KIP-10 accessors: binding/templateId/borrowOutpoint/borrowAmount/
+additiveThreshold/paymentOutputIndex/reservationId/borrowRedeemScript),
+`Resource`, `Outpoint`, `ExactPayload{type:exact-transaction,transaction,
+transactionEncoding,paymentOutputIndex,payerAddress?,requestHash?}`,
+`PaymentPayload{x402Version,accepted,payload,extensions?}`,
+`FacilitatorRequest`, `AwaitRequest`(TODO), `VerifyResponse`,
+`SettlementResponse{success,transaction,network?,payer?,amount?,errorReason?,
+extensions.kaspa}`, `SupportedResponse{kinds[],extensions[],signers{}}`,
+`encode_header`/`decode_header` (base64 JSON) + PAYMENT-REQUIRED/SIGNATURE/
+RESPONSE names + `errors::*` closed enum.
+Schema-conformance tests (6) assert sample v2 messages satisfy the invariants
+extracted from the vendored `interop/schemas/*.json` (x402Version==2, asset
+const KAS, exact scheme extra dependentRequired borrow fields, payload.type
+== exact-transaction with transactionEncoding + no transactionId, settlement
+success requires network+amount+64hex-txid and forbids top-level extra,
+/supported extra+extensions+signers, header base64 round-trip, closed error
+enum).
+
+REMAINING B1 (next): migrate facilitator.rs verify/settle/await + server.rs +
+existing unit tests + E2E clients/harnesses onto `wire_v2` (route native/KCC20
+by a KOB binding under the v2 envelope; only KIP-10 exact claims strict
+interop). This is the mechanical "rewrite" step; kept separate from the type
+landing so the build stays green at each step.
 
 ## Build handoff log
 

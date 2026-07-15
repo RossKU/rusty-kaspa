@@ -1443,10 +1443,44 @@ hand-rolled `submit_match` body ~270 LOC, added the delegating `submit_match`
 hand-rolled same-pair build/fee/tamper-inline body, added the planner delegation
 + `apply_tamper` + F6 tests).
 
-### Build / on-chain — see Phase 11 checklist below
+### Build / test results
 
-- [ ] `cargo build --release -p kob-cli -p kob-engine` — pending (one combined
-      background build; heavy linking on this device).
-- [ ] `cargo test` for kob-core / kob-domain / kob-cli — pending.
+- [x] `cargo build --release -p kob-cli -p kob-engine` — **SUCCEEDED** (release
+      profile, ~3m44s; production binaries fine, no heavy-link blocker).
+- [x] `cargo test -p kob-core --lib` — **820 passed, 0 failed**.
+- [x] `cargo test -p kob-core --test toccata_fill_repro` — **4 passed, 0 failed**
+      (incl. the two new F6-cap on-chain proofs).
+- [x] `cargo test -p kob-domain --lib` — passed (green; unchanged by this phase).
+- [x] `cargo test -p kob-cli --lib` — **501 passed, 16 failed**. The 16 failures
+      are **all pre-existing** `*_v12_*` RS/sigscript-**size** asserts
+      (`estimate::tests::{buy,sell}_v12_*` ×8, `recover::*_v12_*` ×4,
+      `requote::*_v12_*` ×3, `matching::tests::fill_sigscripts_v12` ×1) that
+      hardcode pre-Toccata byte sizes (e.g. `BUY_RS_SIZE = 387`, now 396) and
+      have been red since the post-Toccata merge — they were never surfaced
+      because Phase 4 only ran kob-core + kob-domain. Verified pre-existing:
+      `git diff 6866c12 HEAD` touches none of `core/src/contract/`,
+      `estimate.rs`, `recover.rs`, or `requote.rs`, and base `6866c12` already
+      asserted `BUY_RS_SIZE = 387` against the (unchanged) builder that now
+      emits 396. They are orthogonal to the matcher consolidation (contract RS
+      byte layout, not matching logic) and are **left untouched** here —
+      blind-updating 16 size constants across 4 files would risk masking a real
+      layout regression. **Flagged for the owner as a separate post-Toccata
+      cleanup.** All consolidation-related tests are green:
+      `matching::tests::v16_match_matcher_surplus_is_capped_not_full_spread`,
+      `v16_match_within_cap_matcher_keeps_spread`, and
+      `auto_match::tests::detected_order_pair_builds_a_valid_plan` all pass.
 - [ ] Optional on-chain honest within-cap `kob-cli match` via the token fixture
-      — pending (TXID to be recorded here).
+      — not run this session (needs a funded reachable node); the F6-cap
+      behaviour is proven off-chain by `toccata_fill_repro` and on-chain by the
+      Phase-10 testnet-10 TXIDs above.
+
+### Two E0061/test-bug fixes made while landing Phase 11
+
+- `cli/src/batch.rs` (JSON-batch `match` op): its `matching::run` call still
+  used the pre-consolidation arg list. Threaded the three new args
+  (`DEFAULT_MAX_MATCHER_FEE`, `mmfee_bps=None`, `fee_bps=None` — batch matches
+  are v14, no on-chain F6).
+- `cli/src/auto_match.rs` test `detected_order_pair_builds_a_valid_plan`: built
+  both `BatchOrder`s from `make_test_order` (shared `a*64:0` outpoint), which
+  the planner correctly rejected as a `DuplicateOutpoint`. Gave the sell a
+  distinct outpoint.

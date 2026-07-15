@@ -1375,8 +1375,10 @@ pub async fn deploy_oco_sell(
     // Sell with covenant binding → TX version 1
     let mut tx = Transaction::new(1);
 
-    // Token UTXO as input[0] for covenant lineage
-    let mut token_input_value: u64 = 0;
+    // Token UTXO as input[0] for covenant lineage. Every path either
+    // assigns this before use or bails out early, so it needs no initial
+    // value (the previous `= 0` default was never actually read).
+    let token_input_value: u64;
     if let Some(token_op_str) = token_utxo_str {
         let token_op = Outpoint::parse(token_op_str)?;
         let found_utxo = rpc_utxos

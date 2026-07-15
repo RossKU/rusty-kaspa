@@ -1,7 +1,6 @@
 //! Atomic match transaction construction and continuous matching loop.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -5729,6 +5728,7 @@ pub async fn run_dry_run(
 mod tests {
     use super::*;
     use kob_core::RECEIPT_VALUE;
+    use std::time::Instant;
 
     #[test]
     fn spent_tracker_basic() {

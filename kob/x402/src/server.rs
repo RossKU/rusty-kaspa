@@ -74,7 +74,15 @@ async fn settle_handler<B: ChainBackend + 'static>(
     body: Bytes,
 ) -> Response {
     let resp = match read_request(&headers, &body) {
-        Ok(req) => fac.settle(&req).await,
+        // Run settle() on a detached task: if the client disconnects, axum
+        // drops this request future — which must NOT cancel an in-flight
+        // broadcast. The spawned task runs to completion regardless.
+        Ok(req) => {
+            let fac = fac.clone();
+            tokio::spawn(async move { fac.settle(&req).await })
+                .await
+                .unwrap_or_else(|_| SettlementResponse::failed(errors::UNEXPECTED_SETTLE_ERROR))
+        }
         Err(code) => SettlementResponse::failed(code),
     };
     let encoded = encode_header(&resp).ok();
@@ -95,7 +103,13 @@ async fn await_handler<B: ChainBackend + 'static>(
     State(fac): State<Arc<Facilitator<B>>>,
     Json(req): Json<AwaitRequest>,
 ) -> Json<SettlementResponse> {
-    Json(fac.await_payment(&req).await)
+    // Detached like settle: a client disconnect must not cancel an in-flight
+    // discovery/credit.
+    let fac = fac.clone();
+    let resp = tokio::spawn(async move { fac.await_payment(&req).await })
+        .await
+        .unwrap_or_else(|_| SettlementResponse::failed(errors::UNEXPECTED_SETTLE_ERROR));
+    Json(resp)
 }
 
 async fn supported_handler<B: ChainBackend + 'static>(

@@ -73,12 +73,17 @@ pub trait ChainBackend: Send + Sync {
 
 impl ChainBackend for RpcClient {
     fn get_address_utxos<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Vec<RpcUtxo>, String>> {
-        Box::pin(async move { self.get_utxos(address, None).await })
+        // Retrying variant: a transient RPC blip must not read as "input
+        // spent" and reject a valid payment.
+        Box::pin(async move { self.get_utxos_with_retry(address, None).await })
     }
 
     fn submit<'a>(&'a self, tx_json: serde_json::Value) -> BoxFuture<'a, Result<String, String>> {
+        // Retrying variant: transient submit failures are retried before the
+        // error is surfaced; a fatal rejection (non-transient) is returned as
+        // its real string so the facilitator can classify it.
         Box::pin(async move {
-            let res = self.submit_transaction(tx_json).await?;
+            let res = self.submit_transaction_with_retry(tx_json).await?;
             if res.ok {
                 res.tx_id.ok_or_else(|| "submit ok but no transactionId returned".to_string())
             } else {

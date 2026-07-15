@@ -328,13 +328,22 @@ pub const SELL_ORDER_BODY: &[u8] = &[
     0x56, 0x79, 0xc3,             // Op6 OpPick(koi) OpTxOutputSpk                   [3B]
     0xaa,                         // OpBlake2b                                       [1B]
     0x52, 0x79, 0x87, 0x69,       // Op2 OpPick(sspkh) OpEqual OpVerify              [4B]
-    // F4: token conservation full fill
-    0xb9, 0xcf, 0x76,             // OpTxInputIndex OpInputCovenantId OpDup          [3B]
-    0xd2, 0x51, 0xa2, 0x69,       // OpCovOutCount(T) Op1 OpGTE OpVerify             [4B]
-    0x00, 0xd3,                   // Op0 OpCovOutputIdx(T,0)                         [2B]
+    // F4: token conservation bound to THIS input's OWN authorized output, not
+    // the transaction-wide shared covenant-output-0. OpCovOutputIdx(T,0) returns
+    // output_indices[0] for token T across the WHOLE tx, so two sellers of the
+    // same token both checked one shared output and a matcher could satisfy both
+    // with a single token output while draining the other seller's tokens to KAS.
+    // OpAuthOutputIdx(thisInput,0) returns the 0th output THIS input authorized;
+    // each output has exactly one authorizing_input, so two sellers can never
+    // share one. (Length-neutral: new F4 is 14B == old F4 14B.)
+    0xb9, 0x00, 0xcc,             // OpTxInputIndex Op0 OpAuthOutputIdx -> my out idx [3B]
+    0x76,                         // OpDup                                           [1B]
+    0xd5,                         // OpOutputCovenantId(idx) -> covid                [1B]
+    0xb9, 0xcf,                   // OpTxInputIndex OpInputCovenantId -> T           [2B]
+    0x87, 0x69,                   // OpEqual OpVerify (out covid == my token)        [2B]
     0xc2,                         // OpTxOutputAmount(idx)                           [1B]
-    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount                  [2B]
-    0xa2, 0x69,                   // OpGTE OpVerify                                  [2B]
+    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> token_in      [2B]
+    0xa2, 0x69,                   // OpGTE OpVerify (my out >= token_in)             [2B]
 
     // F6 REMOVED: sell F6 was denomination-blind (token_in - kas_out[0])
     // which only passed at price 1/1.  Sell is protected by F4 (token

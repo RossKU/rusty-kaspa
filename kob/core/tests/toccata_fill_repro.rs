@@ -23,7 +23,7 @@ use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_core::contract::spot::order::{
     build_buy_v16_fill_sigscript, build_buy_v16_ioc_fill_sigscript, build_buy_v16_redeem_script,
-    build_sell_fill_sigscript_fixed_offset, build_sell_redeem_script,
+    build_sell_fill_sigscript, build_sell_fill_sigscript_fixed_offset, build_sell_redeem_script,
 };
 use kob_core::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::listing::{build_listing_redeem_script, build_listing_settle_sigscript};
@@ -299,6 +299,72 @@ fn v16_ioc_partial_delivery_within_cap_passes_f6() {
     assert!(
         res.is_ok(),
         "v16 IOC F6 must ACCEPT a partial delivery within the widened cap (surplus 22M <= 24M); got {res:?}"
+    );
+}
+
+/// **Fix 3 (sell F4 per-input binding): the shared-output drain now FAILS,
+/// honest delivery still passes.**
+///
+/// Two sellers (A, B) of the SAME token in one batch. Before the fix each
+/// checked the transaction-wide shared covenant-output-0, so a matcher could
+/// deliver ONE token output (satisfying both) and drain the second seller's
+/// tokens out as KAS. F4 now checks the 0th output THIS input authorized; each
+/// output has exactly one authorizing_input. The matcher makes only output[2]
+/// (authorized by seller A) hold tokens; seller B authorizes no output.
+///
+/// Runs both sell scripts: A (input 0, has its authorized token output) must
+/// PASS; B (input 1, whose tokens were drained to KAS) must FAIL.
+#[test]
+fn sell_f4_shared_output_drain_rejected_honest_passes() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+
+    // Both sellers price 1/1; A has 30M tokens, B has 20M.
+    let sell_rs = build_sell_redeem_script(1, 1, 8_000_000, &owner_hash, &spk_hash, 10_000_000, 0, 0).unwrap();
+    let sell_p2sh = build_p2sh(&sell_rs);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    // A pays KAS at output[0]; B pays KAS at output[1]; the single token output
+    // is output[2], authorized by input 0 (seller A) ONLY.
+    let ss_a = build_sell_fill_sigscript(0, &sell_rs);
+    let ss_b = build_sell_fill_sigscript(1, &sell_rs);
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), ss_a, 50, 0),           // seller A (token 30M)
+        TransactionInput::new(op(0x11, 0), ss_b, 50, 0),           // seller B (token 20M)
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1),  // buyer/fee placeholder
+    ];
+    let outputs = vec![
+        TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), None),                                   // A's KAS
+        TransactionOutput::with_covenant(20_000_000, wallet_spk.clone(), None),                                   // B's KAS
+        TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), Some(CovenantBinding::new(0, token_cov_id))), // tokens, auth by A only
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+    let entries = vec![
+        UtxoEntry { amount: 30_000_000, script_public_key: sell_p2sh.clone(), block_daa_score: 0, is_coinbase: false, covenant_id: Some(token_cov_id) },
+        UtxoEntry { amount: 20_000_000, script_public_key: sell_p2sh, block_daa_score: 0, is_coinbase: false, covenant_id: Some(token_cov_id) },
+        UtxoEntry { amount: 260_000_000, script_public_key: wallet_spk, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+    ];
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).expect("CovenantsContext::from_tx");
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+
+    let run = |idx: usize| {
+        let reused = SigHashReusedValuesUnsync::new();
+        let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+        let (input, entry) = populated.populated_input(idx);
+        let mut vm = TxScriptEngine::from_transaction_input(&populated, input, idx, entry, ctx, flags);
+        vm.execute().map_err(|e| format!("{e:?}"))
+    };
+
+    assert!(run(0).is_ok(), "seller A (has its own authorized token output) must PASS; got {:?}", run(0));
+    assert!(
+        run(1).is_err(),
+        "seller B MUST FAIL: its tokens were drained to KAS with no output authorized by input 1, \
+         but F4 is still accepting the shared covenant-output-0"
     );
 }
 

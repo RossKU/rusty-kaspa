@@ -1,8 +1,9 @@
-# KOB Covenant Security Fixes — Phase 1 (release hardening)
+# KOB Security Fixes — release hardening (Phases 1-3)
 
-Phase 1 of the 5-phase release-hardening sequence: fix the covenant
-fund-theft holes found in the adversarial audit of the spot ORDER/TOKEN
-covenants. Read-only audit findings are in the audit report; this file tracks
+5-phase release-hardening sequence. Phase 1: covenant fund-theft holes found
+in the adversarial audit of the spot ORDER/TOKEN covenants. Phase 2: x402
+facilitator hardening. Phase 3: a DoS byte-slice panic class in RPC/JSON
+parsing. Read-only audit findings are in the audit report; this file tracks
 what was actually changed.
 
 Verification: off-chain against the real post-Toccata `kaspa-txscript`
@@ -196,3 +197,145 @@ never share one output.
   counterparty price, with the state-layout bump (224→232, RS 365→373, sigLen
   dispatch, parse, pin) and an engine harness. Treat as a bracket-hardening
   project, not a covenant one-liner.
+
+---
+
+# Phase 2 — x402 facilitator hardening
+
+`kob/x402/src/facilitator.rs` (+ `scheme_exact.rs`). Fixes 1 and 3 (exact
+verifies against the stored reservation; requestHash threaded) landed first
+(commits `66e0ef0`, `7e81003`). This section covers Fix 2 and Fix 4.
+
+Verification: off-chain, `cargo test -p kob-x402 --lib` = 59 passed (0
+failed) — up from 54 (Fix 3) + the Fix-4 alignment test. `wire_v2` schema
+conformance (6 tests) untouched and still green. `cargo test -p kob-settle
+--lib` = 216 passed, unaffected by this phase's edits.
+
+### Fix 2 — cross-resource replay: a settled artifact was replayable against a different request
+- **File**: `kob/x402/src/facilitator.rs` (+ `scheme_exact.rs` call site).
+- **What**: the facilitator's internal `Validated` carried no per-request
+  binding. On a `DuplicateTxid` replay-store hit (the SAME signed artifact
+  presented again), `/settle` returned the cached success unconditionally —
+  it never checked that this SECOND presentation was still authorizing the
+  SAME request/resource the artifact was originally settled for. Two
+  compounding gaps made this reachable:
+  1. Request-binding (`extra.fingerprint` for native/KCC20, `requestHash` for
+     exact/KIP-10) was OPTIONAL. A merchant/reservation that never set one
+     produced artifacts with no per-request scope at all.
+  2. For exact/KIP-10, `requestHash` lives in the wire payload, not in the
+     hashed transaction bytes (`artifact_id = blake2b256(compact_json(tx))`),
+     so it was never pinned to a specific artifact in the first place —
+     unlike native/KCC20, where the fingerprint is embedded IN the tx payload
+     and therefore baked into `artifact_id` once mandatory (see below).
+- **Fix**:
+  - Added `Validated.binding_fingerprint: String` (mandatory, non-`Option`),
+    set per scheme: `extra.fingerprint` for native/KCC20, the reservation's
+    bound `request_hash` for exact/KIP-10.
+  - Request-binding is now MANDATORY for all three schemes: `validate()`
+    rejects (`invalid_payload`) a native/KCC20 request with no
+    `extra.fingerprint`, and an exact/KIP-10 reservation with no bound
+    `request_hash`, before ever reaching scheme verification.
+  - New helper `duplicate_binding_matches(store, artifact_id,
+    binding_fingerprint)`: on a `DuplicateTxid` hit, the stored
+    `PaymentRecord.fingerprint` must equal THIS request's
+    `binding_fingerprint`, or the call is refused
+    (`invalid_transaction_state`) — applied in both `/verify` and `/settle`
+    (including the not-yet-broadcast retry sub-case, so a mismatch can't
+    silently overwrite the original record's binding either).
+  - `settle()`'s replay-store record now always stores
+    `binding_fingerprint` (previously `req.payment_requirements.fingerprint()`,
+    which is always `None` for exact — so exact-scheme settlements
+    previously recorded NO binding at all).
+- **Tests**: `rejects_missing_fingerprint_binding` /
+  `kcc20_rejects_missing_fingerprint_binding` /
+  `exact_kip10_rejects_reservation_with_no_bound_request_hash` (mandatory
+  binding enforced per scheme); `settle_refuses_duplicate_artifact_bound_to_a_different_request`
+  — settles an artifact, then tampers the stored replay record's fingerprint
+  to simulate it having been bound to a different request, and proves a
+  re-presentation of the SAME artifact (still bound to the original request)
+  is now refused at both `/verify` and `/settle`, with no re-broadcast.
+- **Residual (honest)**: for native/KCC20, once the fingerprint is mandatory
+  and scheme-checked against the embedded tx payload, the `DuplicateTxid`
+  binding mismatch can no longer occur through the ordinary validate() path
+  (the embedded value is fixed once signed, so any request that re-validates
+  the identical artifact must supply the same fingerprint) — the check is
+  defense-in-depth there. For exact/KIP-10 it is load-bearing, since
+  `requestHash` is NOT part of the hashed artifact. `kob-x402`'s live E2E
+  client (`x402_client.rs`) currently omits `requestHash`/`fingerprint` for
+  its KCC20 mode and for some exact-scheme reservations — a live re-run of
+  `e2e_x402_kcc20.sh` / `e2e_x402_exact.sh` would now fail at the mandatory
+  check until the client is updated to always supply one. Not done here
+  (off-chain unit tests only, per scope); flagged for the live-E2E follow-up.
+  Separately (found, not in scope to fix): `ReservationProvider::mark_consumed`
+  is never called from `facilitator.rs`, so `BorrowTerms.consumed` never
+  flips — reservations rely entirely on the on-chain spent-outpoint check and
+  the replay store for reuse protection, not the `consumed` flag.
+
+### Fix 4 — reject-code mapping was inconsistent across schemes (and used wildcard arms)
+- **File**: `kob/x402/src/facilitator.rs` (`native_reject_code`,
+  `kcc20_reject_code`, `exact_reject_code`).
+- **What**: the three `*_reject_code` functions mapped the same logical
+  failure (a missing/mismatched request binding) to different wire codes —
+  exact used `invalid_transaction_state`, native/KCC20 fell through a
+  wildcard `_ =>` arm to `invalid_payload`. The wildcard arms also meant a
+  new reject variant would silently get miscategorized instead of failing to
+  compile.
+- **Fix**: aligned all three to ONE mapping table (documented in-code):
+  payment doesn't satisfy the offer -> `invalid_payment_requirements`;
+  request binding missing/mismatched -> `invalid_payload`; spent/stale
+  on-chain outpoint -> `invalid_transaction_state`; otherwise malformed ->
+  `invalid_payload`. All wildcard `_ =>` arms replaced with exhaustive
+  explicit arms (compiler-enforced: a new reject variant now fails to build
+  until it's classified).
+- **Test**: `reject_codes_align_request_binding_across_schemes` — the same
+  logical failure (`FingerprintMismatch`/`FingerprintMissing` per scheme)
+  maps to the identical wire code across all three `*_reject_code` functions.
+
+---
+
+# Phase 3 — DoS: byte-slice panic on malformed scriptPublicKey (4+1 sites)
+
+One panic class, reachable from untrusted client JSON and node RPC data:
+`flat.len() >= 4` measures BYTE length, but `&flat[..4]` / `&flat[4..]` slice
+Rust `str`s at a BYTE index. Rust panics if that index doesn't land on a
+UTF-8 char boundary — which a multibyte character straddling offset 4 can
+trigger even when the byte-length guard passes. A single malformed
+`scriptPublicKey` string (e.g. from a hostile/buggy node response, or
+attacker-controlled JSON reaching these parsers) crashes the process.
+
+- **Files fixed** (the 4 flagged sites, plus a 5th identical-pattern
+  occurrence found in the same sweep):
+  1. `kob/settle/src/observe/mod.rs` (`ObservedOutput::from_rpc_json`)
+  2. `kob/settle/src/rpc_types.rs` (`RpcSpk`'s `visit_str` deserializer)
+  3. `kob/settle/src/rpc_types.rs` (`parse_rest_spk`, same pattern, not
+     originally flagged — fixed in the same pass since the shared helper
+     lives in this file)
+  4. `kob/settle/src/rpc/rest_client.rs` (`translate_wrpc_tx_to_rest`)
+  5. `kob/engine/src/chain/scanner.rs` (`TransactionData::from_rpc_json`)
+- **Fix**: added a shared helper, `kob_settle::rpc_types::split_flat_spk_hex(s:
+  &str) -> Option<(&str, &str)>` — `Some((s.get(..4)?, s.get(4..)?))`.
+  `str::get` is the checked, non-panicking equivalent of indexing: it returns
+  `None` on an out-of-bounds OR non-boundary index, so it can never panic
+  regardless of input. All 5 sites now go through it; `None` falls back to
+  the SAME degrade path each site already had for an under-length string
+  (version 0, whole string treated as script hex) instead of panicking.
+  `kob/engine/src/chain/scanner.rs` (a different crate) calls it via the
+  existing `kob_core::rpc_types` re-export, no new dependency.
+- **Tests**: one regression test per site (`split_flat_spk_hex` itself, the
+  `RpcSpk` deserializer, `parse_rest_spk`, `translate_wrpc_tx_to_rest`,
+  `ObservedOutput::from_rpc_json`, and `TransactionData::from_rpc_json`),
+  each feeding a string with a multibyte UTF-8 character (`'\u{20AC}'`, 3
+  bytes) straddling byte offset 4 — the exact shape that previously panicked
+  — and asserting a clean `None`/`Err`/graceful-degrade result instead.
+- **Verified**: `cargo test -p kob-settle --lib` = 216 passed (0 failed),
+  covers sites 1-4. `cargo check -p kob-engine` (non-test) is clean for site
+  5's actual fix. `cargo test -p kob-engine --lib`/`--tests` currently fails
+  to even COMPILE for reasons unrelated to this fix or to `scanner.rs`: the
+  legacy inline test module in `kob/engine/src/chain/executor.rs` calls a
+  `SpentTracker::prune_spent_by_age` method that no longer exists post-Phase-1
+  extraction (the real method is `prune_spent`) and a `prune_spent_with_probe`
+  that is `pub(crate)` in `kob-settle` (not visible from `kob-engine`).
+  Confirmed pre-existing via `git stash` on a clean checkout — present before
+  any Phase 2/3 edit in this pass, unrelated to `scanner.rs`. Out of scope
+  here; flagged as a residual (kob-engine's lib test suite cannot currently
+  run at all until that's fixed).

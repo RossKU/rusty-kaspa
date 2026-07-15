@@ -18,8 +18,9 @@ use kob_settle::rpc::{ConfirmConfig, RpcClient, RpcUtxo};
 use crate::scheme_kcc20;
 use crate::scheme_native;
 use crate::fingerprint;
-use crate::wire::{
-    ASSET_NATIVE_KAS, AwaitRequest, FacilitatorRequest, SCHEME_EXACT, SettleResponse, VerifyResponse,
+use crate::wire_v2::{
+    errors, AwaitRequest, FacilitatorRequest, KaspaSettleExt, SettlementResponse, VerifyResponse,
+    BINDING_KCC20, BINDING_NATIVE, SCHEME_EXACT, X402_VERSION,
 };
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -162,6 +163,24 @@ struct Validated {
     amount: u64,
 }
 
+/// Map a native-scheme reject to a closed wire error code.
+fn native_reject_code(r: scheme_native::NativeReject) -> &'static str {
+    use scheme_native::NativeReject::*;
+    match r {
+        WrongRecipient | Underpayment { .. } => errors::INVALID_PAYMENT_REQUIREMENTS,
+        _ => errors::INVALID_PAYLOAD,
+    }
+}
+
+/// Map a KCC20-scheme reject to a closed wire error code.
+fn kcc20_reject_code(r: scheme_kcc20::Kcc20Reject) -> &'static str {
+    use scheme_kcc20::Kcc20Reject::*;
+    match r {
+        WrongRecipient | Underpayment { .. } => errors::INVALID_PAYMENT_REQUIREMENTS,
+        _ => errors::INVALID_PAYLOAD,
+    }
+}
+
 impl<B: ChainBackend> Facilitator<B> {
     pub fn new(backend: B, replay: ReplayStore, config: FacilitatorConfig) -> Self {
         Facilitator { backend, replay: Mutex::new(replay), config }
@@ -174,43 +193,31 @@ impl<B: ChainBackend> Facilitator<B> {
 
     /// Shared envelope/scheme/network validation + pure scheme verification +
     /// on-chain input-existence check. Does NOT touch the replay store.
-    async fn validate(&self, req: &FacilitatorRequest) -> Result<Validated, String> {
+    async fn validate(&self, req: &FacilitatorRequest) -> Result<Validated, &'static str> {
         let pp = &req.payment_payload;
         let requirements = &req.payment_requirements;
 
-        if pp.scheme != SCHEME_EXACT || requirements.scheme != SCHEME_EXACT {
-            return Err(format!("unsupported scheme (only '{}')", SCHEME_EXACT));
+        if req.x402_version != X402_VERSION || pp.x402_version != X402_VERSION {
+            return Err(errors::INVALID_X402_VERSION);
         }
-        if pp.network != self.config.network || requirements.network != self.config.network {
-            return Err(format!(
-                "network mismatch: facilitator settles '{}'",
-                self.config.network
-            ));
+        if requirements.scheme != SCHEME_EXACT {
+            return Err(errors::INVALID_SCHEME);
+        }
+        if requirements.network != self.config.network {
+            return Err(errors::INVALID_NETWORK);
         }
 
-        // Common payload fields.
-        let from = pp
-            .payload
-            .get("from")
-            .and_then(|v| v.as_str())
-            .ok_or("payload missing 'from'")?
-            .to_string();
-        let payload_pay_to = pp
-            .payload
-            .get("payTo")
-            .and_then(|v| v.as_str())
-            .ok_or("payload missing 'payTo'")?;
-        if payload_pay_to != requirements.pay_to {
-            return Err("payload payTo does not match requirements payTo".to_string());
-        }
-        let transaction = pp
-            .payload
-            .get("transaction")
-            .ok_or("payload missing 'transaction'")?
-            .clone();
+        // Common payload fields (v2 envelope: payerAddress + transaction).
+        let from = pp.payer_address().ok_or(errors::INVALID_PAYLOAD)?.to_string();
+        let transaction = pp.transaction().ok_or(errors::INVALID_PAYLOAD)?.clone();
 
-        // Route by asset: native-KAS (scheme A) vs KCC20 token_unit (scheme B).
-        let is_native = requirements.asset.is_empty() || requirements.asset == ASSET_NATIVE_KAS;
+        // Route by extra.binding under the v2 envelope.
+        let binding = requirements.binding().unwrap_or_default();
+        let is_native = binding == BINDING_NATIVE;
+        if binding != BINDING_NATIVE && binding != BINDING_KCC20 {
+            // KIP-10 exact (kaspa-exact-v1) is implemented in scheme_exact (B2).
+            return Err(errors::UNSUPPORTED_SCHEME);
+        }
 
         // `owner_addresses`: the address(es) whose unspent UTXO sets must cover
         // every spent input. `require_covenant`: for KCC20, at least one spent
@@ -218,7 +225,7 @@ impl<B: ChainBackend> Facilitator<B> {
         let (validated, owner_addresses, require_covenant): (Validated, Vec<String>, Option<String>) =
             if is_native {
                 let v = scheme_native::verify_native_exact(&transaction, &from, requirements)
-                    .map_err(|r| r.to_string())?;
+                    .map_err(native_reject_code)?;
                 let owners = vec![from.clone()];
                 (
                     Validated {
@@ -230,14 +237,14 @@ impl<B: ChainBackend> Facilitator<B> {
                         pay_to: requirements.pay_to.clone(),
                         // Native: the payment output is a P2PK output to pay_to.
                         confirm_address: requirements.pay_to.clone(),
-                        amount: requirements.max_amount_sompi()?,
+                        amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
                     },
                     owners,
                     None,
                 )
             } else {
                 let v = scheme_kcc20::verify_kcc20_exact(&transaction, &from, requirements)
-                    .map_err(|r| r.to_string())?;
+                    .map_err(kcc20_reject_code)?;
                 // Inputs may include the token covenant UTXO (at the payer's
                 // token_unit P2SH address) AND a KAS fee UTXO (at the payer's
                 // P2PK address) — union both.
@@ -255,7 +262,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         // KCC20: the payment output lives at the recipient's
                         // token_unit P2SH address, not their P2PK identity.
                         confirm_address,
-                        amount: requirements.max_amount_sompi()?,
+                        amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
                     },
                     owners,
                     Some(asset),
@@ -275,7 +282,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 .backend
                 .get_address_utxos(owner)
                 .await
-                .map_err(|e| format!("could not fetch UTXOs for {}: {}", owner, e))?;
+                .map_err(|_| errors::UNEXPECTED_SETTLE_ERROR)?;
             for u in &utxos {
                 let key = u.outpoint_key();
                 if let Some(req_cov) = &require_covenant {
@@ -290,14 +297,11 @@ impl<B: ChainBackend> Facilitator<B> {
         }
         for op in &validated.input_outpoints {
             if !unspent.contains(op) {
-                return Err(format!("input {} is not an unspent UTXO of the payer", op));
+                return Err(errors::INVALID_TRANSACTION_STATE);
             }
         }
         if !covenant_seen {
-            return Err(format!(
-                "no spent input carries the required token covenant {}",
-                require_covenant.unwrap_or_default()
-            ));
+            return Err(errors::INVALID_TRANSACTION_STATE);
         }
 
         Ok(validated)
@@ -314,11 +318,8 @@ impl<B: ChainBackend> Facilitator<B> {
         // invalid; the same artifact again is fine (idempotent).
         let store = self.replay.lock().await;
         match store.check_replay(&validated.artifact_id, &validated.input_outpoints) {
-            ReplayCheck::OutpointReused { outpoint, existing_txid } => {
-                return VerifyResponse::invalid(format!(
-                    "input {} already consumed by payment {}",
-                    outpoint, existing_txid
-                ));
+            ReplayCheck::OutpointReused { .. } => {
+                return VerifyResponse::invalid(errors::INVALID_TRANSACTION_STATE);
             }
             ReplayCheck::Fresh | ReplayCheck::DuplicateTxid(_) => {}
         }
@@ -330,25 +331,23 @@ impl<B: ChainBackend> Facilitator<B> {
     ///
     /// Idempotent: a retry of an already-settled artifact returns the
     /// previously-recorded on-chain txid instead of re-broadcasting.
-    pub async fn settle(&self, req: &FacilitatorRequest) -> SettleResponse {
+    pub async fn settle(&self, req: &FacilitatorRequest) -> SettlementResponse {
         let net = self.config.network.clone();
         let validated = match self.validate(req).await {
             Ok(v) => v,
-            Err(e) => return SettleResponse::failed(net, e),
+            Err(e) => return SettlementResponse::failed(e),
         };
         let Validated {
             artifact_id, payer, pay_output_index, input_outpoints, tx, pay_to, confirm_address, amount,
         } = validated;
+        let request_hash = req.payment_payload.request_hash().map(|s| s.to_string());
 
         // Replay / idempotency decision under the store lock.
         {
             let mut store = self.replay.lock().await;
             match store.check_replay(&artifact_id, &input_outpoints) {
-                ReplayCheck::OutpointReused { outpoint, existing_txid } => {
-                    return SettleResponse::failed(
-                        net,
-                        format!("input {} already consumed by payment {}", outpoint, existing_txid),
-                    );
+                ReplayCheck::OutpointReused { .. } => {
+                    return SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE);
                 }
                 ReplayCheck::DuplicateTxid(_) => {
                     // Same artifact seen before. If it already has an on-chain
@@ -358,13 +357,10 @@ impl<B: ChainBackend> Facilitator<B> {
                         if let Some(chain_txid) = rec.chain_txid.clone() {
                             drop(store);
                             return self
-                                .finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, Some(payer))
+                                .finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash)
                                 .await;
                         }
                     }
-                    // No on-chain txid recorded (prior attempt crashed before
-                    // broadcast completed) — fall through and (re-)broadcast;
-                    // the node dedupes by txid.
                 }
                 ReplayCheck::Fresh => {}
             }
@@ -377,8 +373,8 @@ impl<B: ChainBackend> Facilitator<B> {
                 Some(fp) => record.with_fingerprint(fp),
                 None => record,
             };
-            if let Err(e) = store.record(record) {
-                return SettleResponse::failed(net, format!("failed to persist payment record: {}", e));
+            if store.record(record).is_err() {
+                return SettlementResponse::failed(errors::UNEXPECTED_SETTLE_ERROR);
             }
         }
 
@@ -386,10 +382,10 @@ impl<B: ChainBackend> Facilitator<B> {
         let envelope = serde_json::json!({ "transaction": tx, "allowOrphan": false });
         let chain_txid = match self.backend.submit(envelope).await {
             Ok(txid) => txid,
-            Err(e) => {
+            Err(_) => {
                 let mut store = self.replay.lock().await;
                 let _ = store.mark_failed(&artifact_id);
-                return SettleResponse::failed(net, format!("broadcast failed: {}", e));
+                return SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE);
             }
         };
 
@@ -403,7 +399,7 @@ impl<B: ChainBackend> Facilitator<B> {
             let _ = store.record(base.with_chain_txid(chain_txid.clone()));
         }
 
-        self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, Some(payer)).await
+        self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash).await
     }
 
     /// `/await` (PULL mode): the client broadcasts the payment ITSELF; the
@@ -419,30 +415,31 @@ impl<B: ChainBackend> Facilitator<B> {
     /// - timeout: nothing matching appears -> not authorized.
     /// - replay/double-credit: a payment already credited is not credited
     ///   again (deduped by its payTo-output outpoint in the replay store).
-    pub async fn await_payment(&self, req: &AwaitRequest) -> SettleResponse {
+    pub async fn await_payment(&self, req: &AwaitRequest) -> SettlementResponse {
         let net = self.config.network.clone();
         let requirements = &req.payment_requirements;
 
         if requirements.scheme != SCHEME_EXACT {
-            return SettleResponse::failed(net, format!("unsupported scheme (only '{}')", SCHEME_EXACT));
+            return SettlementResponse::failed(errors::INVALID_SCHEME);
         }
         if requirements.network != self.config.network {
-            return SettleResponse::failed(net, format!("network mismatch: facilitator settles '{}'", self.config.network));
+            return SettlementResponse::failed(errors::INVALID_NETWORK);
         }
-        if !requirements.asset.is_empty() && requirements.asset != ASSET_NATIVE_KAS {
-            return SettleResponse::failed(net, "pull mode currently supports native-KAS only".to_string());
+        if requirements.binding().unwrap_or_default() != BINDING_NATIVE {
+            // Pull discovery is implemented for the KOB-native binding only.
+            return SettlementResponse::failed(errors::UNSUPPORTED_SCHEME);
         }
-        let required = match requirements.max_amount_sompi() {
+        let required = match requirements.amount_sompi() {
             Ok(r) => r,
-            Err(e) => return SettleResponse::failed(net, e),
+            Err(_) => return SettlementResponse::failed(errors::INVALID_PAYMENT_REQUIREMENTS),
         };
         let pay_to = requirements.pay_to.clone();
         let expected_fp = requirements.fingerprint().map(|s| s.to_string());
         let timeout_secs = if requirements.max_timeout_seconds == 0 { 30 } else { requirements.max_timeout_seconds };
 
         let mut observer = PaymentObserver::new();
-        if let Err(e) = observer.watch(&pay_to) {
-            return SettleResponse::failed(net, format!("bad payTo address: {}", e));
+        if observer.watch(&pay_to).is_err() {
+            return SettlementResponse::failed(errors::INVALID_PAYMENT_REQUIREMENTS);
         }
 
         let deadline = std::time::Instant::now() + Duration::from_secs(timeout_secs);
@@ -493,11 +490,9 @@ impl<B: ChainBackend> Facilitator<B> {
                 }
 
                 // Amount check. (Only reached for our request's payment.)
+                let _ = timeout_secs;
                 if ev.value < required {
-                    return SettleResponse::failed(net, format!(
-                        "underpayment discovered at {}: paid {} < required {} (txid {})",
-                        pay_to, ev.value, required, ev.txid
-                    ));
+                    return SettlementResponse::failed(errors::INVALID_PAYMENT_REQUIREMENTS);
                 }
 
                 // Discovered + confirmed (present in the UTXO set) +
@@ -513,7 +508,13 @@ impl<B: ChainBackend> Facilitator<B> {
                     let _ = store.record(record);
                     let _ = store.mark_confirmed(&ev.txid);
                 }
-                return SettleResponse::ok(net, ev.txid.clone(), None);
+                let ext = KaspaSettleExt {
+                    payment_output_index: Some(ev.output_index),
+                    finality: Some("accepted".to_string()),
+                    request_hash: None,
+                    ..Default::default()
+                };
+                return SettlementResponse::ok(&net, &ev.txid, ev.value, None, ext);
             }
 
             if std::time::Instant::now() >= deadline {
@@ -522,14 +523,13 @@ impl<B: ChainBackend> Facilitator<B> {
             tokio::time::sleep(Duration::from_millis(700)).await;
         }
 
-        if saw_already_credited {
-            SettleResponse::failed(net, "matching payment already credited (not double-crediting)".to_string())
-        } else {
-            SettleResponse::failed(net, format!("no matching payment discovered at {} within {}s", pay_to, timeout_secs))
-        }
+        // No matching payment (or only an already-credited one) within timeout.
+        let _ = saw_already_credited;
+        SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE)
     }
 
     /// Confirm finality for a broadcast payment and record the outcome.
+    #[allow(clippy::too_many_arguments)]
     async fn finalize(
         &self,
         net: String,
@@ -537,8 +537,10 @@ impl<B: ChainBackend> Facilitator<B> {
         chain_txid: &str,
         pay_output_index: u32,
         confirm_address: &str,
+        amount: u64,
         payer: Option<String>,
-    ) -> SettleResponse {
+        request_hash: Option<String>,
+    ) -> SettlementResponse {
         let confirmed = self
             .backend
             .confirm(chain_txid, pay_output_index, confirm_address, Some(self.config.confirm.clone()))
@@ -547,15 +549,19 @@ impl<B: ChainBackend> Facilitator<B> {
         let mut store = self.replay.lock().await;
         if confirmed {
             let _ = store.mark_confirmed(artifact_id);
-            SettleResponse::ok(net, chain_txid.to_string(), payer)
+            let ext = KaspaSettleExt {
+                payment_output_index: Some(pay_output_index),
+                finality: Some("accepted".to_string()),
+                request_hash,
+                ..Default::default()
+            };
+            SettlementResponse::ok(&net, chain_txid, amount, payer, ext)
         } else {
             // Broadcast accepted but not yet observed on-chain. Leave the
             // record as Submitted (with its chain_txid) so an idempotent
             // retry can re-confirm and flip to success.
-            SettleResponse::failed(
-                net,
-                format!("broadcast accepted ({}) but not confirmed within timeout", chain_txid),
-            )
+            let _ = net;
+            SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE)
         }
     }
 }
@@ -570,9 +576,7 @@ mod tests {
     use kob_settle::rpc_types::{RpcSpk, RpcUtxoEntry};
 
     // `fingerprint` comes from `super::*` (the parent module imports it).
-    use crate::wire::{
-        NativeExactPayload, PaymentPayload, PaymentRequirements, NETWORK_TESTNET10, X402_VERSION,
-    };
+    use crate::wire_v2::{PaymentPayload, PaymentRequirements, ASSET_KAS, NETWORK_TESTNET10};
 
     fn addr(seed: u8) -> String {
         kob_settle::wallet::pubkey_to_address(&[seed; 32], kob_settle::types::Network::Testnet)
@@ -714,20 +718,18 @@ mod tests {
     }
 
     fn requirements(pay_to: &str, amount: u64, fp: Option<&str>) -> PaymentRequirements {
+        let mut extra = serde_json::json!({ "binding": BINDING_NATIVE });
+        if let Some(f) = fp {
+            extra["fingerprint"] = serde_json::json!(f);
+        }
         PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: NETWORK_TESTNET10.to_string(),
-            max_amount_required: amount.to_string(),
-            resource: "https://ex/r".to_string(),
-            description: String::new(),
-            mime_type: String::new(),
+            amount: amount.to_string(),
+            asset: ASSET_KAS.to_string(),
             pay_to: pay_to.to_string(),
             max_timeout_seconds: 60,
-            asset: ASSET_NATIVE_KAS.to_string(),
-            extra: match fp {
-                Some(f) => serde_json::json!({ "fingerprint": f }),
-                None => serde_json::Value::Null,
-            },
+            extra,
         }
     }
 
@@ -762,21 +764,20 @@ mod tests {
             "subnetworkId": "0000000000000000000000000000000000000000",
             "payload": payload_hex,
         });
+        let req = requirements(pay_to, req_amount, fp);
         FacilitatorRequest {
             x402_version: X402_VERSION,
             payment_payload: PaymentPayload {
                 x402_version: X402_VERSION,
-                scheme: SCHEME_EXACT.to_string(),
-                network: NETWORK_TESTNET10.to_string(),
-                payload: serde_json::to_value(NativeExactPayload {
-                    transaction: tx,
-                    from: from.to_string(),
-                    pay_to: pay_to.to_string(),
-                    amount: amount.to_string(),
-                })
-                .unwrap(),
+                accepted: req.clone(),
+                payload: serde_json::json!({
+                    "type": "kob-native-transfer",
+                    "payerAddress": from,
+                    "transaction": tx,
+                }),
+                extensions: None,
             },
-            payment_requirements: requirements(pay_to, req_amount, fp),
+            payment_requirements: req,
         }
     }
 
@@ -795,7 +796,7 @@ mod tests {
 
         let s = fac.settle(&req).await;
         assert!(s.success, "settle: {:?}", s.error_reason);
-        assert!(s.transaction.is_some());
+        assert!(!s.transaction.is_empty());
         assert_eq!(fac.backend.submit_count(), 1);
     }
 
@@ -827,9 +828,6 @@ mod tests {
         // Pays `wrong`, requirements demand `pay_to`.
         let mut req = request(&from, &wrong, 100_000_000, &in_txid, 0, None, 100_000_000);
         req.payment_requirements = requirements(&pay_to, 100_000_000, None);
-        // Keep payload.payTo consistent with requirements so we exercise the
-        // recipient-in-tx check, not the payTo-consistency check.
-        req.payment_payload.payload["payTo"] = serde_json::json!(pay_to);
 
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
@@ -850,7 +848,7 @@ mod tests {
 
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
-        assert!(v.invalid_reason.unwrap().contains("unspent UTXO"));
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_TRANSACTION_STATE));
         assert_eq!(fac.backend.submit_count(), 0);
     }
 
@@ -917,7 +915,7 @@ mod tests {
         let fac2 = Facilitator::new(chain2, store2, config());
         let s2 = fac2.settle(&req).await;
         assert!(s2.success, "retry should confirm: {:?}", s2.error_reason);
-        assert!(s2.transaction.is_some());
+        assert!(!s2.transaction.is_empty());
         assert_eq!(fac2.backend.submit_count(), 0, "recovery must not re-broadcast");
         std::fs::remove_file(&path).ok();
     }
@@ -965,32 +963,28 @@ mod tests {
             "subnetworkId": "0000000000000000000000000000000000000000",
             "payload": "",
         });
+        let requirements = PaymentRequirements {
+            scheme: SCHEME_EXACT.to_string(),
+            network: NETWORK_TESTNET10.to_string(),
+            amount: req_amount.to_string(),
+            asset: ASSET_KAS.to_string(),
+            pay_to: recipient_addr,
+            max_timeout_seconds: 60,
+            extra: serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset }),
+        };
         let req = FacilitatorRequest {
             x402_version: X402_VERSION,
             payment_payload: PaymentPayload {
                 x402_version: X402_VERSION,
-                scheme: SCHEME_EXACT.to_string(),
-                network: NETWORK_TESTNET10.to_string(),
+                accepted: requirements.clone(),
                 payload: serde_json::json!({
+                    "type": "kob-kcc20-transfer",
+                    "payerAddress": payer_addr.clone(),
                     "transaction": tx,
-                    "from": payer_addr,
-                    "payTo": recipient_addr,
-                    "asset": asset,
-                    "amount": amount.to_string(),
                 }),
+                extensions: None,
             },
-            payment_requirements: PaymentRequirements {
-                scheme: SCHEME_EXACT.to_string(),
-                network: NETWORK_TESTNET10.to_string(),
-                max_amount_required: req_amount.to_string(),
-                resource: "https://ex/token".to_string(),
-                description: String::new(),
-                mime_type: String::new(),
-                pay_to: recipient_addr,
-                max_timeout_seconds: 60,
-                asset: asset.to_string(),
-                extra: serde_json::Value::Null,
-            },
+            payment_requirements: requirements,
         };
         (req, payer_addr)
     }
@@ -1021,7 +1015,7 @@ mod tests {
 
         let s = fac.settle(&req).await;
         assert!(s.success, "kcc20 settle: {:?}", s.error_reason);
-        assert!(s.transaction.is_some());
+        assert!(!s.transaction.is_empty());
         assert_eq!(fac.backend.submit_count(), 1);
     }
 
@@ -1079,22 +1073,20 @@ mod tests {
     // --- PULL mode (/await): client broadcasts, facilitator DISCOVERS ---
 
     fn await_req(pay_to: &str, required: u64, fp: Option<&str>, timeout: u64) -> AwaitRequest {
+        let mut extra = serde_json::json!({ "binding": BINDING_NATIVE });
+        if let Some(f) = fp {
+            extra["fingerprint"] = serde_json::json!(f);
+        }
         AwaitRequest {
             x402_version: X402_VERSION,
             payment_requirements: PaymentRequirements {
                 scheme: SCHEME_EXACT.to_string(),
                 network: NETWORK_TESTNET10.to_string(),
-                max_amount_required: required.to_string(),
-                resource: "https://ex/pull".to_string(),
-                description: String::new(),
-                mime_type: String::new(),
+                amount: required.to_string(),
+                asset: ASSET_KAS.to_string(),
                 pay_to: pay_to.to_string(),
                 max_timeout_seconds: timeout,
-                asset: crate::wire::ASSET_NATIVE_KAS.to_string(),
-                extra: match fp {
-                    Some(f) => serde_json::json!({ "fingerprint": f }),
-                    None => serde_json::Value::Null,
-                },
+                extra,
             },
         }
     }
@@ -1111,7 +1103,7 @@ mod tests {
         let fac = Facilitator::new(chain, tmp_store("pull_happy"), config());
         let s = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 5)).await;
         assert!(s.success, "await should authorize: {:?}", s.error_reason);
-        assert_eq!(s.transaction.as_deref(), Some(pay_txid.as_str()), "returns the discovered txid");
+        assert_eq!(s.transaction, pay_txid, "returns the discovered txid");
         // The facilitator never broadcast anything (pull mode).
         assert_eq!(fac.backend.submit_count(), 0);
     }
@@ -1128,7 +1120,7 @@ mod tests {
         let fac = Facilitator::new(chain, tmp_store("pull_under"), config());
         let s = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 5)).await;
         assert!(!s.success);
-        assert!(s.error_reason.unwrap().contains("underpayment"));
+        assert_eq!(s.error_reason.as_deref(), Some(errors::INVALID_PAYMENT_REQUIREMENTS));
     }
 
     #[tokio::test]
@@ -1140,7 +1132,7 @@ mod tests {
         let fac = Facilitator::new(chain, tmp_store("pull_timeout"), config());
         let s = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 1)).await;
         assert!(!s.success);
-        assert!(s.error_reason.unwrap().contains("no matching payment"));
+        assert_eq!(s.error_reason.as_deref(), Some(errors::INVALID_TRANSACTION_STATE));
     }
 
     #[tokio::test]
@@ -1158,6 +1150,6 @@ mod tests {
         // Second: same payment still in the UTXO set, already credited -> refused.
         let s2 = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 1)).await;
         assert!(!s2.success);
-        assert!(s2.error_reason.unwrap().contains("already credited"));
+        assert_eq!(s2.error_reason.as_deref(), Some(errors::INVALID_TRANSACTION_STATE));
     }
 }

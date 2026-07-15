@@ -12,6 +12,10 @@ pub const NETWORK_MAINNET: &str = "kaspa:mainnet";
 pub const NETWORK_TESTNET10: &str = "kaspa:testnet-10";
 
 pub const BINDING_EXACT: &str = "kaspa-exact-v1";
+/// KOB-native binding under the v2 envelope (not strict interop).
+pub const BINDING_NATIVE: &str = "kaspa-native-v1";
+/// KOB KCC20 token binding under the v2 envelope (not strict interop).
+pub const BINDING_KCC20: &str = "kaspa-kcc20-v1";
 pub const TEMPLATE_KIP10_ADDITIVE: &str = "kaspa-x402-kip10-additive-v1";
 pub const TX_ENCODING_SAFE_JSON: &str = "kaspa-sdk-safe-json-v2.0.0";
 pub const PAYLOAD_TYPE_EXACT_TX: &str = "exact-transaction";
@@ -98,6 +102,15 @@ impl PaymentRequirements {
     pub fn borrow_redeem_script(&self) -> Option<&str> {
         self.extra.get("borrowRedeemScript").and_then(|v| v.as_str())
     }
+    /// KOB request-fingerprint (native/KCC20 KOB-binding schemes) from
+    /// `extra.fingerprint`.
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.extra.get("fingerprint").and_then(|v| v.as_str())
+    }
+    /// KCC20 token covenant id (KOB-binding scheme) from `extra.assetId`.
+    pub fn kcc20_covenant_id(&self) -> Option<&str> {
+        self.extra.get("assetId").and_then(|v| v.as_str())
+    }
 }
 
 /// 402 body / `PAYMENT-REQUIRED` header payload.
@@ -141,6 +154,24 @@ pub struct PaymentPayload {
     pub extensions: Option<serde_json::Value>,
 }
 
+impl PaymentPayload {
+    /// The scheme payload's transaction field (object for native/KCC20; encoded
+    /// string for KIP-10 exact).
+    pub fn transaction(&self) -> Option<&serde_json::Value> {
+        self.payload.get("transaction")
+    }
+    /// The payer address (`payerAddress` or legacy `from`).
+    pub fn payer_address(&self) -> Option<&str> {
+        self.payload.get("payerAddress").or_else(|| self.payload.get("from")).and_then(|v| v.as_str())
+    }
+    pub fn payload_type(&self) -> Option<&str> {
+        self.payload.get("type").and_then(|v| v.as_str())
+    }
+    pub fn request_hash(&self) -> Option<&str> {
+        self.payload.get("requestHash").and_then(|v| v.as_str())
+    }
+}
+
 /// Facilitator `/verify` and `/settle` request body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FacilitatorRequest {
@@ -148,6 +179,16 @@ pub struct FacilitatorRequest {
     pub x402_version: u32,
     #[serde(rename = "paymentPayload")]
     pub payment_payload: PaymentPayload,
+    #[serde(rename = "paymentRequirements")]
+    pub payment_requirements: PaymentRequirements,
+}
+
+/// Pull-mode `/await` request body (no payment payload — the client broadcasts
+/// itself; the facilitator discovers).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AwaitRequest {
+    #[serde(rename = "x402Version", default)]
+    pub x402_version: u32,
     #[serde(rename = "paymentRequirements")]
     pub payment_requirements: PaymentRequirements,
 }

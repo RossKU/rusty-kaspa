@@ -12,7 +12,7 @@ use std::sync::Arc;
 use kob_settle::observe::ReplayStore;
 use kob_settle::rpc::{ConfirmConfig, RpcClient};
 use kob_x402::facilitator::{Facilitator, FacilitatorConfig};
-use kob_x402::wire::NETWORK_TESTNET10;
+use kob_x402::wire_v2::NETWORK_TESTNET10;
 
 struct Args {
     node: String,

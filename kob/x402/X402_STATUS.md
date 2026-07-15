@@ -462,11 +462,51 @@ success requires network+amount+64hex-txid and forbids top-level extra,
 /supported extra+extensions+signers, header base64 round-trip, closed error
 enum).
 
-REMAINING B1 (next): migrate facilitator.rs verify/settle/await + server.rs +
-existing unit tests + E2E clients/harnesses onto `wire_v2` (route native/KCC20
-by a KOB binding under the v2 envelope; only KIP-10 exact claims strict
-interop). This is the mechanical "rewrite" step; kept separate from the type
-landing so the build stays green at each step.
+### B1 — consumer migration (in progress)
+Coordinator decision: END STATE = single v2 wire, v1 `wire` module DELETED.
+Migrate consumers onto `wire_v2`, native + KCC20 expressed as KOB-binding
+schemes UNDER the v2 envelope (`extra.binding` = `kaspa-native-v1` /
+`kaspa-kcc20-v1`; KCC20 token id in `extra.assetId`; KOB request-fingerprint
+in `extra.fingerprint`), KIP-10 exact = strict interop (`kaspa-exact-v1`).
+
+DONE so far (committed a39a620 = wire_v2 types; these edits uncommitted):
+- `scheme_native.rs` + `scheme_kcc20.rs`: verifiers + their test modules
+  migrated to `wire_v2::PaymentRequirements` (`amount_sompi()`,
+  `kcc20_covenant_id()` from extra.assetId, fingerprint from extra).
+- `facilitator.rs` NON-TEST code migrated: `validate()` routes by
+  `extra.binding` (native/kcc20; kaspa-exact-v1 -> unsupported until B2),
+  reads `payerAddress`+`transaction` from the v2 payload, returns closed
+  `errors::*` codes; `verify()` -> `VerifyResponse`; `settle()`/`await_payment()`
+  -> `SettlementResponse` (amount + `extensions.kaspa`); `finalize()` builds
+  the kaspa extension. Error mapping: underpayment/wrong-recipient ->
+  invalid_payment_requirements; replay/not-unspent/broadcast-conflict/
+  no-matching-payment/timeout -> invalid_transaction_state; malformed ->
+  invalid_payload.
+
+**B1 COMPLETE (single v2 wire, v1 `wire.rs` DELETED).** Migrated: facilitator
+test module, server.rs (+ the PAYMENT-SIGNATURE request / PAYMENT-RESPONSE
+header path now wired, no longer dead), lib.rs re-exports (v2 only), main.rs,
+`src/bin/x402_client.rs` (native+kcc20 request builders emit the v2 envelope;
+tx-build path unchanged), and the pull harness (v2 AwaitRequest JSON +
+error-code greps). `grep crate::wire`/`kob_x402::wire` = empty. Verified:
+`cargo test -p kob-x402 --lib` = 39 passed / 0 failed; full workspace
+`cargo check` (7 kob crates) green (only the pre-existing kob-cli warning);
+release build of both bins clean; all 3 harnesses `bash -n` clean.
+Error-code assertion choices: input-not-unspent / await-timeout /
+already-credited -> `invalid_transaction_state`; await-underpayment ->
+`invalid_payment_requirements`. Since native/KCC20 tx-build path is unchanged
+(only the wire envelope differs), a full live re-run of their E2E is not
+required (per coordinator).
+
+### B2/B3 — NOT STARTED
+B2 = KIP-10 additive borrow covenant (retarget spot/swap.rs
+OP_TXOUTPUTAMOUNT(0xc2)/OP_TXOUTPUTSPK(0xc3)/OP_GTE(0xa2)/OP_BLAKE2B(0xaa) to
+enforce the merchant continuation output >= borrowAmount+additiveThreshold) in
+a new `scheme_exact.rs`, + a `reservation.rs` ReservationProvider (fund/track
+borrow outpoints), + facilitator exact verify/settle routing binding
+kaspa-exact-v1. B3 = live testnet-10 E2E (reserve -> additive exact-transaction
+-> verify/broadcast/confirm/authorize + 4 rejection cases) + validate a
+captured happy-path message set against the vendored interop/schemas.
 
 ## Build handoff log
 

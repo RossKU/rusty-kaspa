@@ -13,7 +13,7 @@
 use kob_settle::observe::ObservedOutput;
 
 use crate::fingerprint;
-use crate::wire::PaymentRequirements;
+use crate::wire_v2::PaymentRequirements;
 
 /// Successful pure-verification result for a KCC20 token payment.
 #[derive(Debug, Clone)]
@@ -142,14 +142,14 @@ pub fn verify_kcc20_exact(
     payer: &str,
     requirements: &PaymentRequirements,
 ) -> Result<Kcc20Verified, Kcc20Reject> {
-    let required = requirements.max_amount_sompi().map_err(Kcc20Reject::Malformed)?;
+    let required = requirements.amount_sompi().map_err(Kcc20Reject::Malformed)?;
 
-    // asset must be a 32-byte covenant id (hex).
-    let asset = requirements.asset.to_lowercase();
+    // Token covenant id (KOB KCC20 binding) lives in extra.assetId.
+    let asset = requirements.kcc20_covenant_id().unwrap_or_default().to_lowercase();
     if asset.len() != 64 || hex::decode(&asset).map(|b| b.len() != 32).unwrap_or(true) {
         return Err(Kcc20Reject::BadAsset(format!(
-            "asset must be a 32-byte covenant id (hex), got '{}'",
-            requirements.asset
+            "extra.assetId must be a 32-byte covenant id (hex), got '{}'",
+            asset
         )));
     }
 
@@ -241,7 +241,7 @@ pub fn verify_kcc20_exact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{NETWORK_TESTNET10, SCHEME_EXACT};
+    use crate::wire_v2::{ASSET_KAS, BINDING_KCC20, NETWORK_TESTNET10, SCHEME_EXACT};
 
     fn testnet_addr(seed: u8) -> String {
         kob_settle::wallet::pubkey_to_address(&[seed; 32], kob_settle::types::Network::Testnet)
@@ -254,20 +254,18 @@ mod tests {
     }
 
     fn requirements(pay_to: &str, asset: &str, amount: u64, fp: Option<&str>) -> PaymentRequirements {
+        let mut extra = serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset });
+        if let Some(f) = fp {
+            extra["fingerprint"] = serde_json::json!(f);
+        }
         PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: NETWORK_TESTNET10.to_string(),
-            max_amount_required: amount.to_string(),
-            resource: "https://ex/r".to_string(),
-            description: String::new(),
-            mime_type: String::new(),
+            amount: amount.to_string(),
+            asset: ASSET_KAS.to_string(),
             pay_to: pay_to.to_string(),
             max_timeout_seconds: 60,
-            asset: asset.to_string(),
-            extra: match fp {
-                Some(f) => serde_json::json!({ "fingerprint": f }),
-                None => serde_json::Value::Null,
-            },
+            extra,
         }
     }
 

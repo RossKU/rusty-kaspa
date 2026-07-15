@@ -27,8 +27,8 @@ use kob_settle::wallet::WalletContext;
 use kob_settle::MIN_UTXO_VALUE;
 
 use kob_x402::fingerprint;
-use kob_x402::wire::{
-    NativeExactPayload, PaymentPayload, PaymentRequirements, ASSET_NATIVE_KAS, SCHEME_EXACT,
+use kob_x402::wire_v2::{
+    PaymentPayload, PaymentRequirements, ASSET_KAS, BINDING_KCC20, BINDING_NATIVE, SCHEME_EXACT,
     X402_VERSION,
 };
 
@@ -189,33 +189,27 @@ fn facilitator_request(
     tx: serde_json::Value,
     from: &str,
     pay_to: &str,
-    amount: u64,
     require: u64,
     fingerprint_hex: &str,
 ) -> serde_json::Value {
-    let payload = PaymentPayload {
-        x402_version: X402_VERSION,
-        scheme: SCHEME_EXACT.to_string(),
-        network: network.to_string(),
-        payload: serde_json::to_value(NativeExactPayload {
-            transaction: tx,
-            from: from.to_string(),
-            pay_to: pay_to.to_string(),
-            amount: amount.to_string(),
-        })
-        .unwrap(),
-    };
     let requirements = PaymentRequirements {
         scheme: SCHEME_EXACT.to_string(),
         network: network.to_string(),
-        max_amount_required: require.to_string(),
-        resource: "https://example/resource".to_string(),
-        description: "x402 e2e".to_string(),
-        mime_type: "application/json".to_string(),
+        amount: require.to_string(),
+        asset: ASSET_KAS.to_string(),
         pay_to: pay_to.to_string(),
         max_timeout_seconds: 60,
-        asset: ASSET_NATIVE_KAS.to_string(),
-        extra: serde_json::json!({ "fingerprint": fingerprint_hex }),
+        extra: serde_json::json!({ "binding": BINDING_NATIVE, "fingerprint": fingerprint_hex }),
+    };
+    let payload = PaymentPayload {
+        x402_version: X402_VERSION,
+        accepted: requirements.clone(),
+        payload: serde_json::json!({
+            "type": "kob-native-transfer",
+            "payerAddress": from,
+            "transaction": tx,
+        }),
+        extensions: None,
     };
     serde_json::json!({
         "x402Version": X402_VERSION,
@@ -351,7 +345,6 @@ async fn main() -> anyhow::Result<()> {
         tx,
         &wallet.address,
         &args.pay_to,
-        args.amount,
         require,
         &fingerprint_hex,
     );
@@ -379,7 +372,6 @@ async fn main() -> anyhow::Result<()> {
             tx2,
             &wallet.address,
             &args.pay_to,
-            second_amount,
             second_amount,
             &fingerprint_hex,
         );
@@ -418,7 +410,7 @@ mod kcc20 {
         pay_to: String,           // requirements.payTo (recipient identity, P2PK)
         tx_recipient: String,     // who the tx output actually pays (defaults to pay_to)
         amount: u64,              // token units to send (== output native value)
-        require: u64,             // requirements.maxAmountRequired
+        require: u64,             // requirements.amount
         asset: String,            // token covenant id (hex)
         token_utxo: String,       // "txid:index" of the payer's token_unit UTXO
         out: Option<String>,
@@ -589,33 +581,28 @@ mod kcc20 {
         Ok(to_rpc_payload(&tx, &final_ss))
     }
 
-    fn kcc20_request(net: &str, tx: serde_json::Value, from: &str, pay_to: &str, asset: &str, amount: u64, require: u64) -> serde_json::Value {
-        let payload = PaymentPayload {
-            x402_version: X402_VERSION,
-            scheme: SCHEME_EXACT.to_string(),
-            network: net.to_string(),
-            payload: serde_json::json!({
-                "transaction": tx,
-                "from": from,
-                "payTo": pay_to,
-                "asset": asset,
-                "amount": amount.to_string(),
-            }),
-        };
+    fn kcc20_request(net: &str, tx: serde_json::Value, from: &str, pay_to: &str, asset: &str, require: u64) -> serde_json::Value {
+        // Fingerprint binding is scheme-agnostic and unit-proven; omitted for the
+        // KCC20 live run to keep the covenant transaction's payload empty
+        // (standard). No extra.fingerprint -> the verifier skips that check.
         let requirements = PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: net.to_string(),
-            max_amount_required: require.to_string(),
-            resource: "https://example/token-resource".to_string(),
-            description: "x402 kcc20 e2e".to_string(),
-            mime_type: "application/json".to_string(),
+            amount: require.to_string(),
+            asset: ASSET_KAS.to_string(),
             pay_to: pay_to.to_string(),
             max_timeout_seconds: 60,
-            asset: asset.to_string(),
-            // Fingerprint binding is scheme-agnostic and unit-proven; omitted for
-            // the KCC20 live run to keep the covenant transaction's payload empty
-            // (standard). extra is null -> the verifier skips the fingerprint check.
-            extra: serde_json::Value::Null,
+            extra: serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset }),
+        };
+        let payload = PaymentPayload {
+            x402_version: X402_VERSION,
+            accepted: requirements.clone(),
+            payload: serde_json::json!({
+                "type": "kob-kcc20-transfer",
+                "payerAddress": from,
+                "transaction": tx,
+            }),
+            extensions: None,
         };
         serde_json::json!({
             "x402Version": X402_VERSION,
@@ -686,7 +673,7 @@ mod kcc20 {
             &token_txid, token_index, token_value, &payer_pk, &tx_recipient_pk, a.amount,
             &fee_utxo, wallet_spk_version, &wallet_spk, &a.asset, &privkey,
         )?;
-        let req = kcc20_request(&a.network, tx, &wallet.address, &a.pay_to, &a.asset, a.amount, a.require);
+        let req = kcc20_request(&a.network, tx, &wallet.address, &a.pay_to, &a.asset, a.require);
         write_out(&a.out, &req)?;
 
         // Replay partner: a second artifact over the SAME token + fee inputs,
@@ -706,7 +693,7 @@ mod kcc20 {
                 &fee_utxo, wallet_spk_version, &wallet_spk, &a.asset, &privkey,
             )?;
             let alt_addr = kob_settle::wallet::pubkey_to_address(&alt_pk, net);
-            let req2 = kcc20_request(&a.network, tx2, &wallet.address, &alt_addr, &a.asset, a.amount, a.amount);
+            let req2 = kcc20_request(&a.network, tx2, &wallet.address, &alt_addr, &a.asset, a.amount);
             write_out(&Some(replay_path.clone()), &req2)?;
             eprintln!("[kcc20] replay-partner written to {}", replay_path);
         }

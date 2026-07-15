@@ -7,7 +7,7 @@
 //! mock chain provider.
 //!
 //! Layers:
-//! - [`wire`] — x402 wire types (`PaymentRequirements`, `X-PAYMENT`,
+//! - [`wire_v2`] — x402 v2 wire types (`PaymentRequirements`, PAYMENT-* headers,
 //!   verify/settle request+response, `/supported`).
 //! - [`fingerprint`] — request-fingerprint <-> payment binding.
 //! - [`scheme_native`] — scheme (A) native-KAS "exact" verification (pure).
@@ -20,12 +20,12 @@ pub mod fingerprint;
 pub mod scheme_kcc20;
 pub mod scheme_native;
 pub mod server;
-pub mod wire;
 pub mod wire_v2;
 
 pub use facilitator::{ChainBackend, DiscoveredTx, Facilitator, FacilitatorConfig};
-pub use wire::{
-    AwaitRequest, FacilitatorRequest, PaymentPayload, PaymentRequirements, PaymentRequiredResponse,
-    SettleResponse, SupportedResponse, VerifyResponse,
-    ASSET_NATIVE_KAS, NETWORK_MAINNET, NETWORK_TESTNET10, SCHEME_EXACT, X402_VERSION,
+pub use wire_v2::{
+    AwaitRequest, FacilitatorRequest, PaymentPayload, PaymentRequired, PaymentRequirements,
+    SettlementResponse, SupportedResponse, VerifyResponse,
+    ASSET_KAS, BINDING_EXACT, BINDING_KCC20, BINDING_NATIVE, NETWORK_MAINNET, NETWORK_TESTNET10,
+    SCHEME_EXACT, X402_VERSION,
 };

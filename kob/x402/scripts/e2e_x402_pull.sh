@@ -36,7 +36,7 @@ MERCHANT=$("$BIN/x402-client" derive-address "$MERCHANT_PK" testnet 2>/dev/null)
 log "merchant (payTo) = $MERCHANT"
 
 await_json() { # payTo required fp timeout
-  printf '{"x402Version":1,"paymentRequirements":{"scheme":"exact","network":"%s","maxAmountRequired":"%s","resource":"https://ex/pull","description":"pull e2e","mimeType":"application/json","payTo":"%s","maxTimeoutSeconds":%s,"asset":"kas","extra":{"fingerprint":"%s"}}}' \
+  printf '{"x402Version":2,"paymentRequirements":{"scheme":"exact","network":"%s","amount":"%s","asset":"KAS","payTo":"%s","maxTimeoutSeconds":%s,"extra":{"binding":"kaspa-native-v1","fingerprint":"%s"}}}' \
     "$NETWORK" "$2" "$1" "$4" "$3"
 }
 
@@ -86,7 +86,7 @@ log "client broadcast underpayment txid=$TXID2"
 wait $AW2
 A2=$(cat "$WORK/await2.out"); log "await -> $A2"
 check "underpayment await refused" "false" "$(echo "$A2" | field success)"
-echo "$A2" | grep -qi "underpayment" && echo "  (rejected reason: underpayment discovered)"
+echo "$A2" | grep -qi "invalid_payment_requirements" && echo "  (rejected reason: invalid_payment_requirements — amount < required)"
 echo "PULL_UNDERPAYMENT_TXID=$TXID2 (discovered, rejected: amount < required)" | tee -a "$RESULTS"
 
 # =====================================================================
@@ -98,10 +98,10 @@ await_json "$MERCHANT" 5000000 "$FP3" 6 > "$WORK/await3.json"
 A3=$(curl -s -X POST "$FAC_URL/await" -H 'content-type: application/json' --data-binary @"$WORK/await3.json")
 log "await -> $A3"
 check "timeout await not authorized" "false" "$(echo "$A3" | field success)"
-if echo "$A3" | grep -qi "no matching payment"; then
-  echo "  PASS: timeout reason is 'no matching payment' (not fooled by other credited UTXOs)"; PASS=$((PASS+1))
+if echo "$A3" | grep -qi "invalid_transaction_state"; then
+  echo "  PASS: timeout reason is 'invalid_transaction_state' (not fooled by other credited UTXOs)"; PASS=$((PASS+1))
 else
-  echo "  FAIL: timeout reason should be 'no matching payment', got: $A3"; FAIL=$((FAIL+1))
+  echo "  FAIL: timeout reason should be 'invalid_transaction_state', got: $A3"; FAIL=$((FAIL+1))
 fi
 
 # =====================================================================
@@ -112,7 +112,7 @@ await_json "$MERCHANT" 5000000 "$FP1" 5 > "$WORK/await4.json"
 A4=$(curl -s -X POST "$FAC_URL/await" -H 'content-type: application/json' --data-binary @"$WORK/await4.json")
 log "await -> $A4"
 check "replay await refused (no double-credit)" "false" "$(echo "$A4" | field success)"
-echo "$A4" | grep -qi "already credited" && echo "  (reason: payment already credited)"
+echo "$A4" | grep -qi "invalid_transaction_state" && echo "  (reason: invalid_transaction_state — already credited)"
 
 # =====================================================================
 # Independent on-chain confirmation of the discovered happy payment.

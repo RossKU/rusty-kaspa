@@ -2,24 +2,30 @@
 //!
 //! Routes (aligned with the upstream x402 facilitator contract):
 //! - `POST /verify`    -> `VerifyResponse`
-//! - `POST /settle`    -> `SettleResponse`
+//! - `POST /settle`    -> `SettlementResponse` (sets the `PAYMENT-RESPONSE` header)
+//! - `POST /await`     -> `SettlementResponse` (pull mode)
 //! - `GET  /supported` -> `SupportedResponse`
 //! - `GET  /health`    -> `"ok"`
+//!
+//! `/verify` and `/settle` accept the `FacilitatorRequest` either as a JSON body
+//! or base64-encoded in a `PAYMENT-SIGNATURE` header.
 
 use std::sync::Arc;
 
 use axum::{
+    body::Bytes,
     extract::State,
-    response::Json,
+    http::{HeaderMap, HeaderName, HeaderValue},
+    response::{IntoResponse, Json, Response},
     routing::{get, post},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
 
 use crate::facilitator::{ChainBackend, Facilitator};
-use crate::wire::{
-    AwaitRequest, FacilitatorRequest, SettleResponse, SupportedKind, SupportedResponse,
-    VerifyResponse, SCHEME_EXACT, X402_VERSION,
+use crate::wire_v2::{
+    decode_header, encode_header, errors, AwaitRequest, FacilitatorRequest, SettlementResponse,
+    SupportedResponse, VerifyResponse, HEADER_PAYMENT_RESPONSE, HEADER_PAYMENT_SIGNATURE,
 };
 
 /// Build the router for a facilitator over any chain backend.
@@ -39,38 +45,61 @@ pub fn router<B: ChainBackend + 'static>(fac: Arc<Facilitator<B>>) -> Router {
         .with_state(fac)
 }
 
+/// Read a `FacilitatorRequest` from the `PAYMENT-SIGNATURE` header (base64 JSON)
+/// if present, otherwise from the JSON body.
+fn read_request(headers: &HeaderMap, body: &Bytes) -> Result<FacilitatorRequest, &'static str> {
+    if let Some(h) = headers.get(HEADER_PAYMENT_SIGNATURE) {
+        let s = h.to_str().map_err(|_| errors::INVALID_PAYLOAD)?;
+        return decode_header::<FacilitatorRequest>(s).map_err(|_| errors::INVALID_PAYLOAD);
+    }
+    serde_json::from_slice(body).map_err(|_| errors::INVALID_PAYLOAD)
+}
+
 async fn verify_handler<B: ChainBackend + 'static>(
     State(fac): State<Arc<Facilitator<B>>>,
-    Json(req): Json<FacilitatorRequest>,
-) -> Json<VerifyResponse> {
-    Json(fac.verify(&req).await)
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match read_request(&headers, &body) {
+        Ok(req) => Json(fac.verify(&req).await).into_response(),
+        Err(code) => Json(VerifyResponse::invalid(code)).into_response(),
+    }
 }
 
 async fn settle_handler<B: ChainBackend + 'static>(
     State(fac): State<Arc<Facilitator<B>>>,
-    Json(req): Json<FacilitatorRequest>,
-) -> Json<SettleResponse> {
-    Json(fac.settle(&req).await)
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let resp = match read_request(&headers, &body) {
+        Ok(req) => fac.settle(&req).await,
+        Err(code) => SettlementResponse::failed(code),
+    };
+    let encoded = encode_header(&resp).ok();
+    let mut out = Json(resp).into_response();
+    if let Some(enc) = encoded {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(HEADER_PAYMENT_RESPONSE.as_bytes()),
+            HeaderValue::from_str(&enc),
+        ) {
+            out.headers_mut().insert(name, val);
+        }
+    }
+    out
 }
 
 /// Pull mode: discover a client-broadcast payment and authorize it.
 async fn await_handler<B: ChainBackend + 'static>(
     State(fac): State<Arc<Facilitator<B>>>,
     Json(req): Json<AwaitRequest>,
-) -> Json<SettleResponse> {
+) -> Json<SettlementResponse> {
     Json(fac.await_payment(&req).await)
 }
 
 async fn supported_handler<B: ChainBackend + 'static>(
     State(fac): State<Arc<Facilitator<B>>>,
 ) -> Json<SupportedResponse> {
-    Json(SupportedResponse {
-        kinds: vec![SupportedKind {
-            x402_version: X402_VERSION,
-            scheme: SCHEME_EXACT.to_string(),
-            network: fac.network().to_string(),
-        }],
-    })
+    Json(SupportedResponse::exact_only(fac.network()))
 }
 
 /// Bind and serve the facilitator on `bind` (e.g. `0.0.0.0:8402`).

@@ -9,7 +9,7 @@
 use kob_settle::observe::{ObservedOutput, PaymentObserver};
 
 use crate::fingerprint;
-use crate::wire::PaymentRequirements;
+use crate::wire_v2::PaymentRequirements;
 
 /// Successful pure-verification result for a native-KAS payment.
 #[derive(Debug, Clone)]
@@ -111,7 +111,7 @@ pub fn verify_native_exact(
     requirements: &PaymentRequirements,
 ) -> Result<NativeVerified, NativeReject> {
     let required = requirements
-        .max_amount_sompi()
+        .amount_sompi()
         .map_err(NativeReject::Malformed)?;
 
     let tx = normalize_tx(transaction);
@@ -190,7 +190,7 @@ pub fn verify_native_exact(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wire::{ASSET_NATIVE_KAS, NETWORK_TESTNET10, SCHEME_EXACT};
+    use crate::wire_v2::{ASSET_KAS, BINDING_NATIVE, NETWORK_TESTNET10, SCHEME_EXACT};
 
     fn testnet_addr(seed: u8) -> String {
         let pk = [seed; 32];
@@ -202,20 +202,18 @@ mod tests {
     }
 
     fn requirements(pay_to: &str, amount: u64, fp: Option<&str>) -> PaymentRequirements {
+        let mut extra = serde_json::json!({ "binding": BINDING_NATIVE });
+        if let Some(f) = fp {
+            extra["fingerprint"] = serde_json::json!(f);
+        }
         PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
             network: NETWORK_TESTNET10.to_string(),
-            max_amount_required: amount.to_string(),
-            resource: "https://example/resource".to_string(),
-            description: String::new(),
-            mime_type: String::new(),
+            amount: amount.to_string(),
+            asset: ASSET_KAS.to_string(),
             pay_to: pay_to.to_string(),
             max_timeout_seconds: 60,
-            asset: ASSET_NATIVE_KAS.to_string(),
-            extra: match fp {
-                Some(f) => serde_json::json!({ "fingerprint": f }),
-                None => serde_json::Value::Null,
-            },
+            extra,
         }
     }
 

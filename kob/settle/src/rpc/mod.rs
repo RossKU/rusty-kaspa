@@ -851,7 +851,7 @@ impl RpcClient {
     // Retry Logic (F19)
 
     /// Determine whether an RPC error is transient (worth retrying).
-    fn is_transient_error(err: &str) -> bool {
+    pub fn is_transient_error(err: &str) -> bool {
         let lower = err.to_lowercase();
         lower.contains("connection closed")
             || lower.contains("connection reset")

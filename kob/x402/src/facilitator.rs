@@ -11,6 +11,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
+use tracing::{error, warn};
 
 use kob_settle::observe::{ObservedOutput, PaymentObserver, PaymentRecord, ReplayCheck, ReplayStore};
 use kob_settle::rpc::{ConfirmConfig, RpcClient, RpcUtxo};
@@ -470,7 +471,12 @@ impl<B: ChainBackend> Facilitator<B> {
                 .backend
                 .get_address_utxos(owner)
                 .await
-                .map_err(|_| errors::UNEXPECTED_SETTLE_ERROR)?;
+                .map_err(|e| {
+                    // Server-only: the raw RPC error string never leaves the
+                    // node. No secrets here (address is public chain data).
+                    error!(owner = %owner, error = %e, "[x402] check_inputs_on_chain UTXO lookup failed");
+                    errors::UNEXPECTED_SETTLE_ERROR
+                })?;
             for u in &utxos {
                 let key = u.outpoint_key();
                 if let Some(req_cov) = require_covenant {
@@ -485,10 +491,12 @@ impl<B: ChainBackend> Facilitator<B> {
         }
         for op in input_outpoints {
             if !unspent.contains(op) {
+                warn!(outpoint = %op, "[x402] rejecting payment: input outpoint not unspent on-chain (spent/stale)");
                 return Err(errors::INVALID_TRANSACTION_STATE);
             }
         }
         if !covenant_seen {
+            warn!(covenant = ?require_covenant, "[x402] rejecting payment: no spent input carries the required token covenant");
             return Err(errors::INVALID_TRANSACTION_STATE);
         }
         Ok(())
@@ -573,7 +581,8 @@ impl<B: ChainBackend> Facilitator<B> {
             let record = PaymentRecord::submitted(artifact_id.clone(), input_outpoints.clone())
                 .with_parties(Some(payer.clone()), Some(pay_to.clone()), amount)
                 .with_fingerprint(binding_fingerprint.clone());
-            if store.record(record).is_err() {
+            if let Err(e) = store.record(record) {
+                error!(artifact = %artifact_id, error = %e, "[x402] settle: replay-store record write failed");
                 return SettlementResponse::failed(errors::UNEXPECTED_SETTLE_ERROR);
             }
         }
@@ -582,7 +591,8 @@ impl<B: ChainBackend> Facilitator<B> {
         let envelope = serde_json::json!({ "transaction": tx, "allowOrphan": false });
         let chain_txid = match self.backend.submit(envelope).await {
             Ok(txid) => txid,
-            Err(_) => {
+            Err(e) => {
+                error!(artifact = %artifact_id, error = %e, "[x402] settle: broadcast rejected by node");
                 let mut store = self.replay.lock().await;
                 let _ = store.mark_failed(&artifact_id);
                 return SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE);
@@ -692,6 +702,10 @@ impl<B: ChainBackend> Facilitator<B> {
                 // Amount check. (Only reached for our request's payment.)
                 let _ = timeout_secs;
                 if ev.value < required {
+                    warn!(
+                        pay_to = %pay_to, txid = %ev.txid, got = ev.value, required,
+                        "[x402] await: discovered payment underpays the required amount"
+                    );
                     return SettlementResponse::failed(errors::INVALID_PAYMENT_REQUIREMENTS);
                 }
 
@@ -724,6 +738,10 @@ impl<B: ChainBackend> Facilitator<B> {
         }
 
         // No matching payment (or only an already-credited one) within timeout.
+        warn!(
+            pay_to = %pay_to, timeout_secs, already_credited = saw_already_credited,
+            "[x402] await: timed out with no matching payment discovered"
+        );
         let _ = saw_already_credited;
         SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE)
     }
@@ -760,6 +778,10 @@ impl<B: ChainBackend> Facilitator<B> {
             // Broadcast accepted but not yet observed on-chain. Leave the
             // record as Submitted (with its chain_txid) so an idempotent
             // retry can re-confirm and flip to success.
+            warn!(
+                artifact = %artifact_id, chain_txid = %chain_txid, confirm_address = %confirm_address,
+                "[x402] finalize: confirmation poll exhausted; broadcast accepted but output not yet observed (recoverable via retry)"
+            );
             let _ = net;
             SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE)
         }

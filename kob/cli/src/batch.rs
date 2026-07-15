@@ -521,6 +521,9 @@ async fn execute_operation(
                 fee,
                 0, // buy_expiry (GTC)
                 0, // sell_expiry (GTC)
+                crate::deploy::DEFAULT_MAX_MATCHER_FEE, // v14 max_matcher_fee (sompi)
+                None, // mmfee_bps (v16-only; batch matches are v14)
+                None, // fee_bps (no bps cap; v14 has no on-chain F6)
                 None, // no tamper mode in batch
             )
             .await?;

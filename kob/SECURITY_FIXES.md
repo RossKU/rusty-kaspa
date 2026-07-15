@@ -1,10 +1,14 @@
-# KOB Security Fixes — release hardening (Phases 1-3)
+# KOB Security Fixes — release hardening (Phases 1-5)
 
 5-phase release-hardening sequence. Phase 1: covenant fund-theft holes found
 in the adversarial audit of the spot ORDER/TOKEN covenants. Phase 2: x402
 facilitator hardening. Phase 3: a DoS byte-slice panic class in RPC/JSON
-parsing. Read-only audit findings are in the audit report; this file tracks
-what was actually changed.
+parsing. Phase 4: a network-wide fee 100x underpayment (post-Toccata
+min-relay floor was not applied). Phase 5: x402 facilitator/server
+operability (failure logging, partial-broadcast recovery, retrying RPC,
+disconnect-safe broadcast, and unauthenticated-surface bounds). Read-only
+audit findings are in the audit report; this file tracks what was actually
+changed. Phases 4-5 are detailed at the bottom of this file.
 
 Verification: off-chain against the real post-Toccata `kaspa-txscript`
 `TxScriptEngine` (`covenants_enabled = true`) via
@@ -339,3 +343,142 @@ attacker-controlled JSON reaching these parsers) crashes the process.
   any Phase 2/3 edit in this pass, unrelated to `scanner.rs`. Out of scope
   here; flagged as a residual (kob-engine's lib test suite cannot currently
   run at all until that's fixed).
+
+---
+
+## PHASE 4 — fee 100x underpayment (post-Toccata min-relay floor)
+
+### The bug
+`kob/settle/src/mass.rs` `calc_miner_fee` returned raw `calc_compute_mass(tx)`
+(1 sompi/gram — the *pre*-Toccata `LEGACY_MINIMUM_RELAY_TRANSACTION_FEE` rate)
+and `converge_fee` maxed raw compute mass against the override, not the scaled
+floor. Post-Toccata the node's floor is `mass × 100` sompi/gram
+(`MIN_RELAY_FEE_PER_GRAM`, already defined + a `min_relay_fee` fn at
+`mass.rs:455`). Every path that priced a fee from mass underpaid by 100× and
+would be rejected as non-standard ("has N fees which is under the required
+amount ...").
+
+### Fixes (each committed separately)
+- **`kob/settle/src/mass.rs`** — `calc_miner_fee` now returns
+  `min_relay_fee(calc_compute_mass(tx))`; `converge_fee` floors on
+  `min_relay_fee(compute_mass).max(min_fee_override)`. Fixed at the source so
+  every caller inherits the floor. Updated the two tests asserting the old
+  unscaled value; added `calc_miner_fee_clears_min_relay_floor_for_sample_tx`.
+- **CLI + engine (17 files)** — every money-movement path recomputes an
+  "exact fee" post-signing via `calc_mass_with_sigscripts` and used the raw
+  mass (`let exact_fee = exact_mass[.max(min_fee_override)]`), *bypassing*
+  `calc_miner_fee`/`converge_fee` — so the mass.rs fix alone did NOT fix them.
+  Wrapped each in `min_relay_fee` (matching the pattern `token.rs` already had
+  right): `wallet_send, bracket, perp, lending, dca, insurance, deploy, cancel,
+  cancel_all, cancel_mark, ifd, consolidate, requote, receipt, swap,
+  auto_match, engine/mm`. `cancel_all.rs` had the same raw-mass bug in its
+  per-order dry-run preview; scaled it and made the subtraction saturating.
+- **domain single-phase blueprint builders** — `build_lending_match_tx`
+  (engine lending matcher), `build_open_position_tx` (engine perp matcher),
+  and all 10 `prediction_executor.rs` builders (used directly by
+  `cli/src/prediction.rs`) bake the fee from `estimate_compute_mass` straight
+  into an output with **no** Phase-2 convergence — so the raw fee is the final
+  on-chain fee. All are live; all underpaid 100×. Applied `min_relay_fee` and
+  updated the tests that exercised their exact-fee arithmetic (lending funding
+  10.1M→10.6M; perp `default_open_params` value bumps; prediction assertions).
+
+### Residual (dead code — noted, not changed)
+The other `lending_executor.rs` / `perp_executor.rs` blueprint builders
+(liquidation, default-claim, repay, partial-repay, topup, extend, rebalance,
+partial-liquidation, loan-transfer; cooperative/unilateral/emergency/partial
+close, maturity-settle, add/withdraw-margin) still price fees unscaled. A tree
+grep confirms **none are called from any CLI or engine path today** — they are
+dead code, not a live underpayment. Whoever wires them up must wrap the fee in
+`kob_core::mass::min_relay_fee` (or route through `converge_fee`) at that time.
+
+### Verified
+`kob-settle --lib` 217, `kob-domain --lib` 629, `kob-core --lib` 655,
+`kob-cli --lib` 517, `kob-x402 --lib` 66 — all green.
+
+### Residual A (enabling validation) — kob-engine test compile
+`kob/settle/src/chain/cache.rs`: `SpentTracker::prune_spent_with_probe` was
+`pub(crate)` and `prune_spent_by_age` was `#[cfg(test)]`-gated — both scoped
+to kob-settle from before `SpentTracker` was extracted out of kob-engine.
+kob-engine's `executor.rs` tests (written when the type lived locally) call
+both, so the kob-engine test binary no longer compiled. Widened both to plain
+`pub` (no production behavior change). `cargo test -p kob-engine --lib` now
+compiles and passes 369/369 (incl. the 6 `mempool_prune_*` and 3 `m6_*` tests
+that couldn't compile before).
+
+---
+
+## PHASE 5 — x402 facilitator / server operability
+
+### Item 1 — failure-path logging (`facilitator.rs`)
+Every failure returned only the opaque closed-enum wire code and discarded the
+real cause, leaving an operator blind. Added `tracing::warn!/error!` carrying
+the dropped string at: `check_inputs_on_chain` (RPC lookup failure + which
+outpoint was spent/stale + which covenant was absent), `settle` (replay-store
+write failure + node broadcast rejection), `finalize` (confirmation-poll
+exhaustion), `await_payment` (discovered underpayment + timeout). Logs carry
+only public chain data (addresses, txids, amounts) — never the signed tx bytes
+or any secret. Also made `RpcClient::is_transient_error` `pub`.
+
+### Item 2 — partial-broadcast recovery (`facilitator.rs`)
+On a submit error the facilitator unconditionally `mark_failed` + returned
+`invalid_transaction_state` — wrong when the tx actually landed (duplicate
+rebroadcast / lost-response RPC hiccup) or when the error was transient. Now on
+submit error it first polls the confirm address for the expected output
+(`discover_landed_payment`, the evidence `finalize` trusts); if present it
+records the discovered txid and finalizes to success. Only if nothing landed
+does it consult `is_transient` (new `ChainBackend` method backed by
+`RpcClient::is_transient_error`): a transient error returns
+`unexpected_settle_error` and leaves the record recoverable (no `mark_failed`);
+a confirmed non-transient rejection is the only path that marks it failed.
+Tests: `submit_error_but_payment_landed_recovers_to_success`,
+`transient_submit_error_does_not_mark_failed`,
+`fatal_submit_error_with_no_landed_output_marks_failed`.
+
+### Item 3 — retrying RPC + disconnect-safe broadcast (`facilitator.rs`, `server.rs`)
+The `RpcClient` `ChainBackend` impls now use `submit_transaction_with_retry` /
+`get_utxos_with_retry` (a transient blip on a UTXO read would otherwise read as
+"input spent" and reject a valid payment). `/settle` and `/await` run
+`settle()`/`await_payment()` inside `tokio::spawn` and await the JoinHandle:
+axum cancels a handler future on client disconnect, which without detachment
+would abort an in-flight broadcast/credit. The spawned task runs to
+completion; a join failure maps to `unexpected_settle_error`.
+
+### Item 4 — bound the unauthenticated surface (`facilitator.rs`, `reservation.rs`, `server.rs`)
+- `/await` `maxTimeoutSeconds` clamped into `[.., 120s]` (0 ⇒ 30s) via
+  `clamp_await_timeout`, so one request can't pin a task polling unbounded.
+- `ReservationProvider` gained a TTL (1h) + hard cap (100k). Each `reserve()`
+  evicts expired reservations (freeing their continuation targets) then fails
+  closed at the cap — an unauthenticated caller can't grow the map without
+  bound.
+- A successful settle now calls `mark_consumed` on the backing reservation
+  (plumbed through `Validated.reservation_id`, applied at all three finalize
+  return sites). It was dead code before: settled reservations stayed "active"
+  forever, blocking their continuation target and never becoming evictable.
+- `/await` + `/reserve` decode the body manually and map a parse failure to the
+  closed-enum wire code (like `/verify`); the default axum `Json` extractor
+  422s with serde field names, leaking the internal request shape. `/reserve`
+  also logs the real rejection reason (server-only).
+Tests: `await_timeout_is_clamped`, `exact_settle_marks_reservation_consumed`,
+`rejects_new_reservation_at_capacity`,
+`evicts_expired_reservations_and_reclaims_capacity`.
+
+### Residual B — client + E2E always send the mandatory binding
+Phase 2 made request-binding mandatory, so the KCC20 and exact/KIP-10 paths
+that sent no fingerprint/requestHash now fail closed at the facilitator.
+- `x402_client.rs` kcc20 mode derives a fingerprint (or `--fingerprint`/
+  `--nonce`), embeds `X402:<fp>` in the transfer tx payload, and sets
+  `extra.fingerprint`.
+- `x402_client.rs` exact mode takes `--request-hash` and echoes it as
+  `payload.requestHash` (a `wrong-request-hash` scenario perturbs it).
+- `scripts/e2e_x402_exact.sh` sends `requestHash` at `/reserve`, passes the
+  same value to `build_exact`, and adds an R5 wrong-request-hash rejection case
+  (⇒ `invalid_payload`). The KCC20 E2E needs no change (client defaults the
+  fingerprint).
+Off-chain: client type-checks, `kob-x402 --lib` = 66 green. **A live
+testnet-10 re-run of `e2e_x402_exact.sh` / `e2e_x402_kcc20.sh` is still needed**
+to confirm the on-chain happy paths end to end (funded wallet + node required;
+not run here).
+
+### Phase 5 verification
+`cargo test -p kob-x402 --lib` = 66 passed (was 50 at Phase 2; +16 across
+Phases 4-5). `cargo check -p kob-x402 --bin x402-client` clean.

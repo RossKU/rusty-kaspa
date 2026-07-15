@@ -17,12 +17,15 @@
 
 pub mod facilitator;
 pub mod fingerprint;
+pub mod reservation;
+pub mod scheme_exact;
 pub mod scheme_kcc20;
 pub mod scheme_native;
 pub mod server;
 pub mod wire_v2;
 
 pub use facilitator::{ChainBackend, DiscoveredTx, Facilitator, FacilitatorConfig};
+pub use reservation::{BorrowTerms, ReservationProvider};
 pub use wire_v2::{
     AwaitRequest, FacilitatorRequest, PaymentPayload, PaymentRequired, PaymentRequirements,
     SettlementResponse, SupportedResponse, VerifyResponse,

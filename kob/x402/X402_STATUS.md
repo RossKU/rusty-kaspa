@@ -498,15 +498,48 @@ already-credited -> `invalid_transaction_state`; await-underpayment ->
 (only the wire envelope differs), a full live re-run of their E2E is not
 required (per coordinator).
 
-### B2/B3 — NOT STARTED
-B2 = KIP-10 additive borrow covenant (retarget spot/swap.rs
-OP_TXOUTPUTAMOUNT(0xc2)/OP_TXOUTPUTSPK(0xc3)/OP_GTE(0xa2)/OP_BLAKE2B(0xaa) to
-enforce the merchant continuation output >= borrowAmount+additiveThreshold) in
-a new `scheme_exact.rs`, + a `reservation.rs` ReservationProvider (fund/track
-borrow outpoints), + facilitator exact verify/settle routing binding
-kaspa-exact-v1. B3 = live testnet-10 E2E (reserve -> additive exact-transaction
--> verify/broadcast/confirm/authorize + 4 rejection cases) + validate a
-captured happy-path message set against the vendored interop/schemas.
+### B2 — KIP-10 additive "exact" scheme — DONE (unit-proven)
+- `kob/core/src/contract/x402_borrow.rs`: the additive borrow covenant.
+  Redeem script = state `[0x08]min_continuation[0x20]merchant_spk_hash` + body
+  (OP_TXOUTPUTAMOUNT/OP_GTE + OP_TXOUTPUTSPK/OP_BLAKE2B/OP_EQUAL on a
+  sigscript-pushed continuation index — the swap.rs F2+F3 pattern retargeted).
+  Spendable by anyone who returns >= `borrowAmount + additiveThreshold` to the
+  merchant continuation output. `build_x402_borrow_redeem_script`,
+  `build_x402_borrow_spend_sigscript`, `parse_x402_borrow`. **Proven through
+  the real post-Toccata `kaspa-txscript` engine** in
+  `kob/core/tests/x402_borrow_covenant.rs` (4/4: valid additive spend passes,
+  over-min passes, under-min rejected, wrong-recipient rejected).
+- `kob/x402/src/reservation.rs`: `ReservationProvider` (fund/track borrow
+  terms) + `borrow_covenant(pay_to, borrow_amount, threshold)` (computes the
+  covenant P2SH; merchant continuation = payTo SPK; min = borrow+threshold) +
+  `BorrowTerms::requirements_extra()` (the v2 exact `extra`).
+- `kob/x402/src/scheme_exact.rs`: pure `verify_exact_kip10` — decodes the
+  `exact-transaction` (JSON string, `kaspa-sdk-safe-json-v2.0.0`), asserts it
+  spends exactly `borrowOutpoint`, pays >= `amount` to `payTo` at
+  `paymentOutputIndex`, has a continuation output >= `borrowAmount+threshold`
+  to the merchant, and binds `requestHash`. Rejects
+  WrongBorrowOutpoint/Underpayment/UnderThreshold/WrongRecipient/mismatch.
+- `facilitator.rs`: `Facilitator` gains a `ReservationProvider`; `reserve(...)`
+  builds the v2 `PaymentRequired` (402 offer). `validate()` routes binding
+  `kaspa-exact-v1` -> reservation lookup (must be issued + unspent) ->
+  `verify_exact_kip10` -> on-chain input check across [borrow P2SH, payer].
+  Shared `check_inputs_on_chain` helper. Replay/idempotency/finality reuse the
+  scheme-agnostic settle path.
+- Tests: 49 lib passed (6 scheme_exact + 2 reservation + 2 facilitator exact
+  incl. reserve->verify->settle happy + under-threshold refusal), 4 covenant
+  script-engine tests, full workspace check green.
+
+### B3 — NOT STARTED
+Live testnet-10 E2E: merchant funds a borrow UTXO to the covenant P2SH ->
+`/reserve` -> client builds the additive exact-transaction (spend borrow +
+funding, pay amount to payTo, continuation >= borrow+threshold, sign the
+borrow spend via `build_x402_borrow_spend_sigscript` + P2PK funding) -> verify
+-> broadcast -> confirm -> authorize; record TXIDs; 4 rejection cases (wrong
+outpoint, under threshold, replay, wrong recipient). Then validate a captured
+happy-path message set (PaymentRequired/PaymentPayload/SettlementResponse)
+against the vendored `interop/schemas/*.json`. Needs: a `/reserve` HTTP
+endpoint + an `x402-client exact` mode that builds+encodes the additive
+exact-transaction, and a borrow-funding step (merchant wallet -> covenant P2SH).
 
 ## Build handoff log
 

@@ -15,12 +15,15 @@ use tokio::sync::Mutex;
 use kob_settle::observe::{ObservedOutput, PaymentObserver, PaymentRecord, ReplayCheck, ReplayStore};
 use kob_settle::rpc::{ConfirmConfig, RpcClient, RpcUtxo};
 
+use crate::reservation::ReservationProvider;
+use crate::scheme_exact;
 use crate::scheme_kcc20;
 use crate::scheme_native;
 use crate::fingerprint;
 use crate::wire_v2::{
-    errors, AwaitRequest, FacilitatorRequest, KaspaSettleExt, SettlementResponse, VerifyResponse,
-    BINDING_KCC20, BINDING_NATIVE, SCHEME_EXACT, X402_VERSION,
+    errors, AwaitRequest, FacilitatorRequest, KaspaSettleExt, PaymentRequired, PaymentRequirements,
+    Resource, SettlementResponse, VerifyResponse, ASSET_KAS, BINDING_EXACT, BINDING_KCC20,
+    BINDING_NATIVE, NETWORK_TESTNET10, SCHEME_EXACT, X402_VERSION,
 };
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -144,6 +147,7 @@ pub struct Facilitator<B: ChainBackend> {
     backend: B,
     replay: Mutex<ReplayStore>,
     config: FacilitatorConfig,
+    reservations: Mutex<ReservationProvider>,
 }
 
 /// Internal: a fully pure+on-chain-validated payment (either scheme), ready to
@@ -181,9 +185,73 @@ fn kcc20_reject_code(r: scheme_kcc20::Kcc20Reject) -> &'static str {
     }
 }
 
+fn now_nanos() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+/// Map a KIP-10 exact reject to a closed wire error code.
+fn exact_reject_code(r: scheme_exact::ExactReject) -> &'static str {
+    use scheme_exact::ExactReject::*;
+    match r {
+        WrongRecipient | Underpayment | UnderThreshold => errors::INVALID_PAYMENT_REQUIREMENTS,
+        WrongBorrowOutpoint | FingerprintMismatch => errors::INVALID_TRANSACTION_STATE,
+        _ => errors::INVALID_PAYLOAD,
+    }
+}
+
 impl<B: ChainBackend> Facilitator<B> {
     pub fn new(backend: B, replay: ReplayStore, config: FacilitatorConfig) -> Self {
-        Facilitator { backend, replay: Mutex::new(replay), config }
+        Facilitator {
+            backend,
+            replay: Mutex::new(replay),
+            config,
+            reservations: Mutex::new(ReservationProvider::new()),
+        }
+    }
+
+    /// Reserve a KIP-10 additive borrow outpoint and return the v2
+    /// PaymentRequired the merchant serves in its 402. The merchant must have
+    /// already funded `borrow_txid:borrow_index` (holding `borrow_amount`) to
+    /// the covenant P2SH given by `ReservationProvider::borrow_covenant`.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve(
+        &self,
+        pay_to: &str,
+        amount: u64,
+        borrow_txid: &str,
+        borrow_index: u32,
+        borrow_amount: u64,
+        additive_threshold: u64,
+        payment_output_index: u32,
+        resource_url: &str,
+    ) -> Result<PaymentRequired, String> {
+        let seed = format!("{}:{}:{}", borrow_txid, borrow_index, now_nanos());
+        let reservation_id = hex::encode(kob_settle::blake2b_256(seed.as_bytes()));
+        let terms = {
+            let mut store = self.reservations.lock().await;
+            store.reserve(
+                reservation_id, pay_to, amount, borrow_txid, borrow_index, borrow_amount,
+                additive_threshold, payment_output_index,
+            )?
+        };
+        Ok(PaymentRequired {
+            x402_version: X402_VERSION,
+            resource: Resource { url: resource_url.to_string(), description: None, mime_type: None },
+            accepts: vec![PaymentRequirements {
+                scheme: SCHEME_EXACT.to_string(),
+                network: self.config.network.clone(),
+                amount: amount.to_string(),
+                asset: ASSET_KAS.to_string(),
+                pay_to: pay_to.to_string(),
+                max_timeout_seconds: 60,
+                extra: terms.requirements_extra(),
+            }],
+            error: None,
+            extensions: None,
+        })
     }
 
     /// The network this facilitator settles on.
@@ -214,8 +282,48 @@ impl<B: ChainBackend> Facilitator<B> {
         // Route by extra.binding under the v2 envelope.
         let binding = requirements.binding().unwrap_or_default();
         let is_native = binding == BINDING_NATIVE;
+
+        // KIP-10 additive exact (strict interop) — handled here (string-encoded
+        // transaction + reservation lookup).
+        if binding == BINDING_EXACT {
+            let enc = transaction.as_str().ok_or(errors::INVALID_PAYLOAD)?;
+            let encoding = pp.payload.get("transactionEncoding").and_then(|v| v.as_str()).unwrap_or("");
+            let poi = pp
+                .payload
+                .get("paymentOutputIndex")
+                .and_then(|v| v.as_u64())
+                .ok_or(errors::INVALID_PAYLOAD)? as u32;
+            let req_hash = pp.request_hash().map(|s| s.to_string());
+            let rid = requirements.reservation_id().ok_or(errors::INVALID_PAYMENT_REQUIREMENTS)?;
+            // Only settle a reservation we issued and that is not yet consumed.
+            let borrow_owner = {
+                let store = self.reservations.lock().await;
+                let t = store.get(rid).ok_or(errors::INVALID_PAYMENT_REQUIREMENTS)?;
+                if t.consumed {
+                    return Err(errors::INVALID_TRANSACTION_STATE);
+                }
+                let prefix = if requirements.network == NETWORK_TESTNET10 { "kaspatest" } else { "kaspa" };
+                kob_settle::bech32::spk_to_address(&t.p2sh_script, prefix)
+                    .map_err(|_| errors::UNEXPECTED_SETTLE_ERROR)?
+            };
+            let v = scheme_exact::verify_exact_kip10(enc, encoding, poi, req_hash.as_deref(), &from, None, requirements)
+                .map_err(exact_reject_code)?;
+            let validated = Validated {
+                artifact_id: v.artifact_id,
+                payer: v.payer,
+                pay_output_index: v.payment_output_index,
+                input_outpoints: v.input_outpoints,
+                tx: v.tx,
+                pay_to: requirements.pay_to.clone(),
+                confirm_address: v.confirm_address,
+                amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
+            };
+            // On-chain: every input unspent across [borrow P2SH, payer].
+            self.check_inputs_on_chain(&validated.input_outpoints, &[borrow_owner, from.clone()], None).await?;
+            return Ok(validated);
+        }
+
         if binding != BINDING_NATIVE && binding != BINDING_KCC20 {
-            // KIP-10 exact (kaspa-exact-v1) is implemented in scheme_exact (B2).
             return Err(errors::UNSUPPORTED_SCHEME);
         }
 
@@ -269,15 +377,22 @@ impl<B: ChainBackend> Facilitator<B> {
                 )
             };
 
-        // On-chain: every spent input must be an unspent UTXO owned by one of
-        // `owner_addresses` (proves inputs are real, unspent, owned by the
-        // declared payer). For KCC20, at least one such input must carry the
-        // required token covenant id (proves the token being spent is genuine —
-        // the generic on-chain-existence idea from kob-settle's CovenantCache,
-        // applied directly per-settle here).
+        self.check_inputs_on_chain(&validated.input_outpoints, &owner_addresses, require_covenant.as_deref()).await?;
+        Ok(validated)
+    }
+
+    /// On-chain check: every input outpoint must be an unspent UTXO owned by one
+    /// of `owner_addresses`. If `require_covenant` is set, at least one spent
+    /// input must carry that covenant id (KCC20 token genuineness).
+    async fn check_inputs_on_chain(
+        &self,
+        input_outpoints: &[String],
+        owner_addresses: &[String],
+        require_covenant: Option<&str>,
+    ) -> Result<(), &'static str> {
         let mut unspent: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut covenant_seen = require_covenant.is_none();
-        for owner in &owner_addresses {
+        for owner in owner_addresses {
             let utxos = self
                 .backend
                 .get_address_utxos(owner)
@@ -285,9 +400,9 @@ impl<B: ChainBackend> Facilitator<B> {
                 .map_err(|_| errors::UNEXPECTED_SETTLE_ERROR)?;
             for u in &utxos {
                 let key = u.outpoint_key();
-                if let Some(req_cov) = &require_covenant {
-                    if u.utxo_entry.covenant_id.as_deref() == Some(req_cov.as_str())
-                        && validated.input_outpoints.contains(&key)
+                if let Some(req_cov) = require_covenant {
+                    if u.utxo_entry.covenant_id.as_deref() == Some(req_cov)
+                        && input_outpoints.contains(&key)
                     {
                         covenant_seen = true;
                     }
@@ -295,7 +410,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 unspent.insert(key);
             }
         }
-        for op in &validated.input_outpoints {
+        for op in input_outpoints {
             if !unspent.contains(op) {
                 return Err(errors::INVALID_TRANSACTION_STATE);
             }
@@ -303,8 +418,7 @@ impl<B: ChainBackend> Facilitator<B> {
         if !covenant_seen {
             return Err(errors::INVALID_TRANSACTION_STATE);
         }
-
-        Ok(validated)
+        Ok(())
     }
 
     /// `/verify`: validate without broadcasting.
@@ -1151,5 +1265,88 @@ mod tests {
         let s2 = fac.await_payment(&await_req(&merchant, 40_000_000, Some(&fp), 1)).await;
         assert!(!s2.success);
         assert_eq!(s2.error_reason.as_deref(), Some(errors::INVALID_TRANSACTION_STATE));
+    }
+
+    // --- KIP-10 additive "exact" (strict interop) through the facilitator ---
+
+    fn exact_encoded_tx(merchant: &str, borrow_txid: &str, pay: u64, cont: u64) -> String {
+        let tx = serde_json::json!({
+            "transaction": {
+                "version": 0,
+                "inputs": [
+                    { "previousOutpoint": { "transactionId": borrow_txid, "index": 0 }, "signatureScript": "00", "sequence": 0, "sigOpCount": 0 },
+                    { "previousOutpoint": { "transactionId": "ff".repeat(32), "index": 0 }, "signatureScript": "41".to_string()+&"cd".repeat(65), "sequence": 0, "sigOpCount": 1 }
+                ],
+                "outputs": [
+                    { "value": pay, "scriptPublicKey": { "version": 0, "script": spk_hex(merchant) } },
+                    { "value": cont, "scriptPublicKey": { "version": 0, "script": spk_hex(merchant) } }
+                ],
+                "lockTime": 0, "subnetworkId": "0000000000000000000000000000000000000000", "payload": ""
+            }
+        });
+        serde_json::to_string(&tx).unwrap()
+    }
+
+    async fn exact_request<B: ChainBackend>(fac: &Facilitator<B>, merchant: &str, payer: &str, borrow_txid: &str, pay: u64, cont: u64) -> FacilitatorRequest {
+        let borrow_amount = 100_000_000u64;
+        let threshold = 3000u64;
+        let pr = fac.reserve(merchant, 250, borrow_txid, 0, borrow_amount, threshold, 0, "https://ex/r").await.unwrap();
+        let requirements = pr.accepts[0].clone();
+        let enc = exact_encoded_tx(merchant, borrow_txid, pay, cont);
+        let payload = serde_json::json!({
+            "type": "exact-transaction",
+            "payerAddress": payer,
+            "transaction": enc,
+            "transactionEncoding": crate::wire_v2::TX_ENCODING_SAFE_JSON,
+            "paymentOutputIndex": 0
+        });
+        FacilitatorRequest {
+            x402_version: X402_VERSION,
+            payment_payload: PaymentPayload { x402_version: X402_VERSION, accepted: requirements.clone(), payload, extensions: None },
+            payment_requirements: requirements,
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_kip10_verify_and_settle_happy() {
+        let merchant = addr(2);
+        let payer = addr(1);
+        let borrow_txid = "a1".repeat(32);
+        let (_rs, borrow_spk, borrow_addr) =
+            crate::reservation::borrow_covenant(&merchant, 100_000_000, 3000).unwrap();
+        let chain = MockChain::new(true)
+            .with_covenant_utxo(&borrow_addr, &hex::encode(&borrow_spk), &borrow_txid, 0, 100_000_000, &"00".repeat(32))
+            .with_utxo(&payer, &"ff".repeat(32), 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("exact_happy"), config());
+        // pays 250 to merchant, continuation 100_003_000 (>= 100M+3000).
+        let req = exact_request(&fac, &merchant, &payer, &borrow_txid, 250, 100_003_000).await;
+
+        let v = fac.verify(&req).await;
+        assert!(v.is_valid, "exact verify: {:?}", v.invalid_reason);
+        let s = fac.settle(&req).await;
+        assert!(s.success, "exact settle: {:?}", s.error_reason);
+        assert_eq!(s.amount.as_deref(), Some("250"));
+        assert_eq!(fac.backend.submit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_kip10_rejects_under_threshold() {
+        let merchant = addr(2);
+        let payer = addr(1);
+        let borrow_txid = "a2".repeat(32);
+        let (_rs, borrow_spk, borrow_addr) =
+            crate::reservation::borrow_covenant(&merchant, 100_000_000, 3000).unwrap();
+        let chain = MockChain::new(true)
+            .with_covenant_utxo(&borrow_addr, &hex::encode(&borrow_spk), &borrow_txid, 0, 100_000_000, &"00".repeat(32))
+            .with_utxo(&payer, &"ff".repeat(32), 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("exact_under"), config());
+        // continuation only 100_000_000 (< 100M + 3000) -> refused, no broadcast.
+        let req = exact_request(&fac, &merchant, &payer, &borrow_txid, 250, 100_000_000).await;
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYMENT_REQUIREMENTS));
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_eq!(fac.backend.submit_count(), 0);
     }
 }

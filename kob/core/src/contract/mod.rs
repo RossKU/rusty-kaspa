@@ -14,6 +14,7 @@ pub mod options;
 
 pub mod token;
 pub mod payload;
+pub mod x402_borrow;
 
 #[cfg(test)]
 mod tests;

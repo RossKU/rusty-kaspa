@@ -61,6 +61,14 @@ pub trait ChainBackend: Send + Sync {
     fn discover_incoming<'a>(&'a self, _address: &'a str) -> BoxFuture<'a, Result<Vec<DiscoveredTx>, String>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+
+    /// Classify a submit/RPC error string as transient (a network/RPC hiccup
+    /// that is safe to retry and is NOT a validity verdict on the tx) vs
+    /// fatal. Default: treat everything as fatal — mock backends produce
+    /// deterministic, non-transient errors.
+    fn is_transient(&self, _err: &str) -> bool {
+        false
+    }
 }
 
 impl ChainBackend for RpcClient {
@@ -87,6 +95,10 @@ impl ChainBackend for RpcClient {
         cfg: Option<ConfirmConfig>,
     ) -> BoxFuture<'a, bool> {
         Box::pin(async move { self.confirm_tx_output(txid, output_idx, address, cfg).await.confirmed })
+    }
+
+    fn is_transient(&self, err: &str) -> bool {
+        RpcClient::is_transient_error(err)
     }
 
     fn discover_incoming<'a>(&'a self, address: &'a str) -> BoxFuture<'a, Result<Vec<DiscoveredTx>, String>> {
@@ -592,7 +604,43 @@ impl<B: ChainBackend> Facilitator<B> {
         let chain_txid = match self.backend.submit(envelope).await {
             Ok(txid) => txid,
             Err(e) => {
-                error!(artifact = %artifact_id, error = %e, "[x402] settle: broadcast rejected by node");
+                // The submit call errored, but the payment may still have
+                // landed (a duplicate rebroadcast, or a post-submit RPC hiccup
+                // that lost the response). NEVER fail a tx that actually made
+                // it on chain: poll the confirm address for the expected
+                // output before declaring failure.
+                if let Some(landed) = self
+                    .discover_landed_payment(&confirm_address, pay_output_index, amount)
+                    .await
+                {
+                    warn!(
+                        artifact = %artifact_id, chain_txid = %landed, error = %e,
+                        "[x402] settle: submit errored but payment landed on chain; recovering"
+                    );
+                    {
+                        let mut store = self.replay.lock().await;
+                        let base = store
+                            .get(&artifact_id)
+                            .cloned()
+                            .unwrap_or_else(|| PaymentRecord::submitted(artifact_id.clone(), input_outpoints.clone()));
+                        let _ = store.record(base.with_chain_txid(landed.clone()));
+                    }
+                    return self
+                        .finalize(net, &artifact_id, &landed, pay_output_index, &confirm_address, amount, Some(payer), request_hash)
+                        .await;
+                }
+
+                let transient = self.backend.is_transient(&e);
+                error!(artifact = %artifact_id, transient, error = %e, "[x402] settle: broadcast rejected by node");
+                if transient {
+                    // Transient: the error is a network/RPC condition, not a
+                    // validity verdict, and the tx did not land. Leave the
+                    // record as Submitted so an idempotent retry can recover;
+                    // do NOT mark_failed on a transient error.
+                    return SettlementResponse::failed(errors::UNEXPECTED_SETTLE_ERROR);
+                }
+                // Confirmed non-transient rejection: the node rejected the tx
+                // on its merits and it did not land. Now it is safe to fail.
                 let mut store = self.replay.lock().await;
                 let _ = store.mark_failed(&artifact_id);
                 return SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE);
@@ -746,6 +794,25 @@ impl<B: ChainBackend> Facilitator<B> {
         SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE)
     }
 
+    /// After a submit error, discover whether the payment actually landed on
+    /// chain despite the error (a duplicate rebroadcast, or a post-submit RPC
+    /// hiccup that dropped the response). Scans `confirm_address` for an
+    /// unspent output of the expected value at the expected index — the same
+    /// evidence `finalize` trusts, discovered by address instead of by a
+    /// known txid. Returns the on-chain txid of the matching output.
+    async fn discover_landed_payment(
+        &self,
+        confirm_address: &str,
+        pay_output_index: u32,
+        amount: u64,
+    ) -> Option<String> {
+        let utxos = self.backend.get_address_utxos(confirm_address).await.ok()?;
+        utxos
+            .into_iter()
+            .find(|u| u.outpoint.index == pay_output_index && u.utxo_entry.amount == amount)
+            .map(|u| u.outpoint.transaction_id)
+    }
+
     /// Confirm finality for a broadcast payment and record the outcome.
     #[allow(clippy::too_many_arguments)]
     async fn finalize(
@@ -815,6 +882,9 @@ mod tests {
         confirm_ok: bool,
         next_txid: StdMutex<u64>,
         incoming: Vec<DiscoveredTx>,
+        /// When set, `submit` returns this error string instead of a txid
+        /// (models a node rejection or a post-submit RPC hiccup).
+        submit_err: Option<String>,
     }
 
     impl MockChain {
@@ -825,7 +895,14 @@ mod tests {
                 confirm_ok,
                 next_txid: StdMutex::new(1),
                 incoming: Vec::new(),
+                submit_err: None,
             }
+        }
+        /// Make `submit` fail with `err` (classified transient/fatal by the
+        /// real `RpcClient::is_transient_error`, as production would).
+        fn with_submit_error(mut self, err: &str) -> Self {
+            self.submit_err = Some(err.to_string());
+            self
         }
         /// Seed a discovered incoming payment (mempool) + its confirmed UTXO at
         /// `address`, with `payload` carrying the memo. Models a client-broadcast
@@ -892,10 +969,13 @@ mod tests {
             Box::pin(async move { Ok(v) })
         }
         fn submit<'a>(&'a self, tx_json: serde_json::Value) -> BoxFuture<'a, Result<String, String>> {
+            self.submitted.lock().unwrap().push(tx_json);
+            if let Some(e) = self.submit_err.clone() {
+                return Box::pin(async move { Err(e) });
+            }
             let mut n = self.next_txid.lock().unwrap();
             let txid = format!("{:064x}", *n);
             *n += 1;
-            self.submitted.lock().unwrap().push(tx_json);
             Box::pin(async move { Ok(txid) })
         }
         fn confirm<'a>(
@@ -918,6 +998,9 @@ mod tests {
                 .cloned()
                 .collect();
             Box::pin(async move { Ok(v) })
+        }
+        fn is_transient(&self, err: &str) -> bool {
+            RpcClient::is_transient_error(err)
         }
     }
 
@@ -1148,6 +1231,65 @@ mod tests {
         assert!(!s2.transaction.is_empty());
         assert_eq!(fac2.backend.submit_count(), 0, "recovery must not re-broadcast");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn submit_error_but_payment_landed_recovers_to_success() {
+        // The submit call errors, but the payment output is present at pay_to
+        // on chain (a duplicate rebroadcast, or a lost-response RPC hiccup).
+        // The facilitator must discover it and NOT fail a tx that landed.
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "aa".repeat(32);
+        let landed_txid = "bb".repeat(32);
+        let chain = MockChain::new(true)
+            .with_utxo(&from, &in_txid, 0, 200_000_000)
+            // The payment output actually landed at pay_to, index 0, 100M.
+            .with_utxo(&pay_to, &landed_txid, 0, 100_000_000)
+            .with_submit_error("connection reset by peer");
+        let fac = Facilitator::new(chain, tmp_store("landed"), config());
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
+
+        let s = fac.settle(&req).await;
+        assert!(s.success, "submit errored but payment landed -> must recover: {:?}", s.error_reason);
+        assert_eq!(s.transaction, landed_txid, "must report the discovered on-chain txid");
+    }
+
+    #[tokio::test]
+    async fn transient_submit_error_does_not_mark_failed() {
+        // A transient submit error with no landed output must not be a fatal
+        // verdict: return unexpected_settle_error (not invalid_transaction_state)
+        // and leave the record recoverable rather than mark_failed.
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "cc".repeat(32);
+        let chain = MockChain::new(true)
+            .with_utxo(&from, &in_txid, 0, 200_000_000)
+            .with_submit_error("RPC call timed out");
+        let fac = Facilitator::new(chain, tmp_store("transient"), config());
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
+
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_eq!(s.error_reason.as_deref(), Some(errors::UNEXPECTED_SETTLE_ERROR));
+    }
+
+    #[tokio::test]
+    async fn fatal_submit_error_with_no_landed_output_marks_failed() {
+        // A non-transient node rejection with no landed output is a genuine
+        // failure: invalid_transaction_state.
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "dd".repeat(32);
+        let chain = MockChain::new(true)
+            .with_utxo(&from, &in_txid, 0, 200_000_000)
+            .with_submit_error("RPC error: script validation failed");
+        let fac = Facilitator::new(chain, tmp_store("fatal"), config());
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
+
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_eq!(s.error_reason.as_deref(), Some(errors::INVALID_TRANSACTION_STATE));
     }
 
     #[tokio::test]

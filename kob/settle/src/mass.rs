@@ -562,9 +562,12 @@ pub fn calc_compute_mass(tx: &crate::tx::Transaction) -> u64 {
 /// Compute the minimum miner fee for a transaction.
 ///
 /// Mempool only enforces compute mass. Storage mass affects block template
-/// priority only. Fee = compute_mass * 1 sompi/gram.
+/// priority only. Fee = compute_mass * MIN_RELAY_FEE_PER_GRAM (100 sompi/gram,
+/// post-Toccata). Applying the floor here means every caller that goes
+/// through `calc_miner_fee` gets a fee that clears the node's min-relay
+/// requirement without needing to remember to scale it themselves.
 pub fn calc_miner_fee(tx: &crate::tx::Transaction) -> u64 {
-    calc_compute_mass(tx)
+    min_relay_fee(calc_compute_mass(tx))
 }
 
 /// Iteratively converge on the correct fee for a transaction where one output
@@ -578,7 +581,10 @@ pub fn calc_miner_fee(tx: &crate::tx::Transaction) -> u64 {
 /// - `tx`: mutable transaction — `tx.outputs[adjust_idx].value` is updated each round.
 /// - `total_in`: sum of all input values (sompi).
 /// - `adjust_idx`: index of the output whose value absorbs the residual.
-/// - `min_fee_override`: floor fee (e.g. matcher fee or minimum relay fee).
+/// - `min_fee_override`: floor fee (e.g. matcher fee or minimum relay fee),
+///   compared against the mass-derived fee AFTER the min-relay rate is
+///   applied -- callers passing an explicit `--fee-rate` override still get
+///   whichever is larger.
 ///
 /// # Returns
 /// `(converged_fee, final_output_value)` for the adjusted output.
@@ -601,7 +607,8 @@ pub fn converge_fee(
         .map(|(_, o)| o.value)
         .sum();
 
-    let fee = compute_mass.max(min_fee_override);
+    // Post-Toccata floor is mass * 100 sompi/gram, not mass * 1.
+    let fee = min_relay_fee(compute_mass).max(min_fee_override);
     let final_value = total_in.saturating_sub(fixed_sum + fee);
     tx.outputs[adjust_idx].value = final_value;
     (fee, final_value)
@@ -1208,8 +1215,8 @@ mod tests {
     }
 
     #[test]
-    fn calc_miner_fee_uses_max_of_compute_and_storage() {
-        // TX with very large outputs (minimal storage mass) -- compute mass dominates
+    fn calc_miner_fee_applies_min_relay_floor() {
+        // TX with very large outputs (minimal storage mass) -- compute mass dominates.
         let mut tx = crate::tx::Transaction::new(0);
         tx.inputs.push(crate::tx::TxInput {
             prev_tx_id: "a".repeat(64),
@@ -1229,8 +1236,39 @@ mod tests {
         let compute = calc_compute_mass(&tx);
         let storage = compute_storage_mass(&[100_000_000_000], &[99_999_000_000]);
         // With 1000 KAS input and single large output, storage mass is tiny
+        // (mempool doesn't enforce it anyway -- calc_miner_fee never looks at it).
         assert!(storage < compute, "storage mass {} should be < compute mass {}", storage, compute);
-        assert_eq!(fee, compute, "for very large outputs, miner fee = compute mass");
+        // Post-Toccata: fee = compute_mass * 100 sompi/gram, not compute_mass * 1.
+        assert_eq!(fee, compute * MIN_RELAY_FEE_PER_GRAM, "miner fee must apply the min-relay floor");
+        assert_eq!(fee, min_relay_fee(compute));
+    }
+
+    #[test]
+    fn calc_miner_fee_clears_min_relay_floor_for_sample_tx() {
+        // A realistic single-input, single-output tx: the resulting fee must
+        // clear the network's 100 sompi/gram floor, i.e. fee / mass >= 100.
+        let mut tx = crate::tx::Transaction::new(0);
+        tx.inputs.push(crate::tx::TxInput {
+            prev_tx_id: "b".repeat(64),
+            prev_index: 0,
+            sequence: 0,
+            sig_op_count: 1,
+            script_version: 0,
+            script_bytes: vec![0x20; 34],
+            value: 50_000_000,
+        });
+        tx.outputs.push(crate::tx::TxOutput {
+            value: 49_000_000,
+            script_public_key: kaspa_consensus_core::tx::ScriptPublicKey::new(0, vec![0x20; 34].into()),
+            covenant: None,
+        });
+        let mass = calc_compute_mass(&tx);
+        let fee = calc_miner_fee(&tx);
+        assert!(mass > 0, "sample tx must have nonzero mass");
+        assert!(
+            fee >= mass * 100,
+            "fee {} must clear the 100 sompi/gram floor for mass {}", fee, mass
+        );
     }
 
     #[test]
@@ -1305,12 +1343,16 @@ mod tests {
 
     #[test]
     fn converge_fee_large_value_low_mass() {
-        // Large values → low storage mass, so compute mass dominates.
+        // Large values → low storage mass, so compute mass (scaled by the
+        // min-relay rate) dominates and determines the fee exactly.
         let mut tx = make_test_tx(&[1_000_000_000], &[500_000_000, 0]);
+        let mass_before = calc_compute_mass(&tx);
         let (fee, final_val) = converge_fee(&mut tx, 1_000_000_000, 1, 0);
         assert_eq!(final_val + 500_000_000 + fee, 1_000_000_000);
-        // With large outputs, storage mass is trivial; compute mass is a few hundred.
-        assert!(fee < 10_000, "fee {} should be low for large values", fee);
+        // Fee is the mass-derived floor (mass is tiny -- a few hundred grams
+        // -- so the post-Toccata fee is still a small fraction of the value).
+        assert_eq!(fee, mass_before * MIN_RELAY_FEE_PER_GRAM);
+        assert!(fee < 1_000_000, "fee {} should still be low for large values", fee);
     }
 
 

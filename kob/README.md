@@ -6,10 +6,16 @@ Pure order book DEX on Kaspa L1 covenants. No AMM, no liquidity pools, no oracle
 
 ```
 kob/
+  settle/  — Settlement core: crypto, mass/fee, tx building, wallet, RPC
+             client (submit/UTXO/finality), payment-watch seam, replay log.
+             Zero DEX-domain coupling; reused by the DEX and the x402 crate.
   core/    — Contract scripts, sighash, mass calculation, signing, wallet
+             (re-exports the settlement pieces from kob-settle)
   domain/  — Order books, batch planner, match domain logic (spot/perp/lending/prediction)
   cli/     — Command-line interface for deploy, cancel, match, MM bot
   engine/  — Matching engine, chain scanner/executor, cross-pair routing, API
+  x402/    — Kaspa x402 payment facilitator (verify/settle HTTP server) over
+             kob-settle: native-KAS + KCC20 "exact" payment schemes
   lab/     — Script-level experiments and prototypes
 ```
 

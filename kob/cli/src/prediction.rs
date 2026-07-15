@@ -2152,12 +2152,40 @@ async fn refund_pool(
             let real_bp = build_refund_split_merge_tx(&real_params)
                 .map_err(|e| anyhow::anyhow!("build_refund_split_merge_tx (real) failed: {}", e))?;
 
-            let real_tx = blueprint_to_tx(&real_bp);
-            let sigscripts: Vec<Vec<u8>> = real_bp.inputs.iter().map(|i| i.sig_script.clone()).collect();
+            let mut real_tx = blueprint_to_tx(&real_bp);
+            let mut sigscripts: Vec<Vec<u8>> = real_bp.inputs.iter().map(|i| i.sig_script.clone()).collect();
+
+            // Phase 2: exact fee from the real sigscript size + reshrink the
+            // reclaim output + re-sign, same as expire_ballot. The refund
+            // sigscript embeds the FULL SplitMerge redeemScript (~230B) on top
+            // of the sig+pubkey pushes, which the domain layer's generic
+            // estimate_compute_mass(1,1,..) does not account for -- live-
+            // confirmed rejected otherwise: "has 166900 fees which is under
+            // the required amount of 190900 for compute mass 1909".
+            real_tx.inputs[0].script_bytes = p2sh.script().to_vec();
+            real_tx.inputs[0].value = value;
+            let exact_mass = kob_core::mass::calc_mass_with_sigscripts(&real_tx, &sigscripts);
+            let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
+            let domain_fee = value.saturating_sub(real_bp.outputs.first().map(|o| o.value).unwrap_or(0));
+            if exact_fee > domain_fee {
+                let new_payout = value.checked_sub(exact_fee).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "SplitMerge value {} too small to cover the exact fee {} (compute mass {})",
+                        value, exact_fee, exact_mass
+                    )
+                })?;
+                real_tx.outputs[0].value = new_payout;
+                let sighash2 = compute_sighash(&real_tx, 0)?;
+                let signature2 = signing::schnorr_sign_secure(&privkey, &sighash2)?;
+                sigscripts[0] = kob_core::prediction::build_split_merge_refund_sigscript(
+                    &signature2, &pubkey, &redeem_script,
+                );
+            }
+
             let payload = to_rpc_payload(&real_tx, &sigscripts);
             let tx_id = rpc.submit_transaction(payload).await?;
 
-            let payout = real_bp.outputs.first().map(|o| o.value).unwrap_or(0);
+            let payout = real_tx.outputs.first().map(|o| o.value).unwrap_or(0);
             println!("SUCCESS! SplitMerge pool refunded.");
             println!("TXID:    {}", tx_id);
             println!("Reclaimed: {}:0 ({})", tx_id, fmt_sompi(payout));
@@ -2212,12 +2240,37 @@ async fn refund_pool(
             let real_bp = build_refund_redemption_tx(&real_params)
                 .map_err(|e| anyhow::anyhow!("build_refund_redemption_tx (real) failed: {}", e))?;
 
-            let real_tx = blueprint_to_tx(&real_bp);
-            let sigscripts: Vec<Vec<u8>> = real_bp.inputs.iter().map(|i| i.sig_script.clone()).collect();
+            let mut real_tx = blueprint_to_tx(&real_bp);
+            let mut sigscripts: Vec<Vec<u8>> = real_bp.inputs.iter().map(|i| i.sig_script.clone()).collect();
+
+            // Phase 2: exact fee + reshrink reclaim output + re-sign (the
+            // Redemption redeemScript is ~267B, far larger than the generic
+            // estimate; same fix as expire_ballot and the SplitMerge refund
+            // above).
+            real_tx.inputs[0].script_bytes = p2sh.script().to_vec();
+            real_tx.inputs[0].value = value;
+            let exact_mass = kob_core::mass::calc_mass_with_sigscripts(&real_tx, &sigscripts);
+            let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
+            let domain_fee = value.saturating_sub(real_bp.outputs.first().map(|o| o.value).unwrap_or(0));
+            if exact_fee > domain_fee {
+                let new_payout = value.checked_sub(exact_fee).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Redemption value {} too small to cover the exact fee {} (compute mass {})",
+                        value, exact_fee, exact_mass
+                    )
+                })?;
+                real_tx.outputs[0].value = new_payout;
+                let sighash2 = compute_sighash(&real_tx, 0)?;
+                let signature2 = signing::schnorr_sign_secure(&privkey, &sighash2)?;
+                sigscripts[0] = kob_core::prediction::build_redemption_refund_sigscript(
+                    &signature2, &pubkey, &redeem_script,
+                );
+            }
+
             let payload = to_rpc_payload(&real_tx, &sigscripts);
             let tx_id = rpc.submit_transaction(payload).await?;
 
-            let payout = real_bp.outputs.first().map(|o| o.value).unwrap_or(0);
+            let payout = real_tx.outputs.first().map(|o| o.value).unwrap_or(0);
             println!("SUCCESS! Redemption pool refunded.");
             println!("TXID:    {}", tx_id);
             println!("Reclaimed: {}:0 ({})", tx_id, fmt_sompi(payout));

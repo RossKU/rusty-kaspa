@@ -7,9 +7,15 @@ what was actually changed.
 
 Verification: off-chain against the real post-Toccata `kaspa-txscript`
 `TxScriptEngine` (`covenants_enabled = true`) via
-`kob/core/tests/toccata_fill_repro.rs`. Every applied fix has an adversarial
-test proving the specific theft tx now FAILS and the honest tx still PASSES.
-`cargo test -p kob-core --lib` = 655 passed; the harness = 9 passed.
+`kob/core/tests/toccata_fill_repro.rs` (spot) and
+`kob/core/tests/x402_borrow_covenant.rs` (x402). Every applied fix has an
+adversarial test proving the specific theft tx now FAILS and the honest tx
+still PASSES. `cargo test -p kob-core --lib` = 655 passed; the spot harness =
+11 passed; the x402 harness = 6 passed; `kob-domain --lib` = 629;
+`kob-x402 --lib` = 50 (wire_v2 schema conformance intact).
+
+Phase 1a applied fixes 2/3/4/5/7; Phase 1b applied fixes 1/8 and refined the
+analysis of fix 6 (see below).
 
 Key primitive used throughout: **per-input output binding**. `OpCovOutputIdx`
 (0xd3) returns the k-th covenant output for a token id across the WHOLE
@@ -102,74 +108,91 @@ never share one output.
 
 ---
 
-## NOT YET APPLIED — require coordinated multi-file changes (documented for a
-## dedicated slice; not rushed because an unverified covenant edit can ship a
-## worse bug than the known one)
+### Fix 1 — sell IOC (Op5) fill: free `fta`, no residual conservation  [Phase 1b]
+- **File**: `kob/core/src/contract/spot/order.rs` (`SELL_ORDER_BODY` IOC path).
+- **What**: IOC priced the fill from a free sigscript `fta` and its F4 was
+  existence-only (`OpCovOutCount >= 1`), so the seller's whole `token_in` was
+  consumed while only `fta` was priced and the `token_in - fta` residual could
+  be drained out as KAS. F4 now forces the residual to return to THIS seller via
+  a self-continuation output that is the input's 0th authorized covenant output:
+  `OpTxInputIndex Op0 OpAuthOutputIdx` → r, `OpTxOutputSpk(r) == OpTxInputSpk`,
+  `OpTxOutputAmount(r) >= token_in - fta`. Per-input (like Fix 3), so sellers
+  can't share and the matcher can't skip the return.
+- **Impact**: NO sigscript change → v16 F6's fixed-offset sell-price reads are
+  untouched (RS start stays at the same prefix offset; PUSHDATA2 for both 416
+  and 427). `SELL_ORDER_BODY` 304 → 315B, `SELL_RS_SIZE` 416 → 427B: updated
+  parse/estimate constants, the RS-length asserts across
+  recover/requote/matching/scanner/batch, and the `SELL_ORDER`
+  `bytecode_stable` pin.
+- **Tests**: `sell_ioc_residual_drain_rejected` (short residual, and residual
+  not bound to this input, both FAIL) + `sell_ioc_honest_residual_passes`.
+- **Residual (honest)**: the covenant is now safe-closed on-chain, but the
+  batch/CLI match builders do not yet EMIT the residual self-continuation output
+  for IOC-sell, so honest partial IOC-sell fills fail closed (no drain) until
+  that builder wiring lands. Follow-on: make the match builders create the
+  residual as the sell's 0th authorized output.
 
-### Fix 1 — sell IOC (Op5) fill: free `fta`, no residual conservation
-- **File**: `kob/core/src/contract/spot/order.rs` (`SELL_ORDER_BODY` IOC path,
-  ~L370), driven by `kob/domain/src/spot/batch.rs` (`has_remainder` → IOC).
-- **The hole**: IOC prices the fill from a free sigscript `fta` never bounded
-  by the real `OpTxInputAmount`, and its F4 is existence-only
-  (`OpCovOutCount >= 1`, no amount). The seller's whole `token_in` is consumed,
-  only `fta` is priced/delivered, and the residual `token_in - fta` is
-  unconstrained — it can go out as KAS to the matcher.
-- **Why deferred**: the correct fix (bind `fta`, force the residual back to the
-  seller as a covenant output, like the PARTIAL path) is genuinely coupled:
-  (a) adding a residual index to the IOC sigscript shifts the fixed-offset
-  bytes that v16 buy F6 reads for IOC (`build_sell_ioc_fill_sigscript_fixed_offset`,
-  pnum at [16..24), pden at [25..33)), so v16 F6 offsets must move in lockstep;
-  (b) full residual conservation needs two per-input authorized outputs
-  ([buyer fta, seller residual]) with a builder ordering convention; (c) the
-  PARTIAL path (Op2) already conserves correctly, so the cleanest fix is to
-  **route sell remainders to PARTIAL instead of IOC** in `batch.rs` and make
-  IOC-sell full-delivery-only — a batch-builder + body change.
-- **Recommended slice**: (1) `batch.rs`: route `has_remainder` sells to the
-  Op2 PARTIAL path (which already forces `residual = token_in - fta` back via a
-  self-continuation output and checks it); (2) tighten IOC-sell F4 to the
-  per-input `OpAuthOutputIdx` binding used in Fix 3 so it can't share outputs
-  either; (3) add an engine test: IOC/partial sell that pockets the residual
-  FAILS, honest partial with residual returned PASSES.
+### Fix 8 — x402 additive borrow: aggregate-inputs drain  [Phase 1b]
+- **File**: `kob/x402/src/reservation.rs` (+ harness
+  `kob/core/tests/x402_borrow_covenant.rs`).
+- **What (non-breaking mitigation, as directed)**: the covenant is unchanged;
+  the drain needed two concurrent borrow UTXOs sharing one `merchant_spk_hash`
+  so a single continuation output could satisfy both. `ReservationProvider` now
+  tracks active `merchant_spk_hash`es and rejects any reservation that reuses
+  one; `mark_consumed` frees the target (its UTXO is spent). Two live borrow
+  UTXOs therefore always have distinct continuation targets, so one shared
+  continuation output can satisfy at most one covenant.
+- **Impact**: client/wire untouched (the client keys the continuation off
+  `req.payTo`, so a fresh per-reservation merchant address flows through with no
+  wire change); single-reservation E2E and the wire_v2 schema conformance are
+  unaffected (kob-x402 lib 50/50).
+- **Tests**: `rejects_duplicate_merchant_continuation_target` (reservation
+  provider) + covenant harness `same_merchant_aggregate_shares_one_continuation`
+  (documents the drain) and `distinct_merchant_aggregate_cannot_share_continuation`
+  (distinct targets → the second covenant FAILS).
+- **Residual (spec proposal)**: a merchant that insists on a single fixed
+  continuation address for concurrent reservations is not covered by this
+  provider-side guard. The complete fix is the covenant-output option: make the
+  merchant continuation a covenant output (carrying `authorizing_input`), then
+  require `OpOutputAuthorizingInput(cont_idx) == OpTxInputIndex` in
+  `X402_BORROW_BODY`, and update `x402_client.rs` + facilitator. That changes
+  the KIP-10 "additive exact" interop and must be agreed with the counterparty
+  (elldeeone), so it is proposed here rather than applied unilaterally.
 
-### Fix 6 — bracket buy entry has no surplus cap (and no mmfee field)
+## NOT APPLIED — refined analysis
+
+### Fix 6 — bracket buy entry surplus cap: does not fit the current bracket model
 - **File**: `kob/core/src/contract/spot/bracket.rs` (`BRACKET_ORDER_BODY` buy
-  entry, ~L102).
-- **The hole**: buy entry checks only `output[1] >= et` (token floor) + SPK;
-  nothing bounds the buyer's KAS outflow, and the bracket state has NO `mmfee`
-  field, so there is no v16-style cap available. Every bracket buy entry is
-  exposed to unbounded matcher surplus capture.
-- **Why deferred**: fixing it needs a new state field (`mmfee_bps`) →
-  `BRACKET_STATE_SIZE` 224 → 232, `BRACKET_RS_SIZE` 365 → 373, the sigLen<400
-  dispatch threshold, `parse_bracket_state`, every hardcoded bracket size, and
-  the `BRACKET_ORDER` `bytecode_stable` pin — plus an F6-equivalent cap body
-  reading the counterparty price. A state-layout + dispatch change that must be
-  done and verified as its own slice.
-- **Recommended slice**: add `mmfee_bps` to state; add a buy-entry surplus cap
-  mirroring v16 F6 (surplus of `kas_in` over the fair token value ≤ cap); bump
-  all size constants + dispatch + pin; add an engine test bracketing the cap.
-
-### Fix 8 — x402 additive borrow: aggregate-inputs drain of concurrent reservations
-- **File**: `kob/core/src/contract/x402_borrow.rs` (`X402_BORROW_BODY`).
-- **The hole**: the borrow UTXO is spendable by anyone who produces a
-  continuation output ≥ `min_continuation` to the merchant, at a free sigscript
-  index `cont_idx`. Multiple concurrent borrow reservations (same merchant) can
-  be spent in one tx all pointing `cont_idx` at ONE continuation output — each
-  covenant passes, and the attacker pockets `(N-1) * min_continuation` of the
-  merchant's locked funds.
-- **Why deferred**: the per-input binding here is blocked by the wire scheme.
-  The continuation is a PLAIN merchant payment (no `CovenantBinding`), so
-  `OpOutputAuthorizingInput`/`OpAuthOutputIdx` can't bind it, and hardcoding
-  `cont_idx == OpTxInputIndex(+k)` over-constrains the layout and would break
-  the KIP-10 "additive exact" strict-interop scheme (elldeeone interop) which
-  places the continuation at an arbitrary non-payment index
-  (`kob/x402/src/scheme_exact.rs`). The safe fix requires a coordinated
-  protocol decision: either make the continuation a covenant output (so it
-  carries an authorizing input, then require
-  `OpOutputAuthorizingInput(cont_idx) == OpTxInputIndex`) and update the client
-  (`kob/x402/src/bin/x402_client.rs`) + facilitator, or mandate a
-  covenant-computable continuation index. This must be agreed against the
-  interop spec, not patched unilaterally.
-- **Recommended slice**: decide with the interop counterparty whether the
-  continuation becomes a covenant output; then add the per-input binding +
-  update the client/facilitator + add the drain/honest engine tests in
-  `kob/core/tests/x402_borrow_covenant.rs`.
+  entry).
+- **Refined analysis (deeper than the original "medium" finding)**: the scoped
+  fix — a v16-F6-style surplus cap plus an `mmfee_bps` state field — does not
+  cleanly fit bracket, for two structural reasons found while implementing it:
+  1. **No counterparty price to cap against.** The bracket entry fill layout
+     (`cli/src/bracket.rs` doc: `input[0]=bracket, input[1]=P2PK funding,
+     input[2]=receipt`) has NO resting counterparty sell-order input. The entry
+     fills at the buyer's own `entry_price` against matcher inventory, so there
+     is no fair/counterparty price for an F6-style cap to reference. The buyer
+     is already protected at their limit by the existing `output[1].value >= et`
+     (`et = kas * entry_price`) + SPK check — getting filled AT the limit is
+     correct limit-order semantics, and the matcher's arbitrage-within-limit is
+     not principal theft.
+  2. **`output[1]` is value-based, not a token covenant.** The buy entry has no
+     covenant-id check on `output[1]`, AND the honest builder
+     (`cli/src/bracket.rs:645`) emits `output[1]` as a PLAIN output (`None`
+     covenant) to a wallet SPK. Bracket's "tokens" are represented as sompi
+     value, not a KCC20 covenant continuation. Adding either a token-covenant
+     binding or a covenant-output surplus cap would break the honest flow and
+     requires redefining bracket's entry token/matching model.
+- **Why not applied**: both would require a redesign of bracket's (currently
+  UNWIRED — see audit finding #9) entry-fill counterparty/token model, not a
+  covenant patch. Forcing an `mmfee_bps` field + cap onto a value-based,
+  counterparty-less, dead-code path would be unverifiable (no honest flow to
+  test against) and could mask the deeper `output[1]` binding gap. Immediate
+  exploit risk is gated: bracket batch-matching is unwired and fails closed.
+- **Recommended slice (dedicated)**: define the bracket entry matching layout
+  (which input is the priced counterparty; whether `output[1]` becomes a token
+  covenant output); then bind `output[1]` to the token covenant (per-input,
+  `OpAuthOutputIdx` like Fix 3) and add a surplus cap against the now-defined
+  counterparty price, with the state-layout bump (224→232, RS 365→373, sigLen
+  dispatch, parse, pin) and an engine harness. Treat as a bracket-hardening
+  project, not a covenant one-liner.

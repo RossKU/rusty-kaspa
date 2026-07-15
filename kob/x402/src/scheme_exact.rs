@@ -165,7 +165,7 @@ mod tests {
 
     fn terms(pay_to: &str, amount: u64, borrow_txid: &str) -> BorrowTerms {
         let mut rp = ReservationProvider::new();
-        rp.reserve("11".repeat(32), pay_to, amount, borrow_txid, 0, 100_000_000, 3000, 0)
+        rp.reserve("11".repeat(32), pay_to, amount, borrow_txid, 0, 100_000_000, 3000, 0, None)
             .unwrap()
     }
 

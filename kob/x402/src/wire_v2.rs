@@ -213,6 +213,9 @@ pub struct ReserveRequest {
     pub payment_output_index: u32,
     #[serde(rename = "resourceUrl", default)]
     pub resource_url: String,
+    /// Optional expected request hash to bind the payment to (64-hex).
+    #[serde(rename = "requestHash", default, skip_serializing_if = "Option::is_none")]
+    pub request_hash: Option<String>,
 }
 
 /// `/verify` response.

@@ -227,6 +227,7 @@ impl<B: ChainBackend> Facilitator<B> {
         additive_threshold: u64,
         payment_output_index: u32,
         resource_url: &str,
+        request_hash: Option<String>,
     ) -> Result<PaymentRequired, String> {
         let seed = format!("{}:{}:{}", borrow_txid, borrow_index, now_nanos());
         let reservation_id = hex::encode(kob_settle::blake2b_256(seed.as_bytes()));
@@ -234,7 +235,7 @@ impl<B: ChainBackend> Facilitator<B> {
             let mut store = self.reservations.lock().await;
             store.reserve(
                 reservation_id, pay_to, amount, borrow_txid, borrow_index, borrow_amount,
-                additive_threshold, payment_output_index,
+                additive_threshold, payment_output_index, request_hash,
             )?
         };
         Ok(PaymentRequired {
@@ -322,8 +323,10 @@ impl<B: ChainBackend> Facilitator<B> {
             if !req_matches_terms {
                 return Err(errors::INVALID_PAYMENT_REQUIREMENTS);
             }
-            let v = scheme_exact::verify_exact_kip10(enc, encoding, poi, req_hash.as_deref(), &from, None, &t)
-                .map_err(exact_reject_code)?;
+            let v = scheme_exact::verify_exact_kip10(
+                enc, encoding, poi, req_hash.as_deref(), &from, t.request_hash.as_deref(), &t,
+            )
+            .map_err(exact_reject_code)?;
             let validated = Validated {
                 artifact_id: v.artifact_id,
                 payer: v.payer,
@@ -1304,18 +1307,29 @@ mod tests {
     }
 
     async fn exact_request<B: ChainBackend>(fac: &Facilitator<B>, merchant: &str, payer: &str, borrow_txid: &str, pay: u64, cont: u64) -> FacilitatorRequest {
+        exact_request_rh(fac, merchant, payer, borrow_txid, pay, cont, None, None).await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn exact_request_rh<B: ChainBackend>(
+        fac: &Facilitator<B>, merchant: &str, payer: &str, borrow_txid: &str, pay: u64, cont: u64,
+        reserve_rh: Option<String>, payload_rh: Option<&str>,
+    ) -> FacilitatorRequest {
         let borrow_amount = 100_000_000u64;
         let threshold = 3000u64;
-        let pr = fac.reserve(merchant, 250, borrow_txid, 0, borrow_amount, threshold, 0, "https://ex/r").await.unwrap();
+        let pr = fac.reserve(merchant, 250, borrow_txid, 0, borrow_amount, threshold, 0, "https://ex/r", reserve_rh).await.unwrap();
         let requirements = pr.accepts[0].clone();
         let enc = exact_encoded_tx(merchant, borrow_txid, pay, cont);
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "type": "exact-transaction",
             "payerAddress": payer,
             "transaction": enc,
             "transactionEncoding": crate::wire_v2::TX_ENCODING_SAFE_JSON,
             "paymentOutputIndex": 0
         });
+        if let Some(rh) = payload_rh {
+            payload["requestHash"] = serde_json::json!(rh);
+        }
         FacilitatorRequest {
             x402_version: X402_VERSION,
             payment_payload: PaymentPayload { x402_version: X402_VERSION, accepted: requirements.clone(), payload, extensions: None },
@@ -1389,6 +1403,52 @@ mod tests {
         let s = fac.settle(&req).await;
         assert!(!s.success);
         assert_ne!(s.amount.as_deref(), Some("1"));
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    async fn exact_fac_with_borrow(borrow_txid: &str, tag: &str) -> (Facilitator<MockChain>, String, String) {
+        let merchant = addr(2);
+        let payer = addr(1);
+        let (_rs, borrow_spk, borrow_addr) =
+            crate::reservation::borrow_covenant(&merchant, 100_000_000, 3000).unwrap();
+        let chain = MockChain::new(true)
+            .with_covenant_utxo(&borrow_addr, &hex::encode(&borrow_spk), borrow_txid, 0, 100_000_000, &"00".repeat(32))
+            .with_utxo(&payer, &"ff".repeat(32), 0, 200_000_000);
+        (Facilitator::new(chain, tmp_store(tag), config()), merchant, payer)
+    }
+
+    #[tokio::test]
+    async fn exact_kip10_request_hash_binding_enforced() {
+        let bt = "a4".repeat(32);
+        let (fac, merchant, payer) = exact_fac_with_borrow(&bt, "exact_rh_ok").await;
+        let h = "ab".repeat(32);
+        // Reservation binds request hash h; payload carries h -> accepted.
+        let req = exact_request_rh(&fac, &merchant, &payer, &bt, 250, 100_003_000, Some(h.clone()), Some(&h)).await;
+        let v = fac.verify(&req).await;
+        assert!(v.is_valid, "matching request hash must pass: {:?}", v.invalid_reason);
+    }
+
+    #[tokio::test]
+    async fn exact_kip10_rejects_request_hash_mismatch() {
+        let bt = "a5".repeat(32);
+        let (fac, merchant, payer) = exact_fac_with_borrow(&bt, "exact_rh_bad").await;
+        // Reservation binds "ab...", payload carries "cd..." -> refused (dead code before).
+        let req = exact_request_rh(&fac, &merchant, &payer, &bt, 250, 100_003_000, Some("ab".repeat(32)), Some(&"cd".repeat(32))).await;
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_kip10_rejects_missing_request_hash_when_bound() {
+        let bt = "a6".repeat(32);
+        let (fac, merchant, payer) = exact_fac_with_borrow(&bt, "exact_rh_missing").await;
+        // Reservation binds a hash; payload omits it -> refused.
+        let req = exact_request_rh(&fac, &merchant, &payer, &bt, 250, 100_003_000, Some("ab".repeat(32)), None).await;
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
         assert_eq!(fac.backend.submit_count(), 0);
     }
 }

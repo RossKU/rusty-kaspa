@@ -119,8 +119,9 @@ async fn reserve_handler<B: ChainBackend + 'static>(
         _ => return err(),
     };
     let url = if r.resource_url.is_empty() { "https://kob-x402/resource" } else { &r.resource_url };
+    let request_hash = r.request_hash.clone().filter(|s| !s.is_empty());
     match fac
-        .reserve(&r.pay_to, amount, &r.borrow_txid, r.borrow_index, borrow_amount, threshold, r.payment_output_index, url)
+        .reserve(&r.pay_to, amount, &r.borrow_txid, r.borrow_index, borrow_amount, threshold, r.payment_output_index, url, request_hash)
         .await
     {
         Ok(pr) => Json(pr).into_response(),

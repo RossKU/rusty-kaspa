@@ -30,6 +30,8 @@ pub struct BorrowTerms {
     /// blake2b(version||merchant_spk) — the covenant's continuation target hash.
     /// Enforced unique per active reservation (aggregate-drain prevention).
     pub merchant_spk_hash: [u8; 32],
+    /// Expected request hash; when set the client payload MUST carry it.
+    pub request_hash: Option<String>,
     pub consumed: bool,
 }
 
@@ -121,6 +123,7 @@ impl ReservationProvider {
         borrow_amount: u64,
         additive_threshold: u64,
         payment_output_index: u32,
+        request_hash: Option<String>,
     ) -> Result<BorrowTerms, String> {
         let merchant_spk_hash = merchant_spk_hash_of(pay_to)?;
         if self.active_hashes.contains(&merchant_spk_hash) {
@@ -145,6 +148,7 @@ impl ReservationProvider {
             p2sh_script,
             payment_output_index,
             merchant_spk_hash,
+            request_hash,
             consumed: false,
         };
         self.active_hashes.insert(merchant_spk_hash);
@@ -186,7 +190,7 @@ mod tests {
     fn reserve_records_and_extra_conforms() {
         let mut rp = ReservationProvider::new();
         let rid = "ab".repeat(32);
-        let t = rp.reserve(rid.clone(), &testnet_addr(1), 250, &"cd".repeat(32), 0, 100_000_000, 3000, 1).unwrap();
+        let t = rp.reserve(rid.clone(), &testnet_addr(1), 250, &"cd".repeat(32), 0, 100_000_000, 3000, 1, None).unwrap();
         let extra = t.requirements_extra();
         assert_eq!(extra["binding"], BINDING_EXACT);
         assert_eq!(extra["templateId"], TEMPLATE_KIP10_ADDITIVE);
@@ -203,22 +207,22 @@ mod tests {
     fn rejects_duplicate_merchant_continuation_target() {
         let mut rp = ReservationProvider::new();
         let merchant = testnet_addr(7);
-        let t1 = rp.reserve("11".repeat(32), &merchant, 250, &"aa".repeat(32), 0, 100_000_000, 3000, 1).unwrap();
+        let t1 = rp.reserve("11".repeat(32), &merchant, 250, &"aa".repeat(32), 0, 100_000_000, 3000, 1, None).unwrap();
         // Second concurrent reservation to the SAME merchant address is rejected:
         // a shared continuation target is exactly what the aggregate-drain needs.
-        let dup = rp.reserve("22".repeat(32), &merchant, 250, &"bb".repeat(32), 0, 100_000_000, 3000, 1);
+        let dup = rp.reserve("22".repeat(32), &merchant, 250, &"bb".repeat(32), 0, 100_000_000, 3000, 1, None);
         assert!(dup.is_err(), "reusing a merchant continuation target must be rejected");
 
         // A distinct merchant address is accepted and yields a DISTINCT covenant
         // (distinct merchant_spk_hash => distinct P2SH), so the two live borrow
         // UTXOs cannot be satisfied by one shared continuation output.
-        let t2 = rp.reserve("33".repeat(32), &testnet_addr(8), 250, &"cc".repeat(32), 0, 100_000_000, 3000, 1).unwrap();
+        let t2 = rp.reserve("33".repeat(32), &testnet_addr(8), 250, &"cc".repeat(32), 0, 100_000_000, 3000, 1, None).unwrap();
         assert_ne!(t1.merchant_spk_hash, t2.merchant_spk_hash);
         assert_ne!(t1.p2sh_script, t2.p2sh_script);
 
         // Consuming a reservation frees its target for later reuse (UTXO spent).
         rp.mark_consumed(&"11".repeat(32));
-        let reuse = rp.reserve("44".repeat(32), &merchant, 250, &"dd".repeat(32), 0, 100_000_000, 3000, 1);
+        let reuse = rp.reserve("44".repeat(32), &merchant, 250, &"dd".repeat(32), 0, 100_000_000, 3000, 1, None);
         assert!(reuse.is_ok(), "target must be reusable after the prior reservation is consumed");
     }
 }

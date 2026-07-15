@@ -296,17 +296,33 @@ impl<B: ChainBackend> Facilitator<B> {
             let req_hash = pp.request_hash().map(|s| s.to_string());
             let rid = requirements.reservation_id().ok_or(errors::INVALID_PAYMENT_REQUIREMENTS)?;
             // Only settle a reservation we issued and that is not yet consumed.
-            let borrow_owner = {
+            // ALL economic terms come from the stored reservation, never the
+            // caller-supplied requirements.
+            let (t, borrow_owner) = {
                 let store = self.reservations.lock().await;
-                let t = store.get(rid).ok_or(errors::INVALID_PAYMENT_REQUIREMENTS)?;
+                let t = store.get(rid).ok_or(errors::INVALID_PAYMENT_REQUIREMENTS)?.clone();
                 if t.consumed {
                     return Err(errors::INVALID_TRANSACTION_STATE);
                 }
                 let prefix = if requirements.network == NETWORK_TESTNET10 { "kaspatest" } else { "kaspa" };
-                kob_settle::bech32::spk_to_address(&t.p2sh_script, prefix)
-                    .map_err(|_| errors::UNEXPECTED_SETTLE_ERROR)?
+                let owner = kob_settle::bech32::spk_to_address(&t.p2sh_script, prefix)
+                    .map_err(|_| errors::UNEXPECTED_SETTLE_ERROR)?;
+                (t, owner)
             };
-            let v = scheme_exact::verify_exact_kip10(enc, encoding, poi, req_hash.as_deref(), &from, None, requirements)
+            // Caller-supplied requirements must agree with the stored terms.
+            let req_matches_terms = requirements.amount_sompi().map(|a| a == t.amount).unwrap_or(false)
+                && requirements.pay_to == t.pay_to
+                && requirements
+                    .borrow_outpoint()
+                    .map(|o| o.txid.eq_ignore_ascii_case(&t.borrow_txid) && o.index == t.borrow_index)
+                    .unwrap_or(false)
+                && requirements.borrow_amount_sompi() == Some(t.borrow_amount)
+                && requirements.additive_threshold_sompi() == Some(t.additive_threshold)
+                && requirements.payment_output_index() == Some(t.payment_output_index);
+            if !req_matches_terms {
+                return Err(errors::INVALID_PAYMENT_REQUIREMENTS);
+            }
+            let v = scheme_exact::verify_exact_kip10(enc, encoding, poi, req_hash.as_deref(), &from, None, &t)
                 .map_err(exact_reject_code)?;
             let validated = Validated {
                 artifact_id: v.artifact_id,
@@ -314,9 +330,9 @@ impl<B: ChainBackend> Facilitator<B> {
                 pay_output_index: v.payment_output_index,
                 input_outpoints: v.input_outpoints,
                 tx: v.tx,
-                pay_to: requirements.pay_to.clone(),
+                pay_to: t.pay_to.clone(),
                 confirm_address: v.confirm_address,
-                amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
+                amount: t.amount,
             };
             // On-chain: every input unspent across [borrow P2SH, payer].
             self.check_inputs_on_chain(&validated.input_outpoints, &[borrow_owner, from.clone()], None).await?;
@@ -1347,6 +1363,32 @@ mod tests {
         assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYMENT_REQUIREMENTS));
         let s = fac.settle(&req).await;
         assert!(!s.success);
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_kip10_rejects_caller_amount_mismatch() {
+        let merchant = addr(2);
+        let payer = addr(1);
+        let borrow_txid = "a3".repeat(32);
+        let (_rs, borrow_spk, borrow_addr) =
+            crate::reservation::borrow_covenant(&merchant, 100_000_000, 3000).unwrap();
+        let chain = MockChain::new(true)
+            .with_covenant_utxo(&borrow_addr, &hex::encode(&borrow_spk), &borrow_txid, 0, 100_000_000, &"00".repeat(32))
+            .with_utxo(&payer, &"ff".repeat(32), 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("exact_amt_tamper"), config());
+        // Reservation quoted at 250; caller rewrites requirements to amount "1"
+        // (pay-what-you-want attempt). Must be refused, never settle at "1".
+        let mut req = exact_request(&fac, &merchant, &payer, &borrow_txid, 250, 100_003_000).await;
+        req.payment_requirements.amount = "1".to_string();
+        req.payment_payload.accepted.amount = "1".to_string();
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYMENT_REQUIREMENTS));
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_ne!(s.amount.as_deref(), Some("1"));
         assert_eq!(fac.backend.submit_count(), 0);
     }
 }

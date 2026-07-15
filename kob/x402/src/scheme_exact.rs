@@ -6,8 +6,9 @@
 
 use kob_settle::observe::ObservedOutput;
 
+use crate::reservation::BorrowTerms;
 use crate::scheme_native::{artifact_id, normalize_tx};
-use crate::wire_v2::{PaymentRequirements, TX_ENCODING_SAFE_JSON};
+use crate::wire_v2::TX_ENCODING_SAFE_JSON;
 
 #[derive(Debug, Clone)]
 pub struct ExactVerified {
@@ -25,8 +26,8 @@ pub struct ExactVerified {
 pub enum ExactReject {
     Malformed,
     BadEncoding,
-    MissingBorrowTerms,
     WrongBorrowOutpoint,
+    WrongPaymentOutputIndex,
     WrongRecipient,
     Underpayment,
     UnderThreshold,
@@ -56,10 +57,10 @@ fn input_outpoints(tx: &serde_json::Value) -> Vec<String> {
 
 /// Verify a KIP-10 additive exact-transaction (pure, node-independent).
 ///
-/// `transaction_encoded` is the `exact-transaction` payload's `transaction`
-/// string (encoded per `kaspa-sdk-safe-json-v2.0.0`; here a JSON string of the
-/// tx object). `expected_request_hash` binds the request when the merchant set
-/// one on the reservation.
+/// All economic terms (`amount`, `payTo`, borrow outpoint/amount, threshold,
+/// payment output index) come from the SERVER-AUTHORITATIVE `terms` — never
+/// from caller-supplied requirements. `expected_request_hash` binds the
+/// request when the merchant set one on the reservation.
 pub fn verify_exact_kip10(
     transaction_encoded: &str,
     encoding: &str,
@@ -67,7 +68,7 @@ pub fn verify_exact_kip10(
     request_hash: Option<&str>,
     payer: &str,
     expected_request_hash: Option<&str>,
-    requirements: &PaymentRequirements,
+    terms: &BorrowTerms,
 ) -> Result<ExactVerified, ExactReject> {
     if encoding != TX_ENCODING_SAFE_JSON {
         return Err(ExactReject::BadEncoding);
@@ -79,12 +80,12 @@ pub fn verify_exact_kip10(
         return Err(ExactReject::Malformed);
     }
 
-    let required = requirements.amount_sompi().map_err(|_| ExactReject::Malformed)?;
-    let borrow = requirements.borrow_outpoint().ok_or(ExactReject::MissingBorrowTerms)?;
-    let borrow_amount = requirements.borrow_amount_sompi().ok_or(ExactReject::MissingBorrowTerms)?;
-    let threshold = requirements.additive_threshold_sompi().ok_or(ExactReject::MissingBorrowTerms)?;
-    let min_continuation = borrow_amount.saturating_add(threshold);
-    let pay_to_spk = spk_of(&requirements.pay_to).ok_or(ExactReject::WrongRecipient)?;
+    let required = terms.amount;
+    let min_continuation = terms.min_continuation;
+    let pay_to_spk = spk_of(&terms.pay_to).ok_or(ExactReject::WrongRecipient)?;
+    if payment_output_index != terms.payment_output_index {
+        return Err(ExactReject::WrongPaymentOutputIndex);
+    }
 
     // Request-hash binding.
     if let Some(exp) = expected_request_hash {
@@ -99,7 +100,7 @@ pub fn verify_exact_kip10(
     if outpoints.is_empty() {
         return Err(ExactReject::NoInputs);
     }
-    let borrow_key = format!("{}:{}", borrow.txid, borrow.index);
+    let borrow_key = format!("{}:{}", terms.borrow_txid, terms.borrow_index);
     if !outpoints.iter().any(|o| o == &borrow_key) {
         return Err(ExactReject::WrongBorrowOutpoint);
     }
@@ -145,7 +146,7 @@ pub fn verify_exact_kip10(
         amount_paid: pay.value,
         input_outpoints: outpoints,
         borrow_outpoint: borrow_key,
-        confirm_address: requirements.pay_to.clone(),
+        confirm_address: terms.pay_to.clone(),
         tx,
     })
 }
@@ -154,7 +155,6 @@ pub fn verify_exact_kip10(
 mod tests {
     use super::*;
     use crate::reservation::ReservationProvider;
-    use crate::wire_v2::{ASSET_KAS, NETWORK_TESTNET10, SCHEME_EXACT};
 
     fn testnet_addr(seed: u8) -> String {
         kob_settle::wallet::pubkey_to_address(&[seed; 32], kob_settle::types::Network::Testnet)
@@ -163,20 +163,10 @@ mod tests {
         hex::encode(kob_settle::bech32::address_to_spk(addr).unwrap())
     }
 
-    fn requirements(pay_to: &str, amount: u64, borrow_txid: &str) -> PaymentRequirements {
+    fn terms(pay_to: &str, amount: u64, borrow_txid: &str) -> BorrowTerms {
         let mut rp = ReservationProvider::new();
-        let terms = rp
-            .reserve("11".repeat(32), pay_to, amount, borrow_txid, 0, 100_000_000, 3000, 0)
-            .unwrap();
-        PaymentRequirements {
-            scheme: SCHEME_EXACT.to_string(),
-            network: NETWORK_TESTNET10.to_string(),
-            amount: amount.to_string(),
-            asset: ASSET_KAS.to_string(),
-            pay_to: pay_to.to_string(),
-            max_timeout_seconds: 60,
-            extra: terms.requirements_extra(),
-        }
+        rp.reserve("11".repeat(32), pay_to, amount, borrow_txid, 0, 100_000_000, 3000, 0)
+            .unwrap()
     }
 
     /// Encoded tx spending `borrow_txid:0`, paying `pay_amt` to `pay_to` at
@@ -206,10 +196,10 @@ mod tests {
         let merchant = testnet_addr(2);
         let payer = testnet_addr(1);
         let bt = "aa".repeat(32);
-        let req = requirements(&merchant, 250, &bt);
+        let t = terms(&merchant, 250, &bt);
         // pays 250 to merchant, continuation 100_003_000 (>= 100M+3000).
         let enc = encoded_tx(&merchant, &bt, 250, 100_003_000);
-        let v = verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &payer, None, &req).unwrap();
+        let v = verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &payer, None, &t).unwrap();
         assert_eq!(v.amount_paid, 250);
         assert_eq!(v.borrow_outpoint, format!("{}:0", bt));
     }
@@ -217,11 +207,11 @@ mod tests {
     #[test]
     fn rejects_wrong_borrow_outpoint() {
         let merchant = testnet_addr(2);
-        let req = requirements(&merchant, 250, &"aa".repeat(32));
+        let t = terms(&merchant, 250, &"aa".repeat(32));
         // tx spends a DIFFERENT borrow outpoint.
         let enc = encoded_tx(&merchant, &"be".repeat(32), 250, 100_003_000);
         assert_eq!(
-            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &req).unwrap_err(),
+            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &t).unwrap_err(),
             ExactReject::WrongBorrowOutpoint
         );
     }
@@ -230,11 +220,11 @@ mod tests {
     fn rejects_under_threshold_continuation() {
         let merchant = testnet_addr(2);
         let bt = "aa".repeat(32);
-        let req = requirements(&merchant, 250, &bt);
+        let t = terms(&merchant, 250, &bt);
         // continuation only 100M (< 100M + 3000).
         let enc = encoded_tx(&merchant, &bt, 250, 100_000_000);
         assert_eq!(
-            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &req).unwrap_err(),
+            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &t).unwrap_err(),
             ExactReject::UnderThreshold
         );
     }
@@ -243,10 +233,10 @@ mod tests {
     fn rejects_underpayment() {
         let merchant = testnet_addr(2);
         let bt = "aa".repeat(32);
-        let req = requirements(&merchant, 250, &bt);
+        let t = terms(&merchant, 250, &bt);
         let enc = encoded_tx(&merchant, &bt, 249, 100_003_000);
         assert_eq!(
-            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &req).unwrap_err(),
+            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &t).unwrap_err(),
             ExactReject::Underpayment
         );
     }
@@ -256,11 +246,11 @@ mod tests {
         let merchant = testnet_addr(2);
         let other = testnet_addr(9);
         let bt = "aa".repeat(32);
-        let req = requirements(&merchant, 250, &bt);
+        let t = terms(&merchant, 250, &bt);
         // payment goes to `other`, not the required merchant.
         let enc = encoded_tx(&other, &bt, 250, 100_003_000);
         assert_eq!(
-            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &req).unwrap_err(),
+            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &t).unwrap_err(),
             ExactReject::WrongRecipient
         );
     }
@@ -269,10 +259,10 @@ mod tests {
     fn rejects_request_hash_mismatch() {
         let merchant = testnet_addr(2);
         let bt = "aa".repeat(32);
-        let req = requirements(&merchant, 250, &bt);
+        let t = terms(&merchant, 250, &bt);
         let enc = encoded_tx(&merchant, &bt, 250, 100_003_000);
         let err = verify_exact_kip10(
-            &enc, TX_ENCODING_SAFE_JSON, 0, Some(&"11".repeat(32)), &testnet_addr(1), Some(&"22".repeat(32)), &req,
+            &enc, TX_ENCODING_SAFE_JSON, 0, Some(&"11".repeat(32)), &testnet_addr(1), Some(&"22".repeat(32)), &t,
         ).unwrap_err();
         assert_eq!(err, ExactReject::FingerprintMismatch);
     }

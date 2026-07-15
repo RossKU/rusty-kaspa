@@ -49,11 +49,11 @@ const P2SH_SPK_SIZE: u64 = 35;
 /// The v14 body is 251B — 9B larger than the pre-IOC v13 body (242B) because
 /// v14 added the IOC fill sub-dispatch; see `order.rs`.)
 const BUY_RS_SIZE: u64 = 396;
-/// sell_order v14 redeemScript: 112B state + 304B body = 416B.
-/// (Matches kob-core `parse::SELL_RS_SIZE = SELL_STATE_SIZE(112) + SELL_BODY_SIZE(304)`.
-/// The v14 sell body is 304B — 60B larger than the v13 body (244B) from the
+/// sell_order v14 redeemScript: 112B state + 315B body = 427B.
+/// (Matches kob-core `parse::SELL_RS_SIZE = SELL_STATE_SIZE(112) + SELL_BODY_SIZE(315)`.
+/// The v14 sell body is 315B — 60B larger than the v13 body (244B) from the
 /// v14 IOC fill path.)
-const SELL_RS_SIZE: u64 = 416;
+const SELL_RS_SIZE: u64 = 427;
 /// bracket_order v6 redeemScript: 224B state + 141B body = 365B.
 #[allow(dead_code)] // Kept for fee estimation reference
 const BRACKET_RS_SIZE: u64 = 365;
@@ -74,17 +74,17 @@ const SWAP_CANCEL_SS_SIZE: u64 = 346;
 
 /// buy_v14 fill sigscript: 4 opcodes + pushData(396) = 4 + 3 + 396 = 403.
 const BUY_FILL_SS_SIZE: u64 = 403;
-/// sell_v14 fill sigscript: 2 opcodes + pushData(416) = 2 + 3 + 416 = 421.
+/// sell_v14 fill sigscript: 2 opcodes + pushData(427) = 2 + 3 + 427 = 432.
 const SELL_FILL_SS_SIZE: u64 = 421;
 
 /// buy_v14 cancel sigscript: 1 + 66 + 33 + 3 + 396 = 499.
 const BUY_CANCEL_SS_SIZE: u64 = 499;
-/// sell_v14 cancel sigscript: 66 + 33 + 1 + 3 + 416 = 519.
+/// sell_v14 cancel sigscript: 66 + 33 + 1 + 3 + 427 = 530.
 const SELL_CANCEL_SS_SIZE: u64 = 519;
 
 /// buy_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 396 = 411.
 const BUY_PARTIAL_SS_SIZE: u64 = 411;
-/// sell_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 416 = 431.
+/// sell_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 427 = 442.
 const SELL_PARTIAL_SS_SIZE: u64 = 431;
 
 /// P2PK wallet input sigscript: pushData(sig+sighash 65B) = 66B.

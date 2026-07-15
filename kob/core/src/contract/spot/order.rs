@@ -416,9 +416,24 @@ pub const SELL_ORDER_BODY: &[u8] = &[
     0x52, 0x79, 0x87, 0x69,       // Op2 OpPick(sspkh) OpEqual OpVerify              [4B]
     // mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5), fta(6), koi(7)
 
-    // F4: token conservation — at least 1 covenant output (6B)
-    0xb9, 0xcf,                   // OpTxInputIndex OpInputCovenantId -> T           [2B]
-    0xd2, 0x51, 0xa2, 0x69,       // OpCovOutCount(T) Op1 OpGTE OpVerify             [4B]
+    // F4: RESIDUAL CONSERVATION (17B). The old check was existence-only
+    // (OpCovOutCount>=1) with a free `fta`: a matcher could consume the whole
+    // token_in, price only `fta` to the seller, and drain the (token_in - fta)
+    // unsold tokens out as KAS. Now the residual must return to THIS seller via
+    // a self-continuation output bound to THIS input (its 0th authorized covenant
+    // output, OpAuthOutputIdx — per-input, like the full-fill F4; needs NO
+    // sigscript change so v16 F6's fixed-offset reads are untouched).
+    // r = OpTxInputIndex Op0 OpAuthOutputIdx (this input's 0th authorized output)
+    0xb9, 0x00, 0xcc,             // OpTxInputIndex Op0 OpAuthOutputIdx -> r          [3B]
+    0x76,                         // OpDup                                            [1B]
+    0xc3,                         // OpTxOutputSpk(r)                                 [1B]
+    0xb9, 0xbf,                   // OpTxInputIndex OpTxInputSpk -> my spk            [2B]
+    0x87, 0x69,                   // OpEqual OpVerify (r is self-continuation to me)  [2B]
+    0xc2,                         // OpTxOutputAmount(r)                              [1B]
+    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> token_in       [2B]
+    0x58, 0x79,                   // Op8 OpPick(fta)                                  [2B]
+    0x94,                         // OpSub -> token_in - fta                          [1B]
+    0xa2, 0x69,                   // OpGTE OpVerify (residual out >= token_in - fta)  [2B]
 
     // Cleanup: 8 items = Op2Drop x4 (4B)
     0x6d, 0x6d, 0x6d, 0x6d,       // Op2Drop x4                                      [4B]
@@ -505,9 +520,9 @@ pub const SELL_ORDER_BODY: &[u8] = &[
 ];
 
 /// Expected body length for sell order.
-pub const SELL_ORDER_BODY_EXPECTED_LEN: usize = 304;
+pub const SELL_ORDER_BODY_EXPECTED_LEN: usize = 315;
 
-/// Expected redeemScript length for sell order (112B state + 304B body).
+/// Expected redeemScript length for sell order (112B state + 315B body).
 pub const SELL_ORDER_RS_EXPECTED_LEN: usize = 112 + SELL_ORDER_BODY_EXPECTED_LEN;
 
 /// Build buy_order redeemScript (145B state + 242B body = 387B).

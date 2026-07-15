@@ -674,7 +674,7 @@ mod tests {
         let spk_hash = compute_p2pk_spk_hash(&pk);
         let rs = contract::build_sell_redeem_script(
             50, 1, 500_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 416); // v14 sell RS: 112 state + 304 body (kob-core SELL_RS_SIZE)
+        assert_eq!(rs.len(), 427); // v14 sell RS: 112 state + 315 body (kob-core SELL_RS_SIZE)
     }
 
     #[test]
@@ -719,12 +719,12 @@ mod tests {
         let new_rs = contract::build_sell_redeem_script(
             100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
         // A buy->sell requote must change the RS size. In v14 the sell RS
-        // (416B = 112 state + 304 body) is LARGER than the buy RS (396B =
+        // (427B = 112 state + 315 body) is LARGER than the buy RS (396B =
         // 145 state + 251 body) -- the reverse of v13 (buy 387 > sell 356),
         // because the v14 IOC fill path grew the sell body (+60B) far more
         // than the buy body (+9B). Assert the exact sizes + that they differ.
         assert_eq!(old_rs.len(), 396, "v14 buy RS");
-        assert_eq!(new_rs.len(), 416, "v14 sell RS");
+        assert_eq!(new_rs.len(), 427, "v14 sell RS");
         assert_ne!(old_rs.len(), new_rs.len(), "side change must alter the RS size");
     }
 

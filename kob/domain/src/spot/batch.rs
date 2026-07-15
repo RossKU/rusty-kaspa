@@ -2361,10 +2361,10 @@ mod tests {
 
         let tx = plan.build_tx().expect("build should succeed");
 
-        // Sell v14 IOC fill SS: [Op(koi)] [push8(fta)] [Op5] [PUSHDATA2(2)] [416B RS]
-        // = 1 + 9 + 1 + 3 + 416 = 430 bytes (IOC mode: sell excess > 0)
+        // Sell v14 IOC fill SS: [Op(koi)] [push8(fta)] [Op5] [PUSHDATA2(2)] [427B RS]
+        // = 1 + 9 + 1 + 3 + 427 = 441 bytes (IOC mode: sell excess > 0)
         let sell_ss_len = tx.inputs[0].sigscript.len();
-        assert_eq!(sell_ss_len, 430, "sell_v14 IOC fill SS = 430B");
+        assert_eq!(sell_ss_len, 441, "sell_v14 IOC fill SS = 441B");
 
         // Buy v14 fill SS: [Op(toi)] [Op(tii)] [Op(coi)] [Op1] [PUSHDATA2(2)] [396B RS]
         // = 1 + 1 + 1 + 1 + 3 + 396 = 403 bytes

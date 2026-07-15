@@ -23,7 +23,8 @@ use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_core::contract::spot::order::{
     build_buy_v16_fill_sigscript, build_buy_v16_ioc_fill_sigscript, build_buy_v16_redeem_script,
-    build_sell_fill_sigscript, build_sell_fill_sigscript_fixed_offset, build_sell_redeem_script,
+    build_sell_fill_sigscript, build_sell_fill_sigscript_fixed_offset,
+    build_sell_ioc_fill_sigscript, build_sell_redeem_script,
 };
 use kob_core::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::listing::{build_listing_redeem_script, build_listing_settle_sigscript};
@@ -366,6 +367,81 @@ fn sell_f4_shared_output_drain_rejected_honest_passes() {
         "seller B MUST FAIL: its tokens were drained to KAS with no output authorized by input 1, \
          but F4 is still accepting the shared covenant-output-0"
     );
+}
+
+/// Run the IOC-sell (Op5) covenant with token_in=30M, fta=20M (partial), and a
+/// residual self-continuation output at output[0] worth `residual_value` (SPK
+/// = the sell P2SH => auth[0] of the sell input). `residual_bound` controls
+/// whether output[0] carries the sell's covenant binding (authorizing_input=0);
+/// when false the residual isn't a covenant continuation of the sell input, so
+/// OpAuthOutputIdx finds nothing. Returns the sell script result.
+fn run_sell_ioc(residual_value: u64, residual_bound: bool) -> Result<(), String> {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+
+    let token_in = 30_000_000u64;
+    let fta = 20_000_000u64; // partial fill; residual should be token_in - fta = 10M
+    let sell_rs = build_sell_redeem_script(1, 1, 8_000_000, &owner_hash, &spk_hash, 10_000_000, 0, 0).unwrap();
+    let sell_p2sh = build_p2sh(&sell_rs);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    // koi = 1 (seller KAS at output[1]); IOC selector (Op5) + fta.
+    let sell_ss = build_sell_ioc_fill_sigscript(1, fta, &sell_rs);
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), sell_ss, 50, 0),       // sell (token 30M)
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1), // fee placeholder
+    ];
+    // output[0] = residual self-continuation to the sell P2SH; output[1] = seller KAS.
+    let residual_cov = if residual_bound { Some(CovenantBinding::new(0, token_cov_id)) } else { None };
+    let residual_p2sh = ScriptPublicKey::new(sell_p2sh.version(), sell_p2sh.script().into());
+    let outputs = vec![
+        TransactionOutput::with_covenant(residual_value, residual_p2sh, residual_cov), // residual -> seller
+        TransactionOutput::with_covenant(fta, wallet_spk.clone(), None),               // fill_kas 20M -> seller
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+    let entries = vec![
+        UtxoEntry { amount: token_in, script_public_key: sell_p2sh, block_daa_score: 0, is_coinbase: false, covenant_id: Some(token_cov_id) },
+        UtxoEntry { amount: 260_000_000, script_public_key: wallet_spk, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+    ];
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).expect("CovenantsContext::from_tx");
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let reused = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+    let (input, entry) = populated.populated_input(0);
+    let mut vm = TxScriptEngine::from_transaction_input(&populated, input, 0, entry, ctx, flags);
+    vm.execute().map_err(|e| format!("{e:?}"))
+}
+
+/// **Fix 1 (sell IOC residual conservation): the residual-drain now FAILS,
+/// honest partial IOC still passes.**
+///
+/// IOC-sell prices only `fta` of the seller's `token_in` and (before the fix)
+/// only checked a covenant output exists — so the `token_in - fta` unsold
+/// tokens could be drained out as KAS. F4 now requires that residual to return
+/// to the seller via a self-continuation output bound to THIS input.
+#[test]
+fn sell_ioc_residual_drain_rejected() {
+    // Matcher returns only 5M (< token_in - fta = 10M) to the seller and pockets
+    // the other 5M -> residual conservation FAILS.
+    let short = run_sell_ioc(5_000_000, true);
+    assert!(short.is_err(), "under-returned residual must be rejected; got Ok");
+    // Matcher returns the residual to a NON-covenant output (drains it as plain
+    // KAS): the sell input then authorizes no continuation output -> FAILS.
+    let unbound = run_sell_ioc(10_000_000, false);
+    assert!(unbound.is_err(), "residual not bound to this input as a continuation must be rejected; got Ok");
+}
+
+#[test]
+fn sell_ioc_honest_residual_passes() {
+    // Full residual (token_in - fta = 10M) returned to the seller via the sell's
+    // own P2SH self-continuation -> passes.
+    let r = run_sell_ioc(10_000_000, true);
+    assert!(r.is_ok(), "honest IOC partial with the residual returned must pass; got {r:?}");
 }
 
 /// Run a listing PATH 6 (settle english auction) script with the seller paid

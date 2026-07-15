@@ -2010,7 +2010,7 @@ mod adversarial_tests {
             ("BUY_ORDER", BUY_ORDER_BODY,
              "76a8eee18a1ed148f622a82ca1f18eb70bd039d2ecf9a936f5eb9fc1cd6f7e63"),
             ("SELL_ORDER", SELL_ORDER_BODY,
-             "f673a23cb666973e181ca8619186869dd1361601ec21f279dffa8e778749bb30"),
+             "7cd8fcba4f4b684183231ecc7663f0cd044e9ee1c4ac023e59da421cb124f1be"),
             ("OCO_SELL", OCO_SELL_BODY,
              "6ca1f63b8e6ee999da0a4a4d69c6bcaef6ee1d43010906f69337bb8337e20129"),
             ("DCA_ORDER", DCA_ORDER_BODY,

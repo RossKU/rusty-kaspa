@@ -906,7 +906,7 @@ mod recover_orders_tests {
         let spk_hash = [0xEE; 32];
         let rs = kob_core::contract::build_sell_redeem_script(
             500, 3, 1_000_000, &owner_hash, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 416); // v14 sell RS: 112 state + 304 body (kob-core SELL_RS_SIZE)
+        assert_eq!(rs.len(), 427); // v14 sell RS: 112 state + 315 body (kob-core SELL_RS_SIZE)
 
         let parsed = parse_redeem_script(&rs).unwrap();
         assert_eq!(parsed.side, "sell");
@@ -1052,7 +1052,7 @@ mod recover_orders_tests {
         let spk_hash = [0xEE; 32];
         let rs = kob_core::contract::build_sell_redeem_script(
             200, 1, 500_000, &owner_hash, &spk_hash, 0, 1, 0,).unwrap();
-        assert_eq!(rs.len(), 416); // v14 sell RS: 112 state + 304 body (kob-core SELL_RS_SIZE)
+        assert_eq!(rs.len(), 427); // v14 sell RS: 112 state + 315 body (kob-core SELL_RS_SIZE)
 
         let parsed = parse_redeem_script(&rs).unwrap();
         assert_eq!(parsed.owner_hash, owner_hash);

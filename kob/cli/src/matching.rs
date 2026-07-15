@@ -1179,9 +1179,9 @@ mod tests {
         // is +9B over v13's 242B for the IOC fill sub-dispatch). Matches
         // kob-core parse::BUY_RS_SIZE.
         assert_eq!(buy_rs.len(), 396, "Buy v14 RS must be 396 bytes");
-        // Sell v14 RS must be 416 bytes (112B state + 304B body; +60B over
+        // Sell v14 RS must be 427 bytes (112B state + 315B body; IOC residual
         // v13's 244B for the v14 IOC fill path). Matches kob-core parse::SELL_RS_SIZE.
-        assert_eq!(sell_rs.len(), 416, "Sell v14 RS must be 416 bytes");
+        assert_eq!(sell_rs.len(), 427, "Sell v14 RS must be 427 bytes");
         // Fill sigscripts should be non-empty
         assert!(!buy_ss.is_empty(), "Buy fill SS must not be empty");
         assert!(!sell_ss.is_empty(), "Sell fill SS must not be empty");

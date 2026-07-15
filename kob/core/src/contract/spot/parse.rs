@@ -55,14 +55,14 @@ pub const BRACKET_STATE_SIZE: usize = 224;
 
 /// Buy body size (v14: IOC path added, +9B).
 const BUY_BODY_SIZE: usize = 251;
-/// Sell body size (v14: IOC path added, +60B).
-const SELL_BODY_SIZE: usize = 304;
+/// Sell body size (v14 IOC path + IOC residual conservation).
+const SELL_BODY_SIZE: usize = 315;
 /// Bracket body size: 141B.
 const BRACKET_BODY_SIZE: usize = 141;
 
 /// Buy RS size: 145 + 251 = 396.
 pub const BUY_RS_SIZE: usize = BUY_STATE_SIZE + BUY_BODY_SIZE;
-/// Sell RS size: 112 + 304 = 416.
+/// Sell RS size: 112 + 315 = 427.
 pub const SELL_RS_SIZE: usize = SELL_STATE_SIZE + SELL_BODY_SIZE;
 /// Bracket RS size: 224 + 141 = 365.
 pub const BRACKET_RS_SIZE: usize = BRACKET_STATE_SIZE + BRACKET_BODY_SIZE;

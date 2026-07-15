@@ -898,7 +898,7 @@ mod tests {
     #[test]
     fn test_parse_sell_v12_rs_default() {
         let (rs, pnum, pden, mfill, ohash, sspkh) = make_sell_v12_rs_default();
-        assert_eq!(rs.len(), SELL_RS_SIZE, "Sell RS must be 415 bytes");
+        assert_eq!(rs.len(), SELL_RS_SIZE, "Sell RS must be 427 bytes");
 
         let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse sell v12 RS");
         assert_eq!(parsed.order_type, OrderSide::Sell);
@@ -1976,7 +1976,7 @@ mod tests {
         let t = [0u8; 32];
         let rs = kob_core::contract::build_sell_redeem_script(1, 2, 1, &t, &t, 0, 0, 0).unwrap();
         assert_eq!(rs.len(), SELL_RS_SIZE, "SELL_RS_SIZE constant must match actual RS length");
-        assert_eq!(SELL_RS_SIZE, 416);
+        assert_eq!(SELL_RS_SIZE, 427);
     }
 
     #[test]

@@ -93,7 +93,65 @@ rand, base64, sha2, hmac, pbkdf2, blake2b_simd — still declared in
 `contract/*.rs`/`listing.rs`; if not, they'll just be unused-dep warnings,
 not errors — no action needed unless doing a dependency-cleanup pass later.
 
-### PHASE 2 — NOT STARTED
+### PHASE 2 — IN PROGRESS (build handed off)
+
+Generic payment-watch seam + durable replay log, both inside `kob-settle`
+(no covenant-parsing dependency), new module `kob/settle/src/observe/`:
+
+- `observe/mod.rs` — `PaymentObserver`: watch address(es) (decoded to their
+  script-public-key via `crate::bech32::address_to_spk`), then match paying
+  outputs against the watched set purely on SPK bytes (native P2PK/P2SH are
+  both spk-version 0). Emits a generic `ScanEvent { txid, output_index,
+  address, value, covenant_id (opaque hex, NOT parsed), spk_version,
+  spk_script }`. Three feed paths: `scan_utxos(&[RpcUtxo])` (polling
+  `get_utxos`), `scan_tx_outputs(txid, &[ObservedOutput])`
+  (block-notification / self-broadcast), and `observe_tx_json(&Value)`
+  (parses raw RPC tx JSON — both TN12 flat-hex SPK and `{version,script}`
+  object forms, `value`/`amount` keys, optional covenant binding).
+  `ObservedOutput::from_rpc_json` mirrors the engine scanner's output
+  parsing so real node responses work unchanged. Finality confirmation is a
+  separate async step behind a `FinalityChecker` trait (impl'd for
+  `RpcClient` -> `confirm_tx_output`; tests mock it) — same seam pattern as
+  `MempoolProbe` in `chain::cache`.
+- `observe/replay.rs` — `ReplayStore`: durable append-only JSON-lines file
+  (NO sqlite/rocksdb — keeps `kob-settle` leaf-light; `PaymentRecord` per
+  line, last-write-wins per txid on reload, each write flushed + `sync_all`).
+  Keyed by txid AND by consumed outpoint. `check_replay(txid, outpoints) ->
+  ReplayCheck::{Fresh, DuplicateTxid(status), OutpointReused{..}}` is the
+  guard both `/verify` and `/settle` will use in Phase 3: same-txid retry =
+  idempotent `DuplicateTxid`; a *different* artifact re-spending a consumed
+  outpoint = rejected `OutpointReused`. `mark_confirmed`/`mark_failed` do
+  in-place status updates (append a new line). Tolerates a corrupt/truncated
+  trailing line on open (crash mid-write).
+
+Design decisions:
+- Observer matching is pure (no RPC) so it unit-tests without a node; the
+  only async surface (finality) is behind a mockable trait. Tests build a
+  *real* testnet P2PK address<->SPK pair (`pubkey_to_address` +
+  `address_to_spk`) and feed it through as a node would — the
+  "construct-real-bytecode, run-off-chain" harness style from
+  `toccata_fill_repro.rs`, applied to the address/SPK layer.
+- `covenant_id` is carried through opaquely (raw hex) rather than dropped, so
+  the Phase 4 KCC20 scheme can consume it, but the observer neither parses
+  nor links against any covenant logic — satisfies "does NOT depend on
+  covenant parsing".
+- Replay store deliberately a flat file, not SQLite: the gap the extraction
+  analysis named was "durable state (submitted-tx log) is absent"; a
+  synced append-only log is the minimal durable answer and adds zero deps.
+
+Wired into `kob/settle/src/lib.rs` (`pub mod observe;` + flat re-exports of
+`PaymentObserver`/`ScanEvent`/`ObservedOutput`/`FinalityChecker`/`ReplayStore`
+/`PaymentRecord`/`PaymentStatus`/`ReplayCheck`).
+
+Build: `cargo test -p kob-settle --lib` (PID 13685) came back **GREEN** —
+`test result: ok. 211 passed; 0 failed` (198 Phase-1 + 13 new: 7
+`observe::tests` + 6 `observe::replay::tests`, all confirmed executed).
+
+**PHASE 2 STATUS: DONE.** Committed. Next: Phase 3 (kob-x402 facilitator
+crate). The Phase-3 verify/settle flow will use `PaymentObserver`
+(observe the broadcast tx's paying output) + `FinalityChecker` on
+`RpcClient` (confirm) + `ReplayStore::check_replay` (idempotent settle +
+outpoint-reuse rejection).
 ### PHASE 3 — NOT STARTED
 ### PHASE 4 — NOT STARTED
 ### PHASE 5 — NOT STARTED

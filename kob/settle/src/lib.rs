@@ -21,6 +21,7 @@ pub mod config;
 pub mod crypto;
 pub mod error;
 pub mod mass;
+pub mod observe;
 pub mod primitives;
 pub mod rpc;
 pub mod rpc_types;
@@ -65,6 +66,10 @@ pub use mass::{
     MASS_PER_TX_BYTE, MASS_PER_SCRIPT_PUB_KEY_BYTE, MASS_PER_SIG_OP,
 };
 pub use rpc::RpcClient;
+pub use observe::{
+    PaymentObserver, ScanEvent, ObservedOutput, FinalityChecker,
+    ReplayStore, PaymentRecord, PaymentStatus, ReplayCheck,
+};
 
 /// Minimum UTXO value to avoid storage mass rejection (~3M sompi).
 ///

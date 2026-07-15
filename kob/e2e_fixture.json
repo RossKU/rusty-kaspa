@@ -2,8 +2,8 @@
   "network": "testnet-10",
   "node": "ws://65.108.107.30:18210",
   "ticker": "V16E2E",
-  "token_covenant_id": "0c113120cb56668a5aa984752496f8cc4ac65e9044f2fa85d64e7bbcb5fc6039",
-  "token_genesis_txid": "c20dc48acf266f94582884eeab8222de729b167bc317abdb6eddceb5c2da8376",
-  "mint_authority_outpoint": "aca2d5dd6299ce02c05d3d6b64773f4693be27cd31b2843660330a6c1fac970e:0",
+  "token_covenant_id": "690fa2aacde2ad6344114a2622bd402fdb493d564cfc025c38564cd0d18d5a10",
+  "token_genesis_txid": "e2697bc5153bb4fe06bf4fce97770f20ee751f64be52984c169cf1e0e3d350b5",
+  "mint_authority_outpoint": "7e561020a2a73b9d5157aa02fb124847bda5d61e12b04f86a3072b8fa6810fe5:0",
   "note": "Reusable v16 E2E token. Do NOT re-deploy the token genesis on every run. Mint fresh token_units from mint_authority_outpoint (cheap); after each mint, update mint_authority_outpoint to the new continuation ':0'. Only deploy a fresh genesis (kob-cli token create) if this file is missing or mint_authority_outpoint is spent. token_units are minted per-run because a cancelled sell unlocks its tokens back to KAS (KOB model), so they are not long-lived UTXOs to persist."
 }

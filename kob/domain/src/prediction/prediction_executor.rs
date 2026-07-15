@@ -265,8 +265,17 @@ pub fn build_create_market_tx(
         .and_then(|v| v.checked_add(params.split_merge_initial_value))
         .ok_or_else(|| PredictionTxError::Overflow("total output sum".to_string()))?;
 
-    // Mass-based fee estimate: 1 input, 4 outputs (3 covenants + change)
-    let estimated_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 4, payload.len()));
+    // Mass-based fee estimate: 1 input, 4 outputs (3 covenants + change).
+    // The two BallotBox outputs now carry a genesis CovenantBinding
+    // (authorizing_input u16 + covenant_id 32B = 34 serialized bytes each)
+    // that `estimate_compute_mass` does not count -- omitting it underpays
+    // and the node rejects the tx as non-standard ("has N fees which is
+    // under the required amount"). Add the covenant-binding bytes explicitly
+    // (MASS_PER_TX_BYTE = 1).
+    const COVENANT_BINDING_BYTES: u64 = 2 + 32;
+    let estimated_fee = kob_core::mass::min_relay_fee(
+        estimate_compute_mass(1, 4, payload.len()) + 2 * COVENANT_BINDING_BYTES,
+    );
 
     let total_required = total_output
         .checked_add(estimated_fee)

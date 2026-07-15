@@ -1256,7 +1256,22 @@ async fn create_market(
     println!("Redemption:      {}:0", tx_id2);
     println!("YES token CID:   {}", hex::encode(yes_token_cid));
     println!("NO token CID:    {}", hex::encode(no_token_cid));
+    println!("BallotBox CID:   {}", hex::encode(ballot_cid));
     println!("BallotBox RS:    {}", hex::encode(&yes_ballot_rs));
+    // Reconstruct the SplitMerge + Redemption redeemScripts so the `refund`
+    // command (which needs `--rs`) has a source for them -- they are built
+    // inside the domain layer and were otherwise never surfaced.
+    let sm_rs = kob_core::prediction::build_split_merge_redeem_script(
+        &market_id, &yes_token_cid, &no_token_cid, &creator_pkh, unit_value, expiry_daa,
+    )?;
+    // Same placeholders build_deploy_redemption_tx uses (threshold 4096,
+    // reward_per_receipt 1, receipt CIDs zero).
+    let redemption_rs = kob_core::prediction::build_redemption_redeem_script(
+        &market_id, &ballot_cid, &yes_token_cid, &no_token_cid,
+        payout_per_token, 4096, &creator_pkh, expiry_daa, 1, &[0u8; 32], &[0u8; 32],
+    )?;
+    println!("SplitMerge RS:   {}", hex::encode(&sm_rs));
+    println!("Redemption RS:   {}", hex::encode(&redemption_rs));
 
     Ok(())
 }

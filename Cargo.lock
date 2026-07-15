@@ -4984,6 +4984,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kob-x402"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.7.9",
+ "base64",
+ "hex",
+ "kaspa-consensus-core",
+ "kob-settle",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber 0.3.22",
+]
+
+[[package]]
 name = "kv-log-macro"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"

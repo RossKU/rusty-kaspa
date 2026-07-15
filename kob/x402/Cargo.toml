@@ -1,0 +1,29 @@
+[package]
+name = "kob-x402"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "kob_x402"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kob-x402"
+path = "src/main.rs"
+
+[dependencies]
+kob-settle = { path = "../settle" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+axum = { version = "0.7" }
+tower-http = { workspace = true, features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+
+[dev-dependencies]
+kaspa-consensus-core = { workspace = true }

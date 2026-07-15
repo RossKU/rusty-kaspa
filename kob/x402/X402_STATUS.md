@@ -152,7 +152,70 @@ crate). The Phase-3 verify/settle flow will use `PaymentObserver`
 (observe the broadcast tx's paying output) + `FinalityChecker` on
 `RpcClient` (confirm) + `ReplayStore::check_replay` (idempotent settle +
 outpoint-reuse rejection).
-### PHASE 3 — NOT STARTED
+### PHASE 3 — IN PROGRESS (build handed off)
+
+New crate `kob-x402` (`kob/x402/`, workspace member added), HTTP facilitator
++ scheme (A) native-KAS "exact" end to end:
+
+- `src/wire.rs` — x402 wire types kept aligned with upstream
+  (coinbase/x402): `PaymentRequirements` (scheme/network/maxAmountRequired
+  string-sompi/resource/payTo/asset/extra), `PaymentPayload` +
+  `NativeExactPayload` (`transaction` signed RPC tx, `from`, `payTo`,
+  `amount`), `X-PAYMENT` base64(JSON) encode/decode, 402
+  `PaymentRequiredResponse`, `FacilitatorRequest` (paymentPayload +
+  paymentRequirements), `VerifyResponse` (isValid/invalidReason/payer),
+  `SettleResponse` (success/errorReason/transaction/network/payer),
+  `/supported` types. Networks `kaspa:mainnet` / `kaspa:testnet-10`, asset
+  `kas`.
+- `src/fingerprint.rs` — request-fingerprint binding. `compute_fingerprint`
+  = sha256(method\0path\0payTo\0maxAmountRequired\0nonce) hex;
+  `embed_fingerprint` -> `X402:<hex>` tx-payload bytes; `extract_fingerprint`
+  reads it back (hex-validated so a covenant payload can't smuggle bytes).
+- `src/scheme_native.rs` — PURE native-KAS verification
+  (`verify_native_exact`): normalizes envelope/bare tx, parses outputs
+  generically, matches payTo via `kob_settle`'s `PaymentObserver`
+  (SPK-based, covenant-blind), rejects covenant outputs / wrong recipient /
+  underpayment / missing-or-mismatched fingerprint / no-inputs, computes a
+  deterministic `artifact_id = blake2b256(compact_json(tx))` as the
+  pre-broadcast replay key. 9 unit tests.
+- `src/facilitator.rs` — `Facilitator<B: ChainBackend>` (chain access behind
+  a mockable trait; impl'd for `RpcClient` via get_utxos/submit_transaction/
+  confirm_tx_output). `verify()` = envelope/scheme/network + pure verify +
+  ON-CHAIN input-existence check (every spent input must be an unspent UTXO
+  of the declared `from` — proves real+unspent+owned) + replay check.
+  `settle()` = re-verify, record Submitted BEFORE broadcast, broadcast,
+  persist chain txid, confirm finality, mark Confirmed, authorize.
+  Idempotent (same artifact retried returns the recorded on-chain txid, no
+  double broadcast; a broadcast-accepted-but-unconfirmed payment recovers on
+  retry from the durable log). Different artifact reusing a consumed outpoint
+  is rejected at verify AND settle. 7 async unit tests with a `MockChain`.
+- `src/server.rs` — axum router: POST /verify, POST /settle, GET /supported,
+  GET /health, permissive CORS. Generic over the backend.
+- `src/main.rs` — binary: `--node --bind --network --replay-log`, connects
+  RpcClient, opens ReplayStore, serves.
+- Added `chain_txid: Option<String>` (serde default) to `PaymentRecord` in
+  `kob-settle` (replay.rs) so an idempotent `/settle` retry returns the same
+  on-chain txid; Phase 2 tests unaffected (default field).
+
+Design notes:
+- artifact_id (hash of signed tx), NOT the canonical Kaspa txid, is the
+  replay key — the canonical txid depends on covenant/compute-budget
+  serialization subtleties and isn't known pre-broadcast; the artifact hash
+  is deterministic, node-independent, and gives the exact same replay
+  guarantees (same artifact = idempotent; shared outpoint = reuse). The real
+  on-chain txid is learned at submit and returned in SettleResponse.
+- payer is verified by requiring the spent inputs to be in `from`'s unspent
+  set (no per-outpoint RPC lookup exists in the wRPC surface we have; this
+  also validates the `from` claim).
+- KCC20 asset (Phase 4) currently returns invalid "asset not supported yet".
+
+Build: `cargo test -p kob-x402 --lib` (PID 19263) came back **GREEN** —
+`test result: ok. 22 passed; 0 failed` (3 wire + 3 fingerprint + 9
+scheme_native + 7 facilitator, all confirmed). Compiled clean on axum 0.7,
+no warnings surfaced.
+
+**PHASE 3 STATUS: DONE.** Committed. Next: Phase 4 (KCC20 covenant
+token_unit transfer as an x402 payment).
 ### PHASE 4 — NOT STARTED
 ### PHASE 5 — NOT STARTED
 

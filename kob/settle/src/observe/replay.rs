@@ -35,8 +35,17 @@ pub enum PaymentStatus {
 /// A single recorded payment.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaymentRecord {
-    /// Transaction ID of the payment.
+    /// Replay key for the payment. The facilitator uses a deterministic
+    /// artifact id (a hash of the signed transaction) here, so the key is
+    /// known before broadcast; the canonical on-chain transaction id is
+    /// stored separately in `chain_txid` once the node accepts the tx.
     pub txid: String,
+    /// The canonical on-chain transaction id, learned from the node's
+    /// `submitTransaction` response. `None` until broadcast succeeds. Used so
+    /// an idempotent `/settle` retry returns the same on-chain txid it
+    /// returned the first time.
+    #[serde(default)]
+    pub chain_txid: Option<String>,
     /// Consumed input outpoints ("txid:index"). These are what a *different*
     /// artifact must not re-spend.
     pub outpoints: Vec<String>,
@@ -65,6 +74,7 @@ impl PaymentRecord {
     pub fn submitted(txid: impl Into<String>, outpoints: Vec<String>) -> Self {
         PaymentRecord {
             txid: txid.into(),
+            chain_txid: None,
             outpoints,
             fingerprint: None,
             payer: None,
@@ -73,6 +83,12 @@ impl PaymentRecord {
             status: PaymentStatus::Submitted,
             recorded_at_secs: now_secs(),
         }
+    }
+
+    /// Builder: set the canonical on-chain transaction id.
+    pub fn with_chain_txid(mut self, chain_txid: impl Into<String>) -> Self {
+        self.chain_txid = Some(chain_txid.into());
+        self
     }
 
     /// Builder: bind an x402 request fingerprint.

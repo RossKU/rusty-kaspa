@@ -75,6 +75,7 @@ members = [
     "kob/cli",
     "kob/engine",
     "kob/lab",
+    "kob/x402",
 ]
 
 [workspace.package]

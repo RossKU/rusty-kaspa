@@ -1289,8 +1289,17 @@ pub fn match_swap_routes(
             continue;
         }
 
-        // Both legs viable. Surplus goes to matcher.
-        let surplus = kas_available.saturating_sub(kas_needed);
+        // Both legs viable. Surplus goes to matcher, capped at both legs'
+        // max_matcher_fee (planner-side cap, mirrors the sibling match fns).
+        // Residual: the cross-pair buy leg is v14-only (v16 is excluded from
+        // cross-pair swaps in executor.rs because F6's fixed-offset read needs
+        // buy and sell to share a token), and v14 has no on-chain surplus cap,
+        // so this .min() is the ONLY bound on matcher take here — a matcher
+        // bypassing the planner is not additionally constrained on-chain.
+        let surplus = kas_available
+            .saturating_sub(kas_needed)
+            .min(buy_source.max_matcher_fee)
+            .min(sell_target.max_matcher_fee);
 
         // Ensure minimum output values.
         if kas_needed < kob_core::MIN_UTXO_VALUE {

@@ -433,9 +433,10 @@ impl SpentTracker {
 
     /// Testable variant of `prune_spent()` that accepts any mempool probe.
     ///
-    /// Kept `pub(crate)` so unit tests can swap in a deterministic probe
-    /// without needing a full RpcClient / WebSocket harness.
-    pub(crate) async fn prune_spent_with_probe<P: MempoolProbe>(
+    /// Public so callers outside this crate (e.g. kob-engine's executor
+    /// tests) can swap in a deterministic probe without needing a full
+    /// RpcClient / WebSocket harness.
+    pub async fn prune_spent_with_probe<P: MempoolProbe>(
         &mut self,
         max_age_secs: u64,
         probe: &P,
@@ -501,9 +502,8 @@ impl SpentTracker {
 
     /// Pure age-based prune with no RPC dependency.
     ///
-    /// Used only by tests and by callers that have no RPC handle. Prefer
+    /// Used by tests and by callers that have no RPC handle. Prefer
     /// `prune_spent()` in production.
-    #[cfg(test)]
     pub fn prune_spent_by_age(&mut self, max_age_secs: u64) {
         let before = self.spent.len();
         self.spent.retain(|_, entry| entry.when.elapsed().as_secs() < max_age_secs);

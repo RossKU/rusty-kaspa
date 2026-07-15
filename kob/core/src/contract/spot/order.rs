@@ -996,12 +996,18 @@ pub const BUY_ORDER_V16_BODY: &[u8] = &[
     // (14): sell_pden(0), sell_pnum(1), kas(2), mmfee_bps(3), ...,
     //       pden_b(7), pnum_b(8), ..., toi(13)
     //
-    // Recompute: tokens = kas / buy_pden * buy_pnum (div-first, overflow-safe)
-    0x52, 0x79,                   // Op2 OpPick(kas)                               [2B]
-    0x58, 0x79,                   // Op8 OpPick(pden_b)                            [2B]
-    0x96,                         // OpDiv -> kas / buy_pden                       [1B]
-    0x59, 0x79,                   // Op9 OpPick(pnum_b)                            [2B]
-    0x95,                         // OpMul -> tokens                               [1B]
+    // tokens = ACTUAL tokens delivered to the buyer at output[toi], NOT the
+    // full hypothetical kas/pden*pnum. The IOC sub-dispatch relaxes the token
+    // output floor to mfill, so a matcher can deliver only mfill tokens while
+    // consuming the full kas_in; basing fair_kas on the hypothetical full
+    // quantity let that surplus escape F6. Reading output[toi] binds the cap to
+    // what the buyer really received. Same stack effect (pushes one item);
+    // 5 OpNop pad the freed bytes so RS length / dispatch thresholds are
+    // unchanged. (toi is at depth 13 here: sell_pden,sell_pnum,kas,mmfee_bps,
+    // bspkh,ohash,mfill,pden_b,pnum_b,tcid,1,coi,tii,toi.)
+    0x5d, 0x79,                   // Op13 OpPick(toi)                              [2B]
+    0xc2,                         // OpTxOutputAmount -> actual tokens             [1B]
+    0x61, 0x61, 0x61, 0x61, 0x61, // OpNop x5 (length-neutral pad)                 [5B]
     //
     // fair_kas = tokens / sell_pden * sell_pnum (div-first, overflow-safe)
     0x51, 0x79,                   // Op1 OpPick(sell_pden)                         [2B]

@@ -11,10 +11,17 @@ path = "src/lib.rs"
 name = "kob-cli"
 path = "src/main.rs"
 
+[[bin]]
+name = "kob-miner"
+path = "src/bin/kob_miner.rs"
+
 [dependencies]
 kob-core = { path = "../core" }
 kob-domain = { path = "../domain" }
 kob-engine = { path = "../engine" }
+kaspa-consensus-core = { workspace = true }
+kaspa-pow = { workspace = true }
+kaspa-rpc-core = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = { workspace = true }

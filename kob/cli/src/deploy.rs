@@ -320,8 +320,11 @@ pub async fn deploy_buy(
     max_matcher_fee: u64,
     mmfee_bps: Option<u64>,
 ) -> anyhow::Result<String> {
-    if version != 14 && version != 16 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 and v16 are supported for buy deployment.", version);
+    // v14 buy has no on-chain surplus/matcher-fee cap (F6 removed) and lets a
+    // matcher keep the whole spread. New buy deploys must be v16 (F6 cap). v14
+    // remains parseable/reconstructable for managing already-deployed orders.
+    if version != 16 {
+        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v16 (F6 surplus cap) may be deployed; v14 is retained only for managing pre-existing on-chain orders.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;

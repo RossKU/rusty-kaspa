@@ -967,8 +967,10 @@ pub enum DeployCommands {
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version (14 or 16). v16 uses --mmfee-bps instead of --max-matcher-fee (see V16_STATUS.md).
-        #[arg(long, default_value = "14")]
+        /// Contract version. Only v16 (F6 surplus cap) may be deployed; v14 has
+        /// no on-chain matcher-fee cap and is rejected for new deploys. v16 uses
+        /// --mmfee-bps instead of --max-matcher-fee (see V16_STATUS.md).
+        #[arg(long, default_value = "16")]
         version: u8,
 
         /// Time-in-force: GTC (default), IOC, or FOK.
@@ -1789,12 +1791,9 @@ pub async fn dispatch(
                 max_matcher_fee,
                 mmfee_bps,
             } => {
-                // v16 is the default when --mmfee-bps is set and --version
-                // was left at its default (14); an explicit --version 16 is
-                // always respected as-is. v14 is needed for cross-pair swap
-                // fills because the v16 F6 surplus cap check reads the
-                // counterparty sell's price, which is incompatible when buy
-                // and sell are for different tokens.
+                // v16 is now the deploy default; --mmfee-bps also forces v16 if
+                // an older version was passed explicitly. deploy_buy rejects any
+                // non-v16 version for new orders (v14 has no on-chain F6 cap).
                 let version = if mmfee_bps.is_some() && version == 14 { 16 } else { version };
 
                 // Resolve token alias

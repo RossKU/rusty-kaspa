@@ -747,3 +747,33 @@ the covenant does not constrain output scripts).
   `recipient_token_address` to `Kcc20Verified` and a `confirm_address` field
   on the facilitator's internal `Validated`; `finalize()` now confirms
   against `confirm_address` (native: pay_to; KCC20: recipient token P2SH).
+
+---
+
+### Release-backlog pass -- CASE R2 regression FIXED, live-verified
+
+`scheme_exact.rs::verify_exact_kip10`'s `has_continuation` off-chain
+double-check scanned ALL outputs for "any output at the merchant's SPK with
+value >= min_continuation" instead of the ONE output the borrow input's own
+signature script designates (the same index `X402_BORROW_BODY` reads
+on-chain via `Op2 OpPick`) -- an incidental same-address output (self-pay
+harness change) could coincidentally satisfy it. Fixed: decode that
+designated index from the borrow input's `signatureScript`
+(`decode_continuation_index`, mirrors `push_index`'s push encoding) and check
+only that output. Test fixtures in `scheme_exact.rs` and `facilitator.rs`
+(`encoded_tx`/`exact_encoded_tx`) updated to embed a correct sigscript
+(`push_index(1)` = `0x51`); new regression test
+`rejects_under_threshold_continuation_despite_incidental_matching_change`.
+`cargo test -p kob-x402 --lib` = 67/67. Live re-run `e2e_x402_exact.sh`:
+30/30, R2 correctly refused. Full detail + TXIDs in
+`kob/E2E_LIVE_RESULTS.md`. The separate `discover_landed_payment` stale-UTXO
+false-success gap (surfaced by, but not caused by, the R2 bug) is still open.
+
+**Environment note (recorded for future crash recovery on this host)**: this
+filesystem (Android storage / sdcardfs) does not reliably bump a file's
+mtime on writes made through the editor tool -- cargo's incremental build
+then silently reuses a STALE cached artifact and gives a false green/red
+result. Always `touch` every edited source file immediately before the next
+`cargo build`/`cargo test` invocation, and treat a suspiciously-fast
+"Finished" compile after an edit as a signal to check `stat` before trusting
+the result.

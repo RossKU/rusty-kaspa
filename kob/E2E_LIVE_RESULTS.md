@@ -38,18 +38,21 @@ to confirm it now lands, unless noted otherwise.
 | `prediction vote` | NOT FIXED (found broken, out of scope) | domain builder is a stale 2-in/2-out "v4" blueprint; deployed contract requires 3-in/4-out with VoteReceipt minting -- real feature gap, not a bugfix |
 | `redemption.rs` / `split_merge.rs` refund paths (same CLTV bug family) | FIXED in code, NOT live-verified | fix derived by rigorous stack-trace + confirmed against 63/63 passing `cargo test -p kob-core` (construction-level only, cannot catch VM-level bugs) |
 | `listing` (English/Dutch auction) | NOT EXERCISABLE | no CLI subcommand exists at all; contract-only, off-chain-tested per SECURITY_FIXES.md Fix 5 |
-| x402 KIP-10 exact CASE R2 (under-threshold continuation) | REGRESSION FOUND, NOT patched | `/verify` false-accepts in this E2E's self-pay setup; on-chain covenant still correctly rejects `/settle` -- funds safe, but a second bug (stale-UTXO false "success") found via repro; see rationale above |
+| x402 KIP-10 exact CASE R2 (under-threshold continuation) | FIXED, live-verified | root cause + fix in `kob/x402/src/scheme_exact.rs` (see below); re-run of `e2e_x402_exact.sh` after rebuild: 30/30, R2 now correctly refused (`invalid_payment_requirements`); happy-path settle TXID `9d61a47c4180785b8b8e85af9b72c26979471a5c006876e4a1e7279b2c62f78c` |
 
 **Release verdict**: NOT ready to ship as-is. Spot lifecycle, auto-matching,
 F6 adversarial defense, and most secondary instruments are solid and
 live-confirmed. But this pass found **5 live bugs in the prediction
 market module alone** (malformed SPK, two independent CLTV-consumption
 stack bugs, an undersized fee estimate, and a structurally stale vote
-path) plus the pre-existing x402 false-positive-settlement gap -- the
-prediction contract family in particular was very likely non-functional
-end-to-end before this pass, and `vote` still is. Ship spot/x402/other
-instruments; block on a real audit + fix pass for prediction's vote path
-before treating that module as production-ready.
+path) -- the prediction contract family in particular was very likely
+non-functional end-to-end before this pass, and `vote` still is. Ship
+spot/x402/other instruments; block on a real audit + fix pass for
+prediction's vote path before treating that module as production-ready.
+(Update, release-backlog pass: the x402 CASE R2 `has_continuation` regression
+is now FIXED + live-verified -- see below. The unrelated
+`discover_landed_payment` stale-UTXO false-success gap it surfaced is still
+open, tracked separately.)
 
 ## Post-hardening full run — running log
 
@@ -141,7 +144,7 @@ from.
    calc_mass_with_sigscripts, min_relay_fee}`), for both the sell and buy
    partial-fill builders.
 
-### x402 finding (documented, NOT patched -- see rationale)
+### x402 finding: CASE R2 regression -- FIXED, live-verified (backlog item 4)
 
 Live KIP-10 "exact" E2E (`e2e_x402_exact.sh`) CASE R2 (under-threshold
 additive continuation) **regressed**: historically 28/28 (commit `56cbdce`);
@@ -188,6 +191,31 @@ sure). Flagged here as a follow-up, not silently patched.
 unpaid/rejected request) when the merchant reuses a fixed `(payTo, amount,
 index)` tuple across requests; NOT a payer-fund-theft vector -- the on-chain
 covenant still correctly protects the actual value transfer.
+**Residual, still NOT patched (separate from the R2 fix below, out of this
+pass's scope)**: the `discover_landed_payment` stale-UTXO issue just above is
+a DIFFERENT bug from the R2 `has_continuation` heuristic (it was only
+surfaced by the R2 repro, not caused by it). It still needs the
+snapshot-before-broadcast or spends-these-outpoints fix described above.
+
+**FIXED**: root cause was `scheme_exact.rs::verify_exact_kip10`'s
+`has_continuation` check scanning ALL outputs for "any output at the
+merchant's SPK with value >= min_continuation", instead of checking the ONE
+output the borrow input's own signature script designates as the
+continuation index -- the exact same index `X402_BORROW_BODY` reads on-chain
+via `Op2 OpPick` (`kob/core/src/contract/x402_borrow.rs`). Fixed by decoding
+that designated index from the borrow input's `signatureScript` (new
+`decode_continuation_index`, mirroring `push_index`'s encoding) and checking
+only that output -- bit-for-bit consistent with on-chain enforcement, so an
+incidental same-address output (the payer's own change in this self-pay
+harness) can no longer coincidentally satisfy it. New regression test
+`scheme_exact::tests::rejects_under_threshold_continuation_despite_incidental_matching_change`.
+`cargo test -p kob-x402 --lib` = 67 passed (was 66), 0 failed. Live re-run of
+`e2e_x402_exact.sh` against testnet-10 after rebuild: **30/30 passed**,
+CASE R2 now correctly refused (`invalid_payment_requirements`); happy-path
+settle TXID `9d61a47c4180785b8b8e85af9b72c26979471a5c006876e4a1e7279b2c62f78c`,
+borrow-funding TXID
+`6875548ce8e302511c06c1f6f1f9e9d665c02c88588d8290ddd4b0b8909be2f0`. No
+further live re-run needed for this specific bug.
 
 ### Spot lifecycle -- remaining commands (all live, all PASS)
 

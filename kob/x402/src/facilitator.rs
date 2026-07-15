@@ -1679,7 +1679,10 @@ mod tests {
             "transaction": {
                 "version": 0,
                 "inputs": [
-                    { "previousOutpoint": { "transactionId": borrow_txid, "index": 0 }, "signatureScript": "00", "sequence": 0, "sigOpCount": 0 },
+                    // signatureScript "51" = push_index(1): designates output
+                    // 1 as the continuation index (see scheme_exact.rs's
+                    // decode_continuation_index, which reads this exact byte).
+                    { "previousOutpoint": { "transactionId": borrow_txid, "index": 0 }, "signatureScript": "51", "sequence": 0, "sigOpCount": 0 },
                     { "previousOutpoint": { "transactionId": "ff".repeat(32), "index": 0 }, "signatureScript": "41".to_string()+&"cd".repeat(65), "sequence": 0, "sigOpCount": 1 }
                 ],
                 "outputs": [

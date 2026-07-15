@@ -39,6 +39,27 @@ fn spk_of(addr: &str) -> Option<Vec<u8>> {
     kob_settle::bech32::address_to_spk(addr).ok()
 }
 
+/// Decode the continuation output index the borrow input's own signature
+/// script designates. Mirrors `kob_core::contract::helpers::push_index`'s
+/// encoding — the SAME bytes `X402_BORROW_BODY`'s `Op2 OpPick` reads on-chain
+/// (`kob/core/src/contract/x402_borrow.rs`), so this must decode identically
+/// or the off-chain check can disagree with what the covenant will actually
+/// enforce. Returns `None` on anything unrecognized (fail closed).
+fn decode_continuation_index(sigscript_hex: &str) -> Option<u32> {
+    let bytes = hex::decode(sigscript_hex).ok()?;
+    match *bytes.first()? {
+        0x00 => Some(0),
+        b @ 0x51..=0x60 => Some((b - 0x50) as u32),
+        0x01 => bytes.get(1).map(|&b| b as u32),
+        0x02 => {
+            let lo = *bytes.get(1)? as u32;
+            let hi = *bytes.get(2)? as u32;
+            Some(lo | (hi << 8))
+        }
+        _ => None,
+    }
+}
+
 fn input_outpoints(tx: &serde_json::Value) -> Vec<String> {
     tx.get("inputs")
         .and_then(|v| v.as_array())
@@ -101,9 +122,10 @@ pub fn verify_exact_kip10(
         return Err(ExactReject::NoInputs);
     }
     let borrow_key = format!("{}:{}", terms.borrow_txid, terms.borrow_index);
-    if !outpoints.iter().any(|o| o == &borrow_key) {
-        return Err(ExactReject::WrongBorrowOutpoint);
-    }
+    let borrow_input_idx = match outpoints.iter().position(|o| o == &borrow_key) {
+        Some(i) => i,
+        None => return Err(ExactReject::WrongBorrowOutpoint),
+    };
 
     // Parse outputs.
     let raw_outputs = tx
@@ -127,14 +149,27 @@ pub fn verify_exact_kip10(
         return Err(ExactReject::Underpayment);
     }
 
-    // Additive continuation: some OTHER output returns >= min_continuation to
-    // the merchant (the covenant enforces this on-chain; we double-check).
-    let has_continuation = outputs.iter().enumerate().any(|(i, o)| {
-        i as u32 != payment_output_index
-            && o.spk_version == 0
-            && o.spk_script == pay_to_spk
-            && o.value >= min_continuation
-    });
+    // Additive continuation: the SAME output the borrow input's own signature
+    // script designates as `continuation_output_idx` must return >=
+    // min_continuation to the merchant. This must check EXACTLY that index
+    // (not "any output at the merchant's address"): `X402_BORROW_BODY` only
+    // ever reads the sigscript-designated index on-chain (`Op2 OpPick`), so a
+    // scan-all-outputs heuristic can be satisfied by an unrelated output that
+    // coincidentally lands at the merchant's SPK with enough value -- e.g. the
+    // payer's own change output in a self-pay setup -- even when the real
+    // designated continuation is under threshold. Regression: found live,
+    // documented in E2E_LIVE_RESULTS.md ("x402 KIP-10 exact CASE R2").
+    let raw_inputs = tx.get("inputs").and_then(|v| v.as_array()).ok_or(ExactReject::Malformed)?;
+    let sigscript_hex = raw_inputs
+        .get(borrow_input_idx)
+        .and_then(|i| i.get("signatureScript"))
+        .and_then(|v| v.as_str())
+        .ok_or(ExactReject::Malformed)?;
+    let cont_idx = decode_continuation_index(sigscript_hex).ok_or(ExactReject::Malformed)? as usize;
+    let has_continuation = match outputs.get(cont_idx) {
+        Some(o) => o.spk_version == 0 && o.spk_script == pay_to_spk && o.value >= min_continuation,
+        None => false,
+    };
     if !has_continuation {
         return Err(ExactReject::UnderThreshold);
     }
@@ -169,26 +204,45 @@ mod tests {
             .unwrap()
     }
 
-    /// Encoded tx spending `borrow_txid:0`, paying `pay_amt` to `pay_to` at
-    /// output 0, and returning `cont` to `pay_to` at output 1.
-    fn encoded_tx(pay_to: &str, borrow_txid: &str, pay_amt: u64, cont: u64) -> String {
+    /// Encoded tx spending `borrow_txid:0` (signature script designates
+    /// output 1 as the continuation index, matching
+    /// `build_x402_borrow_spend_sigscript(1, ..)` — push_index(1) = 0x51),
+    /// paying `pay_amt` to `pay_to` at output 0, and returning `cont` to
+    /// `pay_to` at output 1. `extra_outputs` are appended after (e.g. an
+    /// incidental change output, for the self-pay false-positive regression
+    /// test below).
+    fn encoded_tx_ex(
+        pay_to: &str,
+        borrow_txid: &str,
+        pay_amt: u64,
+        cont: u64,
+        extra_outputs: &[(String, u64)],
+    ) -> String {
+        let mut outputs = vec![
+            serde_json::json!({ "value": pay_amt, "scriptPublicKey": { "version": 0, "script": spk_hex(pay_to) } }),
+            serde_json::json!({ "value": cont, "scriptPublicKey": { "version": 0, "script": spk_hex(pay_to) } }),
+        ];
+        for (spk_addr, value) in extra_outputs {
+            outputs.push(serde_json::json!({ "value": value, "scriptPublicKey": { "version": 0, "script": spk_hex(spk_addr) } }));
+        }
         let tx = serde_json::json!({
             "transaction": {
                 "version": 0,
                 "inputs": [
-                    { "previousOutpoint": { "transactionId": borrow_txid, "index": 0 }, "signatureScript": "00", "sequence": 0, "sigOpCount": 0 },
+                    { "previousOutpoint": { "transactionId": borrow_txid, "index": 0 }, "signatureScript": "51", "sequence": 0, "sigOpCount": 0 },
                     { "previousOutpoint": { "transactionId": "ff".repeat(32), "index": 0 }, "signatureScript": "41".to_string() + &"cd".repeat(65), "sequence": 0, "sigOpCount": 1 }
                 ],
-                "outputs": [
-                    { "value": pay_amt, "scriptPublicKey": { "version": 0, "script": spk_hex(pay_to) } },
-                    { "value": cont, "scriptPublicKey": { "version": 0, "script": spk_hex(pay_to) } }
-                ],
+                "outputs": outputs,
                 "lockTime": 0,
                 "subnetworkId": "0000000000000000000000000000000000000000",
                 "payload": ""
             }
         });
         serde_json::to_string(&tx).unwrap()
+    }
+
+    fn encoded_tx(pay_to: &str, borrow_txid: &str, pay_amt: u64, cont: u64) -> String {
+        encoded_tx_ex(pay_to, borrow_txid, pay_amt, cont, &[])
     }
 
     #[test]
@@ -225,6 +279,34 @@ mod tests {
         let enc = encoded_tx(&merchant, &bt, 250, 100_000_000);
         assert_eq!(
             verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &testnet_addr(1), None, &t).unwrap_err(),
+            ExactReject::UnderThreshold
+        );
+    }
+
+    /// Regression for the live-found CASE R2 false-accept: in a self-pay
+    /// setup (payer == merchant), the designated continuation (output 1) is
+    /// genuinely under threshold, but an incidental extra output (e.g. the
+    /// payer's own change, at output 2) coincidentally lands at the SAME
+    /// merchant address with enough value. The old "scan all outputs"
+    /// heuristic accepted this; checking only the sigscript-designated index
+    /// must still reject it.
+    #[test]
+    fn rejects_under_threshold_continuation_despite_incidental_matching_change() {
+        let merchant = testnet_addr(2); // self-pay: payer == merchant
+        let bt = "aa".repeat(32);
+        let t = terms(&merchant, 250, &bt);
+        // designated continuation (output 1) is only 100M (< 100M + 3000)...
+        let enc = encoded_tx_ex(
+            &merchant,
+            &bt,
+            250,
+            100_000_000,
+            // ...but an unrelated change output at the SAME address easily
+            // clears the threshold.
+            &[(merchant.clone(), 500_000_000)],
+        );
+        assert_eq!(
+            verify_exact_kip10(&enc, TX_ENCODING_SAFE_JSON, 0, None, &merchant, None, &t).unwrap_err(),
             ExactReject::UnderThreshold
         );
     }

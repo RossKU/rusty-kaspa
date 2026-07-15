@@ -165,14 +165,31 @@ struct Validated {
     /// in `pay_to` never receives the output directly).
     confirm_address: String,
     amount: u64,
+    /// Request-binding fingerprint: `extra.fingerprint` for native/KCC20, the
+    /// bound `requestHash` for exact/KIP-10. MANDATORY across all schemes —
+    /// every payment must be scoped to exactly one request, otherwise a
+    /// settled artifact could be presented again as authorization for a
+    /// DIFFERENT resource/request. Re-checked against the stored
+    /// `PaymentRecord` on a `DuplicateTxid` replay-store hit (see
+    /// `duplicate_binding_matches`).
+    binding_fingerprint: String,
 }
+
+// Wire-error mapping is aligned across schemes for the same logical failure:
+//   payment doesn't satisfy the offer  -> invalid_payment_requirements
+//   request binding missing/mismatched -> invalid_payload  (identifier payload)
+//   spent/stale on-chain outpoint       -> invalid_transaction_state
+//   otherwise malformed                 -> invalid_payload
+// Arms are exhaustive (no wildcard) so a new reject variant can't be silently
+// miscategorised.
 
 /// Map a native-scheme reject to a closed wire error code.
 fn native_reject_code(r: scheme_native::NativeReject) -> &'static str {
     use scheme_native::NativeReject::*;
     match r {
         WrongRecipient | Underpayment { .. } => errors::INVALID_PAYMENT_REQUIREMENTS,
-        _ => errors::INVALID_PAYLOAD,
+        FingerprintMissing | FingerprintMismatch { .. } => errors::INVALID_PAYLOAD,
+        Malformed(_) | CovenantNotAllowed | NoInputs => errors::INVALID_PAYLOAD,
     }
 }
 
@@ -181,7 +198,9 @@ fn kcc20_reject_code(r: scheme_kcc20::Kcc20Reject) -> &'static str {
     use scheme_kcc20::Kcc20Reject::*;
     match r {
         WrongRecipient | Underpayment { .. } => errors::INVALID_PAYMENT_REQUIREMENTS,
-        _ => errors::INVALID_PAYLOAD,
+        FingerprintMissing | FingerprintMismatch { .. } => errors::INVALID_PAYLOAD,
+        Malformed(_) | BadAsset(_) | BadRecipient(_) | BadPayer(_) | MissingCovenantBinding
+        | NoInputs => errors::INVALID_PAYLOAD,
     }
 }
 
@@ -196,9 +215,27 @@ fn now_nanos() -> u128 {
 fn exact_reject_code(r: scheme_exact::ExactReject) -> &'static str {
     use scheme_exact::ExactReject::*;
     match r {
-        WrongRecipient | Underpayment | UnderThreshold => errors::INVALID_PAYMENT_REQUIREMENTS,
-        WrongBorrowOutpoint | FingerprintMismatch => errors::INVALID_TRANSACTION_STATE,
-        _ => errors::INVALID_PAYLOAD,
+        WrongRecipient | Underpayment | UnderThreshold | WrongPaymentOutputIndex => {
+            errors::INVALID_PAYMENT_REQUIREMENTS
+        }
+        // Aligned with native/kcc20: a bad request binding is a payload issue.
+        FingerprintMismatch => errors::INVALID_PAYLOAD,
+        // Spending a wrong/stale outpoint is an on-chain state conflict.
+        WrongBorrowOutpoint => errors::INVALID_TRANSACTION_STATE,
+        Malformed | BadEncoding | NoInputs => errors::INVALID_PAYLOAD,
+    }
+}
+
+/// Whether a `DuplicateTxid` hit at `artifact_id` is a legitimate idempotent
+/// retry of the SAME request (its stored binding fingerprint matches this
+/// one) rather than a different request presenting an already-settled
+/// artifact as its own authorization. `check_replay` proves the ARTIFACT is
+/// self-consistent (same signed bytes); this additionally proves THIS
+/// request is the one that artifact was actually settled for.
+fn duplicate_binding_matches(store: &ReplayStore, artifact_id: &str, binding_fingerprint: &str) -> bool {
+    match store.get(artifact_id) {
+        Some(rec) => rec.fingerprint.as_deref() == Some(binding_fingerprint),
+        None => true, // unreachable in practice: DuplicateTxid implies a record exists
     }
 }
 
@@ -323,8 +360,15 @@ impl<B: ChainBackend> Facilitator<B> {
             if !req_matches_terms {
                 return Err(errors::INVALID_PAYMENT_REQUIREMENTS);
             }
+            // Request-binding is MANDATORY: a reservation with no bound
+            // requestHash can never settle. Without this, the same signed
+            // artifact could be replayed against a different reservation/
+            // resource (requestHash lives in the wire payload, not in the
+            // hashed transaction bytes, so it is not otherwise pinned to one
+            // artifact_id).
+            let bound_hash = t.request_hash.clone().ok_or(errors::INVALID_PAYLOAD)?;
             let v = scheme_exact::verify_exact_kip10(
-                enc, encoding, poi, req_hash.as_deref(), &from, t.request_hash.as_deref(), &t,
+                enc, encoding, poi, req_hash.as_deref(), &from, Some(bound_hash.as_str()), &t,
             )
             .map_err(exact_reject_code)?;
             let validated = Validated {
@@ -336,6 +380,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 pay_to: t.pay_to.clone(),
                 confirm_address: v.confirm_address,
                 amount: t.amount,
+                binding_fingerprint: bound_hash,
             };
             // On-chain: every input unspent across [borrow P2SH, payer].
             self.check_inputs_on_chain(&validated.input_outpoints, &[borrow_owner, from.clone()], None).await?;
@@ -345,6 +390,13 @@ impl<B: ChainBackend> Facilitator<B> {
         if binding != BINDING_NATIVE && binding != BINDING_KCC20 {
             return Err(errors::UNSUPPORTED_SCHEME);
         }
+
+        // Request-binding is MANDATORY: without it, an artifact settled for
+        // one resource could be replayed (via a fresh /verify or /settle
+        // call presenting the SAME signed artifact) as authorization for a
+        // different one. The scheme-level check below additionally requires
+        // this to match what the transaction payload actually embeds.
+        let binding_fingerprint = requirements.fingerprint().map(|s| s.to_string()).ok_or(errors::INVALID_PAYLOAD)?;
 
         // `owner_addresses`: the address(es) whose unspent UTXO sets must cover
         // every spent input. `require_covenant`: for KCC20, at least one spent
@@ -365,6 +417,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         // Native: the payment output is a P2PK output to pay_to.
                         confirm_address: requirements.pay_to.clone(),
                         amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
+                        binding_fingerprint,
                     },
                     owners,
                     None,
@@ -390,6 +443,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         // token_unit P2SH address, not their P2PK identity.
                         confirm_address,
                         amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
+                        binding_fingerprint,
                     },
                     owners,
                     Some(asset),
@@ -448,13 +502,19 @@ impl<B: ChainBackend> Facilitator<B> {
         };
 
         // Replay: a *different* artifact re-spending a consumed outpoint is
-        // invalid; the same artifact again is fine (idempotent).
+        // invalid; the same artifact again is fine (idempotent) ONLY if it is
+        // still bound to the SAME request (see `duplicate_binding_matches`).
         let store = self.replay.lock().await;
         match store.check_replay(&validated.artifact_id, &validated.input_outpoints) {
             ReplayCheck::OutpointReused { .. } => {
                 return VerifyResponse::invalid(errors::INVALID_TRANSACTION_STATE);
             }
-            ReplayCheck::Fresh | ReplayCheck::DuplicateTxid(_) => {}
+            ReplayCheck::DuplicateTxid(_) => {
+                if !duplicate_binding_matches(&store, &validated.artifact_id, &validated.binding_fingerprint) {
+                    return VerifyResponse::invalid(errors::INVALID_TRANSACTION_STATE);
+                }
+            }
+            ReplayCheck::Fresh => {}
         }
 
         VerifyResponse::valid(validated.payer)
@@ -472,6 +532,7 @@ impl<B: ChainBackend> Facilitator<B> {
         };
         let Validated {
             artifact_id, payer, pay_output_index, input_outpoints, tx, pay_to, confirm_address, amount,
+            binding_fingerprint,
         } = validated;
         let request_hash = req.payment_payload.request_hash().map(|s| s.to_string());
 
@@ -483,9 +544,18 @@ impl<B: ChainBackend> Facilitator<B> {
                     return SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE);
                 }
                 ReplayCheck::DuplicateTxid(_) => {
-                    // Same artifact seen before. If it already has an on-chain
-                    // txid, re-confirm and return idempotently rather than
-                    // re-broadcasting.
+                    // Same artifact seen before. It is only authorized as
+                    // THIS request's payment if it is still bound to the same
+                    // request — otherwise a settled artifact could be
+                    // presented again to authorize a DIFFERENT resource. A
+                    // mismatch here refuses even a not-yet-broadcast retry
+                    // (below) so it can't silently steal/overwrite the
+                    // original record's binding.
+                    if !duplicate_binding_matches(&store, &artifact_id, &binding_fingerprint) {
+                        return SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE);
+                    }
+                    // If it already has an on-chain txid, re-confirm and
+                    // return idempotently rather than re-broadcasting.
                     if let Some(rec) = store.get(&artifact_id) {
                         if let Some(chain_txid) = rec.chain_txid.clone() {
                             drop(store);
@@ -501,11 +571,8 @@ impl<B: ChainBackend> Facilitator<B> {
             // Reserve: record Submitted (with outpoints) BEFORE broadcast so a
             // crash immediately after submit can't lose the replay guard.
             let record = PaymentRecord::submitted(artifact_id.clone(), input_outpoints.clone())
-                .with_parties(Some(payer.clone()), Some(pay_to.clone()), amount);
-            let record = match req.payment_requirements.fingerprint() {
-                Some(fp) => record.with_fingerprint(fp),
-                None => record,
-            };
+                .with_parties(Some(payer.clone()), Some(pay_to.clone()), amount)
+                .with_fingerprint(binding_fingerprint.clone());
             if store.record(record).is_err() {
                 return SettlementResponse::failed(errors::UNEXPECTED_SETTLE_ERROR);
             }
@@ -850,6 +917,14 @@ mod tests {
         }
     }
 
+    /// A fixed valid test binding fingerprint. Fingerprint binding is
+    /// mandatory (Fix 2), so happy-path/unrelated-failure tests need SOME
+    /// valid value here; tests specifically about the binding itself build
+    /// their own.
+    fn test_fp() -> String {
+        "ab".repeat(32)
+    }
+
     fn requirements(pay_to: &str, amount: u64, fp: Option<&str>) -> PaymentRequirements {
         let mut extra = serde_json::json!({ "binding": BINDING_NATIVE });
         if let Some(f) = fp {
@@ -921,7 +996,7 @@ mod tests {
         let in_txid = "aa".repeat(32);
         let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
         let fac = Facilitator::new(chain, tmp_store("happy"), config());
-        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, None, 100_000_000);
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
 
         let v = fac.verify(&req).await;
         assert!(v.is_valid, "verify: {:?}", v.invalid_reason);
@@ -941,7 +1016,7 @@ mod tests {
         let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
         let fac = Facilitator::new(chain, tmp_store("under"), config());
         // pays 99_999_999 but requires 100_000_000
-        let req = request(&from, &pay_to, 99_999_999, &in_txid, 0, None, 100_000_000);
+        let req = request(&from, &pay_to, 99_999_999, &in_txid, 0, Some(&test_fp()), 100_000_000);
 
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
@@ -959,8 +1034,8 @@ mod tests {
         let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
         let fac = Facilitator::new(chain, tmp_store("wrong"), config());
         // Pays `wrong`, requirements demand `pay_to`.
-        let mut req = request(&from, &wrong, 100_000_000, &in_txid, 0, None, 100_000_000);
-        req.payment_requirements = requirements(&pay_to, 100_000_000, None);
+        let mut req = request(&from, &wrong, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
+        req.payment_requirements = requirements(&pay_to, 100_000_000, Some(&test_fp()));
 
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
@@ -977,7 +1052,7 @@ mod tests {
         // MockChain has NO utxo for `from` -> input existence check fails.
         let chain = MockChain::new(true);
         let fac = Facilitator::new(chain, tmp_store("noinput"), config());
-        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, None, 100_000_000);
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
 
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
@@ -992,7 +1067,7 @@ mod tests {
         let in_txid = "ee".repeat(32);
         let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
         let fac = Facilitator::new(chain, tmp_store("idem"), config());
-        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, None, 100_000_000);
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
 
         let s1 = fac.settle(&req).await;
         assert!(s1.success);
@@ -1011,13 +1086,13 @@ mod tests {
         let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 300_000_000);
         let fac = Facilitator::new(chain, tmp_store("replay"), config());
 
-        let req1 = request(&from, &pay_to, 100_000_000, &in_txid, 0, None, 100_000_000);
+        let req1 = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
         let s1 = fac.settle(&req1).await;
         assert!(s1.success);
 
         // A different artifact (different amount => different tx => different
         // artifact_id) reusing the same input outpoint.
-        let req2 = request(&from, &pay_to, 120_000_000, &in_txid, 0, None, 100_000_000);
+        let req2 = request(&from, &pay_to, 120_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
         let v2 = fac.verify(&req2).await;
         assert!(!v2.is_valid, "replayed outpoint must be rejected at verify");
         let s2 = fac.settle(&req2).await;
@@ -1036,7 +1111,7 @@ mod tests {
         let store = tmp_store("recover");
         let path = store.path().to_path_buf();
         let fac = Facilitator::new(chain, store, config());
-        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, None, 100_000_000);
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
         let s1 = fac.settle(&req).await;
         assert!(!s1.success);
         assert_eq!(fac.backend.submit_count(), 1);
@@ -1051,6 +1126,68 @@ mod tests {
         assert!(!s2.transaction.is_empty());
         assert_eq!(fac2.backend.submit_count(), 0, "recovery must not re-broadcast");
         std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_fingerprint_binding() {
+        // Fix 2: request-binding is mandatory. Requirements with no
+        // `extra.fingerprint` at all must be refused, even for an otherwise
+        // perfectly valid payment.
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "14".repeat(32);
+        let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("fp_missing"), config());
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, None, 100_000_000);
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn settle_refuses_duplicate_artifact_bound_to_a_different_request() {
+        // Fix 2 (cross-resource replay). A DuplicateTxid hit is only an
+        // authorized idempotent retry if the stored record's binding
+        // fingerprint matches THIS request's. Here we settle an artifact,
+        // then simulate the stored record having been bound to a DIFFERENT
+        // request (e.g. as if this facilitator's history shows the artifact
+        // was actually settled for some other resource/request) by tampering
+        // the replay record directly — this isolates and proves the new
+        // DuplicateTxid guard itself, independent of how any particular
+        // caller might arrive at a binding mismatch.
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "15".repeat(32);
+        let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("fp_cross"), config());
+        let fp = test_fp();
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&fp), 100_000_000);
+
+        let s1 = fac.settle(&req).await;
+        assert!(s1.success, "first settle: {:?}", s1.error_reason);
+
+        let artifact_id = fac.validate(&req).await.unwrap().artifact_id;
+        {
+            let mut store = fac.replay.lock().await;
+            let rec = store.get(&artifact_id).unwrap().clone();
+            assert_eq!(rec.fingerprint.as_deref(), Some(fp.as_str()));
+            store.record(rec.with_fingerprint("cc".repeat(32))).unwrap();
+        }
+
+        // Re-presenting the SAME artifact, still bound to `fp` in THIS
+        // request, must now be refused: the DuplicateTxid hit's stored
+        // fingerprint no longer matches.
+        let v2 = fac.verify(&req).await;
+        assert!(!v2.is_valid, "verify must also refuse the cross-request replay");
+        assert_eq!(v2.invalid_reason.as_deref(), Some(errors::INVALID_TRANSACTION_STATE));
+        let s2 = fac.settle(&req).await;
+        assert!(!s2.success, "cross-request replay of a settled artifact must be refused");
+        assert_eq!(s2.error_reason.as_deref(), Some(errors::INVALID_TRANSACTION_STATE));
+        assert_eq!(fac.backend.submit_count(), 1, "must not re-broadcast");
     }
 
     // --- scheme (B): KCC20 token payment, end to end through the facilitator ---
@@ -1078,6 +1215,8 @@ mod tests {
         let recipient_addr =
             kob_settle::wallet::pubkey_to_address(recipient_pk, kob_settle::types::Network::Testnet);
         let (_recip_token_addr, recip_token_spk) = token_addr_and_spk(recipient_pk);
+        let fp = test_fp();
+        let payload_hex = hex::encode(fingerprint::embed_fingerprint(&fp));
 
         let tx = serde_json::json!({
             "version": 1,
@@ -1094,7 +1233,7 @@ mod tests {
             }],
             "lockTime": 0,
             "subnetworkId": "0000000000000000000000000000000000000000",
-            "payload": "",
+            "payload": payload_hex,
         });
         let requirements = PaymentRequirements {
             scheme: SCHEME_EXACT.to_string(),
@@ -1103,7 +1242,7 @@ mod tests {
             asset: ASSET_KAS.to_string(),
             pay_to: recipient_addr,
             max_timeout_seconds: 60,
-            extra: serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset }),
+            extra: serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset, "fingerprint": fp }),
         };
         let req = FacilitatorRequest {
             x402_version: X402_VERSION,
@@ -1200,6 +1339,34 @@ mod tests {
 
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kcc20_rejects_missing_fingerprint_binding() {
+        // Fix 2: mandatory for KCC20 too.
+        let payer_pk = [1u8; 32];
+        let recipient_pk = [2u8; 32];
+        let asset = "ab".repeat(32);
+        let in_txid = "b0".repeat(32);
+        let (payer_token_addr, payer_token_spk) = token_addr_and_spk(&payer_pk);
+        let chain = MockChain::new(true).with_covenant_utxo(
+            &payer_token_addr,
+            &payer_token_spk,
+            &in_txid,
+            0,
+            100_000_000,
+            &asset,
+        );
+        let fac = Facilitator::new(chain, tmp_store("kcc20_fp_missing"), config());
+        let (mut req, _payer) = kcc20_request(&payer_pk, &recipient_pk, &asset, 50_000_000, &in_txid, 50_000_000);
+        // Strip the fingerprint the helper embeds.
+        req.payment_requirements.extra = serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset });
+        req.payment_payload.accepted = req.payment_requirements.clone();
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
         assert_eq!(fac.backend.submit_count(), 0);
     }
 
@@ -1306,8 +1473,12 @@ mod tests {
         serde_json::to_string(&tx).unwrap()
     }
 
+    /// requestHash binding is mandatory (Fix 2), so the default builder binds
+    /// and supplies a fixed, matching hash. Tests specifically about the
+    /// requestHash binding itself use `exact_request_rh` directly.
     async fn exact_request<B: ChainBackend>(fac: &Facilitator<B>, merchant: &str, payer: &str, borrow_txid: &str, pay: u64, cont: u64) -> FacilitatorRequest {
-        exact_request_rh(fac, merchant, payer, borrow_txid, pay, cont, None, None).await
+        let h = test_fp();
+        exact_request_rh(fac, merchant, payer, borrow_txid, pay, cont, Some(h.clone()), Some(&h)).await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1450,5 +1621,38 @@ mod tests {
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
         assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_kip10_rejects_reservation_with_no_bound_request_hash() {
+        // Fix 2: request-binding is mandatory. A reservation issued with NO
+        // requestHash at all can never settle, even with a perfectly valid
+        // payment — otherwise the artifact it produces would carry no
+        // per-request binding at all (requestHash lives outside the hashed
+        // tx bytes for this scheme) and could be replayed against a
+        // different reservation/resource.
+        let bt = "a9".repeat(32);
+        let (fac, merchant, payer) = exact_fac_with_borrow(&bt, "exact_rh_unbound").await;
+        let req = exact_request_rh(&fac, &merchant, &payer, &bt, 250, 100_003_000, None, None).await;
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[test]
+    fn reject_codes_align_request_binding_across_schemes() {
+        // The same logical failure (request-binding mismatch/missing) maps to
+        // ONE wire code across all three schemes.
+        let n = native_reject_code(scheme_native::NativeReject::FingerprintMismatch { expected: "a".into(), got: None });
+        let k = kcc20_reject_code(scheme_kcc20::Kcc20Reject::FingerprintMismatch { expected: "a".into(), got: None });
+        let e = exact_reject_code(scheme_exact::ExactReject::FingerprintMismatch);
+        assert_eq!(n, errors::INVALID_PAYLOAD);
+        assert_eq!(n, k);
+        assert_eq!(n, e);
+        assert_eq!(native_reject_code(scheme_native::NativeReject::FingerprintMissing), errors::INVALID_PAYLOAD);
+        assert_eq!(kcc20_reject_code(scheme_kcc20::Kcc20Reject::FingerprintMissing), errors::INVALID_PAYLOAD);
     }
 }

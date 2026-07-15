@@ -1717,7 +1717,10 @@ mod tests {
             bracket_meta: None,
         };
         let sell_order = kob_domain::batch::BatchOrder {
-            outpoint: (sell.txid.clone(), sell.index),
+            // Distinct outpoint from the buy (make_test_order gives both the
+            // same "a"*64:0, which the planner correctly rejects as a
+            // duplicate/double-spend).
+            outpoint: ("b".repeat(64), 1),
             order_type: kob_domain::batch::OrderType::Sell,
             version: 14,
             token_cov_id: tcid,

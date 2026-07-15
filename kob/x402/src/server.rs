@@ -101,8 +101,15 @@ async fn settle_handler<B: ChainBackend + 'static>(
 /// Pull mode: discover a client-broadcast payment and authorize it.
 async fn await_handler<B: ChainBackend + 'static>(
     State(fac): State<Arc<Facilitator<B>>>,
-    Json(req): Json<AwaitRequest>,
+    body: Bytes,
 ) -> Json<SettlementResponse> {
+    // Decode via the closed-enum error path (like /verify): the default Json
+    // extractor 422s with serde field names on malformed input, leaking the
+    // internal request shape.
+    let req: AwaitRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return Json(SettlementResponse::failed(errors::INVALID_PAYLOAD)),
+    };
     // Detached like settle: a client disconnect must not cancel an in-flight
     // discovery/credit.
     let fac = fac.clone();
@@ -121,9 +128,15 @@ async fn supported_handler<B: ChainBackend + 'static>(
 /// Reserve a KIP-10 additive borrow outpoint; returns the v2 PaymentRequired.
 async fn reserve_handler<B: ChainBackend + 'static>(
     State(fac): State<Arc<Facilitator<B>>>,
-    Json(r): Json<ReserveRequest>,
+    body: Bytes,
 ) -> Response {
     let err = || Json(serde_json::json!({ "error": errors::INVALID_PAYMENT_REQUIREMENTS })).into_response();
+    // Decode via the closed-enum error path (like /verify): don't leak serde
+    // field names from the default Json extractor on malformed input.
+    let r: ReserveRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return err(),
+    };
     let (amount, borrow_amount, threshold) = match (
         r.amount.parse::<u64>(),
         r.borrow_amount.parse::<u64>(),
@@ -139,7 +152,12 @@ async fn reserve_handler<B: ChainBackend + 'static>(
         .await
     {
         Ok(pr) => Json(pr).into_response(),
-        Err(_) => err(),
+        Err(e) => {
+            // Server-only: the real reason (capacity, duplicate target, bad
+            // address) never leaves the node.
+            tracing::warn!(pay_to = %r.pay_to, error = %e, "[x402] reserve rejected");
+            err()
+        }
     }
 }
 

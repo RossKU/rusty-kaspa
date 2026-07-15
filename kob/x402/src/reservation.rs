@@ -5,11 +5,20 @@
 //! the terms, and emits the v2 `PaymentRequirements.extra` the client needs.
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use kob_core::contract::x402_borrow::build_x402_borrow_redeem_script;
 use kob_settle::{blake2b_256, build_p2sh};
 
 use crate::wire_v2::{BINDING_EXACT, TEMPLATE_KIP10_ADDITIVE, TX_ENCODING_SAFE_JSON};
+
+/// Default reservation time-to-live. `/reserve` is unauthenticated, so a
+/// reservation that is never settled must not live forever in memory.
+pub const RESERVATION_TTL: Duration = Duration::from_secs(3600);
+/// Hard cap on live reservations. Once expired entries are evicted, a new
+/// reservation past this cap is rejected (fail-closed) rather than growing
+/// memory without bound.
+pub const MAX_RESERVATIONS: usize = 100_000;
 
 /// Recorded borrow terms for one reservation.
 #[derive(Debug, Clone)]
@@ -33,6 +42,8 @@ pub struct BorrowTerms {
     /// Expected request hash; when set the client payload MUST carry it.
     pub request_hash: Option<String>,
     pub consumed: bool,
+    /// When this reservation was recorded — drives TTL eviction.
+    pub created_at: Instant,
 }
 
 impl BorrowTerms {
@@ -88,7 +99,6 @@ pub fn borrow_covenant(
 }
 
 /// In-memory reservation store.
-#[derive(Default)]
 pub struct ReservationProvider {
     by_id: HashMap<String, BorrowTerms>,
     /// merchant_spk_hashes of active (unconsumed) reservations. Enforced unique
@@ -96,11 +106,44 @@ pub struct ReservationProvider {
     /// continuation output can then never satisfy two covenants at once, which
     /// is what the aggregate-inputs drain relied on.
     active_hashes: HashSet<[u8; 32]>,
+    ttl: Duration,
+    max_entries: usize,
+}
+
+impl Default for ReservationProvider {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ReservationProvider {
     pub fn new() -> Self {
-        Self { by_id: HashMap::new(), active_hashes: HashSet::new() }
+        Self {
+            by_id: HashMap::new(),
+            active_hashes: HashSet::new(),
+            ttl: RESERVATION_TTL,
+            max_entries: MAX_RESERVATIONS,
+        }
+    }
+
+    /// Construct with explicit TTL/cap limits (tests).
+    pub fn with_limits(ttl: Duration, max_entries: usize) -> Self {
+        Self { by_id: HashMap::new(), active_hashes: HashSet::new(), ttl, max_entries }
+    }
+
+    /// Drop reservations older than the TTL, freeing their continuation
+    /// targets. Called at each `reserve` so abandoned (never-settled)
+    /// reservations from an unauthenticated caller cannot accumulate forever.
+    fn evict_expired(&mut self) {
+        let ttl = self.ttl;
+        let active = &mut self.active_hashes;
+        self.by_id.retain(|_, t| {
+            let keep = t.created_at.elapsed() < ttl;
+            if !keep {
+                active.remove(&t.merchant_spk_hash);
+            }
+            keep
+        });
     }
 
     /// Record a reservation for an already-funded borrow outpoint and return the
@@ -125,6 +168,14 @@ impl ReservationProvider {
         payment_output_index: u32,
         request_hash: Option<String>,
     ) -> Result<BorrowTerms, String> {
+        // Reclaim abandoned reservations first so TTL churn keeps memory
+        // bounded without a background task.
+        self.evict_expired();
+        // Fail closed at the cap (post-eviction): an unauthenticated caller
+        // must not be able to grow the map without bound.
+        if self.by_id.len() >= self.max_entries {
+            return Err("reservation capacity reached; try again later".to_string());
+        }
         let merchant_spk_hash = merchant_spk_hash_of(pay_to)?;
         if self.active_hashes.contains(&merchant_spk_hash) {
             return Err(format!(
@@ -150,6 +201,7 @@ impl ReservationProvider {
             merchant_spk_hash,
             request_hash,
             consumed: false,
+            created_at: Instant::now(),
         };
         self.active_hashes.insert(merchant_spk_hash);
         self.by_id.insert(reservation_id, terms.clone());
@@ -224,5 +276,28 @@ mod tests {
         rp.mark_consumed(&"11".repeat(32));
         let reuse = rp.reserve("44".repeat(32), &merchant, 250, &"dd".repeat(32), 0, 100_000_000, 3000, 1, None);
         assert!(reuse.is_ok(), "target must be reusable after the prior reservation is consumed");
+    }
+
+    #[test]
+    fn rejects_new_reservation_at_capacity() {
+        // Cap = 1: a second (distinct-merchant) reservation is rejected once
+        // the map is full, so an unauthenticated caller can't grow it forever.
+        let mut rp = ReservationProvider::with_limits(RESERVATION_TTL, 1);
+        rp.reserve("11".repeat(32), &testnet_addr(1), 250, &"aa".repeat(32), 0, 100_000_000, 3000, 1, None).unwrap();
+        let over = rp.reserve("22".repeat(32), &testnet_addr(2), 250, &"bb".repeat(32), 0, 100_000_000, 3000, 1, None);
+        assert!(over.is_err(), "reservation past the cap must be rejected");
+    }
+
+    #[test]
+    fn evicts_expired_reservations_and_reclaims_capacity() {
+        // TTL ~ 0: the prior reservation is expired at the next reserve, so the
+        // cap-1 slot is reclaimed and a fresh reservation succeeds. The
+        // expired one (and its continuation target) is gone.
+        let mut rp = ReservationProvider::with_limits(Duration::from_millis(1), 1);
+        let t1 = rp.reserve("11".repeat(32), &testnet_addr(1), 250, &"aa".repeat(32), 0, 100_000_000, 3000, 1, None).unwrap();
+        std::thread::sleep(Duration::from_millis(5));
+        let t2 = rp.reserve("22".repeat(32), &testnet_addr(2), 250, &"bb".repeat(32), 0, 100_000_000, 3000, 1, None);
+        assert!(t2.is_ok(), "expired reservation must be evicted to make room");
+        assert!(rp.get(&t1.reservation_id).is_none(), "expired reservation must be gone");
     }
 }

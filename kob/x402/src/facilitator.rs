@@ -151,6 +151,22 @@ impl ChainBackend for RpcClient {
     }
 }
 
+/// Default `/await` discovery window when the request specifies none (0).
+pub const DEFAULT_AWAIT_TIMEOUT_SECS: u64 = 30;
+/// Hard cap on the `/await` discovery window. A caller-supplied
+/// `maxTimeoutSeconds` is clamped to this so one unauthenticated request
+/// cannot pin a server task polling for an unbounded time.
+pub const MAX_AWAIT_TIMEOUT_SECS: u64 = 120;
+
+/// Clamp a caller-supplied `/await` timeout into `[.., MAX_AWAIT_TIMEOUT_SECS]`,
+/// treating 0 as "use the default".
+pub fn clamp_await_timeout(requested: u64) -> u64 {
+    match requested {
+        0 => DEFAULT_AWAIT_TIMEOUT_SECS,
+        t => t.min(MAX_AWAIT_TIMEOUT_SECS),
+    }
+}
+
 /// Facilitator configuration.
 #[derive(Debug, Clone)]
 pub struct FacilitatorConfig {
@@ -191,6 +207,10 @@ struct Validated {
     /// `PaymentRecord` on a `DuplicateTxid` replay-store hit (see
     /// `duplicate_binding_matches`).
     binding_fingerprint: String,
+    /// For the exact/KIP-10 binding: the backing reservation id, so a
+    /// successful settle can `mark_consumed` it (frees its continuation
+    /// target and lets TTL/cap eviction drop it). `None` for native/KCC20.
+    reservation_id: Option<String>,
 }
 
 // Wire-error mapping is aligned across schemes for the same logical failure:
@@ -399,6 +419,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 confirm_address: v.confirm_address,
                 amount: t.amount,
                 binding_fingerprint: bound_hash,
+                reservation_id: Some(rid.to_string()),
             };
             // On-chain: every input unspent across [borrow P2SH, payer].
             self.check_inputs_on_chain(&validated.input_outpoints, &[borrow_owner, from.clone()], None).await?;
@@ -436,6 +457,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         confirm_address: requirements.pay_to.clone(),
                         amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
                         binding_fingerprint,
+                        reservation_id: None,
                     },
                     owners,
                     None,
@@ -462,6 +484,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         confirm_address,
                         amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
                         binding_fingerprint,
+                        reservation_id: None,
                     },
                     owners,
                     Some(asset),
@@ -557,7 +580,7 @@ impl<B: ChainBackend> Facilitator<B> {
         };
         let Validated {
             artifact_id, payer, pay_output_index, input_outpoints, tx, pay_to, confirm_address, amount,
-            binding_fingerprint,
+            binding_fingerprint, reservation_id,
         } = validated;
         let request_hash = req.payment_payload.request_hash().map(|s| s.to_string());
 
@@ -584,9 +607,11 @@ impl<B: ChainBackend> Facilitator<B> {
                     if let Some(rec) = store.get(&artifact_id) {
                         if let Some(chain_txid) = rec.chain_txid.clone() {
                             drop(store);
-                            return self
+                            let resp = self
                                 .finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash)
                                 .await;
+                            self.consume_reservation_if_settled(&resp, reservation_id.as_deref()).await;
+                            return resp;
                         }
                     }
                 }
@@ -630,9 +655,11 @@ impl<B: ChainBackend> Facilitator<B> {
                             .unwrap_or_else(|| PaymentRecord::submitted(artifact_id.clone(), input_outpoints.clone()));
                         let _ = store.record(base.with_chain_txid(landed.clone()));
                     }
-                    return self
+                    let resp = self
                         .finalize(net, &artifact_id, &landed, pay_output_index, &confirm_address, amount, Some(payer), request_hash)
                         .await;
+                    self.consume_reservation_if_settled(&resp, reservation_id.as_deref()).await;
+                    return resp;
                 }
 
                 let transient = self.backend.is_transient(&e);
@@ -662,7 +689,9 @@ impl<B: ChainBackend> Facilitator<B> {
             let _ = store.record(base.with_chain_txid(chain_txid.clone()));
         }
 
-        self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash).await
+        let resp = self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash).await;
+        self.consume_reservation_if_settled(&resp, reservation_id.as_deref()).await;
+        resp
     }
 
     /// `/await` (PULL mode): the client broadcasts the payment ITSELF; the
@@ -698,7 +727,7 @@ impl<B: ChainBackend> Facilitator<B> {
         };
         let pay_to = requirements.pay_to.clone();
         let expected_fp = requirements.fingerprint().map(|s| s.to_string());
-        let timeout_secs = if requirements.max_timeout_seconds == 0 { 30 } else { requirements.max_timeout_seconds };
+        let timeout_secs = clamp_await_timeout(requirements.max_timeout_seconds);
 
         let mut observer = PaymentObserver::new();
         if observer.watch(&pay_to).is_err() {
@@ -797,6 +826,17 @@ impl<B: ChainBackend> Facilitator<B> {
         );
         let _ = saw_already_credited;
         SettlementResponse::failed(errors::INVALID_TRANSACTION_STATE)
+    }
+
+    /// Mark the backing reservation (if any) consumed once its payment has
+    /// successfully settled. Frees the continuation target for reuse and lets
+    /// TTL/cap eviction drop it. Before this, `mark_consumed` was never
+    /// called on the settle path (dead code) so a settled reservation stayed
+    /// "active" forever.
+    async fn consume_reservation_if_settled(&self, resp: &SettlementResponse, reservation_id: Option<&str>) {
+        if let (true, Some(rid)) = (resp.success, reservation_id) {
+            self.reservations.lock().await.mark_consumed(rid);
+        }
     }
 
     /// After a submit error, discover whether the payment actually landed on
@@ -1592,6 +1632,16 @@ mod tests {
         assert_eq!(s.error_reason.as_deref(), Some(errors::INVALID_PAYMENT_REQUIREMENTS));
     }
 
+    #[test]
+    fn await_timeout_is_clamped() {
+        assert_eq!(clamp_await_timeout(0), DEFAULT_AWAIT_TIMEOUT_SECS);
+        assert_eq!(clamp_await_timeout(45), 45);
+        assert_eq!(clamp_await_timeout(MAX_AWAIT_TIMEOUT_SECS), MAX_AWAIT_TIMEOUT_SECS);
+        // An unauthenticated caller cannot pin a task longer than the cap.
+        assert_eq!(clamp_await_timeout(999_999), MAX_AWAIT_TIMEOUT_SECS);
+        assert_eq!(clamp_await_timeout(u64::MAX), MAX_AWAIT_TIMEOUT_SECS);
+    }
+
     #[tokio::test]
     async fn await_times_out_with_no_payment() {
         let merchant = addr(5);
@@ -1697,6 +1747,27 @@ mod tests {
         assert!(s.success, "exact settle: {:?}", s.error_reason);
         assert_eq!(s.amount.as_deref(), Some("250"));
         assert_eq!(fac.backend.submit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn exact_settle_marks_reservation_consumed() {
+        let merchant = addr(2);
+        let payer = addr(1);
+        let borrow_txid = "a9".repeat(32);
+        let (_rs, borrow_spk, borrow_addr) =
+            crate::reservation::borrow_covenant(&merchant, 100_000_000, 3000).unwrap();
+        let chain = MockChain::new(true)
+            .with_covenant_utxo(&borrow_addr, &hex::encode(&borrow_spk), &borrow_txid, 0, 100_000_000, &"00".repeat(32))
+            .with_utxo(&payer, &"ff".repeat(32), 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("exact_consume"), config());
+        let req = exact_request(&fac, &merchant, &payer, &borrow_txid, 250, 100_003_000).await;
+        let rid = req.payment_requirements.reservation_id().unwrap().to_string();
+
+        assert!(!fac.reservations.lock().await.get(&rid).unwrap().consumed, "not consumed before settle");
+        let s = fac.settle(&req).await;
+        assert!(s.success, "settle: {:?}", s.error_reason);
+        // mark_consumed was dead before this fix; a successful settle now frees it.
+        assert!(fac.reservations.lock().await.get(&rid).unwrap().consumed, "consumed after settle");
     }
 
     #[tokio::test]

@@ -2,8 +2,9 @@
 
 pub mod rest_client;
 
-// Re-export shared RPC types from kob-core so existing `use crate::rpc::RpcUtxo` works.
-pub use kob_core::rpc_types::{RpcUtxo, RpcOutpoint, RpcUtxoEntry, RpcSpk, parse_rest_spk};
+// Re-export shared RPC types from this crate's own rpc_types module so
+// existing `use crate::rpc::RpcUtxo` (in downstream re-export shims) works.
+pub use crate::rpc_types::{RpcUtxo, RpcOutpoint, RpcUtxoEntry, RpcSpk, parse_rest_spk};
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

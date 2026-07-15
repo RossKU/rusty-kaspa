@@ -15,8 +15,12 @@ pub mod api;
 pub mod reporting;
 pub mod matcher;
 pub mod mm;
-pub mod rpc;
-pub mod utils;
+
+// RPC client and signing/address utils now live in `kob-settle` (Phase 1
+// extraction, see kob/x402/X402_STATUS.md). Re-exported so every existing
+// `kob_engine::{rpc,utils}` / `crate::{rpc,utils}` path keeps resolving.
+pub use kob_settle::rpc;
+pub use kob_settle::utils;
 
 use std::sync::Arc;
 use tokio::sync::{broadcast, Mutex, RwLock};

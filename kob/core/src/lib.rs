@@ -3,16 +3,21 @@
 #![allow(clippy::too_many_arguments)]
 
 pub mod contract;
-pub mod crypto;
-pub mod error;
 pub mod listing;
-pub mod mass;
-pub mod primitives;
-pub mod tx;
-pub mod types;
-pub mod wallet;
-pub mod compat;
-pub mod rpc_types;
+
+// Settlement-core modules now live in `kob-settle` (Phase 1 extraction, see
+// kob/x402/X402_STATUS.md). Re-exported here so every existing
+// `kob_core::{crypto,error,mass,primitives,tx,types,wallet,compat,rpc_types}`
+// path in the workspace keeps resolving unchanged.
+pub use kob_settle::crypto;
+pub use kob_settle::error;
+pub use kob_settle::mass;
+pub use kob_settle::primitives;
+pub use kob_settle::tx;
+pub use kob_settle::types;
+pub use kob_settle::wallet;
+pub use kob_settle::compat;
+pub use kob_settle::rpc_types;
 
 // Flat re-exports preserve the original `kob_core::{bech32,p2sh,sighash,signing}`
 // paths used throughout the workspace. Relocating into `crypto/` is a storage
@@ -140,7 +145,10 @@ pub use auction::{
 pub const DEFAULT_MATCHER_FEE: u64 = 10_000;
 
 /// Minimum UTXO value to avoid storage mass rejection (~3M sompi).
-pub const MIN_UTXO_VALUE: u64 = 3_000_000;
+///
+/// Canonical definition moved to `kob-settle` (Phase 1 extraction) since
+/// `kob_settle::tx` depends on it; re-exported here unchanged.
+pub use kob_settle::MIN_UTXO_VALUE;
 
 /// Dust value for trade_receipt outputs.
 pub const RECEIPT_DUST: u64 = 3_000_000;
@@ -149,4 +157,7 @@ pub const RECEIPT_DUST: u64 = 3_000_000;
 pub const RECEIPT_VALUE: u64 = 100_000_000;
 
 /// Default subnetwork ID (native, all zeros).
-pub const SUBNETWORK_ID: &str = "0000000000000000000000000000000000000000";
+///
+/// Canonical definition moved to `kob-settle` (Phase 1 extraction) since
+/// `kob_settle::tx` depends on it; re-exported here unchanged.
+pub use kob_settle::SUBNETWORK_ID;

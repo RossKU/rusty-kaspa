@@ -84,7 +84,7 @@ mod tests {
     #[test]
     fn bech32_polymod_nonzero() {
         let values = vec![1, 2, 3, 4, 5];
-        let result = kob_core::bech32::bech32_polymod(&values);
+        let result = crate::bech32::bech32_polymod(&values);
         assert_ne!(result, 0);
     }
 }

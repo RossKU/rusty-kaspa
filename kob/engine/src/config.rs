@@ -1,21 +1,17 @@
 //! Configuration loading for node connection and wallet keys.
 
 use kob_core::wallet::SecureKey;
-use serde::{Deserialize, Serialize};
+use serde::{Serialize, Deserialize};
 use std::fs;
 use std::path::Path;
 
-/// Node configuration from config.json
-#[derive(Debug, Deserialize)]
-pub struct NodeConfig {
-    pub node: String,
-    #[serde(default)]
-    pub fallback: Option<String>,
-    /// Optional RPC authentication token (F17).
-    /// If present, sent as `Authorization: Bearer <token>` during WebSocket handshake.
-    #[serde(default)]
-    pub rpc_auth: Option<String>,
-}
+/// Node configuration from config.json.
+///
+/// Moved to `kob-settle` (Phase 1 extraction, see
+/// kob/x402/X402_STATUS.md) — reusable by the x402 facilitator, which needs
+/// the same node/fallback/rpc_auth shape without the engine-specific
+/// `AppConfig` fields (fee_bps, history, zk_prover_enabled) below.
+pub use kob_settle::config::NodeConfig;
 
 /// Historical data persistence configuration (MT5 style).
 ///

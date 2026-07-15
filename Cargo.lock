@@ -4891,6 +4891,7 @@ dependencies = [
  "kaspa-consensus-core",
  "kaspa-hashes",
  "kaspa-txscript",
+ "kob-settle",
  "pbkdf2",
  "rand 0.8.6",
  "serde",
@@ -4928,6 +4929,7 @@ dependencies = [
  "k256",
  "kob-core",
  "kob-domain",
+ "kob-settle",
  "rand 0.8.6",
  "reqwest",
  "rusqlite",
@@ -4947,6 +4949,38 @@ name = "kob-lab"
 version = "0.1.0"
 dependencies = [
  "kob-core",
+]
+
+[[package]]
+name = "kob-settle"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "base64",
+ "blake2b_simd",
+ "chacha20poly1305",
+ "futures-util",
+ "hex",
+ "hmac",
+ "k256",
+ "kaspa-addresses",
+ "kaspa-consensus-core",
+ "kaspa-hashes",
+ "kaspa-txscript",
+ "pbkdf2",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "signature",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.24.0",
+ "tracing",
+ "url",
+ "zeroize",
 ]
 
 [[package]]

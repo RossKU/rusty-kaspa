@@ -32,6 +32,10 @@ pub struct Kcc20Verified {
     /// The payer's own `token_unit` P2SH address for `asset` — the address
     /// whose UTXO set must contain the spent token input on-chain.
     pub payer_token_address: String,
+    /// The recipient's `token_unit` P2SH address — where the payment output
+    /// lives on-chain (this is what finality confirmation must poll, NOT the
+    /// recipient's P2PK identity address).
+    pub recipient_token_address: String,
     /// Normalized inner transaction object, ready to broadcast.
     pub tx: serde_json::Value,
 }
@@ -218,6 +222,8 @@ pub fn verify_kcc20_exact(
 
     let payer_token_address =
         token_unit_address(&payer_pk, network_of(payer)).map_err(Kcc20Reject::BadPayer)?;
+    let recipient_token_address =
+        token_unit_address(&recipient_pk, network_of(&requirements.pay_to)).map_err(Kcc20Reject::BadRecipient)?;
 
     Ok(Kcc20Verified {
         artifact_id: crate::scheme_native::artifact_id(&tx),
@@ -227,6 +233,7 @@ pub fn verify_kcc20_exact(
         input_outpoints: outpoints,
         asset,
         payer_token_address,
+        recipient_token_address,
         tx,
     })
 }

@@ -339,12 +339,12 @@ designed lifecycle across three appended lines for the happy payment:
 `Submitted (chain_txid=null)` -> `Submitted (chain_txid=<real>)` ->
 `Confirmed`.
 
-KCC20 (scheme B) live E2E: NOT run live (documented gap above — needs a
-spec-form token_unit-P2SH transfer client; kob-cli's `token transfer` emits a
-non-spec P2PK+covenant output). Scheme B is verification-complete and
-unit-proven (10 tests incl. a covenant-aware mock settle). The facilitator
-server already routes scheme B by `asset`; only a matching live artifact
-builder is outstanding.
+KCC20 (scheme B) live E2E: **DONE (2026-07-15, 7/7 on testnet-10)** — see the
+"KCC20 token scheme" entry in the E2E TXID log below. The spec-form gap was
+closed by adding an `x402-client kcc20` mode (builds a token_unit-P2SH
+transfer) plus a facilitator finality-address fix (confirm the recipient
+token P2SH, not the P2PK identity). Real on-chain token payment TXID
+`0577d3616b4c4a38d625f34fc4e916b0de360982495138e3cf2f1d094755d97c`.
 
 Known conservative behavior (documented, not a bug): a *failed* broadcast
 leaves the outpoint reserved in the replay store (record marked Failed but
@@ -438,7 +438,72 @@ Harness: `kob/x402/scripts/e2e_x402.sh`; results file
   the replay-store OutpointReused guard is the backstop when the input is
   still in the UTXO set pre-confirmation); NO broadcast.
 
-### KCC20 token scheme — testnet-10
+### KCC20 token scheme — testnet-10, 2026-07-15 (7/7 checks passed) — DONE
 
-Not run live (see Phase 5 notes: needs a spec-form token_unit-P2SH transfer
-client). Verification unit-proven.
+Token fixture `kob/e2e_fixture.json` (covenant
+`0c113120cb56668a5aa984752496f8cc4ac65e9044f2fa85d64e7bbcb5fc6039`); minted a
+fresh 10M-sompi token_unit `aca2d5dd6299ce02c05d3d6b64773f4693be27cd31b2843660330a6c1fac970e:1`
+from the fixture mint authority (fixture authority advanced to
+`aca2d5dd...970e:0`). Harness `kob/x402/scripts/e2e_x402_kcc20.sh`; results
+`/tmp/kob_e2e/x402_kcc20/E2E_X402_KCC20_TXIDS.txt`.
+
+- CASE 1 HAPPY (spec-form token_unit-P2SH transfer; verify -> settle ->
+  broadcast -> finality-confirm -> authorize): **on-chain TXID**
+  `0577d3616b4c4a38d625f34fc4e916b0de360982495138e3cf2f1d094755d97c`.
+  Spends token_unit `aca2d5dd...970e:1` + fee `aca2d5dd...970e:2`; creates the
+  recipient token_unit at its token P2SH (output :0, covenant-bound to the
+  asset) + fee change (output :1). The node ACCEPTED the spec-form
+  token_unit-P2SH covenant transfer (settle success requires both broadcast
+  and the facilitator's confirm_tx_output on the recipient token P2SH).
+  Independently re-confirmed on-chain: the fee-change output `0577d3...:1`
+  (8,238,067 sompi P2PK) is in the wallet UTXO set.
+- CASE 2 UNDERPAYMENT (pays 10M token units, requirements demand 20M):
+  refused at verify + settle (`underpayment: required 20000000 paid
+  10000000`); NO broadcast.
+- CASE 3 WRONG RECIPIENT (tx pays the wallet's token P2SH, requirements demand
+  a distinct recipient's token P2SH): refused (`no token_unit output pays the
+  required recipient for this asset`); NO broadcast.
+- CASE 4 REPLAY (a 2nd artifact over the token_unit input CASE 1 spent):
+  refused (`input aca2d5dd...970e:1 is not an unspent UTXO of the payer`); NO
+  broadcast.
+
+Durable log captured Submitted(null) -> Submitted(chain_txid=0577d3...) ->
+Confirmed, spending both the token_unit and fee inputs.
+
+Note: single token_unit reuse — the harness builds all artifacts while the
+token_unit is unspent, runs the two non-broadcasting rejection cases first,
+then the happy path (consumes it), then the replay partner (refused). The
+finality-address fix (confirm against the recipient token_unit P2SH, not the
+P2PK identity) was essential for the happy settle to report success.
+
+(superseded IN-PROGRESS notes below retained for the record.)
+
+**Spec-form reconciliation (the fix):** confirmed `kob-cli token mint`
+(token.rs:606) creates the canonical token_unit as
+`P2SH(build_token_unit_redeem_script(recipient_pk))` + covenant binding —
+exactly what `scheme_kcc20` expects. `kob-cli token transfer` (token.rs:1033)
+instead emits a documented non-spec P2PK+covenant shortcut. So the verifier
+was right; the fix is to BUILD a spec-form token_unit-P2SH transfer, NOT to
+loosen the verifier. The node already accepts token_unit-P2SH covenant
+outputs (mint proves it), so a token_unit-P2SH -> token_unit-P2SH transfer
+is valid (covenant continuity = spent input carries C -> output carries C;
+the covenant does not constrain output scripts).
+
+**What was added:**
+- `x402-client kcc20` mode (in `src/bin/x402_client.rs`): builds a signed
+  spec-form token_unit transfer — input0 = payer token_unit P2SH (spent via
+  `build_token_unit_sigscript`), input1 = fee P2PK; output0 = recipient
+  token_unit P2SH + covenant(asset); output1 = remainder token_unit P2SH +
+  covenant (if partial); output N = fee change; `fee = min_relay_fee(mass)`.
+  Emits a KCC20 FacilitatorRequest (payTo = recipient P2PK identity; the
+  client derives the token P2SH). Scenario flags: `--require` (underpayment),
+  `--tx-recipient` (wrong recipient), `--replay-out`/`--replay-recipient`
+  (2nd artifact over the same token+fee inputs to a distinct recipient).
+  Fingerprint omitted for KCC20 (keeps the covenant tx payload standard; the
+  binding is scheme-agnostic + unit-proven).
+- **Facilitator finality-address fix (real bug found):** the confirm step
+  polled `pay_to` (the recipient's P2PK identity), but the KCC20 payment
+  output lives at the recipient's token_unit *P2SH* address. Added
+  `recipient_token_address` to `Kcc20Verified` and a `confirm_address` field
+  on the facilitator's internal `Validated`; `finalize()` now confirms
+  against `confirm_address` (native: pay_to; KCC20: recipient token P2SH).

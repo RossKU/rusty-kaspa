@@ -89,6 +89,11 @@ struct Validated {
     input_outpoints: Vec<String>,
     tx: serde_json::Value,
     pay_to: String,
+    /// Address that owns the payment output on-chain — what finality
+    /// confirmation polls. For native this is `pay_to` (a P2PK output); for
+    /// KCC20 it is the recipient's token_unit P2SH address (the P2PK identity
+    /// in `pay_to` never receives the output directly).
+    confirm_address: String,
     amount: u64,
 }
 
@@ -158,6 +163,8 @@ impl<B: ChainBackend> Facilitator<B> {
                         input_outpoints: v.input_outpoints,
                         tx: v.tx,
                         pay_to: requirements.pay_to.clone(),
+                        // Native: the payment output is a P2PK output to pay_to.
+                        confirm_address: requirements.pay_to.clone(),
                         amount: requirements.max_amount_sompi()?,
                     },
                     owners,
@@ -171,6 +178,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 // P2PK address) — union both.
                 let owners = vec![v.payer_token_address.clone(), from.clone()];
                 let asset = v.asset.clone();
+                let confirm_address = v.recipient_token_address.clone();
                 (
                     Validated {
                         artifact_id: v.artifact_id,
@@ -179,6 +187,9 @@ impl<B: ChainBackend> Facilitator<B> {
                         input_outpoints: v.input_outpoints,
                         tx: v.tx,
                         pay_to: requirements.pay_to.clone(),
+                        // KCC20: the payment output lives at the recipient's
+                        // token_unit P2SH address, not their P2PK identity.
+                        confirm_address,
                         amount: requirements.max_amount_sompi()?,
                     },
                     owners,
@@ -260,8 +271,9 @@ impl<B: ChainBackend> Facilitator<B> {
             Ok(v) => v,
             Err(e) => return SettleResponse::failed(net, e),
         };
-        let Validated { artifact_id, payer, pay_output_index, input_outpoints, tx, pay_to, amount } =
-            validated;
+        let Validated {
+            artifact_id, payer, pay_output_index, input_outpoints, tx, pay_to, confirm_address, amount,
+        } = validated;
 
         // Replay / idempotency decision under the store lock.
         {
@@ -281,7 +293,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         if let Some(chain_txid) = rec.chain_txid.clone() {
                             drop(store);
                             return self
-                                .finalize(net, &artifact_id, &chain_txid, pay_output_index, &pay_to, Some(payer))
+                                .finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, Some(payer))
                                 .await;
                         }
                     }
@@ -326,7 +338,7 @@ impl<B: ChainBackend> Facilitator<B> {
             let _ = store.record(base.with_chain_txid(chain_txid.clone()));
         }
 
-        self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &pay_to, Some(payer)).await
+        self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, Some(payer)).await
     }
 
     /// Confirm finality for a broadcast payment and record the outcome.
@@ -336,12 +348,12 @@ impl<B: ChainBackend> Facilitator<B> {
         artifact_id: &str,
         chain_txid: &str,
         pay_output_index: u32,
-        pay_to: &str,
+        confirm_address: &str,
         payer: Option<String>,
     ) -> SettleResponse {
         let confirmed = self
             .backend
-            .confirm(chain_txid, pay_output_index, pay_to, Some(self.config.confirm.clone()))
+            .confirm(chain_txid, pay_output_index, confirm_address, Some(self.config.confirm.clone()))
             .await;
 
         let mut store = self.replay.lock().await;

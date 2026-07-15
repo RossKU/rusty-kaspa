@@ -1175,10 +1175,13 @@ mod tests {
         let buy_ss = contract::build_buy_fill_sigscript(1, 1, 0, &buy_rs);
         let sell_ss = contract::build_sell_fill_sigscript(0, &sell_rs);
 
-        // Buy v13 RS must be 387 bytes (145B state + 242B body)
-        assert_eq!(buy_rs.len(), 387, "Buy v13 RS must be 387 bytes");
-        // Sell v13 RS must be 356 bytes (112B state + 244B body)
-        assert_eq!(sell_rs.len(), 356, "Sell v13 RS must be 356 bytes");
+        // Buy v14 RS must be 396 bytes (145B state + 251B body; the v14 body
+        // is +9B over v13's 242B for the IOC fill sub-dispatch). Matches
+        // kob-core parse::BUY_RS_SIZE.
+        assert_eq!(buy_rs.len(), 396, "Buy v14 RS must be 396 bytes");
+        // Sell v14 RS must be 416 bytes (112B state + 304B body; +60B over
+        // v13's 244B for the v14 IOC fill path). Matches kob-core parse::SELL_RS_SIZE.
+        assert_eq!(sell_rs.len(), 416, "Sell v14 RS must be 416 bytes");
         // Fill sigscripts should be non-empty
         assert!(!buy_ss.is_empty(), "Buy fill SS must not be empty");
         assert!(!sell_ss.is_empty(), "Sell fill SS must not be empty");

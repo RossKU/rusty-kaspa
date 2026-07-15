@@ -44,10 +44,16 @@ const P2PK_SPK_SIZE: u64 = 34;
 const P2SH_SPK_SIZE: u64 = 35;
 
 
-/// buy_order v14 redeemScript: 145B state + 242B body = 387B.
-const BUY_RS_SIZE: u64 = 387;
-/// sell_order v14 redeemScript: 112B state + 244B body = 356B.
-const SELL_RS_SIZE: u64 = 356;
+/// buy_order v14 redeemScript: 145B state + 251B body = 396B.
+/// (Matches kob-core `parse::BUY_RS_SIZE = BUY_STATE_SIZE(145) + BUY_BODY_SIZE(251)`.
+/// The v14 body is 251B — 9B larger than the pre-IOC v13 body (242B) because
+/// v14 added the IOC fill sub-dispatch; see `order.rs`.)
+const BUY_RS_SIZE: u64 = 396;
+/// sell_order v14 redeemScript: 112B state + 304B body = 416B.
+/// (Matches kob-core `parse::SELL_RS_SIZE = SELL_STATE_SIZE(112) + SELL_BODY_SIZE(304)`.
+/// The v14 sell body is 304B — 60B larger than the v13 body (244B) from the
+/// v14 IOC fill path.)
+const SELL_RS_SIZE: u64 = 416;
 /// bracket_order v6 redeemScript: 224B state + 141B body = 365B.
 #[allow(dead_code)] // Kept for fee estimation reference
 const BRACKET_RS_SIZE: u64 = 365;
@@ -66,20 +72,20 @@ const SWAP_RS_SIZE: u64 = 243;
 const SWAP_CANCEL_SS_SIZE: u64 = 346;
 
 
-/// buy_v14 fill sigscript: 4 opcodes + pushData(387) = 4 + 3 + 387 = 394.
-const BUY_FILL_SS_SIZE: u64 = 394;
-/// sell_v14 fill sigscript: 2 opcodes + pushData(356) = 2 + 3 + 356 = 361.
-const SELL_FILL_SS_SIZE: u64 = 361;
+/// buy_v14 fill sigscript: 4 opcodes + pushData(396) = 4 + 3 + 396 = 403.
+const BUY_FILL_SS_SIZE: u64 = 403;
+/// sell_v14 fill sigscript: 2 opcodes + pushData(416) = 2 + 3 + 416 = 421.
+const SELL_FILL_SS_SIZE: u64 = 421;
 
-/// buy_v14 cancel sigscript: 1 + 66 + 33 + 3 + 387 = 490.
-const BUY_CANCEL_SS_SIZE: u64 = 490;
-/// sell_v14 cancel sigscript: 66 + 33 + 1 + 3 + 356 = 459.
-const SELL_CANCEL_SS_SIZE: u64 = 459;
+/// buy_v14 cancel sigscript: 1 + 66 + 33 + 3 + 396 = 499.
+const BUY_CANCEL_SS_SIZE: u64 = 499;
+/// sell_v14 cancel sigscript: 66 + 33 + 1 + 3 + 416 = 519.
+const SELL_CANCEL_SS_SIZE: u64 = 519;
 
-/// buy_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 387 = 402.
-const BUY_PARTIAL_SS_SIZE: u64 = 402;
-/// sell_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 356 = 371.
-const SELL_PARTIAL_SS_SIZE: u64 = 371;
+/// buy_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 396 = 411.
+const BUY_PARTIAL_SS_SIZE: u64 = 411;
+/// sell_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 416 = 431.
+const SELL_PARTIAL_SS_SIZE: u64 = 431;
 
 /// P2PK wallet input sigscript: pushData(sig+sighash 65B) = 66B.
 const WALLET_INPUT_SS_SIZE: u64 = P2PK_SIGSCRIPT_SIZE;
@@ -1006,13 +1012,13 @@ mod tests {
             OutputEstimate { label: "o2".to_string(), spk_size: P2PK_SPK_SIZE, value: 10_000 },
         ];
         let tm = compute_transaction_mass(&inputs, &outputs);
-        // Sell input: 44 + 3 + 361 = 408 (>253 so varint = 3)
-        // Buy input: 44 + 3 + 394 = 441 (>253 so varint = 3)
-        // Fee input: 44 + 1 + 66 = 111
+        // Sell input: 44 + 3 + 421 = 468 (v14 SELL_FILL_SS_SIZE; >252 so varint = 3)
+        // Buy input:  44 + 3 + 403 = 450 (v14 BUY_FILL_SS_SIZE;  >252 so varint = 3)
+        // Fee input:  44 + 1 + 66  = 111
         // SigOps: 1 * 1000 = 1000
         // Outputs: (11+34) + (11+35) + (11+34) = 45 + 46 + 45 = 136
-        // Total: 68 + 408 + 441 + 111 + 1000 + 136 = 2164
-        assert_eq!(tm, 68 + 408 + 441 + 111 + 1000 + 136);
+        // Total: 68 + 468 + 450 + 111 + 1000 + 136 = 2233
+        assert_eq!(tm, 68 + 468 + 450 + 111 + 1000 + 136);
     }
 
 

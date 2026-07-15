@@ -401,6 +401,43 @@ matching payment" instead).
 Live E2E: `kob/x402/scripts/e2e_x402_pull.sh` — 6/6 checks passed
 (2026-07-15). See the E2E TXID log below.
 
+## Phase B — x402 v2 wire + KIP-10 interop (elldeeone/kaspa-x402 drop-in)
+
+Goal: make kob-x402 wire-conformant with elldeeone/kaspa-x402 (v2) and add
+their KIP-10 additive-covenant "exact" scheme as THE interoperable exact
+scheme. Keep native push/pull + KCC20 working (KOB-native path). Downloaded
+spec/schemas/vectors to `kob/x402/interop/` (schemas from repo main;
+exact-transfer vector from snapshot v0.1.0-alpha.3).
+
+CANONICAL v2 SHAPES (from elldeeone main schemas — authoritative):
+- **x402Version = 2** everywhere; validate it (else `invalid_x402_version`).
+- **PaymentRequired** (402 body / `PAYMENT-REQUIRED` header):
+  `{x402Version:2, resource:{url, description?, mimeType?}, accepts:[PaymentRequirements], error?, extensions?}`.
+- **PaymentRequirements**: `{scheme:"exact"|"batch-settlement", network:"kaspa:mainnet"|"kaspa:testnet-10", amount:"<sompi string>", asset:"KAS", payTo, maxTimeoutSeconds:int, extra}`.
+  Note: `amount` (NOT maxAmountRequired); `asset` const `"KAS"`; nested
+  `resource` at the PaymentRequired top level (not per-requirement).
+- **extra for exact** (kaspa-requirements-extra): `{binding:"kaspa-exact-v1", finality:"mempool"|"accepted"|"confirmed", templateId:"kaspa-x402-kip10-additive-v1", transactionEncoding:"kaspa-sdk-safe-json-v2.0.0", borrowOutpoint:{txid(64hex),index}, borrowAmount:"<sompi>", borrowScriptPublicKey:"0000"+hex, borrowRedeemScript:hex, additiveThresholdSompi:"<sompi>", paymentOutputIndex:int, reservationId:64hex, reservationExpiresAt?, assetKind:"native", assetDecimals:8}`.
+  `dependentRequired`: presence of templateId requires ALL the borrow fields.
+- **PaymentPayload** (`PAYMENT-SIGNATURE` header): `{x402Version:2, accepted:<the chosen PaymentRequirements verbatim>, payload, extensions?}`.
+- **payload for exact** (kaspa-payment-payload, main): `{type:"exact-transaction", transaction:"<encoded string>", transactionEncoding:"kaspa-sdk-safe-json-v2.0.0", paymentOutputIndex:int, payerAddress?, requestHash?(64hex)}`. Main schema REQUIRES type+transaction+transactionEncoding+paymentOutputIndex and FORBIDS transactionId for exact-transaction. (The alpha.3 vector used older `type:"exact-transfer"`+transactionId; follow MAIN = "exact-transaction".)
+- **SettlementResponse** (`PAYMENT-RESPONSE` header / /settle body): `{success, transaction:"<64hex on success, ''/absent on fail>", network, payer?, amount?, errorReason?, extensions:{kaspa:{paymentOutputIndex?, finality?, requestHash?, templateId?, reservationId?, borrowOutpoint?}}}`. On success: network + amount required, transaction must be 64hex. On failure: errorReason required. `extra` field is FORBIDDEN at top level.
+- **/verify** req `{x402Version:2, paymentPayload, paymentRequirements}` -> `{isValid, payer?}` | `{isValid:false, invalidReason:<error code>}`.
+- **/settle** req same -> SettlementResponse.
+- **/supported** -> `{kinds:[{x402Version:2, scheme:"exact", network, extra:{asset:"KAS", binding:"kaspa-exact-v1", modes:["verify","settle"]}}], extensions:[], signers:{}}`.
+- **Headers** (base64 of JSON): `PAYMENT-REQUIRED` (server->client), `PAYMENT-SIGNATURE` (client->server), `PAYMENT-RESPONSE` (server->client). Legacy `X-PAYMENT` NOT supported.
+- **Errors** closed enum (public wire): `invalid_x402_version, invalid_scheme, invalid_network, invalid_payment_requirements, invalid_payload, invalid_transaction_state, unsupported_scheme, unexpected_settle_error`. Local diagnostics (not on wire): `invalid_kaspa_x402_amount, invalid_kaspa_x402_binding, invalid_kaspa_x402_payload, invalid_kaspa_payment_identifier, missing_kaspa_payment_identifier, kaspa_payment_identifier_conflict, invalid_kaspa_exact_replay, invalid_kaspa_settlement_response`.
+
+KIP-10 additive "exact" mechanics: merchant reserves `borrowOutpoint` locked
+by a KIP-10 additive-covenant redeem script (spendable by anyone who returns
+>= borrowAmount + additiveThresholdSompi to the merchant continuation output).
+Client builds an exact-transaction that spends exactly borrowOutpoint, pays
+exactly `amount` to `payTo` at `paymentOutputIndex`, and satisfies the
+additive rule + requestHash binding. Facilitator verifies -> broadcasts ->
+confirms -> authorizes via the real settlement engine.
+
+Phase status: B0 (PLAN.md v2 delta) — see kob/x402/PLAN.md. B1/B2/B3 — see
+below.
+
 ## Build handoff log
 
 (Most recent first. Always check exit status + `cargo check` output before

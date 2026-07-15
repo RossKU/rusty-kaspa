@@ -1359,3 +1359,94 @@ structurally in Phases 3–4 and by the on-chain byte-trace in Phase 8).
 - The latent `SpkEncoding::to_bytes` version-endianness mismatch (BE in the
   engine vs LE in `compute_spk_hash`) is inert for KOB's version-0 SPKs but
   would matter if KOB ever used a non-zero SPK version.
+
+---
+
+## Phase 11 — CLI matcher consolidation (remove the duplicate hand-rolled matcher)
+
+Status: **DONE** (code + tests; build/on-chain sanity per the checklist below).
+
+### Why
+
+`kob-cli` carried a second, older matcher (`cli/src/auto_match.rs` ~2243 LOC
+and the `match`/`run_cross_pair` bodies in `cli/src/matching.rs`) that
+predated the canonical `kob_domain::spot::{matching,batch}` matcher and was
+never rewired onto it. It reimplemented crossing/output/fee logic and —
+critically — folded the *entire* price spread into the matcher's own change
+output, enforcing **no** `max_matcher_fee` cap. That was harmless only because
+those paths were hardcoded to v14 (v14 has no F6 at all); pointed at a v16 buy
+they would have built a tx the buyer's `mmfee_bps` forbids. `cli/src/match_batch.rs`
+already delegated correctly to the canonical planner and was used as the
+template.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `cli/Cargo.toml` | Added `kob-domain = { path = "../domain" }` so the CLI imports the canonical matcher directly (was only reachable via the `kob-engine` legacy façade). |
+| `domain/Cargo.toml` | Added `kaspa-txscript` + `kaspa-hashes` dev-deps (for the — deferred — option of a domain-level script harness; the F6 script proof currently lives in kob-core's existing harness). |
+| `cli/src/matching.rs` | **Rebuilt** `run` (same-pair `kob-cli match`) on top of `plan_batch_match` + `converge_fee_exact`/`apply_exact_fee`. Kept ONLY CLI glue: outpoint/pubkey parse, RPC value lookup, RPC submit, and the unique `TamperMode`. `TamperMode` (F2RedirectSeller/F2RedirectBuyer/F4RemoveBinding/F4ReduceValue) is now applied as a mutation **on top of** the canonically-built + fee-converged tx (`apply_tamper`), then the wallet input is re-signed — so the adversarial-covenant-rejection test capability is preserved. `run_cross_pair` (v8–v13, pre-F6) left as hand-rolled with a doc note on why it can't route through the planner (Token B comes from a separate P2PK input, a shape `BatchOrder` can't express — the engine's own executor builds cross-pair/swap fills the same non-planner way). |
+| `cli/src/auto_match.rs` | **Deleted the redundant same-pair mini-matcher**: `compute_match_outputs` + the hand-rolled `submit_match` body (crossing/output/fee math). `submit_match` now delegates to `plan_batch_match` with an F6-safe default `fee_bps` (the buy's own embedded `mmfee_bps` when it's v16). RS reconstruction in `run()` now uses the cache's own `version`/`max_matcher_fee`/`expiry_daa` (was hardcoded to defaults, so any non-default or v16 order silently failed to be recognized). Cross-pair + the (dead-code, `#[allow(dead_code)]`) partial-fill submitters left as-is (pre-F6 / unreachable). |
+| `cli/src/lib.rs` | `match` subcommand gained `--max-matcher-fee` / `--mmfee-bps` / `--fee-bps` so a v16 buy can be matched with its F6 cap honored; dispatch threads them through. |
+
+### `OrderSide` relocation
+
+The CLI's `OrderSide` enum lived in `auto_match.rs` and was imported by
+`cli/src/orderbook.rs:10` and `cli/src/tif.rs:191`. It is **not** a matcher
+concept, so rather than move it to a new CLI types module it was pointed at the
+already-existing canonical `kob_core::types::OrderSide` (re-exported as
+`kob_core::OrderSide`) — byte-identical shape (`Buy`/`Sell`, `Copy + Eq`). The
+local duplicate definition in `auto_match.rs` is deleted; `auto_match.rs`,
+`orderbook.rs`, and `tif.rs` all now `use kob_core::OrderSide`.
+
+### `auto-match` subcommand decision
+
+**KEPT** as a thin loop over the canonical planner (option 2 of the two offered),
+NOT removed. Rationale: (1) removing it would break `scripts/e2e_spot_full.sh`
+P24 (which exercises `kob-cli auto-match --dry-run`) and delete a large, still-green
+test suite (`find_crossing_pairs`, order-cache, cross-pair tests); (2) the actual
+defect — the redundant same-pair fee/output math that ignored F6 — is removed and
+its `submit_match` now delegates to the canonical planner, which is exactly what
+"thin loop over the canonical planner" asks for. The subcommand's scan/cache/loop
+scaffolding is CLI-specific glue and stays. Automated matching in production is
+still the kob-engine daemon's job; `auto-match` remains a single-pair operator
+convenience.
+
+### Legacy façade (`kob/engine/src/matcher/mod.rs`) — LEFT IN PLACE
+
+Checked after the changes: `cli/src/match_batch.rs` still imports
+`kob_engine::matcher::batch::{...}`, `cli/src/prediction.rs` imports
+`kob_engine::matcher::prediction_*`, and the engine's own `lib.rs`/`api/mod.rs`/
+`config.rs`/`main.rs` import dozens of `crate::matcher::*` paths. The façade is
+still load-bearing, so per the task's "delete ONLY if nothing else imports through
+it" it is **not** deleted.
+
+### Tests added
+
+- `kob-core/tests/toccata_fill_repro.rs` (reuses the existing post-Toccata
+  `TxScriptEngine` harness): `v16_over_cap_spread_rejected_by_f6` (50% spread vs
+  0.30% cap → F6 `OpVerify` aborts) and `v16_within_cap_wide_spread_passes_f6`
+  (50% spread vs 60% cap → F6 passes). These bracket the F6 cap on-chain and are
+  the direct "CLI match now ENFORCES the F6 cap" proof.
+- `kob-cli matching.rs`: `v16_match_matcher_surplus_is_capped_not_full_spread`
+  (planner caps the matcher take at `mmfee_bps` and refunds the spread to the
+  buyer) and `v16_match_within_cap_matcher_keeps_spread` (100% cap → matcher keeps
+  the spread, no refund — proves the cap is a real bound). Replaces the two
+  deleted `compute_match_outputs_*` tests; `detected_order_pair_builds_a_valid_plan`
+  covers `submit_match`'s `BatchOrder` construction.
+
+### LOC delta
+
+`auto_match.rs` 2243 → ~2050 (net −~190; deleted `compute_match_outputs` +
+hand-rolled `submit_match` body ~270 LOC, added the delegating `submit_match`
+~120 LOC + `DetectedOrder` fields). `matching.rs` 1299 → ~1240 (deleted the
+hand-rolled same-pair build/fee/tamper-inline body, added the planner delegation
++ `apply_tamper` + F6 tests).
+
+### Build / on-chain — see Phase 11 checklist below
+
+- [ ] `cargo build --release -p kob-cli -p kob-engine` — pending (one combined
+      background build; heavy linking on this device).
+- [ ] `cargo test` for kob-core / kob-domain / kob-cli — pending.
+- [ ] Optional on-chain honest within-cap `kob-cli match` via the token fixture
+      — pending (TXID to be recorded here).

@@ -14,3 +14,11 @@ serde_json = { workspace = true }
 tracing = "0.1"
 hex = { workspace = true }
 thiserror = "2"
+
+[dev-dependencies]
+# Off-chain covenant-script verification harness (mirrors kob-core's
+# tests/toccata_fill_repro.rs): run the canonical planner's real sigscripts
+# through the post-Toccata `kaspa-txscript` engine to prove F6 (matcher-fee
+# cap) is actually enforced on-chain, not just computed off-chain.
+kaspa-txscript = { workspace = true }
+kaspa-hashes = { workspace = true }

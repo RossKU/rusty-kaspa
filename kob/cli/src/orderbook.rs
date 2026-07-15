@@ -7,7 +7,7 @@
 //! **order-status**: Check whether a specific order UTXO is OPEN,
 //!   FILLED, CANCELLED, or PARTIALLY_FILLED.
 
-use crate::auto_match::OrderSide;
+use kob_core::OrderSide;
 use crate::order_cache::{OrderCache, OrderCacheEntry};
 use crate::cancel::kaspa_address_encode;
 use crate::node::NodeClient;

@@ -388,7 +388,9 @@ pub enum Commands {
         #[arg(long)]
         buy_token: Option<String>,
 
-        /// Contract version (only 14 is supported).
+        /// Contract version: 13/14 (legacy, shared RS layout) or 16 (F6-fix
+        /// buy contract, --mmfee-bps semantics). Sell orders are always v14
+        /// -- there is no v16 sell contract.
         #[arg(long, default_value = "14")]
         version: u8,
 
@@ -399,6 +401,29 @@ pub enum Commands {
         /// Sell order expiry DAA score (for v14 RS reconstruction). 0 = GTC.
         #[arg(long, default_value = "0")]
         sell_expiry: u64,
+
+        /// Max matcher fee (sompi) embedded in the reconstructed v14 buy/sell
+        /// redeemScripts. Must match the value the orders were deployed
+        /// with, or the reconstructed P2SH won't match the on-chain order.
+        /// Ignored for the buy side when --version 16 (use --mmfee-bps).
+        #[arg(long, default_value = "10000000")]
+        max_matcher_fee: u64,
+
+        /// Max matcher fee in basis points, embedded in a v16 buy
+        /// redeemScript (must match the deployed value). Sets --version to
+        /// 16 automatically. Also used (unless --fee-bps overrides it) as
+        /// the canonical planner's matcher-fee cap, so the built tx never
+        /// asks for more surplus than the buy's own on-chain F6 check
+        /// allows. Default when --version 16 and unset: 30 (0.30%).
+        #[arg(long)]
+        mmfee_bps: Option<u64>,
+
+        /// Matcher fee cap in basis points passed to the canonical planner
+        /// (same semantics as `match-batch --fee-bps`). Overrides the
+        /// --mmfee-bps-derived default. Excess surplus is returned to the
+        /// buyer as change.
+        #[arg(long)]
+        fee_bps: Option<u16>,
 
         /// Adversarial tamper mode for security testing. Deliberately constructs
         /// an invalid match TX to verify covenant rejection. The node MUST reject.
@@ -2351,6 +2376,9 @@ pub async fn dispatch(
             version,
             buy_expiry,
             sell_expiry,
+            max_matcher_fee,
+            mmfee_bps,
+            fee_bps,
             tamper,
         } => {
             let token = token::resolve_token(&token, None)?;
@@ -2431,6 +2459,9 @@ pub async fn dispatch(
                     fee,
                     buy_expiry,
                     sell_expiry,
+                    max_matcher_fee,
+                    mmfee_bps,
+                    fee_bps,
                     tamper_mode,
                 )
                 .await?;

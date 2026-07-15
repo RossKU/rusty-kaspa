@@ -188,7 +188,7 @@ pub async fn tif_execute(
     version: u8,
     expiry_daa: u64,
 ) -> anyhow::Result<TifResult> {
-    use crate::auto_match::OrderSide;
+    use kob_core::OrderSide;
     use crate::order_cache::OrderCache;
     use crate::cancel;
     use crate::node::NodeClient;

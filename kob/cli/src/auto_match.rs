@@ -20,11 +20,15 @@ use crate::signing;
 use kob_core::contract;
 use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
-use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
+use kob_core::tx::{to_rpc_payload, CovenantBinding, Transaction, TxInput, TxOutput};
 use kob_core::types::Network;
+// `OrderSide` is the shared, canonical type (kob-core's `types` module) --
+// not redefined here. `orderbook.rs`/`tif.rs` import it from the same place.
+use kob_core::OrderSide;
 use kob_core::wallet::WalletContext;
 use kob_core::mass::{calc_miner_fee, calc_mass_with_sigscripts};
 use kob_core::{MIN_UTXO_VALUE, RECEIPT_DUST, RECEIPT_VALUE};
+use kob_domain::batch::{plan_batch_match, BatchOrder, OrderType, OutputPurpose};
 
 /// Conservative fee estimate (10,000 sompi) used for UTXO selection budgets
 /// and pre-filter profitability checks where the TX is not yet built.
@@ -54,12 +58,15 @@ pub struct DetectedOrder {
     /// for sell orders it identifies the token they hold.
     /// Empty string if unknown (legacy v6 orders without pair metadata).
     pub token_cov_id: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum OrderSide {
-    Buy,
-    Sell,
+    /// Contract version (14 or, for buy orders only, 16 -- the F6-fix
+    /// contract; see V16_STATUS.md). Sell orders are always 14.
+    pub version: u8,
+    /// Max matcher fee embedded in the redeemScript: absolute sompi for
+    /// v14, basis points for a v16 buy. Needed to reconstruct the exact
+    /// on-chain redeemScript bytes (must match what the order was deployed
+    /// with) and, for a v16 buy, to derive a safe default F6-cap `fee_bps`
+    /// for the canonical planner (see `submit_match`).
+    pub max_matcher_fee: u64,
 }
 
 /// A crossing pair ready to be matched.
@@ -135,282 +142,186 @@ pub fn find_crossing_pairs(orders: &[DetectedOrder], min_spread: f64) -> Vec<Cro
     pairs
 }
 
-/// Compute expected match outputs for a crossing pair.
-///
-/// `miner_fee` is the estimated or exact miner fee in sompi. Pass
-/// `FEE_BUDGET` for pre-TX-build estimates; pass the mass-based fee
-/// after the TX is constructed for exact accounting.
-pub fn compute_match_outputs(
-    buy: &DetectedOrder,
-    sell: &DetectedOrder,
-    miner_fee: u64,
-) -> anyhow::Result<MatchOutputs> {
-    let expected_tokens = (buy.value as u128 * buy.price_num as u128 / buy.price_den as u128) as u64;
-    let expected_kas = (sell.value as u128 * sell.price_num as u128 / sell.price_den as u128) as u64;
-
-    let total_in = buy.value + sell.value;
-
-    if expected_kas + expected_tokens > total_in {
-        anyhow::bail!(
-            "Orders cannot be matched: combined output ({} + {} = {} sompi) exceeds combined input ({} sompi). \
-             The buy and sell prices do not overlap.",
-            expected_kas,
-            expected_tokens,
-            expected_kas + expected_tokens,
-            total_in
-        );
-    }
-
-    let surplus = total_in - expected_kas - expected_tokens;
-
-    if surplus < miner_fee {
-        anyhow::bail!(
-            "Match surplus too small: {} sompi available, but need {} sompi for fee. \
-             Try matching orders with a larger price spread.",
-            surplus,
-            miner_fee
-        );
-    }
-
-    if expected_kas < MIN_UTXO_VALUE {
-        anyhow::bail!("Seller's KAS output ({} sompi) is below the minimum UTXO value ({}). \
-             Increase the order size or adjust the price.", expected_kas, MIN_UTXO_VALUE);
-    }
-    if expected_tokens < MIN_UTXO_VALUE {
-        anyhow::bail!(
-            "Buyer's token output ({} sompi) is below the minimum UTXO value ({}). \
-             Increase the order size or adjust the price.",
-            expected_tokens,
-            MIN_UTXO_VALUE
-        );
-    }
-
-    // Receipt value (1 KAS) funded by matcher wallet, not from surplus
-    let receipt_value = RECEIPT_VALUE;
-    let raw_change = surplus - miner_fee;
-    let (final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
-        (expected_kas, raw_change)
-    } else {
-        (expected_kas + raw_change, 0u64)
-    };
-
-    Ok(MatchOutputs {
-        seller_kas: final_seller_kas,
-        buyer_tokens: expected_tokens,
-        receipt_value,
-        matcher_change,
-        exec_amount: expected_tokens.min(sell.value),
-    })
-}
-
-/// Computed output amounts for a match TX.
-#[derive(Debug)]
-pub struct MatchOutputs {
-    pub seller_kas: u64,
-    pub buyer_tokens: u64,
-    pub receipt_value: u64,
-    pub matcher_change: u64,
-    pub exec_amount: u64,
-}
-
 /// Result of a submitted match TX.
+///
+/// `receipt_index` is `None` for matches built by `submit_match` (the
+/// canonical-planner path below does not emit a `trade_receipt` output --
+/// neither does `match-batch`, the documented production match path; see
+/// `matching.rs`'s module doc for the rationale). The partial-fill and
+/// cross-pair paths in this file still emit a receipt and set this field.
 #[derive(Debug)]
 pub struct SubmitResult {
     pub tx_id: String,
     pub seller_kas: u64,
     pub buyer_tokens: u64,
-    pub receipt_index: u32,
+    pub receipt_index: Option<u32>,
 }
 
-/// Build and submit a full match TX for a crossing pair.
+/// Build and submit a full match TX for a crossing pair, routed through the
+/// canonical kob-domain planner (`plan_batch_match` + `converge_fee_exact` /
+/// `apply_exact_fee`) -- the same planner `match-batch` and `kob-cli match`
+/// (see `matching.rs`) use, instead of the hand-rolled fee/output math this
+/// function used before consolidation. This is what makes a v16 buy's F6
+/// (matcher-fee-cap) check reliably pass: `fee_bps` defaults to the buy's
+/// own `max_matcher_fee` (bps) when it's a v16 order, so the built tx never
+/// asks for more matcher surplus than F6 allows.
 ///
-/// Both covenant inputs use fill sigscripts (sigOpCount=0, permissionless).
-/// Only the fee input requires signing.
+/// Self-trade model (unchanged from before consolidation): both outputs are
+/// sent to `wallet_spk` (this wallet's own P2PK SPK), not to a per-order
+/// owner SPK -- `DetectedOrder` only carries owner/spk *hashes* (not full
+/// SPK bytes, which aren't recoverable from a hash), so this function has
+/// never been able to deliver funds to a third-party order owner. That
+/// limitation is preserved as-is; changing it is out of scope here.
 ///
 /// TX layout:
-///   input[0]: buy_order  (P2SH fill, sigOpCount=0)
-///   input[1]: sell_order (P2SH fill, sigOpCount=0)
+///   input[0]: sell_order (P2SH fill, sigOpCount=0)
+///   input[1]: buy_order  (P2SH fill, sigOpCount=0)
 ///   input[2]: fee UTXO   (P2PK signed, sigOpCount=1)
 ///   output[0]: seller KAS
 ///   output[1]: buyer tokens
-///   output[2]: trade_receipt (P2SH)
-///   output[3]: matcher change (optional)
+///   output[2]: matcher fee (optional, bps-capped)
 #[allow(clippy::too_many_arguments)]
-#[allow(deprecated)]
 pub async fn submit_match(
     rpc: &NodeClient,
     buy: &DetectedOrder,
     sell: &DetectedOrder,
-    outputs: &MatchOutputs,
-    pair_id_hex: &str,
-    _wallet: &WalletContext,
     privkey: &[u8; 32],
     fee_utxo: &RpcUtxo,
+    fee_bps: Option<u16>,
 ) -> anyhow::Result<SubmitResult> {
-    let buy_p2sh = build_p2sh(&buy.redeem_script);
-    let sell_p2sh = build_p2sh(&sell.redeem_script);
-
-    // Build fill sigscripts (permissionless, no signature needed) -- v14 only
-    if buy.redeem_script.len() != 387 {
-        anyhow::bail!("Unsupported buy RS length {}. Only v14 (387B) is supported.", buy.redeem_script.len());
+    let token_bytes = hex::decode(&buy.token_cov_id)
+        .map_err(|e| anyhow::anyhow!("Buy order token_cov_id is not valid hex: {}", e))?;
+    if token_bytes.len() != 32 {
+        anyhow::bail!("Buy order token_cov_id must be 64 hex characters (32 bytes)");
     }
-    if sell.redeem_script.len() != 356 {
-        anyhow::bail!("Unsupported sell RS length {}. Only v14 (356B) is supported.", sell.redeem_script.len());
-    }
-    let buy_fill_ss = contract::build_buy_fill_sigscript(1, 1, 0, &buy.redeem_script);
-    let sell_fill_ss = contract::build_sell_fill_sigscript(0, &sell.redeem_script);
-
-    // Build receipt redeemScript
-    let pair_bytes = hex::decode(pair_id_hex)?;
     let mut tcid = [0u8; 32];
-    tcid.copy_from_slice(&pair_bytes);
-    let receipt_rs = contract::build_receipt_redeem_script(
-        &tcid,
-        buy.price_num,
-        buy.price_den,
-        outputs.exec_amount,
-        RECEIPT_DUST,
-        &buy.spk_hash,
-    )?;
-    let receipt_p2sh = build_p2sh(&receipt_rs);
+    tcid.copy_from_slice(&token_bytes);
 
-    // Get wallet SPK from the fee UTXO (it's a P2PK UTXO from the wallet)
     let wallet_spk = fee_utxo.script_bytes();
     let wallet_spk_version = fee_utxo.utxo_entry.script_public_key.version;
-    let fee_spk_bytes = fee_utxo.script_bytes();
-    let fee_value = fee_utxo.utxo_entry.amount;
 
-    // Recompute output amounts including the fee UTXO value
-    let total_in = buy.value + sell.value + fee_value;
-    let seller_kas_base = outputs.seller_kas;
-    let buyer_tokens = outputs.buyer_tokens;
-    let receipt_value = outputs.receipt_value;
-    let new_surplus = total_in - seller_kas_base - buyer_tokens;
-
-    // Phase 1: build TX with estimated fee, then converge
-    // Use FEE_BUDGET as initial estimate; will be refined after signing.
-    let est_fee = FEE_BUDGET;
-    let raw_change = new_surplus.saturating_sub(receipt_value + est_fee);
-    let (mut final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
-        (seller_kas_base, raw_change)
-    } else {
-        (seller_kas_base + raw_change, 0u64)
+    let buy_order = BatchOrder {
+        outpoint: (buy.txid.clone(), buy.index),
+        order_type: OrderType::Buy,
+        version: buy.version,
+        token_cov_id: tcid,
+        price_num: buy.price_num,
+        price_den: buy.price_den,
+        amount: buy.value,
+        redeem_script: buy.redeem_script.clone(),
+        utxo_value: buy.value,
+        counterparty_spk: wallet_spk.clone(),
+        counterparty_spk_version: wallet_spk_version,
+        min_fill: buy.min_fill,
+        oco_path: None,
+        bracket_meta: None,
+    };
+    let sell_order = BatchOrder {
+        outpoint: (sell.txid.clone(), sell.index),
+        order_type: OrderType::Sell,
+        version: 14,
+        token_cov_id: tcid,
+        price_num: sell.price_num,
+        price_den: sell.price_den,
+        amount: sell.value,
+        redeem_script: sell.redeem_script.clone(),
+        utxo_value: sell.value,
+        counterparty_spk: wallet_spk.clone(),
+        counterparty_spk_version: wallet_spk_version,
+        min_fill: sell.min_fill,
+        oco_path: None,
+        bracket_meta: None,
     };
 
-    // Build transaction
-    let mut tx = Transaction::new(0);
-
-    // Input 0: buy_order (fill, sigOpCount=0, CSV=50)
-    tx.inputs.push(TxInput {
-        prev_tx_id: buy.txid.clone(),
-        prev_index: buy.index,
-        sequence: 50,
-        sig_op_count: 0,
-        script_version: buy_p2sh.version,
-        script_bytes: buy_p2sh.script().to_vec(),
-        value: buy.value,
-    });
-
-    // Input 1: sell_order (fill, sigOpCount=0, CSV=50)
-    tx.inputs.push(TxInput {
-        prev_tx_id: sell.txid.clone(),
-        prev_index: sell.index,
-        sequence: 50,
-        sig_op_count: 0,
-        script_version: sell_p2sh.version,
-        script_bytes: sell_p2sh.script().to_vec(),
-        value: sell.value,
-    });
-
-    // Input 2: fee UTXO (P2PK, signed, sigOpCount=1)
-    tx.inputs.push(TxInput {
-        prev_tx_id: fee_utxo.outpoint.transaction_id.clone(),
-        prev_index: fee_utxo.outpoint.index,
-        sequence: 0,
-        sig_op_count: 1,
-        script_version: fee_utxo.utxo_entry.script_public_key.version,
-        script_bytes: fee_spk_bytes,
-        value: fee_value,
-    });
-
-    // Output 0: seller KAS
-    tx.outputs.push(TxOutput::new(final_seller_kas, wallet_spk_version, wallet_spk.clone(), None));
-
-    // Output 1: buyer tokens
-    tx.outputs.push(TxOutput::new(buyer_tokens, wallet_spk_version, wallet_spk.clone(), None));
-
-    // Output 2: trade receipt
-    tx.outputs.push(TxOutput::new(receipt_value, receipt_p2sh.version, receipt_p2sh.script().to_vec(), None));
-
-    // Output 3: matcher change (optional)
-    if matcher_change >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk.clone(), None));
-    }
-
-    // Phase 1 fee: estimate from unsigned TX mass
-    let est_fee_p1 = calc_miner_fee(&tx);
-
-    // Re-adjust outputs if estimated fee differs from initial estimate
-    let adj_change = new_surplus.saturating_sub(receipt_value + est_fee_p1);
-    let (adj_seller, adj_mc) = if adj_change >= MIN_UTXO_VALUE {
-        (seller_kas_base, adj_change)
-    } else {
-        (seller_kas_base + adj_change, 0u64)
-    };
-    tx.outputs[0].value = adj_seller;
-    // Handle matcher change output (index 3)
-    if adj_mc >= MIN_UTXO_VALUE {
-        if tx.outputs.len() > 3 { tx.outputs[3].value = adj_mc; }
-        else { tx.outputs.push(TxOutput::new(adj_mc, wallet_spk_version, wallet_spk.clone(), None)); }
-    } else if tx.outputs.len() > 3 {
-        tx.outputs.pop();
-    }
-    final_seller_kas = adj_seller;
-    let _ = adj_mc; // matcher_change already applied to tx.outputs
-
-    // Sign fee input (index 2)
-    let sighash = compute_sighash(&tx, 2)?;
-    let sig = signing::schnorr_sign(privkey, &sighash)?;
-    let fee_ss = signing::build_p2pk_sigscript(&sig);
-
-    let mut sigscripts = vec![buy_fill_ss, sell_fill_ss, fee_ss];
-
-    // Phase 2: exact mass check with real sigscripts
-    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
-
-    if exact_fee != est_fee_p1 {
-        // Re-adjust outputs with exact fee
-        let adj_change2 = new_surplus.saturating_sub(receipt_value + exact_fee);
-        let (adj_sk2, adj_mc2) = if adj_change2 >= MIN_UTXO_VALUE {
-            (seller_kas_base, adj_change2)
+    // F6 correctness: default to the buy's own embedded mmfee_bps when it's
+    // a v16 order (see `matching.rs::run` for the identical reasoning). A
+    // v14 buy has no on-chain F6 check, so the default stays uncapped.
+    let effective_fee_bps = fee_bps.or_else(|| {
+        if buy.version == 16 {
+            Some(buy.max_matcher_fee as u16)
         } else {
-            (seller_kas_base + adj_change2, 0u64)
-        };
-        tx.outputs[0].value = adj_sk2;
-        if adj_mc2 >= MIN_UTXO_VALUE {
-            if tx.outputs.len() > 3 { tx.outputs[3].value = adj_mc2; }
-            else { tx.outputs.push(TxOutput::new(adj_mc2, wallet_spk_version, wallet_spk.clone(), None)); }
-        } else if tx.outputs.len() > 3 {
-            tx.outputs.pop();
+            None
         }
-        final_seller_kas = adj_sk2;
-        let _ = adj_mc2;
-        // Re-sign fee input
-        let sh = compute_sighash(&tx, 2)?;
-        let sf = signing::schnorr_sign(privkey, &sh)?;
-        *sigscripts.last_mut().unwrap() = signing::build_p2pk_sigscript(&sf);
+    });
+
+    let wallet_utxo_info = (
+        fee_utxo.outpoint.transaction_id.clone(),
+        fee_utxo.outpoint.index,
+        fee_utxo.utxo_entry.amount,
+    );
+
+    let mut plan = plan_batch_match(
+        &[sell_order],
+        &[buy_order],
+        Some(wallet_utxo_info),
+        &wallet_spk,
+        wallet_spk_version,
+        effective_fee_bps,
+    )?;
+    plan.validate()?;
+
+    let mut tx = plan.to_transaction();
+    if let Some(last_input) = tx.inputs.last_mut() {
+        if plan.wallet_input.is_some() {
+            last_input.script_bytes = fee_utxo.script_bytes();
+            last_input.script_version = fee_utxo.utxo_entry.script_public_key.version;
+        }
+    }
+
+    let token_hash = kob_core::compat::parse_hash(&buy.token_cov_id).unwrap();
+    for (idx, planned) in plan.outputs.iter().enumerate() {
+        if planned.purpose == OutputPurpose::BuyerTokens {
+            let authorizing_input = plan.buy_seller_map.get(&idx).copied().unwrap_or(0) as u16;
+            tx.outputs[idx].covenant = Some(CovenantBinding::new(authorizing_input, token_hash));
+        }
+    }
+
+    let batch_tx = plan.build_tx()?;
+    let mut sigscripts: Vec<Vec<u8>> = batch_tx.inputs.iter().map(|i| i.sigscript.clone()).collect();
+
+    if plan.wallet_input.is_some() {
+        let wallet_idx = tx.inputs.len() - 1;
+        let sighash = compute_sighash(&tx, wallet_idx)?;
+        let sig = signing::schnorr_sign(privkey, &sighash)?;
+        sigscripts[wallet_idx] = signing::build_p2pk_sigscript(&sig);
+    }
+
+    let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
+    if delta > 0 {
+        plan.apply_exact_fee(exact_fee);
+
+        tx.outputs.clear();
+        for planned in &plan.outputs {
+            tx.outputs.push(TxOutput::new(
+                planned.value,
+                planned.spk_version,
+                planned.script_public_key.clone(),
+                None,
+            ));
+        }
+        for (idx, planned) in plan.outputs.iter().enumerate() {
+            if planned.purpose == OutputPurpose::BuyerTokens {
+                let authorizing_input = plan.buy_seller_map.get(&idx).copied().unwrap_or(0) as u16;
+                tx.outputs[idx].covenant = Some(CovenantBinding::new(authorizing_input, token_hash));
+            }
+        }
+
+        if plan.wallet_input.is_some() {
+            let wallet_idx = tx.inputs.len() - 1;
+            let sighash = compute_sighash(&tx, wallet_idx)?;
+            let sig = signing::schnorr_sign(privkey, &sighash)?;
+            sigscripts[wallet_idx] = signing::build_p2pk_sigscript(&sig);
+        }
     }
 
     let payload = to_rpc_payload(&tx, &sigscripts);
-
     let tx_id = rpc.submit_transaction(payload).await?;
 
     Ok(SubmitResult {
         tx_id,
-        seller_kas: final_seller_kas,
-        buyer_tokens,
-        receipt_index: 2,
+        seller_kas: tx.outputs[0].value,
+        buyer_tokens: tx.outputs.get(1).map(|o| o.value).unwrap_or(0),
+        receipt_index: None,
     })
 }
 
@@ -628,7 +539,7 @@ pub async fn submit_partial_buy_fill(
         tx_id,
         seller_kas: 0, // Buy partial fill doesn't produce seller KAS in this TX
         buyer_tokens: final_buyer_tokens,
-        receipt_index: 2,
+        receipt_index: Some(2),
     })
 }
 
@@ -803,7 +714,7 @@ pub async fn submit_partial_sell_fill(
         tx_id,
         seller_kas: final_seller_kas,
         buyer_tokens: 0, // Sell partial fill doesn't produce buyer tokens directly
-        receipt_index: 2,
+        receipt_index: Some(2),
     })
 }
 
@@ -1061,9 +972,9 @@ pub async fn submit_cross_pair_match(
     // Output 3: trade receipt (optional)
     let receipt_index = if outputs.include_receipt {
         tx.outputs.push(TxOutput::new(outputs.receipt_value, receipt_p2sh.version, receipt_p2sh.script().to_vec(), None));
-        tx.outputs.len() as u32 - 1
+        Some(tx.outputs.len() as u32 - 1)
     } else {
-        0
+        None
     };
 
     // Output 4: matcher change (optional)
@@ -1328,37 +1239,60 @@ pub async fn run(
                     owner_hash.copy_from_slice(&owner_bytes);
                     spk_hash.copy_from_slice(&spk_bytes);
 
-                    // Reconstruct the redeemScript (v6 canonical contracts)
-                    // cancel_pending = 0 (active order).
-                    // max_matcher_fee = DEFAULT_MAX_MATCHER_FEE (10_000_000 sompi).
+                    // Reconstruct the redeemScript from the cache's OWN
+                    // recorded version/max_matcher_fee/expiry_daa -- not
+                    // hardcoded defaults. `max_matcher_fee` is part of the
+                    // 145B state that's hashed into the P2SH address for
+                    // every version, so any order deployed with a
+                    // non-default value (or expiry, or v16) previously
+                    // failed this reconstruction silently (P2SH mismatch ->
+                    // fell through to "Unknown P2SH UTXO" below).
+                    // cancel_pending = 0 (active order; cancelled orders
+                    // aren't scanned here).
+                    let cached_version = cached.version;
                     let rs = match side {
                         OrderSide::Buy => {
                             let pair_bytes = hex::decode(&cached.pair_id).unwrap_or_default();
                             if pair_bytes.len() != 32 { continue; }
                             let mut tcid = [0u8; 32];
                             tcid.copy_from_slice(&pair_bytes);
-                            kob_core::contract::build_buy_redeem_script(
-                                &tcid,
-                                cached.price_num,
-                                cached.price_den,
-                                cached.min_fill,
-                                &owner_hash,
-                                &spk_hash,
-                                crate::deploy::DEFAULT_MAX_MATCHER_FEE,
-                                0,
-                                0, // expiry_daa = 0 (GTC)
-                            )?
+                            if cached_version == 16 {
+                                kob_core::contract::build_buy_v16_redeem_script(
+                                    &tcid,
+                                    cached.price_num,
+                                    cached.price_den,
+                                    cached.min_fill,
+                                    &owner_hash,
+                                    &spk_hash,
+                                    cached.max_matcher_fee, // bps for v16
+                                    0,
+                                    cached.expiry_daa,
+                                )?
+                            } else {
+                                kob_core::contract::build_buy_redeem_script(
+                                    &tcid,
+                                    cached.price_num,
+                                    cached.price_den,
+                                    cached.min_fill,
+                                    &owner_hash,
+                                    &spk_hash,
+                                    cached.max_matcher_fee, // sompi for v14
+                                    0,
+                                    cached.expiry_daa,
+                                )?
+                            }
                         }
                         OrderSide::Sell => {
+                            // No v16 sell contract exists -- always v14.
                             kob_core::contract::build_sell_redeem_script(
                                 cached.price_num,
                                 cached.price_den,
                                 cached.min_fill,
                                 &owner_hash,
                                 &spk_hash,
-                                crate::deploy::DEFAULT_MAX_MATCHER_FEE,
+                                cached.max_matcher_fee,
                                 0,
-                                0, // expiry_daa = 0 (GTC)
+                                cached.expiry_daa,
                             )?
                         }
                     };
@@ -1376,6 +1310,8 @@ pub async fn run(
                         p2sh_hash: hash.clone(),
                         redeem_script: rs,
                         token_cov_id: cached.pair_id.clone(),
+                        version: if side == OrderSide::Buy { cached_version } else { 14 },
+                        max_matcher_fee: cached.max_matcher_fee,
                     });
 
                     let side_str = match side {
@@ -1425,64 +1361,47 @@ pub async fn run(
                     pair.spread,
                 );
 
-                match compute_match_outputs(&pair.buy, &pair.sell, FEE_BUDGET) {
-                    Ok(outputs) => {
-                        println!(
-                            "         seller_kas={} buyer_tokens={} receipt={} change={}",
-                            outputs.seller_kas,
-                            outputs.buyer_tokens,
-                            outputs.receipt_value,
-                            outputs.matcher_change,
-                        );
+                // Rough pre-submit estimate for display only (no fee/cap
+                // logic here -- the canonical planner inside `submit_match`
+                // computes the real, F6-correct amounts).
+                let est_tokens = (pair.buy.value as u128 * pair.buy.price_num as u128
+                    / pair.buy.price_den as u128) as u64;
+                let est_kas = (pair.sell.value as u128 * pair.sell.price_num as u128
+                    / pair.sell.price_den as u128) as u64;
+                println!(
+                    "         seller_kas~={} buyer_tokens~={} (pre-fee estimate)",
+                    est_kas, est_tokens,
+                );
 
-                        if dry_run {
-                            println!("         [DRY RUN] Would submit match TX.");
-                        } else if let Some(fee) = fee_utxo {
-                            match submit_match(
-                                &rpc,
-                                &pair.buy,
-                                &pair.sell,
-                                &outputs,
-                                pair_id_hex,
-                                &wallet,
-                                &privkey,
-                                fee,
-                            )
-                            .await
-                            {
-                                Ok(result) => {
-                                    println!(
-                                        "         MATCHED! TXID: {}",
-                                        result.tx_id
-                                    );
-                                    println!(
-                                        "         Seller received: {} sompi, Buyer received: {} sompi",
-                                        result.seller_kas, result.buyer_tokens
-                                    );
-                                    println!(
-                                        "         Receipt at: {}:{}",
-                                        result.tx_id, result.receipt_index
-                                    );
-                                }
-                                Err(e) => {
-                                    warn!("         Match TX failed: {}", e);
-                                }
-                            }
-                        } else {
-                            println!("         SKIPPED: No fee UTXO available.");
+                if dry_run {
+                    println!("         [DRY RUN] Would submit match TX via the canonical planner.");
+                    match_count += 1;
+                } else if let Some(fee) = fee_utxo {
+                    // fee_bps=None: submit_match derives the F6-safe default
+                    // from the buy's own max_matcher_fee when it's v16.
+                    match submit_match(&rpc, &pair.buy, &pair.sell, &privkey, fee, None).await {
+                        Ok(result) => {
+                            println!("         MATCHED! TXID: {}", result.tx_id);
+                            println!(
+                                "         Seller received: {} sompi, Buyer received: {} sompi",
+                                result.seller_kas, result.buyer_tokens
+                            );
                         }
-
-                        match_count += 1;
-
-                        // Check max_matches limit after each match
-                        if max_matches > 0 && match_count >= max_matches {
-                            println!("  Reached max_matches limit ({}).", max_matches);
-                            break;
+                        Err(e) => {
+                            warn!("         Match TX failed: {}", e);
+                            println!("         Cannot match: {}", e);
+                            continue;
                         }
                     }
-                    Err(e) => {
-                        println!("         Cannot match: {}", e);
-                    }
+                    match_count += 1;
+                } else {
+                    println!("         SKIPPED: No fee UTXO available.");
+                }
+
+                // Check max_matches limit after each match
+                if max_matches > 0 && match_count >= max_matches {
+                    println!("  Reached max_matches limit ({}).", max_matches);
+                    break;
                 }
             }
         }
@@ -1606,7 +1525,7 @@ pub async fn run(
                                                 if cp_outputs.include_receipt {
                                                     println!(
                                                         "         Receipt at: {}:{}",
-                                                        result.tx_id, result.receipt_index
+                                                        result.tx_id, result.receipt_index.unwrap_or(0)
                                                     );
                                                 }
                                                 match_count += 1;
@@ -1670,6 +1589,8 @@ mod tests {
             p2sh_hash: "00".repeat(32),
             redeem_script: vec![0x51],
             token_cov_id: "00".repeat(32),
+            version: 14,
+            max_matcher_fee: 10_000_000,
         }
     }
 
@@ -1761,25 +1682,65 @@ mod tests {
         assert_eq!(pairs.len(), 0, "Rational prices 2/3 < 3/4 should not cross");
     }
 
+    /// Replaces the old `compute_match_outputs_basic`/`_no_crossing` tests
+    /// (those exercised the now-deleted hand-rolled `compute_match_outputs`
+    /// mini-matcher). Crossing/output computation for the base match path is
+    /// now the canonical kob-domain planner's job, and it already has its
+    /// own coverage (`kob/domain/src/spot/batch.rs` tests, plus the
+    /// F6-cap-specific test in `matching.rs`). This just proves
+    /// `submit_match`'s `BatchOrder` construction from a `DetectedOrder`
+    /// pair is wired correctly by exercising `plan_batch_match` directly
+    /// with the same shape `submit_match` builds.
     #[test]
-    fn compute_match_outputs_basic() {
+    fn detected_order_pair_builds_a_valid_plan() {
         let buy = make_test_order(OrderSide::Buy, 1, 2, 20_000_000);
         let sell = make_test_order(OrderSide::Sell, 1, 2, 20_000_000);
-        let outputs = compute_match_outputs(&buy, &sell, FEE_BUDGET).unwrap();
+        let tcid = [0u8; 32];
+        let wallet_spk = vec![0xCC; 34];
+        let buy_order = kob_domain::batch::BatchOrder {
+            outpoint: (buy.txid.clone(), buy.index),
+            order_type: kob_domain::batch::OrderType::Buy,
+            version: buy.version,
+            token_cov_id: tcid,
+            price_num: buy.price_num,
+            price_den: buy.price_den,
+            amount: buy.value,
+            redeem_script: kob_core::contract::build_buy_redeem_script(
+                &tcid, buy.price_num, buy.price_den, buy.min_fill,
+                &buy.owner_hash, &buy.spk_hash, buy.max_matcher_fee, 0, 0,
+            ).unwrap(),
+            utxo_value: buy.value,
+            counterparty_spk: wallet_spk.clone(),
+            counterparty_spk_version: 0,
+            min_fill: buy.min_fill,
+            oco_path: None,
+            bracket_meta: None,
+        };
+        let sell_order = kob_domain::batch::BatchOrder {
+            outpoint: (sell.txid.clone(), sell.index),
+            order_type: kob_domain::batch::OrderType::Sell,
+            version: 14,
+            token_cov_id: tcid,
+            price_num: sell.price_num,
+            price_den: sell.price_den,
+            amount: sell.value,
+            redeem_script: kob_core::contract::build_sell_redeem_script(
+                sell.price_num, sell.price_den, sell.min_fill,
+                &sell.owner_hash, &sell.spk_hash, sell.max_matcher_fee, 0, 0,
+            ).unwrap(),
+            utxo_value: sell.value,
+            counterparty_spk: wallet_spk.clone(),
+            counterparty_spk_version: 0,
+            min_fill: sell.min_fill,
+            oco_path: None,
+            bracket_meta: None,
+        };
+        let plan = plan_batch_match(&[sell_order], &[buy_order], None, &wallet_spk, 0, None)
+            .expect("plan should succeed for a crossing 1:1 pair");
+        plan.validate().expect("plan should validate");
         // expected_tokens = 20M * 1 / 2 = 10M
-        // expected_kas = 20M * 1 / 2 = 10M
-        // total_in = 40M, surplus = 40M - 10M - 10M = 20M
-        assert_eq!(outputs.buyer_tokens, 10_000_000);
-        assert_eq!(outputs.receipt_value, RECEIPT_VALUE);
-        assert!(outputs.seller_kas >= 10_000_000);
-    }
-
-    #[test]
-    fn compute_match_outputs_no_crossing() {
-        let buy = make_test_order(OrderSide::Buy, 1, 10, 10_000_000);
-        let sell = make_test_order(OrderSide::Sell, 5, 1, 10_000_000);
-        let result = compute_match_outputs(&buy, &sell, FEE_BUDGET);
-        assert!(result.is_err(), "Non-crossing prices should fail");
+        let buyer_out = plan.outputs.iter().find(|o| o.purpose == kob_domain::batch::OutputPurpose::BuyerTokens).unwrap();
+        assert_eq!(buyer_out.value, 10_000_000);
     }
 
     #[test]
@@ -2033,12 +1994,12 @@ mod tests {
             tx_id: "abc".to_string(),
             seller_kas: 5_000_000,
             buyer_tokens: 3_000_000,
-            receipt_index: 2,
+            receipt_index: Some(2),
         };
         assert_eq!(result.tx_id, "abc");
         assert_eq!(result.seller_kas, 5_000_000);
         assert_eq!(result.buyer_tokens, 3_000_000);
-        assert_eq!(result.receipt_index, 2);
+        assert_eq!(result.receipt_index, Some(2));
     }
 
 
@@ -2062,6 +2023,8 @@ mod tests {
             p2sh_hash: "00".repeat(32),
             redeem_script: vec![0x51],
             token_cov_id: token_cov_id.to_string(),
+            version: 14,
+            max_matcher_fee: 10_000_000,
         }
     }
 

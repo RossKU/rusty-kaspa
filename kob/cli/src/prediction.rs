@@ -867,18 +867,45 @@ fn parse_outpoint_parts(s: &str) -> anyhow::Result<(String, u32)> {
 }
 
 /// Build the 36-byte owner SPK: [version_u16_le(2B)] [0x20] [pubkey(32B)] [0xac]
+/// Build a standard P2PK scriptPublicKey's SCRIPT bytes (34 bytes: push32 +
+/// pubkey + OpCheckSig) for `pubkey`.
+///
+/// Every call site plugs this into a domain `*TxOutput` alongside its OWN
+/// separately-tracked `script_version: 0` field (e.g.
+/// `PredictionTxOutput { script_version, script }` in
+/// `prediction_executor.rs`), matching the rest of the codebase's convention
+/// (version and script bytes are always separate fields -- see e.g.
+/// `RpcUtxo::script_bytes()`, which likewise returns script-only with no
+/// version prefix). This used to return 36 bytes with an extra leading 2-byte
+/// zeroed "version" placeholder baked INTO the script itself, double-counting
+/// the version and producing a malformed scriptPublicKey once combined with
+/// the output's own `script_version` field. Confirmed live: the node rejected
+/// an `expire_ballot` reclaim tx built this way as
+/// "non-standard script form" (testnet-10). Every one of this function's 8
+/// call sites (vote/split/merge/settle/redeem/expire/refund, all *_script /
+/// *_spk locals) shares this exact `script_version: 0` + `script: ...` shape,
+/// so fixing the helper fixes all of them uniformly.
 fn build_owner_spk(pubkey: &[u8; 32]) -> Vec<u8> {
-    let mut spk = vec![0u8; 36];
-    // version = 0 as u16 LE (already zeroed)
-    spk[2] = 0x20; // push 32 bytes
-    spk[3..35].copy_from_slice(pubkey);
-    spk[35] = 0xac; // OpCheckSig
+    let mut spk = vec![0u8; 34];
+    spk[0] = 0x20; // push 32 bytes
+    spk[1..33].copy_from_slice(pubkey);
+    spk[33] = 0xac; // OpCheckSig
     spk
 }
 
 /// Convert a PredictionTxBlueprint to a Transaction for signing and submission.
 fn blueprint_to_tx(bp: &PredictionTxBlueprint) -> Transaction {
-    let mut tx = Transaction::new(bp.lock_time as u16);
+    // `Transaction::new` takes the tx VERSION (always 1 elsewhere in this
+    // codebase, for covenant-output/OpTxLockTime support), not the
+    // blueprint's `lock_time` (an absolute DAA-score gate value, often in
+    // the hundreds of millions on testnet-10). This used to pass
+    // `bp.lock_time as u16` straight in as the version, truncating a DAA
+    // score into a bogus version number -- confirmed live: the node
+    // rejected an `expire_ballot` reclaim tx with "transaction version
+    // 32820 is unknown". `lock_time` was never actually applied to the
+    // built tx at all.
+    let mut tx = Transaction::new(1);
+    tx.lock_time = bp.lock_time;
     tx.payload = bp.payload.clone();
     for (i, input) in bp.inputs.iter().enumerate() {
         let soc = bp.sig_op_counts.get(i).copied().unwrap_or(0);
@@ -1902,12 +1929,42 @@ async fn expire_ballot(
     let real_bp = build_expire_ballot_tx(&real_params)
         .map_err(|e| anyhow::anyhow!("build_expire_ballot_tx (real sig) failed: {}", e))?;
 
-    let real_tx = blueprint_to_tx(&real_bp);
-    let sigscripts: Vec<Vec<u8>> = real_bp.inputs.iter().map(|i| i.sig_script.clone()).collect();
+    let mut real_tx = blueprint_to_tx(&real_bp);
+    let mut sigscripts: Vec<Vec<u8>> = real_bp.inputs.iter().map(|i| i.sig_script.clone()).collect();
+
+    // Phase 2: exact fee from the real sigscript size; adjust payout + re-sign
+    // if it differs from build_expire_ballot_tx's rough fee estimate
+    // (kob_core::mass::estimate_compute_mass, ~100 bytes/sig-op). expire's
+    // sigscript embeds the FULL BallotBox redeemScript (~190B) on top of the
+    // signature and pubkey pushes, which the generic estimate doesn't
+    // account for -- live-confirmed via a rejected on-chain expire tx:
+    // "has 166900 fees which is under the required amount of 186500 for
+    // compute mass 1865". Same Phase-1-estimate/Phase-2-exact-recompute
+    // pattern as partial_fill.rs (kob/SECURITY_FIXES.md Phase 4).
+    real_tx.inputs[0].script_bytes = p2sh.script().to_vec();
+    real_tx.inputs[0].value = value;
+    let exact_mass = kob_core::mass::calc_mass_with_sigscripts(&real_tx, &sigscripts);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
+    let domain_fee = value.saturating_sub(real_bp.outputs.first().map(|o| o.value).unwrap_or(0));
+    if exact_fee > domain_fee {
+        let new_payout = value.checked_sub(exact_fee).ok_or_else(|| {
+            anyhow::anyhow!(
+                "BallotBox value {} too small to cover the exact fee {} (compute mass {})",
+                value, exact_fee, exact_mass
+            )
+        })?;
+        real_tx.outputs[0].value = new_payout;
+        let sighash2 = compute_sighash(&real_tx, 0)?;
+        let signature2 = signing::schnorr_sign_secure(&privkey, &sighash2)?;
+        sigscripts[0] = kob_core::prediction::build_ballot_box_expire_sigscript(
+            &signature2, &pubkey, &redeem_script,
+        );
+    }
+
     let payload = to_rpc_payload(&real_tx, &sigscripts);
     let tx_id = rpc.submit_transaction(payload).await?;
 
-    let payout = real_bp.outputs.first().map(|o| o.value).unwrap_or(0);
+    let payout = real_tx.outputs.first().map(|o| o.value).unwrap_or(0);
     println!("SUCCESS! BallotBox expired.");
     println!("TXID:    {}", tx_id);
     println!("Reclaimed: {}:0 ({})", tx_id, fmt_sompi(payout));

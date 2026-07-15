@@ -649,7 +649,7 @@ async fn submit_consolidation_tx(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     if exact_fee != est_fee {
         // Re-adjust outputs

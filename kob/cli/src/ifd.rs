@@ -383,7 +383,7 @@ pub async fn deploy_ifd(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
     if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(buy_amount + exact_fee);
@@ -669,7 +669,7 @@ pub async fn deploy_ifo_trustless(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
     if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(buy_amount + exact_fee);
@@ -954,7 +954,7 @@ pub async fn deploy_ifo(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
     if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
         let new_change = total_input.saturating_sub(buy_amount + exact_fee);

@@ -598,7 +598,7 @@ pub async fn deploy_buy(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != est_fee {
         if tx.outputs.len() > 1 {
@@ -1193,7 +1193,7 @@ pub async fn deploy_sell(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != est_fee_sell {
         if tx.outputs.len() > 1 {
@@ -1590,7 +1590,7 @@ pub async fn deploy_oco_sell(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     if exact_fee != est_fee_oco {
         if has_change && tx.outputs.len() > 1 {

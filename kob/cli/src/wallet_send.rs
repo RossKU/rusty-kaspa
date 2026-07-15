@@ -260,7 +260,7 @@ pub async fn run(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != phase1_fee { exact_fee } else { phase1_fee };
     if exact_fee != phase1_fee && tx.outputs.len() > 1 {

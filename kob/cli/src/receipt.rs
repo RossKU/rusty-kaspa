@@ -372,7 +372,7 @@ pub async fn receipt_create(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let _actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
     let sigscript = if exact_fee != est_fee && tx.outputs.len() > 1 {
@@ -563,7 +563,7 @@ pub async fn receipt_consume(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (receipt_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
@@ -762,7 +762,7 @@ pub async fn receipt_trigger(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (receipt_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
@@ -939,7 +939,7 @@ pub async fn receipt_consume_v1(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts = vec![receipt_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (receipt_ss, fee_ss, actual_fee) = if exact_fee != est_fee {

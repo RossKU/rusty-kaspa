@@ -505,7 +505,7 @@ pub async fn submit_partial_buy_fill(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     if exact_fee != est_fee_p1 {
         let adj_change2 = total_in.saturating_sub(fixed_outputs + expected_tokens + exact_fee);
@@ -683,7 +683,7 @@ pub async fn submit_partial_sell_fill(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     if exact_fee != est_fee_p1 {
         let adj_change2 = total_in.saturating_sub(fixed_outputs + seller_kas + exact_fee);
@@ -1017,7 +1017,7 @@ pub async fn submit_cross_pair_match(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     if exact_fee != est_fee_p1 {
         // Re-adjust fee_change output

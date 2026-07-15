@@ -315,7 +315,7 @@ pub async fn run(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&cancel_tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (cancel_sigscript, fee_sigscript) = if exact_fee != est_fee {
@@ -484,7 +484,7 @@ pub async fn run(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_deploy_mass = calc_mass_with_sigscripts(&deploy_tx, &[deploy_sigscript.clone()]);
-    let exact_deploy_fee = exact_deploy_mass;
+    let exact_deploy_fee = kob_core::mass::min_relay_fee(exact_deploy_mass);
 
     let deploy_sigscript = if exact_deploy_fee != deploy_est_fee && deploy_tx.outputs.len() > 1 {
         let change_idx = deploy_tx.outputs.len() - 1;

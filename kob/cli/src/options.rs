@@ -462,7 +462,7 @@ async fn deploy_call(
     // Phase 2: exact mass check
     let sigscripts_vec = vec![sigscript];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
     let _actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
     let sigscript = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
@@ -685,7 +685,7 @@ async fn deploy_put(
     // Phase 2: exact mass check
     let sigscripts_vec = vec![sigscript];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
     let _actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
     let sigscript = if exact_fee != est_fee && tx.outputs.len() > 1 {
         let change_idx = tx.outputs.len() - 1;
@@ -979,7 +979,7 @@ async fn exercise(
         // Phase 2: exact mass check with real sigscripts
         let sigscripts_ex = vec![exercise_ss.clone(), fee_ss.clone()];
         let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_ex);
-        let exact_fee = exact_mass;
+        let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
         let (exercise_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
             // Re-adjust change output
@@ -1202,7 +1202,7 @@ async fn cancel(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_cancel = vec![cancel_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (cancel_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1431,7 +1431,7 @@ async fn expire(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_expire = vec![expire_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_expire);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (expire_ss, fee_ss, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);

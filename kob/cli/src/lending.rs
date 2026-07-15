@@ -260,7 +260,7 @@ pub async fn deploy_offer(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
     let actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
     if exact_fee != est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
@@ -555,7 +555,7 @@ pub async fn deploy_request(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
     let actual_fee = if exact_fee != est_fee { exact_fee } else { est_fee };
     if exact_fee != est_fee && tx.outputs.len() > 1 {
         let ci = tx.outputs.len() - 1;
@@ -828,7 +828,7 @@ pub async fn cancel(
     // Phase 2: exact mass check
     let sigscripts_cancel = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1147,7 +1147,7 @@ pub async fn repay(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != est_fee_repay { exact_fee } else { est_fee_repay };
     if exact_fee != est_fee_repay && tx.outputs.len() > 1 {
@@ -1374,7 +1374,7 @@ pub async fn claim_default(
     // Phase 2: exact mass check
     let sigscripts_claim = vec![default_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_claim);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let (sigscripts, actual_fee) = if exact_fee != est_fee_claim {
         let new_claim = collateral.saturating_sub(exact_fee);
@@ -1689,7 +1689,7 @@ pub async fn liquidate(
 
     // Phase 2 check: verify fee covers exact mass
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
     let total_in_liq: u64 = tx.inputs.iter().map(|i| i.value).sum();
     let total_out_liq: u64 = tx.outputs.iter().map(|o| o.value).sum();
     let implicit_fee = total_in_liq.saturating_sub(total_out_liq);

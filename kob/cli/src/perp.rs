@@ -543,7 +543,7 @@ async fn deploy_perp(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != est_fee_deploy {
         if tx.outputs.len() > 1 {
@@ -791,7 +791,7 @@ async fn cancel_perp(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_cancel = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1114,7 +1114,7 @@ async fn liquidate_perp(
     // Phase 2: exact mass check
     let sigscripts_liq = vec![liq_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_liq);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let (liq_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee_liq {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1365,7 +1365,7 @@ async fn add_margin_perp(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != est_fee_am {
         if tx.outputs.len() > 1 {
@@ -1618,7 +1618,7 @@ async fn settle_perp(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &all_sigscripts);
-    let exact_fee = exact_mass.max(min_fee_override);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != est_fee_settle {
         if has_change_settle && tx.outputs.len() > 2 {

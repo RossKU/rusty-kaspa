@@ -139,7 +139,7 @@ pub fn build_cancel_tx(
     // Phase 2: exact mass with real sigscripts
     let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = kob_core::mass::calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (cancel_sigscript, fee_sigscript, output_value) = if exact_fee != est_fee {
         // Re-adjust output and re-sign (handles both over- and under-estimate)
@@ -370,9 +370,11 @@ pub async fn run(
 
         let fee_spk_bytes = fee_utxo.script_bytes();
         // Cancel TX: 2 inputs (order + fee), 1 output.
-        // Mempool only enforces compute mass; storage mass affects block template priority only.
-        let cancel_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
-        let output_value = order_value + fee_utxo.utxo_entry.amount - cancel_fee;
+        // Mempool enforces compute mass at the post-Toccata min-relay rate
+        // (100 sompi/gram); this is a preview only -- the real submission
+        // path (build_cancel_tx) recomputes the exact fee after signing.
+        let cancel_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(2, 1, 0));
+        let output_value = (order_value + fee_utxo.utxo_entry.amount).saturating_sub(cancel_fee);
 
         println!("  Order Value: {} sompi", order_value);
         println!("  Fee UTXO:    {}:{} ({} sompi)",

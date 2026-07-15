@@ -341,7 +341,7 @@ pub async fn deploy_bracket_v4(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_vec = vec![sigscript];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (sigscript, actual_fee) = if exact_fee != est_fee {
         if tx.outputs.len() > 1 {
@@ -724,7 +724,7 @@ pub async fn fill_bracket_v4(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_fill = vec![bracket_fill_ss.clone(), fee_sigscript.clone(), receipt_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_fill);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (bracket_fill_ss, fee_sigscript, receipt_sigscript, actual_fee) = if exact_fee != est_fee {
         // Re-adjust change or seller output
@@ -913,7 +913,7 @@ pub async fn cancel_bracket_v4(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_cancel = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_cancel);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
         let output_value = total_in.saturating_sub(exact_fee);
@@ -1188,7 +1188,7 @@ pub async fn run(
     // Phase 2: exact mass check
     let sigscripts_vec = vec![sigscript];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_vec);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (sigscript, _actual_fee) = if exact_fee != est_fee {
         if tx.outputs.len() > 1 {

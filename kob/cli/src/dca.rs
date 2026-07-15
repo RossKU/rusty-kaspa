@@ -492,7 +492,7 @@ async fn deploy(
 
     // Phase 2: exact mass check with real sigscripts
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     if exact_fee != phase1_fee && tx.outputs.len() > 1 {
         let cidx = tx.outputs.len() - 1;
@@ -936,7 +936,7 @@ async fn fill(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_check = vec![fill_ss.clone(), token_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_check);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (fill_ss_final, token_ss_final, fee_ss_final) = if exact_fee != phase1_fee && change_output_idx < tx.outputs.len() {
         // Re-adjust change output
@@ -1139,7 +1139,7 @@ async fn cancel(
     // Phase 2: exact mass check with real sigscripts
     let sigscripts_check = vec![cancel_ss.clone(), fee_ss.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_check);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (cancel_ss_final, fee_ss_final) = if exact_fee != phase1_fee {
         // Re-adjust output

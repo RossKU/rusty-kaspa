@@ -1114,7 +1114,7 @@ async fn deploy_order(
 
     // Phase 2: exact mass check
     let exact_mass = calc_mass_with_sigscripts(&tx, &[sigscript.clone()]);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
     let current_fee = total_in - tx.outputs.iter().map(|o| o.value).sum::<u64>();
 
     let sigscript = if exact_fee != current_fee {
@@ -1285,7 +1285,7 @@ async fn cancel_order(
     // Phase 2: exact mass check
     let sigscripts = vec![cancel_sigscript.clone(), fee_sigscript.clone()];
     let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts);
-    let exact_fee = exact_mass;
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let current_fee = total_in - tx.outputs.iter().map(|o| o.value).sum::<u64>();
     let (cancel_sigscript, fee_sigscript) = if exact_fee != current_fee {

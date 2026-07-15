@@ -377,9 +377,13 @@ async fn run_buy_partial_fill(
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_value
     );
 
-    // Compute output amounts
+    // Compute output amounts.
     // total_in = order_value + token_value + fee_value
     // outputs: residual_order + buyer_tokens + receipt + change
+    //
+    // Phase 1/Phase 2 exact-fee convergence -- see the identical comment in
+    // the sell partial-fill function above (kob/SECURITY_FIXES.md Phase 4;
+    // this owner-initiated path was missed by that sweep).
     let total_in = order_value.checked_add(token_value)
         .and_then(|s| s.checked_add(fee_value))
         .ok_or_else(|| anyhow::anyhow!(
@@ -387,36 +391,29 @@ async fn run_buy_partial_fill(
             order_value, token_value, fee_value
         ))?;
     let receipt_value = RECEIPT_VALUE;
-    let needed = residual_value + expected_tokens + receipt_value + fee;
+    let fee_est = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(3, 4, 0)).max(fee);
 
-    if total_in < needed {
-        anyhow::bail!(
-            "Insufficient funds: total input ({} sompi) cannot cover outputs ({} sompi) + fee ({} sompi). \
-             Add more funding UTXOs or reduce the fill amount.",
-            total_in,
-            needed - fee,
-            fee
-        );
-    }
-
-    let raw_change = total_in - needed;
-    let (final_buyer_tokens, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
-        (expected_tokens, raw_change)
-    } else {
-        // Add small change to buyer output
-        (expected_tokens + raw_change, 0u64)
+    let size_outputs = |fee_for_calc: u64| -> anyhow::Result<(u64, u64)> {
+        let needed = residual_value + expected_tokens + receipt_value + fee_for_calc;
+        if total_in < needed {
+            anyhow::bail!(
+                "Insufficient funds: total input ({} sompi) cannot cover outputs ({} sompi) + fee ({} sompi). \
+                 Add more funding UTXOs or reduce the fill amount.",
+                total_in,
+                needed - fee_for_calc,
+                fee_for_calc
+            );
+        }
+        let raw_change = total_in - needed;
+        Ok(if raw_change >= MIN_UTXO_VALUE {
+            (expected_tokens, raw_change)
+        } else {
+            // Add small change to buyer output
+            (expected_tokens + raw_change, 0u64)
+        })
     };
 
-    println!();
-    println!("Partial Fill TX Outputs:");
-    println!("  output[0]: residual order  {} sompi (P2SH)", residual_value);
-    println!("  output[1]: buyer tokens    {} sompi", final_buyer_tokens);
-    println!("  output[2]: trade_receipt   {} sompi", receipt_value);
-    if matcher_change > 0 {
-        println!("  output[3]: matcher change  {} sompi", matcher_change);
-    }
-    println!("  fee:                       {} sompi", fee);
-    println!();
+    let (mut final_buyer_tokens, mut matcher_change) = size_outputs(fee_est)?;
 
     // Build transaction.
     // version=1 required for covenant output bindings.
@@ -479,12 +476,52 @@ async fn run_buy_partial_fill(
     // Sign input 1 (token UTXO)
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = signing::schnorr_sign(privkey, &sighash_1)?;
-    let token_ss = signing::build_p2pk_sigscript(&sig_1);
+    let mut token_ss = signing::build_p2pk_sigscript(&sig_1);
 
     // Sign input 2 (fee UTXO)
     let sighash_2 = compute_sighash(&tx, 2)?;
     let sig_2 = signing::schnorr_sign(privkey, &sighash_2)?;
-    let fee_ss = signing::build_p2pk_sigscript(&sig_2);
+    let mut fee_ss = signing::build_p2pk_sigscript(&sig_2);
+
+    // Phase 2: exact fee from the real sigscript sizes; adjust + re-sign
+    // BOTH signed inputs if it differs (the sighash covers every output, so
+    // a changed change-output value invalidates both prior signatures).
+    let exact_mass = kob_core::mass::calc_mass_with_sigscripts(&tx, &[buy_pf_ss.clone(), token_ss.clone(), fee_ss.clone()]);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(fee);
+    let mut actual_fee = fee_est;
+    if exact_fee != fee_est {
+        let (fbt, mc) = size_outputs(exact_fee)?;
+        final_buyer_tokens = fbt;
+        matcher_change = mc;
+        tx.outputs[1].value = final_buyer_tokens;
+        if matcher_change >= MIN_UTXO_VALUE {
+            if tx.outputs.len() > 3 {
+                tx.outputs[3].value = matcher_change;
+            } else {
+                tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk.to_vec(), None));
+            }
+        } else if tx.outputs.len() > 3 {
+            tx.outputs.truncate(3);
+        }
+        let sighash_1b = compute_sighash(&tx, 1)?;
+        let sig_1b = signing::schnorr_sign(privkey, &sighash_1b)?;
+        token_ss = signing::build_p2pk_sigscript(&sig_1b);
+        let sighash_2b = compute_sighash(&tx, 2)?;
+        let sig_2b = signing::schnorr_sign(privkey, &sighash_2b)?;
+        fee_ss = signing::build_p2pk_sigscript(&sig_2b);
+        actual_fee = exact_fee;
+    }
+
+    println!();
+    println!("Partial Fill TX Outputs:");
+    println!("  output[0]: residual order  {} sompi (P2SH)", residual_value);
+    println!("  output[1]: buyer tokens    {} sompi", final_buyer_tokens);
+    println!("  output[2]: trade_receipt   {} sompi", receipt_value);
+    if matcher_change > 0 {
+        println!("  output[3]: matcher change  {} sompi", matcher_change);
+    }
+    println!("  fee:                       {} sompi", actual_fee);
+    println!();
 
     // Fee transparency summary
     {
@@ -501,7 +538,7 @@ async fn run_buy_partial_fill(
             storage_mass, MAX_TX_MASS,
             if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Miner fee:        {:>9} sompi", fee);
+        println!("Miner fee:        {:>9} sompi", actual_fee);
         println!("Surplus:          {:>9} sompi", actual_surplus);
         println!();
     }
@@ -646,43 +683,48 @@ async fn run_sell_partial_fill(
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_value
     );
 
-    // Compute output amounts
+    // Compute output amounts.
+    //
+    // Phase 1: size outputs against a conservative fee ESTIMATE
+    // (estimate_compute_mass over-counts sigscript bytes per sig-op), then
+    // (after signing) Phase 2 recomputes the EXACT fee from the real
+    // sigscript sizes via the post-Toccata min-relay floor (mass * 100
+    // sompi/gram) and, if it differs, adjusts the change output and
+    // re-signs. This mirrors the Phase-4 fee-floor fix already applied to
+    // deploy/cancel/requote/etc (kob/SECURITY_FIXES.md Phase 4) -- owner-
+    // initiated `partial-fill` was missed by that sweep and previously
+    // submitted whatever raw `--fee-rate` override was given (0 if
+    // omitted), which the node now rejects as non-standard ("has 0 fees
+    // which is under the required amount").
     let total_in = order_value.checked_add(fee_value)
         .ok_or_else(|| anyhow::anyhow!(
             "Arithmetic overflow: order value ({}) + fee value ({}) is too large to process.",
             order_value, fee_value
         ))?;
     let receipt_value = RECEIPT_VALUE;
-    let needed = seller_kas + residual_value + receipt_value + fee;
+    let fee_est = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(2, 4, 0)).max(fee);
 
-    if total_in < needed {
-        anyhow::bail!(
-            "Insufficient funds: total input ({} sompi) cannot cover outputs ({} sompi) + fee ({} sompi). \
-             Add more funding UTXOs or reduce the fill amount.",
-            total_in,
-            needed - fee,
-            fee
-        );
-    }
-
-    let raw_change = total_in - needed;
-    let (final_seller_kas, matcher_change) = if raw_change >= MIN_UTXO_VALUE {
-        (seller_kas, raw_change)
-    } else {
-        // Add small change to seller output
-        (seller_kas + raw_change, 0u64)
+    let size_outputs = |fee_for_calc: u64| -> anyhow::Result<(u64, u64)> {
+        let needed = seller_kas + residual_value + receipt_value + fee_for_calc;
+        if total_in < needed {
+            anyhow::bail!(
+                "Insufficient funds: total input ({} sompi) cannot cover outputs ({} sompi) + fee ({} sompi). \
+                 Add more funding UTXOs or reduce the fill amount.",
+                total_in,
+                needed - fee_for_calc,
+                fee_for_calc
+            );
+        }
+        let raw_change = total_in - needed;
+        Ok(if raw_change >= MIN_UTXO_VALUE {
+            (seller_kas, raw_change)
+        } else {
+            // Add small change to seller output
+            (seller_kas + raw_change, 0u64)
+        })
     };
 
-    println!();
-    println!("Partial Fill TX Outputs:");
-    println!("  output[0]: seller KAS      {} sompi", final_seller_kas);
-    println!("  output[1]: residual order  {} sompi (P2SH)", residual_value);
-    println!("  output[2]: trade_receipt   {} sompi", receipt_value);
-    if matcher_change > 0 {
-        println!("  output[3]: matcher change  {} sompi", matcher_change);
-    }
-    println!("  fee:                       {} sompi", fee);
-    println!();
+    let (mut final_seller_kas, mut matcher_change) = size_outputs(fee_est)?;
 
     // Build transaction.
     // version=1 required for covenant output bindings.
@@ -734,7 +776,43 @@ async fn run_sell_partial_fill(
     // Sign input 1 (fee UTXO)
     let sighash_1 = compute_sighash(&tx, 1)?;
     let sig_1 = signing::schnorr_sign(privkey, &sighash_1)?;
-    let fee_ss = signing::build_p2pk_sigscript(&sig_1);
+    let mut fee_ss = signing::build_p2pk_sigscript(&sig_1);
+
+    // Phase 2: exact fee from the real sigscript sizes; adjust + re-sign if
+    // it differs from the Phase-1 estimate.
+    let exact_mass = kob_core::mass::calc_mass_with_sigscripts(&tx, &[sell_pf_ss.clone(), fee_ss.clone()]);
+    let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(fee);
+    let mut actual_fee = fee_est;
+    if exact_fee != fee_est {
+        let (fsk, mc) = size_outputs(exact_fee)?;
+        final_seller_kas = fsk;
+        matcher_change = mc;
+        tx.outputs[0].value = final_seller_kas;
+        if matcher_change >= MIN_UTXO_VALUE {
+            if tx.outputs.len() > 3 {
+                tx.outputs[3].value = matcher_change;
+            } else {
+                tx.outputs.push(TxOutput::new(matcher_change, wallet_spk_version, wallet_spk.to_vec(), None));
+            }
+        } else if tx.outputs.len() > 3 {
+            tx.outputs.truncate(3);
+        }
+        let sighash_1b = compute_sighash(&tx, 1)?;
+        let sig_1b = signing::schnorr_sign(privkey, &sighash_1b)?;
+        fee_ss = signing::build_p2pk_sigscript(&sig_1b);
+        actual_fee = exact_fee;
+    }
+
+    println!();
+    println!("Partial Fill TX Outputs:");
+    println!("  output[0]: seller KAS      {} sompi", final_seller_kas);
+    println!("  output[1]: residual order  {} sompi (P2SH)", residual_value);
+    println!("  output[2]: trade_receipt   {} sompi", receipt_value);
+    if matcher_change > 0 {
+        println!("  output[3]: matcher change  {} sompi", matcher_change);
+    }
+    println!("  fee:                       {} sompi", actual_fee);
+    println!();
 
     // Fee transparency summary
     {
@@ -751,7 +829,7 @@ async fn run_sell_partial_fill(
             storage_mass, MAX_TX_MASS,
             if storage_mass <= MAX_TX_MASS { "OK" } else { "OVER" }
         );
-        println!("Miner fee:        {:>9} sompi", fee);
+        println!("Miner fee:        {:>9} sompi", actual_fee);
         println!("Surplus:          {:>9} sompi", actual_surplus);
         println!();
     }

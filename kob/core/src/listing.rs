@@ -117,7 +117,7 @@ pub const LISTING_BODY: &[u8] = &[
     0x51, 0x79,                   // Op1 OpPick -> expiry
     0x76, 0x00, 0x9c,             // OpDup Op0 OpNumEqual
     0x64,                         // OpNotIf (has expiry)
-    0xba, 0xa0, 0x69,             // OpTxLockTime OpGreaterThan OpVerify (expiry > lockTime)
+    0xb5, 0xa0, 0x69,             // OpTxLockTime OpGreaterThan OpVerify (expiry > lockTime)
     0x67,                         // OpElse
     0x75,                         // OpDrop (the 0)
     0x68,                         // OpEndIf
@@ -127,7 +127,7 @@ pub const LISTING_BODY: &[u8] = &[
     0xa2, 0x69,                   // OpGTE OpVerify
     // Verify output[1].spk hash == seller_spk_hash
     0x51, 0xc3, 0xaa,             // Op1 OpTxOutputSpk OpBlake2b
-    0x55, 0x79,                   // Op5 OpPick -> seller_spk_hash
+    0x56, 0x79,                   // Op6 OpPick -> seller_spk_hash (depth 6 after blake2b push; matches PATH2)
     0x87, 0x69,                   // OpEqual OpVerify
     // Cleanup: drop 6 items
     0x75, 0x75, 0x75, 0x75, 0x75, 0x75, // OpDrop x6
@@ -178,7 +178,7 @@ pub const LISTING_BODY: &[u8] = &[
     0x51, 0x79,                   // Op1 OpPick -> expiry
     0x76, 0x00, 0x9c,             // OpDup Op0 OpNumEqual
     0x64,                         // OpNotIf
-    0xba, 0xa0, 0x69,             // OpTxLockTime OpGreaterThan OpVerify
+    0xb5, 0xa0, 0x69,             // OpTxLockTime OpGreaterThan OpVerify
     0x67,                         // OpElse
     0x75,                         // OpDrop
     0x68,                         // OpEndIf
@@ -186,7 +186,7 @@ pub const LISTING_BODY: &[u8] = &[
     0x53, 0x79,                   // Op3 OpPick -> price
     0xa2, 0x69,                   // OpGTE OpVerify
     0x51, 0xc3, 0xaa,             // Op1 OpTxOutputSpk OpBlake2b
-    0x55, 0x79,                   // Op5 OpPick -> seller_spk_hash
+    0x56, 0x79,                   // Op6 OpPick -> seller_spk_hash (depth 6 after blake2b push; matches PATH2)
     0x87, 0x69,                   // OpEqual OpVerify
     0x75, 0x75, 0x75, 0x75, 0x75, 0x75,
     0x51,
@@ -239,7 +239,7 @@ pub const LISTING_BODY: &[u8] = &[
     0x51, 0x79,                   // Op1 OpPick -> expiry
     0x76, 0x00, 0x9c,             // OpDup Op0 OpNumEqual
     0x64,                         // OpNotIf
-    0xba, 0xa0, 0x69,             // OpTxLockTime OpGreaterThan OpVerify
+    0xb5, 0xa0, 0x69,             // OpTxLockTime OpGreaterThan OpVerify
     0x67,                         // OpElse
     0x75,                         // OpDrop
     0x68,                         // OpEndIf
@@ -251,15 +251,23 @@ pub const LISTING_BODY: &[u8] = &[
     0x67,                         // OpElse
     0x75,                         // OpDrop (selector)
 
-    // PATH 6: Settle/Collateral (15B)
+    // PATH 6: Settle/Collateral
     // Verify expiry passed: OpTxLockTime >= expiry_daa
     0x51, 0x79,                   // Op1 OpPick -> expiry
-    0xba,                         // OpTxLockTime
+    0xb5,                         // OpTxLockTime
     0x7c,                         // OpSwap
     0xa2, 0x69,                   // OpGTE OpVerify (lockTime >= expiry)
+    // Verify seller is paid the ACCRUED value: output[1].value >= this UTXO
+    // value. For an english auction the winning bid accrues into the listing
+    // UTXO's own value (PATH 5 self-continuation grows it), so at settle the
+    // UTXO value IS the highest bid. Without this a permissionless settler
+    // could pay the seller dust at the right address and pocket the bid.
+    0x51, 0xc2,                   // Op1 OpTxOutputAmount -> output[1].value
+    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> accrued bid
+    0xa2, 0x69,                   // OpGTE OpVerify (output[1] >= accrued)
     // Verify payment to seller from UTXO value (highest bid)
     0x51, 0xc3, 0xaa,             // Op1 OpTxOutputSpk OpBlake2b
-    0x55, 0x79,                   // Op5 OpPick -> seller_spk_hash
+    0x56, 0x79,                   // Op6 OpPick -> seller_spk_hash (depth 6 after blake2b push; matches PATH2)
     0x87, 0x69,                   // OpEqual OpVerify
     // Cleanup
     0x75, 0x75, 0x75, 0x75, 0x75, 0x75,
@@ -719,7 +727,7 @@ mod tests {
     fn body_contains_locktimeverify() {
         // PATH 6 uses expiry check via OpTxLockTime
         assert!(
-            LISTING_BODY.contains(&0xba),
+            LISTING_BODY.contains(&0xb5),
             "body must contain OpTxLockTime for expiry checks"
         );
     }

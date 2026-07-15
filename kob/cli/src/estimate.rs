@@ -75,17 +75,17 @@ const SWAP_CANCEL_SS_SIZE: u64 = 346;
 /// buy_v14 fill sigscript: 4 opcodes + pushData(396) = 4 + 3 + 396 = 403.
 const BUY_FILL_SS_SIZE: u64 = 403;
 /// sell_v14 fill sigscript: 2 opcodes + pushData(427) = 2 + 3 + 427 = 432.
-const SELL_FILL_SS_SIZE: u64 = 421;
+const SELL_FILL_SS_SIZE: u64 = 432;
 
 /// buy_v14 cancel sigscript: 1 + 66 + 33 + 3 + 396 = 499.
 const BUY_CANCEL_SS_SIZE: u64 = 499;
 /// sell_v14 cancel sigscript: 66 + 33 + 1 + 3 + 427 = 530.
-const SELL_CANCEL_SS_SIZE: u64 = 519;
+const SELL_CANCEL_SS_SIZE: u64 = 530;
 
 /// buy_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 396 = 411.
 const BUY_PARTIAL_SS_SIZE: u64 = 411;
 /// sell_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 427 = 442.
-const SELL_PARTIAL_SS_SIZE: u64 = 431;
+const SELL_PARTIAL_SS_SIZE: u64 = 442;
 
 /// P2PK wallet input sigscript: pushData(sig+sighash 65B) = 66B.
 const WALLET_INPUT_SS_SIZE: u64 = P2PK_SIGSCRIPT_SIZE;
@@ -1012,13 +1012,13 @@ mod tests {
             OutputEstimate { label: "o2".to_string(), spk_size: P2PK_SPK_SIZE, value: 10_000 },
         ];
         let tm = compute_transaction_mass(&inputs, &outputs);
-        // Sell input: 44 + 3 + 421 = 468 (v14 SELL_FILL_SS_SIZE; >252 so varint = 3)
+        // Sell input: 44 + 3 + 432 = 479 (v14 SELL_FILL_SS_SIZE; >252 so varint = 3)
         // Buy input:  44 + 3 + 403 = 450 (v14 BUY_FILL_SS_SIZE;  >252 so varint = 3)
         // Fee input:  44 + 1 + 66  = 111
         // SigOps: 1 * 1000 = 1000
         // Outputs: (11+34) + (11+35) + (11+34) = 45 + 46 + 45 = 136
-        // Total: 68 + 468 + 450 + 111 + 1000 + 136 = 2233
-        assert_eq!(tm, 68 + 468 + 450 + 111 + 1000 + 136);
+        // Total: 68 + 479 + 450 + 111 + 1000 + 136 = 2244
+        assert_eq!(tm, 68 + 479 + 450 + 111 + 1000 + 136);
     }
 
 

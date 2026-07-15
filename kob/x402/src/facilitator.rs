@@ -13,10 +13,10 @@ use tokio::sync::Mutex;
 use kob_settle::observe::{PaymentRecord, ReplayCheck, ReplayStore};
 use kob_settle::rpc::{ConfirmConfig, RpcClient, RpcUtxo};
 
-use crate::scheme_native::{self, NativeVerified};
+use crate::scheme_kcc20;
+use crate::scheme_native;
 use crate::wire::{
-    ASSET_NATIVE_KAS, FacilitatorRequest, NativeExactPayload, SCHEME_EXACT, SettleResponse,
-    VerifyResponse,
+    ASSET_NATIVE_KAS, FacilitatorRequest, SCHEME_EXACT, SettleResponse, VerifyResponse,
 };
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -80,9 +80,14 @@ pub struct Facilitator<B: ChainBackend> {
     config: FacilitatorConfig,
 }
 
-/// Internal: a fully pure+on-chain-validated native payment, ready to settle.
+/// Internal: a fully pure+on-chain-validated payment (either scheme), ready to
+/// settle.
 struct Validated {
-    verified: NativeVerified,
+    artifact_id: String,
+    payer: String,
+    pay_output_index: u32,
+    input_outpoints: Vec<String>,
+    tx: serde_json::Value,
     pay_to: String,
     amount: u64,
 }
@@ -112,41 +117,114 @@ impl<B: ChainBackend> Facilitator<B> {
                 self.config.network
             ));
         }
-        // Route by asset. Native scheme only, for now (KCC20 = Phase 4).
-        if !requirements.asset.is_empty() && requirements.asset != ASSET_NATIVE_KAS {
-            return Err(format!(
-                "asset '{}' not supported yet (native-KAS only)",
-                requirements.asset
-            ));
-        }
 
-        let native: NativeExactPayload = serde_json::from_value(pp.payload.clone())
-            .map_err(|e| format!("invalid native payload: {}", e))?;
-
-        if native.pay_to != requirements.pay_to {
+        // Common payload fields.
+        let from = pp
+            .payload
+            .get("from")
+            .and_then(|v| v.as_str())
+            .ok_or("payload missing 'from'")?
+            .to_string();
+        let payload_pay_to = pp
+            .payload
+            .get("payTo")
+            .and_then(|v| v.as_str())
+            .ok_or("payload missing 'payTo'")?;
+        if payload_pay_to != requirements.pay_to {
             return Err("payload payTo does not match requirements payTo".to_string());
         }
+        let transaction = pp
+            .payload
+            .get("transaction")
+            .ok_or("payload missing 'transaction'")?
+            .clone();
 
-        let verified = scheme_native::verify_native_exact(&native.transaction, &native.from, requirements)
-            .map_err(|r| r.to_string())?;
+        // Route by asset: native-KAS (scheme A) vs KCC20 token_unit (scheme B).
+        let is_native = requirements.asset.is_empty() || requirements.asset == ASSET_NATIVE_KAS;
 
-        // On-chain: every spent input must be an unspent UTXO owned by `from`.
-        // This proves the inputs are real, unspent, and actually belong to the
-        // declared payer — catching a stale/forged artifact before broadcast.
-        let utxos = self
-            .backend
-            .get_address_utxos(&native.from)
-            .await
-            .map_err(|e| format!("could not fetch payer UTXOs: {}", e))?;
-        let unspent: std::collections::HashSet<String> =
-            utxos.iter().map(|u| u.outpoint_key()).collect();
-        for op in &verified.input_outpoints {
+        // `owner_addresses`: the address(es) whose unspent UTXO sets must cover
+        // every spent input. `require_covenant`: for KCC20, at least one spent
+        // input must be an on-chain UTXO carrying this token covenant id.
+        let (validated, owner_addresses, require_covenant): (Validated, Vec<String>, Option<String>) =
+            if is_native {
+                let v = scheme_native::verify_native_exact(&transaction, &from, requirements)
+                    .map_err(|r| r.to_string())?;
+                let owners = vec![from.clone()];
+                (
+                    Validated {
+                        artifact_id: v.artifact_id,
+                        payer: v.payer,
+                        pay_output_index: v.pay_output_index,
+                        input_outpoints: v.input_outpoints,
+                        tx: v.tx,
+                        pay_to: requirements.pay_to.clone(),
+                        amount: requirements.max_amount_sompi()?,
+                    },
+                    owners,
+                    None,
+                )
+            } else {
+                let v = scheme_kcc20::verify_kcc20_exact(&transaction, &from, requirements)
+                    .map_err(|r| r.to_string())?;
+                // Inputs may include the token covenant UTXO (at the payer's
+                // token_unit P2SH address) AND a KAS fee UTXO (at the payer's
+                // P2PK address) — union both.
+                let owners = vec![v.payer_token_address.clone(), from.clone()];
+                let asset = v.asset.clone();
+                (
+                    Validated {
+                        artifact_id: v.artifact_id,
+                        payer: v.payer,
+                        pay_output_index: v.pay_output_index,
+                        input_outpoints: v.input_outpoints,
+                        tx: v.tx,
+                        pay_to: requirements.pay_to.clone(),
+                        amount: requirements.max_amount_sompi()?,
+                    },
+                    owners,
+                    Some(asset),
+                )
+            };
+
+        // On-chain: every spent input must be an unspent UTXO owned by one of
+        // `owner_addresses` (proves inputs are real, unspent, owned by the
+        // declared payer). For KCC20, at least one such input must carry the
+        // required token covenant id (proves the token being spent is genuine —
+        // the generic on-chain-existence idea from kob-settle's CovenantCache,
+        // applied directly per-settle here).
+        let mut unspent: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut covenant_seen = require_covenant.is_none();
+        for owner in &owner_addresses {
+            let utxos = self
+                .backend
+                .get_address_utxos(owner)
+                .await
+                .map_err(|e| format!("could not fetch UTXOs for {}: {}", owner, e))?;
+            for u in &utxos {
+                let key = u.outpoint_key();
+                if let Some(req_cov) = &require_covenant {
+                    if u.utxo_entry.covenant_id.as_deref() == Some(req_cov.as_str())
+                        && validated.input_outpoints.contains(&key)
+                    {
+                        covenant_seen = true;
+                    }
+                }
+                unspent.insert(key);
+            }
+        }
+        for op in &validated.input_outpoints {
             if !unspent.contains(op) {
                 return Err(format!("input {} is not an unspent UTXO of the payer", op));
             }
         }
+        if !covenant_seen {
+            return Err(format!(
+                "no spent input carries the required token covenant {}",
+                require_covenant.unwrap_or_default()
+            ));
+        }
 
-        Ok(Validated { verified, pay_to: requirements.pay_to.clone(), amount: requirements.max_amount_sompi()? })
+        Ok(validated)
     }
 
     /// `/verify`: validate without broadcasting.
@@ -159,7 +237,7 @@ impl<B: ChainBackend> Facilitator<B> {
         // Replay: a *different* artifact re-spending a consumed outpoint is
         // invalid; the same artifact again is fine (idempotent).
         let store = self.replay.lock().await;
-        match store.check_replay(&validated.verified.artifact_id, &validated.verified.input_outpoints) {
+        match store.check_replay(&validated.artifact_id, &validated.input_outpoints) {
             ReplayCheck::OutpointReused { outpoint, existing_txid } => {
                 return VerifyResponse::invalid(format!(
                     "input {} already consumed by payment {}",
@@ -169,7 +247,7 @@ impl<B: ChainBackend> Facilitator<B> {
             ReplayCheck::Fresh | ReplayCheck::DuplicateTxid(_) => {}
         }
 
-        VerifyResponse::valid(validated.verified.payer)
+        VerifyResponse::valid(validated.payer)
     }
 
     /// `/settle`: re-verify, broadcast, confirm finality, authorize.
@@ -182,8 +260,8 @@ impl<B: ChainBackend> Facilitator<B> {
             Ok(v) => v,
             Err(e) => return SettleResponse::failed(net, e),
         };
-        let NativeVerified { artifact_id, payer, pay_output_index, input_outpoints, tx, .. } =
-            validated.verified.clone();
+        let Validated { artifact_id, payer, pay_output_index, input_outpoints, tx, pay_to, amount } =
+            validated;
 
         // Replay / idempotency decision under the store lock.
         {
@@ -203,7 +281,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         if let Some(chain_txid) = rec.chain_txid.clone() {
                             drop(store);
                             return self
-                                .finalize(net, &artifact_id, &chain_txid, pay_output_index, &validated.pay_to, Some(payer))
+                                .finalize(net, &artifact_id, &chain_txid, pay_output_index, &pay_to, Some(payer))
                                 .await;
                         }
                     }
@@ -217,7 +295,7 @@ impl<B: ChainBackend> Facilitator<B> {
             // Reserve: record Submitted (with outpoints) BEFORE broadcast so a
             // crash immediately after submit can't lose the replay guard.
             let record = PaymentRecord::submitted(artifact_id.clone(), input_outpoints.clone())
-                .with_parties(Some(payer.clone()), Some(validated.pay_to.clone()), validated.amount);
+                .with_parties(Some(payer.clone()), Some(pay_to.clone()), amount);
             let record = match req.payment_requirements.fingerprint() {
                 Some(fp) => record.with_fingerprint(fp),
                 None => record,
@@ -248,7 +326,7 @@ impl<B: ChainBackend> Facilitator<B> {
             let _ = store.record(base.with_chain_txid(chain_txid.clone()));
         }
 
-        self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &validated.pay_to, Some(payer)).await
+        self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &pay_to, Some(payer)).await
     }
 
     /// Confirm finality for a broadcast payment and record the outcome.
@@ -292,7 +370,9 @@ mod tests {
     use kob_settle::rpc_types::{RpcSpk, RpcUtxoEntry};
 
     use crate::fingerprint;
-    use crate::wire::{NETWORK_TESTNET10, PaymentPayload, PaymentRequirements, X402_VERSION};
+    use crate::wire::{
+        NativeExactPayload, PaymentPayload, PaymentRequirements, NETWORK_TESTNET10, X402_VERSION,
+    };
 
     fn addr(seed: u8) -> String {
         kob_settle::wallet::pubkey_to_address(&[seed; 32], kob_settle::types::Network::Testnet)
@@ -328,6 +408,30 @@ mod tests {
                     block_daa_score: 0,
                     is_coinbase: false,
                     covenant_id: None,
+                },
+            };
+            self.utxos.entry(address.to_string()).or_default().push(u);
+            self
+        }
+        /// Seed a covenant-bound UTXO (the SPK is stored raw so it need not be a
+        /// P2PK of `address` — for KCC20 it's a token_unit P2SH).
+        fn with_covenant_utxo(
+            mut self,
+            address: &str,
+            spk_script_hex: &str,
+            txid: &str,
+            index: u32,
+            amount: u64,
+            covenant_id: &str,
+        ) -> Self {
+            let u = RpcUtxo {
+                outpoint: RpcOutpoint { transaction_id: txid.to_string(), index },
+                utxo_entry: RpcUtxoEntry {
+                    amount,
+                    script_public_key: RpcSpk { version: 0, script: spk_script_hex.to_string() },
+                    block_daa_score: 0,
+                    is_coinbase: false,
+                    covenant_id: Some(covenant_id.to_string()),
                 },
             };
             self.utxos.entry(address.to_string()).or_default().push(u);
@@ -587,5 +691,159 @@ mod tests {
         assert!(s2.transaction.is_some());
         assert_eq!(fac2.backend.submit_count(), 0, "recovery must not re-broadcast");
         std::fs::remove_file(&path).ok();
+    }
+
+    // --- scheme (B): KCC20 token payment, end to end through the facilitator ---
+
+    fn token_addr_and_spk(pubkey: &[u8; 32]) -> (String, String) {
+        let rs = kob_core::build_token_unit_redeem_script(pubkey);
+        let spk = kob_settle::build_p2sh(&rs);
+        let spk_bytes = spk.script().to_vec();
+        let addr = kob_settle::bech32::spk_to_address(&spk_bytes, "kaspatest").unwrap();
+        (addr, hex::encode(&spk_bytes))
+    }
+
+    /// Build a KCC20 token payment request: spends the payer's token_unit UTXO
+    /// (`in_txid:0`) and creates a recipient token_unit output of `amount`
+    /// bound to `asset`.
+    fn kcc20_request(
+        payer_pk: &[u8; 32],
+        recipient_pk: &[u8; 32],
+        asset: &str,
+        amount: u64,
+        in_txid: &str,
+        req_amount: u64,
+    ) -> (FacilitatorRequest, String) {
+        let payer_addr = kob_settle::wallet::pubkey_to_address(payer_pk, kob_settle::types::Network::Testnet);
+        let recipient_addr =
+            kob_settle::wallet::pubkey_to_address(recipient_pk, kob_settle::types::Network::Testnet);
+        let (_recip_token_addr, recip_token_spk) = token_addr_and_spk(recipient_pk);
+
+        let tx = serde_json::json!({
+            "version": 1,
+            "inputs": [{
+                "previousOutpoint": { "transactionId": in_txid, "index": 0 },
+                "signatureScript": "cd".repeat(70),
+                "sequence": 0,
+                "sigOpCount": 1
+            }],
+            "outputs": [{
+                "value": amount,
+                "scriptPublicKey": { "version": 0, "script": recip_token_spk },
+                "covenant": { "authorizingInput": 0, "covenantId": asset }
+            }],
+            "lockTime": 0,
+            "subnetworkId": "0000000000000000000000000000000000000000",
+            "payload": "",
+        });
+        let req = FacilitatorRequest {
+            x402_version: X402_VERSION,
+            payment_payload: PaymentPayload {
+                x402_version: X402_VERSION,
+                scheme: SCHEME_EXACT.to_string(),
+                network: NETWORK_TESTNET10.to_string(),
+                payload: serde_json::json!({
+                    "transaction": tx,
+                    "from": payer_addr,
+                    "payTo": recipient_addr,
+                    "asset": asset,
+                    "amount": amount.to_string(),
+                }),
+            },
+            payment_requirements: PaymentRequirements {
+                scheme: SCHEME_EXACT.to_string(),
+                network: NETWORK_TESTNET10.to_string(),
+                max_amount_required: req_amount.to_string(),
+                resource: "https://ex/token".to_string(),
+                description: String::new(),
+                mime_type: String::new(),
+                pay_to: recipient_addr,
+                max_timeout_seconds: 60,
+                asset: asset.to_string(),
+                extra: serde_json::Value::Null,
+            },
+        };
+        (req, payer_addr)
+    }
+
+    #[tokio::test]
+    async fn kcc20_verify_and_settle_happy_path() {
+        let payer_pk = [1u8; 32];
+        let recipient_pk = [2u8; 32];
+        let asset = "ab".repeat(32);
+        let in_txid = "a7".repeat(32);
+        let (payer_token_addr, payer_token_spk) = token_addr_and_spk(&payer_pk);
+
+        // The payer owns a token_unit covenant UTXO for `asset` at their token
+        // P2SH address, holding 100 token units.
+        let chain = MockChain::new(true).with_covenant_utxo(
+            &payer_token_addr,
+            &payer_token_spk,
+            &in_txid,
+            0,
+            100_000_000,
+            &asset,
+        );
+        let fac = Facilitator::new(chain, tmp_store("kcc20_happy"), config());
+        let (req, _payer) = kcc20_request(&payer_pk, &recipient_pk, &asset, 50_000_000, &in_txid, 50_000_000);
+
+        let v = fac.verify(&req).await;
+        assert!(v.is_valid, "kcc20 verify: {:?}", v.invalid_reason);
+
+        let s = fac.settle(&req).await;
+        assert!(s.success, "kcc20 settle: {:?}", s.error_reason);
+        assert!(s.transaction.is_some());
+        assert_eq!(fac.backend.submit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn kcc20_rejects_when_token_input_covenant_absent() {
+        let payer_pk = [1u8; 32];
+        let recipient_pk = [2u8; 32];
+        let asset = "ab".repeat(32);
+        let in_txid = "a8".repeat(32);
+        let (payer_token_addr, payer_token_spk) = token_addr_and_spk(&payer_pk);
+
+        // The spent input exists but carries a DIFFERENT covenant id.
+        let chain = MockChain::new(true).with_covenant_utxo(
+            &payer_token_addr,
+            &payer_token_spk,
+            &in_txid,
+            0,
+            100_000_000,
+            &"cd".repeat(32),
+        );
+        let fac = Facilitator::new(chain, tmp_store("kcc20_nocov"), config());
+        let (req, _payer) = kcc20_request(&payer_pk, &recipient_pk, &asset, 50_000_000, &in_txid, 50_000_000);
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid, "must reject: token input covenant does not match asset");
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn kcc20_rejects_underpayment() {
+        let payer_pk = [1u8; 32];
+        let recipient_pk = [2u8; 32];
+        let asset = "ab".repeat(32);
+        let in_txid = "a9".repeat(32);
+        let (payer_token_addr, payer_token_spk) = token_addr_and_spk(&payer_pk);
+        let chain = MockChain::new(true).with_covenant_utxo(
+            &payer_token_addr,
+            &payer_token_spk,
+            &in_txid,
+            0,
+            100_000_000,
+            &asset,
+        );
+        let fac = Facilitator::new(chain, tmp_store("kcc20_under"), config());
+        // Pays 49_999_999 token units but requires 50_000_000.
+        let (req, _payer) = kcc20_request(&payer_pk, &recipient_pk, &asset, 49_999_999, &in_txid, 50_000_000);
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(fac.backend.submit_count(), 0);
     }
 }

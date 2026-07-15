@@ -17,6 +17,7 @@
 
 pub mod facilitator;
 pub mod fingerprint;
+pub mod scheme_kcc20;
 pub mod scheme_native;
 pub mod server;
 pub mod wire;

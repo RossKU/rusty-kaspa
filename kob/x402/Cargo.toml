@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [dependencies]
 kob-settle = { path = "../settle" }
+# Phase 4 (scheme B): reuse the KCC20 token_unit covenant builders/parsers
+# (Standard State Header). kob-core -> kob-settle, so no dependency cycle.
+kob-core = { path = "../core" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 hex = { workspace = true }

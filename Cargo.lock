@@ -4992,6 +4992,7 @@ dependencies = [
  "base64",
  "hex",
  "kaspa-consensus-core",
+ "kob-core",
  "kob-settle",
  "serde",
  "serde_json",

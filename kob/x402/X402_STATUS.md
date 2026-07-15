@@ -216,7 +216,53 @@ no warnings surfaced.
 
 **PHASE 3 STATUS: DONE.** Committed. Next: Phase 4 (KCC20 covenant
 token_unit transfer as an x402 payment).
-### PHASE 4 — NOT STARTED
+### PHASE 4 — IN PROGRESS (build handed off)
+
+Scheme (B): KCC20 covenant `token_unit` transfer as an x402 payment. Reuses
+the KCC20 Standard State Header builders in `kob-core` (added `kob-core` as a
+dep of `kob-x402`; kob-core -> kob-settle so no cycle).
+
+- `src/scheme_kcc20.rs` — pure `verify_kcc20_exact`. A KCC20 payment output
+  is the one whose SPK == `P2SH(build_token_unit_redeem_script(recipient_pk))`
+  (recipient pubkey extracted from the `payTo` P2PK address) AND carrying a
+  covenant binding to the token `asset` (covenant id); its native sompi value
+  is the token amount (per KCC20: amount == UTXO value). Checks:
+  asset is 32-byte hex covenant id; recipient/payer are P2PK identities;
+  finds the recipient token_unit output; rejects wrong-recipient / missing-
+  or-wrong covenant binding / underpayment / bad-asset / fingerprint
+  missing-or-mismatch. Computes the payer's own token_unit P2SH address (for
+  the on-chain input check) and the deterministic artifact_id. 8 unit tests.
+- `src/facilitator.rs` — `validate()` now routes by `asset`: empty/`kas` ->
+  native (scheme A), else -> KCC20 (scheme B). Generalized the on-chain
+  input-existence check to union UTXOs across multiple owner addresses (for
+  KCC20: payer token_unit P2SH address for the token input + payer P2PK
+  address for any KAS fee input) and to additionally require that at least
+  one spent input is an on-chain UTXO carrying the required token covenant id
+  (generic existence — the CovenantCache idea from Phase 1, applied
+  directly). Flattened the internal `Validated` struct so both schemes feed
+  the same settle path (broadcast/confirm/replay/idempotency unchanged and
+  scheme-agnostic). 3 new KCC20 facilitator tests (happy path, token-input-
+  covenant-absent rejection, underpayment) using a covenant-aware MockChain.
+- `src/lib.rs` — registered `scheme_kcc20`.
+
+Design notes:
+- Recipient/payer are identified by their P2PK identity address in `payTo` /
+  `from`; the facilitator derives the token_unit P2SH addresses itself. This
+  keeps the x402 `payTo` a normal address (interoperable) rather than
+  exposing raw covenant P2SH.
+- `asset` in `PaymentRequirements` carries the token covenant id (the KCC20
+  analog of an ERC-20 contract address), matching the PLAN.
+- Full covenant *script* validation still happens on-chain at broadcast (the
+  node enforces the covenant); the facilitator verifies the covenant
+  *binding* (covenantId == asset) + on-chain existence of the spent token
+  UTXO, which is what's needed to refuse a bogus payment before broadcast.
+
+Build: `cargo test -p kob-x402 --lib` (PID 24313) came back **GREEN** —
+`test result: ok. 32 passed; 0 failed` (22 Phase-3 + 7 scheme_kcc20 + 3
+KCC20 facilitator). Clean compile with kob-core added as a dep.
+
+**PHASE 4 STATUS: DONE.** Committed. Next: Phase 5 (testnet-10 E2E for both
+schemes via a fixture, funded by miner.mjs; record TXIDs; rejection cases).
 ### PHASE 5 — NOT STARTED
 
 ## Build handoff log

@@ -76,7 +76,14 @@ async fn main() -> anyhow::Result<()> {
 
     let config = FacilitatorConfig {
         network: args.network.clone(),
-        confirm: ConfirmConfig::default(),
+        // Generous finality window for real-network latency (~10 BPS): poll for
+        // roughly 10s before declaring a broadcast unconfirmed. A retry is
+        // idempotent and re-confirms from the durable log, so this is a soft cap.
+        confirm: ConfirmConfig {
+            initial_delay: std::time::Duration::from_millis(500),
+            max_polls: 15,
+            poll_interval: std::time::Duration::from_millis(700),
+        },
     };
     let fac = Arc::new(Facilitator::new(rpc, replay, config));
 

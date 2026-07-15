@@ -263,7 +263,97 @@ KCC20 facilitator). Clean compile with kob-core added as a dep.
 
 **PHASE 4 STATUS: DONE.** Committed. Next: Phase 5 (testnet-10 E2E for both
 schemes via a fixture, funded by miner.mjs; record TXIDs; rejection cases).
-### PHASE 5 — NOT STARTED
+### PHASE 5 — IN PROGRESS (release build handed off)
+
+Live testnet-10 E2E harness for the native-KAS scheme. Environment verified
+ready: node `ws://65.108.107.30:18210` reachable; wallet
+`/tmp/kob_e2e/wallet.json` FUNDED (~1.97 KAS, 3 P2PK UTXOs — no mining needed
+for native); Node.js v20 present; `kaspatest:qz6qc3j...rwa6v8lf` is the payer.
+
+- `src/bin/x402_client.rs` (new binary `x402-client`): builds + signs a REAL
+  native-KAS transfer as an x402 artifact WITHOUT broadcasting, emits a
+  ready-to-POST `FacilitatorRequest`. Reuses the proven wallet_send tx
+  sequence (select UTXO, 2-phase converge_fee, compute_sighash, schnorr_sign,
+  build_p2pk_sigscript, to_rpc_payload) from kob-settle; sets the tx payload
+  to the `X402:<fingerprint>` tag. Scenario flags: `--require` (underpayment),
+  `--tx-pay-to` (wrong recipient), `--replay-out` (a 2nd artifact over the
+  SAME input for the replay case). Also a `derive-address <pubkey_hex>`
+  helper so the harness gets a valid, distinct 'intended' recipient.
+  Collapses client + resource-server roles (computes the fingerprint itself,
+  binds it into both the tx payload and requirements.extra.fingerprint).
+- `scripts/e2e_x402.sh`: starts the facilitator (release), waits for /health,
+  then drives 4 cases against it: (1) HAPPY self-pay 0.2 KAS -> verify +
+  settle + on-chain-confirm, records TXID; (2) UNDERPAYMENT (tx 20M, require
+  40M) -> refused, no broadcast; (3) WRONG RECIPIENT (tx pays wallet,
+  requirements demand a different valid addr) -> refused; (4) REPLAY (2nd
+  artifact over the consumed outpoint) -> refused. Independently re-confirms
+  the happy txid via kob-cli. No jq (grep/sed field parsing). Records TXIDs
+  to `/tmp/kob_e2e/x402/E2E_X402_TXIDS.txt`.
+- `src/main.rs`: bumped facilitator ConfirmConfig to ~10s window (15 polls x
+  700ms) for real-network latency; idempotent retry re-confirms from the
+  durable log so it's a soft cap.
+
+Self-pay (payTo == payer wallet) for the happy path so the 0.2 KAS returns to
+the wallet — the full verify->broadcast->confirm->authorize loop still runs
+on a real on-chain tx.
+
+KCC20 (scheme B) live E2E: deferred within this phase — needs a token_unit
+transfer artifact builder. Scheme B verification is already proven at unit
+level (7 scheme_kcc20 + 3 facilitator tests incl. covenant-aware mock end to
+end).
+
+IMPORTANT finding for a live scheme-B run (recorded during Phase 5 study of
+`kob/cli/src/token.rs::token_transfer`): kob-cli's `token transfer` builds
+the recipient output as a **P2PK SPK + covenant binding** (line ~1033, an
+explicitly-documented "simpler approach"), NOT the spec-conformant
+**token_unit P2SH** output that `scheme_kcc20` expects (SPK ==
+P2SH(build_token_unit_redeem_script(recipient_pk)), the form `token mint`
+creates and `parse_token_unit_state` reads). So a live KCC20 E2E driven by
+`kob-cli token transfer` would NOT match the facilitator's verifier as
+written. Two clean options for the follow-up live run:
+  (a) write a spec-form KCC20 client that outputs a token_unit-P2SH covenant
+      output (correct KCC20; matches scheme_kcc20 as-is), or
+  (b) additionally accept the P2PK+covenant form in scheme_kcc20 (matches
+      kob-cli's current on-chain tokens, but is the non-spec shortcut).
+Recommend (a) to stay spec-conformant. This is the only remaining gap to a
+live scheme-B run; the verifier logic itself is done and unit-proven. The
+native (scheme A) live E2E — the primary proof that this facilitator does
+real broadcast/UTXO/finality, unlike the elldeeone mock — is what this phase
+runs live.
+
+Release build: green (both bins). First live run surfaced one client bug:
+the fee was set to raw compute-mass, but post-Toccata the node requires
+`min_relay_fee = mass * 100 sompi/gram` — node rejected with "2105 fees ...
+under the required 210500". Fixed the client to compute `fee =
+min_relay_fee(calc_mass_with_sigscripts(...))` (measure mass with real
+sigscript sizes, then *100), rebuilt.
+
+**PHASE 5 STATUS: DONE (native scheme, live on testnet-10).**
+`bash kob/x402/scripts/e2e_x402.sh` -> **7/7 checks passed**. The facilitator
+did REAL settlement end to end: verify -> broadcast -> finality-confirm ->
+authorize, and refused all three rejection cases. This is the concrete proof
+that this facilitator is NOT the elldeeone mock. See the E2E TXID log below.
+
+Durable replay log (`/tmp/kob_e2e/x402/replay.jsonl`) captured the exact
+designed lifecycle across three appended lines for the happy payment:
+`Submitted (chain_txid=null)` -> `Submitted (chain_txid=<real>)` ->
+`Confirmed`.
+
+KCC20 (scheme B) live E2E: NOT run live (documented gap above — needs a
+spec-form token_unit-P2SH transfer client; kob-cli's `token transfer` emits a
+non-spec P2PK+covenant output). Scheme B is verification-complete and
+unit-proven (10 tests incl. a covenant-aware mock settle). The facilitator
+server already routes scheme B by `asset`; only a matching live artifact
+builder is outstanding.
+
+Known conservative behavior (documented, not a bug): a *failed* broadcast
+leaves the outpoint reserved in the replay store (record marked Failed but
+the outpoint stays indexed), so a later *different* artifact over that same
+outpoint is refused even though the funds may still be spendable. This is
+deliberate replay-safety (reject > risk double-spend). The proper future
+refinement is to key the reservation on the canonical Kaspa txid computed
+pre-broadcast (deferred — depends on covenant/compute-budget tx-hash
+serialization).
 
 ## Build handoff log
 
@@ -320,4 +410,35 @@ right next to `chain::cache`.
 
 ## E2E TXID log (Phase 5)
 
-(none yet)
+### Native-KAS "exact" scheme — testnet-10, 2026-07-15 (7/7 checks passed)
+
+Node `ws://65.108.107.30:18210`; payer wallet
+`kaspatest:qz6qc3j490zleazs6upxazfnk79k7v4ksykf499uhur4el95cfy7qrwa6v8lf`.
+Harness: `kob/x402/scripts/e2e_x402.sh`; results file
+`/tmp/kob_e2e/x402/E2E_X402_TXIDS.txt`.
+
+- CASE 1 HAPPY (verify -> settle -> broadcast -> finality-confirm ->
+  authorize): **on-chain TXID**
+  `19155ed285fa57b29e7ab094f151dfca4ea4b5f4444e8854a57a1563d4ee43c7`
+  (self-pay 0.4 KAS; spent input
+  `afd8cb439d98518f813574371ff9a2d49323946008a51b35ec49fa6a2ebd7708:0`).
+  Independently re-confirmed present in the wallet UTXO set via kob-cli
+  (belt-and-suspenders, not just "RPC accepted it"). Facilitator
+  `/verify` -> `{isValid:true}`, `/settle` -> `{success:true, transaction:
+  19155ed2..., payer: kaspatest:qz6qc3j...}`.
+- CASE 2 UNDERPAYMENT (tx pays 20M, requirements demand 40M): refused at
+  `/verify` and `/settle` (`underpayment: required 40000000 paid 20000000`);
+  NO broadcast.
+- CASE 3 WRONG RECIPIENT (tx pays the wallet, requirements demand a distinct
+  valid address): refused (`no output pays the required recipient`); NO
+  broadcast.
+- CASE 4 REPLAY (a 2nd distinct artifact over the input CASE 1 already
+  spent): refused (`input afd8cb43...:0 is not an unspent UTXO of the
+  payer` — CASE 1 genuinely spent it on-chain, so the on-chain check fired;
+  the replay-store OutpointReused guard is the backstop when the input is
+  still in the UTXO set pre-confirmation); NO broadcast.
+
+### KCC20 token scheme — testnet-10
+
+Not run live (see Phase 5 notes: needs a spec-form token_unit-P2SH transfer
+client). Verification unit-proven.

@@ -11,6 +11,10 @@ path = "src/lib.rs"
 name = "kob-x402"
 path = "src/main.rs"
 
+[[bin]]
+name = "x402-client"
+path = "src/bin/x402_client.rs"
+
 [dependencies]
 kob-settle = { path = "../settle" }
 # Phase 4 (scheme B): reuse the KCC20 token_unit covenant builders/parsers

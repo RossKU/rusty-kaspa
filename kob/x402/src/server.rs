@@ -24,8 +24,9 @@ use tower_http::cors::{Any, CorsLayer};
 
 use crate::facilitator::{ChainBackend, Facilitator};
 use crate::wire_v2::{
-    decode_header, encode_header, errors, AwaitRequest, FacilitatorRequest, SettlementResponse,
-    SupportedResponse, VerifyResponse, HEADER_PAYMENT_RESPONSE, HEADER_PAYMENT_SIGNATURE,
+    decode_header, encode_header, errors, AwaitRequest, FacilitatorRequest, ReserveRequest,
+    SettlementResponse, SupportedResponse, VerifyResponse, HEADER_PAYMENT_RESPONSE,
+    HEADER_PAYMENT_SIGNATURE,
 };
 
 /// Build the router for a facilitator over any chain backend.
@@ -34,6 +35,7 @@ pub fn router<B: ChainBackend + 'static>(fac: Arc<Facilitator<B>>) -> Router {
         .route("/verify", post(verify_handler::<B>))
         .route("/settle", post(settle_handler::<B>))
         .route("/await", post(await_handler::<B>))
+        .route("/reserve", post(reserve_handler::<B>))
         .route("/supported", get(supported_handler::<B>))
         .route("/health", get(|| async { "ok" }))
         .layer(
@@ -100,6 +102,30 @@ async fn supported_handler<B: ChainBackend + 'static>(
     State(fac): State<Arc<Facilitator<B>>>,
 ) -> Json<SupportedResponse> {
     Json(SupportedResponse::exact_only(fac.network()))
+}
+
+/// Reserve a KIP-10 additive borrow outpoint; returns the v2 PaymentRequired.
+async fn reserve_handler<B: ChainBackend + 'static>(
+    State(fac): State<Arc<Facilitator<B>>>,
+    Json(r): Json<ReserveRequest>,
+) -> Response {
+    let err = || Json(serde_json::json!({ "error": errors::INVALID_PAYMENT_REQUIREMENTS })).into_response();
+    let (amount, borrow_amount, threshold) = match (
+        r.amount.parse::<u64>(),
+        r.borrow_amount.parse::<u64>(),
+        r.additive_threshold.parse::<u64>(),
+    ) {
+        (Ok(a), Ok(b), Ok(t)) => (a, b, t),
+        _ => return err(),
+    };
+    let url = if r.resource_url.is_empty() { "https://kob-x402/resource" } else { &r.resource_url };
+    match fac
+        .reserve(&r.pay_to, amount, &r.borrow_txid, r.borrow_index, borrow_amount, threshold, r.payment_output_index, url)
+        .await
+    {
+        Ok(pr) => Json(pr).into_response(),
+        Err(_) => err(),
+    }
 }
 
 /// Bind and serve the facilitator on `bind` (e.g. `0.0.0.0:8402`).

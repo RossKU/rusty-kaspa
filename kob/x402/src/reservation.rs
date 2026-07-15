@@ -9,9 +9,7 @@ use std::collections::HashMap;
 use kob_core::contract::x402_borrow::build_x402_borrow_redeem_script;
 use kob_settle::{blake2b_256, build_p2sh};
 
-use crate::wire_v2::{
-    ASSET_KAS, BINDING_EXACT, TEMPLATE_KIP10_ADDITIVE, TX_ENCODING_SAFE_JSON,
-};
+use crate::wire_v2::{BINDING_EXACT, TEMPLATE_KIP10_ADDITIVE, TX_ENCODING_SAFE_JSON};
 
 /// Recorded borrow terms for one reservation.
 #[derive(Debug, Clone)]

@@ -251,6 +251,23 @@ async fn main() -> anyhow::Result<()> {
         return kcc20::run(&raw[1..]).await;
     }
 
+    // `exact-address <payTo> <borrowAmount> <threshold> [testnet|mainnet]` prints
+    // the KIP-10 additive borrow covenant P2SH address (merchant funds it).
+    if raw.first().map(|s| s.as_str()) == Some("exact-address") {
+        let pay_to = raw.get(1).cloned().unwrap_or_default();
+        let ba: u64 = raw.get(2).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let th: u64 = raw.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let (_rs, _spk, addr) = kob_x402::reservation::borrow_covenant(&pay_to, ba, th)
+            .map_err(|e| anyhow::anyhow!(e))?;
+        println!("{}", addr);
+        return Ok(());
+    }
+
+    // KIP-10 additive "exact" mode: build the additive exact-transaction.
+    if raw.first().map(|s| s.as_str()) == Some("exact") {
+        return exact::run(&raw[1..]).await;
+    }
+
     let args = parse_args();
     if args.node.is_empty() || args.wallet.is_empty() || args.pay_to.is_empty() || args.amount == 0 {
         anyhow::bail!("required: --node --wallet --pay-to --amount");
@@ -698,6 +715,149 @@ mod kcc20 {
             eprintln!("[kcc20] replay-partner written to {}", replay_path);
         }
 
+        Ok(())
+    }
+}
+
+/// KIP-10 additive "exact" (strict interop): build the additive exact-transaction
+/// from a `/reserve` PaymentRequirements and emit the v2 FacilitatorRequest.
+mod exact {
+    use super::*;
+    use kob_core::contract::x402_borrow::build_x402_borrow_spend_sigscript;
+    use kob_settle::build_p2sh;
+    use kob_x402::wire_v2::TX_ENCODING_SAFE_JSON;
+
+    struct Args {
+        node: String,
+        wallet: String,
+        requirements_file: String,
+        scenario: String,
+        out: Option<String>,
+    }
+
+    fn parse(raw: &[String]) -> Args {
+        let mut a = Args { node: String::new(), wallet: String::new(), requirements_file: String::new(), scenario: "happy".into(), out: None };
+        let mut it = raw.to_vec().into_iter();
+        while let Some(k) = it.next() {
+            match k.as_str() {
+                "--node" => a.node = it.next().unwrap_or_default(),
+                "--wallet" => a.wallet = it.next().unwrap_or_default(),
+                "--requirements-file" => a.requirements_file = it.next().unwrap_or_default(),
+                "--scenario" => a.scenario = it.next().unwrap_or_default(),
+                "--out" => a.out = Some(it.next().unwrap_or_default()),
+                other => eprintln!("[exact] ignoring unknown arg: {}", other),
+            }
+        }
+        a
+    }
+
+    pub async fn run(raw: &[String]) -> anyhow::Result<()> {
+        let a = parse(raw);
+        if a.node.is_empty() || a.wallet.is_empty() || a.requirements_file.is_empty() {
+            anyhow::bail!("exact requires: --node --wallet --requirements-file");
+        }
+        let req: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&a.requirements_file)?)?;
+        let pay_to = req["payTo"].as_str().ok_or_else(|| anyhow::anyhow!("no payTo"))?.to_string();
+        let amount: u64 = req["amount"].as_str().unwrap_or("0").parse()?;
+        let extra = &req["extra"];
+        let borrow_txid = extra["borrowOutpoint"]["txid"].as_str().ok_or_else(|| anyhow::anyhow!("no borrowOutpoint"))?.to_string();
+        let borrow_index = extra["borrowOutpoint"]["index"].as_u64().unwrap_or(0) as u32;
+        let borrow_rs = hex::decode(extra["borrowRedeemScript"].as_str().ok_or_else(|| anyhow::anyhow!("no borrowRedeemScript"))?)?;
+        let borrow_amount: u64 = extra["borrowAmount"].as_str().unwrap_or("0").parse()?;
+        let threshold: u64 = extra["additiveThresholdSompi"].as_str().unwrap_or("0").parse()?;
+
+        let wallet = WalletContext::load(Path::new(&a.wallet))?;
+        let privkey = *wallet.privkey_bytes();
+        let (wallet_spk_ver, wallet_spk) = spk_of(&wallet.address)?;
+        let (pay_spk_ver, pay_spk) = spk_of(&pay_to)?;
+        let borrow_p2sh = build_p2sh(&borrow_rs);
+
+        // Scenario adjustments.
+        let (in0_txid, in0_index) = if a.scenario == "wrong-borrow" {
+            ("ba".repeat(32), 0) // a non-reserved outpoint
+        } else {
+            (borrow_txid.clone(), borrow_index)
+        };
+        let cont_base = borrow_amount + threshold;
+        let cont_value = match a.scenario.as_str() {
+            "under-threshold" => cont_base.saturating_sub(1_000_000),
+            "replay" => cont_base + 1_000_000, // distinct artifact, same borrow outpoint
+            _ => cont_base,
+        };
+        // wrong-recipient: pay a distinct valid address instead of payTo.
+        let (payment_spk_ver, payment_spk) = if a.scenario == "wrong-recipient" {
+            let other = kob_settle::wallet::pubkey_to_address(&[0x3c; 32], kob_settle::types::Network::Testnet);
+            spk_of(&other)?
+        } else {
+            (pay_spk_ver, pay_spk.clone())
+        };
+
+        let rpc = RpcClient::connect(&a.node).await.map_err(|e| anyhow::anyhow!("connect: {}", e))?;
+        let need = amount + threshold + 3_000_000;
+        let utxos = rpc.get_spendable_utxos(&wallet.address, None).await.map_err(|e| anyhow::anyhow!("{}", e))?;
+        let mut fund: Vec<RpcUtxo> = utxos.into_iter()
+            .filter(|u| !u.is_p2sh() && u.utxo_entry.amount >= need
+                && !(u.outpoint.transaction_id == in0_txid && u.outpoint.index == in0_index))
+            .collect();
+        fund.sort_by_key(|u| u.utxo_entry.amount);
+        let funding = fund.into_iter().next().ok_or_else(|| anyhow::anyhow!("no funding UTXO >= {}", need))?;
+        let total_in = borrow_amount + funding.utxo_entry.amount;
+
+        eprintln!("[exact] scenario={} pay_to={} amount={} borrow={}:{} borrow_amount={} threshold={} cont={} funding={}:{}",
+            a.scenario, pay_to, amount, in0_txid, in0_index, borrow_amount, threshold, cont_value,
+            funding.outpoint.transaction_id, funding.outpoint.index);
+
+        let mut tx = Transaction::new(0);
+        // input0 = borrow outpoint (sig-less additive spend).
+        tx.inputs.push(TxInput {
+            prev_tx_id: in0_txid.clone(), prev_index: in0_index, sequence: 0, sig_op_count: 0,
+            script_version: borrow_p2sh.version(), script_bytes: borrow_p2sh.script().to_vec(), value: borrow_amount,
+        });
+        // input1 = P2PK funding.
+        tx.inputs.push(TxInput {
+            prev_tx_id: funding.outpoint.transaction_id.clone(), prev_index: funding.outpoint.index, sequence: 0, sig_op_count: 1,
+            script_version: funding.utxo_entry.script_public_key.version, script_bytes: funding.script_bytes(), value: funding.utxo_entry.amount,
+        });
+        // output0 = payment; output1 = continuation; output2 = change.
+        tx.outputs.push(TxOutput::new(amount, payment_spk_ver, payment_spk, None));
+        tx.outputs.push(TxOutput::new(cont_value, pay_spk_ver, pay_spk, None));
+        let fixed_out = amount + cont_value;
+        tx.outputs.push(TxOutput::new(total_in.saturating_sub(fixed_out), wallet_spk_ver, wallet_spk.clone(), None));
+
+        // input0 sigscript = borrow additive spend (continuation at output index 1).
+        let borrow_ss = build_x402_borrow_spend_sigscript(1, &borrow_rs);
+        let sign = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
+            let sh = compute_sighash(tx, 1)?;
+            let sig = kob_settle::signing::schnorr_sign(&sh, &privkey)?;
+            Ok(vec![borrow_ss.clone(), kob_settle::utils::build_p2pk_sigscript(&sig)])
+        };
+        let sigscripts = sign(&tx)?;
+        let mass = calc_mass_with_sigscripts(&tx, &sigscripts);
+        let fee = min_relay_fee(mass);
+        let change = total_in.saturating_sub(fixed_out + fee);
+        if change >= MIN_UTXO_VALUE {
+            let ci = tx.outputs.len() - 1;
+            tx.outputs[ci].value = change;
+        } else {
+            tx.outputs.pop();
+        }
+        let final_ss = sign(&tx)?;
+        let envelope = to_rpc_payload(&tx, &final_ss);
+        let encoded = serde_json::to_string(&envelope)?;
+
+        let payload = serde_json::json!({
+            "type": "exact-transaction",
+            "payerAddress": wallet.address,
+            "transaction": encoded,
+            "transactionEncoding": TX_ENCODING_SAFE_JSON,
+            "paymentOutputIndex": 0
+        });
+        let facreq = serde_json::json!({
+            "x402Version": X402_VERSION,
+            "paymentPayload": { "x402Version": X402_VERSION, "accepted": req, "payload": payload },
+            "paymentRequirements": req
+        });
+        write_out(&a.out, &facreq)?;
         Ok(())
     }
 }

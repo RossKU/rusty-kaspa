@@ -193,6 +193,28 @@ pub struct AwaitRequest {
     pub payment_requirements: PaymentRequirements,
 }
 
+/// `/reserve` request: register a KIP-10 additive borrow reservation for an
+/// already-funded borrow outpoint and get back the v2 `PaymentRequired`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReserveRequest {
+    #[serde(rename = "payTo")]
+    pub pay_to: String,
+    /// Payment price (sompi string).
+    pub amount: String,
+    #[serde(rename = "borrowTxid")]
+    pub borrow_txid: String,
+    #[serde(rename = "borrowIndex")]
+    pub borrow_index: u32,
+    #[serde(rename = "borrowAmount")]
+    pub borrow_amount: String,
+    #[serde(rename = "additiveThresholdSompi")]
+    pub additive_threshold: String,
+    #[serde(rename = "paymentOutputIndex", default)]
+    pub payment_output_index: u32,
+    #[serde(rename = "resourceUrl", default)]
+    pub resource_url: String,
+}
+
 /// `/verify` response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VerifyResponse {

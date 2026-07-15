@@ -529,17 +529,40 @@ required (per coordinator).
   incl. reserve->verify->settle happy + under-threshold refusal), 4 covenant
   script-engine tests, full workspace check green.
 
-### B3 — NOT STARTED
-Live testnet-10 E2E: merchant funds a borrow UTXO to the covenant P2SH ->
-`/reserve` -> client builds the additive exact-transaction (spend borrow +
-funding, pay amount to payTo, continuation >= borrow+threshold, sign the
-borrow spend via `build_x402_borrow_spend_sigscript` + P2PK funding) -> verify
--> broadcast -> confirm -> authorize; record TXIDs; 4 rejection cases (wrong
-outpoint, under threshold, replay, wrong recipient). Then validate a captured
-happy-path message set (PaymentRequired/PaymentPayload/SettlementResponse)
-against the vendored `interop/schemas/*.json`. Needs: a `/reserve` HTTP
-endpoint + an `x402-client exact` mode that builds+encodes the additive
-exact-transaction, and a borrow-funding step (merchant wallet -> covenant P2SH).
+### B3 — live testnet-10 KIP-10 exact E2E — DONE (28/28)
+- `/reserve` HTTP endpoint (server.rs) + `ReserveRequest` (wire_v2).
+- `x402-client exact` mode + `exact-address` helper (compute covenant P2SH):
+  reads the `/reserve` requirements, builds the additive exact-transaction
+  (input0 = borrow outpoint via sig-less `build_x402_borrow_spend_sigscript`
+  with continuation index 1, input1 = P2PK funding signed; output0 = payment
+  to payTo, output1 = continuation = borrowAmount+threshold to merchant,
+  output2 = change), `min_relay_fee`, encodes as `kaspa-sdk-safe-json-v2.0.0`,
+  emits the v2 FacilitatorRequest. Scenario flags: wrong-borrow /
+  under-threshold / wrong-recipient / replay.
+- `scripts/e2e_x402_exact.sh`: self-pay flow (payer=merchant=funded wallet).
+
+**Live run (testnet-10, 2026-07-15): 28/28 passed.**
+- Borrow funding txid `6bc834f410f7896e62efbf3c06c20a92dfec0ad433381a016387773535f4642b` (10M sompi -> covenant P2SH `kaspatest:prqazqf39g3hzj0raszy7vr6h04axhvc0w0fuakhhme7avvj4h2d2y6xrewd9`).
+- HAPPY exact settle: on-chain TXID
+  `e2794064ee70553b89067056d695e7c63a13caf5983c8407a83749e5ddec83db`. **The
+  node ACCEPTED the KIP-10 additive borrow covenant spend.** Independently
+  confirmed in the wallet UTXO set: output :0=5,000,000 (payment to payTo),
+  :1=13,000,000 (continuation = borrowAmount 10M + additiveThreshold 3M — the
+  covenant minimum, enforced on-chain), :2=9,900,700 (change). SettlementResponse
+  = `{success:true, transaction:e2794064..., network, amount:"5000000",
+  extensions.kaspa{paymentOutputIndex:0, finality:"accepted"}}`.
+- REJECTIONS (all refused, no broadcast): wrong borrow outpoint ->
+  invalid_transaction_state; continuation under threshold ->
+  invalid_payment_requirements; wrong recipient -> invalid_payment_requirements;
+  replay of the consumed borrow outpoint -> invalid_transaction_state.
+- SCHEMA CONFORMANCE (19 checks on the CAPTURED live messages): PaymentRequired,
+  PaymentPayload (payload.type exact-transaction + transactionEncoding, NO
+  transactionId), SettlementResponse (64hex txid + amount + extensions.kaspa,
+  NO top-level extra) all conform to the vendored elldeeone schemas.
+
+## STATUS: all phases (0-5 + B0-B3) complete. Both KOB-native schemes (native
+push/pull, KCC20) and the strict-interop KIP-10 additive exact scheme run live
+on testnet-10, all under a single x402 v2 wire.
 
 ## Build handoff log
 

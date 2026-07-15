@@ -293,9 +293,18 @@ pub const REDEMPTION_BODY: &[u8] = &[
     //        no_tok(4), yes_tok(5), ballot_cid(6), market_id(7),
     //        pk(8), sig(9) — identical to v6 refund stack
 
-    // RF1 (= v6 RF0): CLTV (2B)
-    OP_CLTV,                               // verify locktime >= expiry    [1B]
-    OP_DROP,                               // drop expiry_daa              [1B]
+    // RF1 (= v6 RF0): CLTV (1B)
+    //
+    // OpCheckLockTimeVerify pops the value it checks (confirmed against the
+    // real kaspad `kaspa-txscript` engine: OpCheckLockTimeVerify uses
+    // `pop_raw()`) -- unlike Bitcoin's non-consuming CLTV. There is nothing
+    // left on the stack to explicitly drop afterward, so the removed
+    // trailing OP_DROP was the only thing wrong here -- RF2's `pk (idx 7)`
+    // PICK depth below already assumed this exact (correct) consuming
+    // behavior. See the identical, live-confirmed bug in ballot_box.rs's
+    // EXPIRE PATH (that one over-drops and starves OP_CHECKSIGVERIFY down
+    // to 1 stack item).
+    OP_CLTV,                               // verify locktime >= expiry; consumes expiry_daa [1B]
 
     // RF2 (= v6 RF1): verify Blake2b(pk) == creator_pkh (5B)
     OP_7, OP_PICK,                         // pk (idx 7 after drop)        [2B]

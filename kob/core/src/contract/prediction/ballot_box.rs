@@ -173,10 +173,18 @@ pub const BALLOT_BOX_BODY: &[u8] = &[
     OP_COVOUTCOUNT,                        // outputs with my cid         [1B]
     OP_2, OP_EQUAL, OP_VERIFY,            // exactly 2 continuations     [3B]
 
-    // V1: start_daa CLTV (4B)
+    // V1: start_daa CLTV (3B)
+    //
+    // OpCheckLockTimeVerify POPS the value it checks (unlike Bitcoin's
+    // non-consuming CLTV) -- confirmed against the real kaspad script
+    // engine (`kaspa-txscript` OpCheckLockTimeVerify: `pop_raw()`). The
+    // PICK'd copy IS what OP_CLTV consumes; there is nothing left to drop
+    // afterward. A trailing OP_DROP here would eat into the real state
+    // (start_daa itself), corrupting every later PICK index. Live-confirmed
+    // via a rejected on-chain `expire_ballot` tx that hit this exact
+    // miscount (see the EXPIRE PATH below).
     OP_2, OP_PICK,                         // copy start_daa              [2B]
-    OP_CLTV,                               // TxLockTime >= start_daa     [1B]
-    OP_DROP,                               // drop copy                   [1B]
+    OP_CLTV,                               // TxLockTime >= start_daa; consumes the copy [1B]
 
     // V1b: end_daa upper bound (5B)
     OP_1, OP_PICK,                         // copy end_daa                [2B]
@@ -248,10 +256,18 @@ pub const BALLOT_BOX_BODY: &[u8] = &[
     OP_2DROP, OP_2DROP, OP_DROP,          // drop 5 state items           [3B]
     OP_1,                                 // TRUE                        [1B]
 
-    // EXPIRE PATH (7B): identical to v8
+    // EXPIRE PATH (6B)
+    //
+    // OP_CLTV pops expiry_daa itself (see the V1 note above), leaving only
+    // 4 state items (end_daa, start_daa, reward_per_vote, market_id) to
+    // drop before (pubkey, sig) are exposed for OP_CHECKSIGVERIFY -- the
+    // old 5-item drop count (matching a non-consuming CLTV model) ate the
+    // pubkey too, leaving CHECKSIGVERIFY with only 1 stack item. Live-
+    // confirmed on testnet-10: node rejected with "failed to verify the
+    // signature script: opcode requires at least 2 but stack has only 1".
     OP_ELSE,                              //                              [1B]
-    OP_CLTV,                              // verify locktime >= expiry    [1B]
-    OP_2DROP, OP_2DROP, OP_DROP,          // drop 5 state items          [3B]
+    OP_CLTV,                              // verify locktime >= expiry; consumes expiry_daa [1B]
+    OP_2DROP, OP_2DROP,                   // drop 4 remaining state items [2B]
     OP_CHECKSIGVERIFY,                    // verify sig                   [1B]
     OP_1,                                 // TRUE                        [1B]
 

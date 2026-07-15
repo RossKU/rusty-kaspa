@@ -4,6 +4,7 @@ const OP_0: u8 = 0x00;
 const OP_1: u8 = 0x51;
 const OP_2: u8 = 0x52;
 const OP_3: u8 = 0x53;
+const OP_5: u8 = 0x55;
 const OP_6: u8 = 0x56;
 const OP_DUP: u8 = 0x76;
 const OP_DROP: u8 = 0x75;
@@ -171,21 +172,33 @@ pub const SPLIT_MERGE_BODY: &[u8] = &[
     // expiry_daa(0), unit_value(1), creator_pkh(2), no_cid(3), yes_cid(4),
     // market_id(5), pk(6), sig(7)
 
-    // RF0: CLTV — expiry_daa is on top (2B)
-    OP_CLTV,                               // verify locktime >= expiry   [1B]
-    OP_DROP,                               // drop expiry_daa             [1B]
+    // RF0: CLTV — expiry_daa is on top; OpCheckLockTimeVerify POPS it (1B)
+    //
+    // OpCheckLockTimeVerify pops the value it checks (confirmed against the
+    // real kaspad `kaspa-txscript` engine: OpCheckLockTimeVerify uses
+    // `pop_raw()`) -- unlike Bitcoin's non-consuming CLTV. The old explicit
+    // OP_DROP after it double-consumed: it dropped unit_value (the next
+    // item down) instead of a nonexistent leftover expiry_daa, which then
+    // threw off both PICK depths below (each off by one) and made the
+    // trailing OP_SWAP wrong too (the natural post-cleanup order is already
+    // (pk, sig) top-to-bottom, exactly what OP_CHECKSIGVERIFY wants -- see
+    // the identical family of bugs in ballot_box.rs's EXPIRE PATH and
+    // redemption.rs's refund path, both live/derivation-confirmed).
+    OP_CLTV,                               // verify locktime >= expiry; consumes expiry_daa [1B]
     // Stack: unit_value(0), creator_pkh(1), no_cid(2), yes_cid(3),
     //        market_id(4), pk(5), sig(6)
 
     // RF1: verify Blake2b(pk) == creator_pkh
-    OP_6, OP_PICK,                         // pk                          [2B]
+    OP_5, OP_PICK,                         // pk (depth 5)                [2B]
     OP_BLAKE2B,                            // Blake2b(pk)                 [1B]
-    OP_6, OP_PICK,                         // creator_pkh                 [2B]
+    OP_2, OP_PICK,                         // creator_pkh (depth 2, shifted by the hash push) [2B]
     OP_EQUAL, OP_VERIFY,                   // must match                  [2B]
 
     // RF2: cleanup state + verify sig
+    // Stack is back to (unit_value(0)..sig(6)) here (RF1 nets to zero); after
+    // dropping the 5 non-signature state items, (pk, sig) are already in
+    // the right order for OP_CHECKSIGVERIFY (pubkey on top) -- no swap.
     OP_2DROP, OP_2DROP, OP_DROP,           // drop 5 state items          [3B]
-    OP_SWAP,                               // pk, sig                     [1B]
     OP_CHECKSIGVERIFY,                     // verify creator sig          [1B]
     OP_1,                                  // TRUE                        [1B]
 

@@ -67,17 +67,26 @@ pub async fn run(
     let spk_hash = compute_p2pk_spk_hash(&pubkey);
 
     // Resolve missing parameters from the orders cache.
+    //
+    // The cache lookup itself always runs (it's a cheap local read):
+    // `version` has no CLI flag at all, so it can ONLY come from the cache.
+    // Gating the lookup on "some other field is missing" (as this used to do)
+    // meant that supplying --side/--price-num/--price-den/--min-fill
+    // explicitly -- a documented, sanctioned usage pattern -- silently
+    // skipped the cache entirely and left `version` to fall back to the
+    // deliberately-invalid sentinel default (12), which then failed the
+    // "Only v14 and v16 are supported" check below even for a perfectly
+    // valid, still-open order. `needs_cache` is kept only to decide whether
+    // to print the "Loaded order parameters from cache" notice.
     let needs_cache = side.is_none()
         || price_num.is_none()
         || price_den.is_none()
         || min_fill.is_none();
 
-    let cached: Option<crate::order_cache::OrderCacheEntry> = if needs_cache {
+    let cached: Option<crate::order_cache::OrderCacheEntry> = {
         let cache_path = cancel_all::orders_cache_path(wallet_path);
         let orders = cancel_all::load_orders_cache(&cache_path)?;
         orders.into_iter().find(|o| o.outpoint == outpoint_str)
-    } else {
-        None
     };
 
     // Helper: resolve a parameter from CLI or cache, bail if neither available.

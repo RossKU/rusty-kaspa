@@ -105,17 +105,25 @@ pub async fn run(
     }
 
     // Resolve missing old_* params from the orders cache.
+    //
+    // The lookup always runs (cheap local read) -- see the identical fix in
+    // `cancel.rs`: `old_version` has no explicit-vs-cache distinction of its
+    // own other than this cache, so gating the lookup on "some other --old-*
+    // field is missing" meant that supplying --old-side/--old-price-num/
+    // --old-price-den/--old-min-fill explicitly (documented as individually
+    // optional-with-cache-fallback) silently skipped the cache and left
+    // `old_version` defaulted to 14 even for a v16 order, reconstructing the
+    // wrong redeemScript. `needs_cache` is kept only for the "loaded from
+    // cache" notice below.
     let needs_cache = old_side.is_none()
         || old_price_num.is_none()
         || old_price_den.is_none()
         || old_min_fill.is_none();
 
-    let cached: Option<crate::order_cache::OrderCacheEntry> = if needs_cache {
+    let cached: Option<crate::order_cache::OrderCacheEntry> = {
         let cache_path = cancel_all::orders_cache_path(wallet_path);
         let orders = cancel_all::load_orders_cache(&cache_path)?;
         orders.into_iter().find(|o| o.outpoint == outpoint_str)
-    } else {
-        None
     };
 
     macro_rules! resolve_field {

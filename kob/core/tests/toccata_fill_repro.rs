@@ -143,3 +143,108 @@ fn v16_buy_ioc_match_scripts_pass() {
     let buy_ss = build_buy_v16_ioc_fill_sigscript(1, 0, 0, &buy_rs); // [toi=1, tii=0, coi=0, Op5]
     run_full_fill_match("buy-ioc/sell-fill", sell_ss, buy_ss, &buy_rs, &sell_rs);
 }
+
+/// Execute the v16 buy covenant script (input[1]) of a 1:1 full-fill match and
+/// return the raw `execute()` result. Same tx shape as `run_full_fill_match`
+/// but returns the buy-script result instead of asserting success, so callers
+/// can assert either PASS (within cap) or REJECT (over cap).
+fn buy_script_result(
+    sell_ss: Vec<u8>,
+    buy_ss: Vec<u8>,
+    buy_rs: &[u8],
+    sell_rs: &[u8],
+    buy_kas_in: u64,
+    seller_kas_out: u64,
+    buyer_tokens_out: u64,
+) -> Result<(), String> {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let sell_p2sh = build_p2sh(sell_rs);
+    let buy_p2sh = build_p2sh(buy_rs);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), sell_ss, 50, 0),
+        TransactionInput::new(op(0x20, 0), buy_ss, 50, 0),
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1),
+    ];
+    let outputs = vec![
+        TransactionOutput::with_covenant(seller_kas_out, wallet_spk.clone(), None),
+        TransactionOutput::with_covenant(buyer_tokens_out, wallet_spk.clone(), Some(CovenantBinding::new(0, token_cov_id))),
+        TransactionOutput::with_covenant(200_000_000, wallet_spk.clone(), None),
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 50, Default::default(), 0, vec![]);
+    let entries = vec![
+        UtxoEntry { amount: buyer_tokens_out, script_public_key: sell_p2sh, block_daa_score: 0, is_coinbase: false, covenant_id: Some(token_cov_id) },
+        UtxoEntry { amount: buy_kas_in, script_public_key: buy_p2sh, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+        UtxoEntry { amount: 260_000_000, script_public_key: wallet_spk, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+    ];
+
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).expect("CovenantsContext::from_tx");
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+
+    let reused = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+    let (input, entry) = populated.populated_input(1);
+    let mut vm = TxScriptEngine::from_transaction_input(&populated, input, 1, entry, ctx, flags);
+    vm.execute().map_err(|e| format!("{e:?}"))
+}
+
+/// **The F6-cap enforcement proof for the consolidated CLI `match` path.**
+///
+/// The CLI now builds the base match tx through the canonical planner, which
+/// caps the *matcher's take* at the buy's `mmfee_bps`. This test proves the
+/// on-chain backstop: the v16 buy covenant's F6 check *rejects* any match
+/// whose intrinsic price spread exceeds `mmfee_bps`, regardless of how the
+/// outputs are allocated — so a matcher can never sneak an over-cap trade
+/// through the CLI (or a raw hand-crafted tx) the way the pre-consolidation
+/// v14-only matcher did (v14 has no F6 at all).
+///
+/// Shape: buy @ 1/1 (30M KAS wants 30M tokens), sell @ 1/2 (30M tokens wants
+/// 15M KAS) — a 15M KAS intrinsic spread (50%). With `mmfee_bps = 30` (0.30%)
+/// the cap is 30M/10000*30 = 90K, far below 15M, so F6 must abort.
+#[test]
+fn v16_over_cap_spread_rejected_by_f6() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    // Tight cap (0.30%) but a wide 50% spread -> F6 must reject.
+    let buy_rs = build_buy_v16_redeem_script(&token, 1, 1, 8_000_000, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+    let sell_rs = build_sell_redeem_script(1, 2, 8_000_000, &owner_hash, &spk_hash, 10_000_000, 0, 0).unwrap();
+    let sell_ss = build_sell_fill_sigscript_fixed_offset(0, &sell_rs);
+    let buy_ss = build_buy_v16_fill_sigscript(1, 0, 0, &buy_rs); // [toi=1, tii=0, coi=0, Op1]
+
+    // buy_kas_in=30M, seller gets fair_kas=15M, buyer gets 30M tokens.
+    let res = buy_script_result(sell_ss, buy_ss, &buy_rs, &sell_rs, 30_000_000, 15_000_000, 30_000_000);
+    assert!(
+        res.is_err(),
+        "v16 buy F6 MUST reject an over-cap spread (surplus 15M > max_surplus 90K); got Ok — \
+         the CLI match path would be able to settle a trade the buyer's mmfee_bps forbids"
+    );
+}
+
+/// Companion to the above: the SAME wide 50% spread, but with `mmfee_bps`
+/// widened to 6000 (60%) so the cap (30M/10000*6000 = 18M) now covers the
+/// 15M spread. F6 must PASS. Together these two tests bracket the F6 cap:
+/// reject when spread > cap, accept when spread <= cap.
+#[test]
+fn v16_within_cap_wide_spread_passes_f6() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let buy_rs = build_buy_v16_redeem_script(&token, 1, 1, 8_000_000, &owner_hash, &spk_hash, 6000, 0, 0).unwrap();
+    let sell_rs = build_sell_redeem_script(1, 2, 8_000_000, &owner_hash, &spk_hash, 10_000_000, 0, 0).unwrap();
+    let sell_ss = build_sell_fill_sigscript_fixed_offset(0, &sell_rs);
+    let buy_ss = build_buy_v16_fill_sigscript(1, 0, 0, &buy_rs);
+
+    let res = buy_script_result(sell_ss, buy_ss, &buy_rs, &sell_rs, 30_000_000, 15_000_000, 30_000_000);
+    assert!(
+        res.is_ok(),
+        "v16 buy F6 must ACCEPT a spread within the cap (surplus 15M <= max_surplus 18M); got {res:?}"
+    );
+}

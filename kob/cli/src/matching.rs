@@ -1262,17 +1262,17 @@ mod tests {
         assert_eq!(buy_ss[3], 0x51, "cross-pair buy: selector=1 (fill)");
     }
 
-    /// Build a v16-buy + v14-sell pair (mirrors what `matching::run` now
-    /// constructs) and prove the canonical planner caps matcher surplus at
-    /// the buy's own `--mmfee-bps`, never dumping the full price spread
-    /// into the matcher output the way the pre-consolidation hand-rolled
-    /// `run()` used to.
-    fn make_pair(buy_mmfee_bps: u64, fee_bps: Option<u16>) -> (BatchOrder, BatchOrder) {
+    /// Build a token-conserving v16-buy + v14-sell pair (the exact shape
+    /// `matching::run` now constructs, and the same 30M/30M shape the
+    /// `toccata_fill_repro` on-chain harness uses): sell has 30M tokens @ 1/2
+    /// (wants 15M KAS), buy has 30M KAS @ 1/1 (wants 30M tokens). The buyer's
+    /// 30M token output is fully backed by the sell's 30M token input; the
+    /// intrinsic spread is 30M - 15M = 15M KAS.
+    fn make_pair(buy_mmfee_bps: u64) -> (BatchOrder, BatchOrder) {
         let pk = [0x03u8; 32];
         let tcid = [0x01u8; 32];
         let owner = blake2b_256(&pk);
         let spk_hash = compute_p2pk_spk_hash(&pk);
-        // Wide spread: buy @ 1/1, sell @ 1/2 -> ~50% of buy_kas is spread.
         let buy_rs = contract::build_buy_v16_redeem_script(
             &tcid, 1, 1, 1_000_000, &owner, &spk_hash, buy_mmfee_bps, 0, 0,
         ).unwrap();
@@ -1286,9 +1286,9 @@ mod tests {
             token_cov_id: tcid,
             price_num: 1,
             price_den: 1,
-            amount: 100_000_000,
+            amount: 30_000_000,
             redeem_script: buy_rs,
-            utxo_value: 100_000_000,
+            utxo_value: 30_000_000,
             counterparty_spk: vec![0xEE; 34],
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
@@ -1302,40 +1302,74 @@ mod tests {
             token_cov_id: tcid,
             price_num: 1,
             price_den: 2,
-            amount: 40_000_000,
+            amount: 30_000_000,
             redeem_script: sell_rs,
-            utxo_value: 40_000_000,
+            utxo_value: 30_000_000,
             counterparty_spk: vec![0xDD; 34],
             counterparty_spk_version: 0,
             min_fill: 1_000_000,
             oco_path: None,
             bracket_meta: None,
         };
-        let _ = fee_bps;
         (buy, sell)
     }
 
+    /// The CLI-level half of the F6 guarantee: the canonical planner caps the
+    /// matcher's take at the buy's `mmfee_bps` and refunds the rest of the
+    /// price spread to the buyer, instead of the pre-consolidation
+    /// hand-rolled matcher dumping the entire 15M spread into matcher change.
+    /// (The on-chain half — F6 rejecting an over-cap spread outright — is
+    /// proved in `kob-core/tests/toccata_fill_repro.rs`.)
     #[test]
     fn v16_match_matcher_surplus_is_capped_not_full_spread() {
-        // buy_kas=100M, sell wants (40M tokens * 1/2) = 20M KAS -> raw spread
-        // is 80M. Uncapped (old behavior) the matcher would take ~all of it;
-        // with a 30 bps cap the matcher may take at most 100M/10000*30 = 300K.
-        let (buy, sell) = make_pair(30, None);
+        // Intrinsic spread is 15M KAS. With a 30 bps cap on total_seller_kas
+        // (15M), the matcher may keep at most 15M*30/10000 = 45K -- below
+        // MIN_UTXO_VALUE, so it is dropped to the miner fee and the matcher
+        // output is 0. The ~14.95M remainder must be refunded to the buyer.
+        let (buy, sell) = make_pair(30);
         let matcher_spk = vec![0xCC; 34];
         let plan = plan_batch_match(&[sell], &[buy], None, &matcher_spk, 0, Some(30))
             .expect("plan should succeed");
+        plan.validate().expect("plan should validate (balanced, all outputs >= MIN_UTXO)");
+
         assert!(
-            plan.matcher_surplus <= 300_000,
-            "matcher surplus {} must be capped at the buy's mmfee_bps allowance (<=300_000)",
+            plan.matcher_surplus <= 45_000,
+            "matcher surplus {} must be capped at the buy's mmfee_bps allowance (<=45_000), \
+             not the full 15M spread",
             plan.matcher_surplus,
         );
-        // And the excess must have gone back to the buyer as change, not
-        // vanished or been folded into the seller (which would break F6's
-        // sibling checks on the seller output too).
+
+        // The excess spread must be refunded to the buyer as change, not
+        // pocketed by the matcher and not folded into the seller output.
         let refunded: u64 = plan.outputs.iter()
             .filter(|o| o.purpose == kob_domain::batch::OutputPurpose::BuyerChange)
             .map(|o| o.value)
             .sum();
-        assert!(refunded > 0, "excess spread must be refunded to the buyer as change");
+        assert!(
+            refunded >= 14_000_000,
+            "the bulk of the 15M spread ({} refunded) must go back to the buyer",
+            refunded,
+        );
+    }
+
+    /// Sanity floor: with a wide enough cap, the matcher legitimately keeps
+    /// the spread (no refund) -- proving the cap is a real bound, not an
+    /// unconditional refund. mmfee_bps large enough that 15M spread fits.
+    #[test]
+    fn v16_match_within_cap_matcher_keeps_spread() {
+        // cap = total_seller_kas(15M) * 9000/10000 = 13.5M. The 15M spread is
+        // still slightly above that, so most is kept and only a little
+        // refunded. Use a full 10000 bps (100%) so nothing is refunded.
+        let (buy, sell) = make_pair(10_000);
+        let matcher_spk = vec![0xCC; 34];
+        let plan = plan_batch_match(&[sell], &[buy], None, &matcher_spk, 0, Some(10_000))
+            .expect("plan should succeed");
+        plan.validate().expect("plan should validate");
+        let refunded: u64 = plan.outputs.iter()
+            .filter(|o| o.purpose == kob_domain::batch::OutputPurpose::BuyerChange)
+            .map(|o| o.value)
+            .sum();
+        assert_eq!(refunded, 0, "with a 100% cap the matcher keeps the spread; no buyer refund");
+        assert!(plan.matcher_surplus > 10_000_000, "matcher keeps the bulk of the 15M spread");
     }
 }

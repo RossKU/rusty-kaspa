@@ -238,8 +238,12 @@ pub fn build_open_position_tx(
         .checked_add(params.short_order.value)
         .ok_or_else(|| PerpTxError::Overflow("long_value + short_value".to_string()))?;
 
-    // Required: position_value + miner fee (estimated from compute mass)
-    let miner_fee = kob_core::mass::estimate_compute_mass(2, 2, 100);
+    // Required: position_value + miner fee (estimated from compute mass).
+    // This blueprint is submitted directly by the engine matcher with no
+    // Phase-2 post-sign convergence, so the post-Toccata min-relay floor
+    // must be applied here or the open-position TX underpays by 100x and
+    // the node rejects it as non-standard.
+    let miner_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(2, 2, 100));
     let required = position_value
         .checked_add(miner_fee)
         .ok_or_else(|| PerpTxError::Overflow("position_value + fee".to_string()))?;
@@ -1199,7 +1203,7 @@ mod tests {
 
     #[test]
     fn open_position_basic() {
-        let params = default_open_params(5_000_000, 5_100_000, 5_000_000, 5_100_000);
+        let params = default_open_params(5_000_000, 5_300_000, 5_000_000, 5_300_000);
 
         let (blueprint, rs) = build_open_position_tx(&params).unwrap();
 
@@ -1224,8 +1228,8 @@ mod tests {
 
         let (blueprint, _) = build_open_position_tx(&params).unwrap();
 
-        // Total input = 20M, position = 10M, fee = mass-based, change = remainder
-        let miner_fee = kob_core::mass::estimate_compute_mass(2, 2, 100);
+        // Total input = 20M, position = 10M, fee = mass-based (min-relay scaled), change = remainder
+        let miner_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(2, 2, 100));
         assert_eq!(blueprint.outputs.len(), 2);
         assert_eq!(blueprint.outputs[0].value, 10_000_000);
         assert_eq!(blueprint.outputs[1].value, 20_000_000 - 10_000_000 - miner_fee);
@@ -1241,17 +1245,23 @@ mod tests {
 
     #[test]
     fn open_position_no_change_when_small_surplus() {
-        // Surplus = 100 (below MIN_UTXO_VALUE) -> no change output
-        let params = default_open_params(5_000_000, 5_005_050, 5_000_000, 5_005_050);
+        // Surplus = 100 (below MIN_UTXO_VALUE) -> no change output.
+        // Split evenly across long/short value so total = position + fee + 100.
+        let miner_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(2, 2, 100));
+        let half_extra = (miner_fee + 100) / 2;
+        let params = default_open_params(
+            5_000_000, 5_000_000 + half_extra,
+            5_000_000, 5_000_000 + half_extra,
+        );
 
         let (blueprint, _) = build_open_position_tx(&params).unwrap();
-        // Total = 10_010_100, position = 10M, fee = 10k, surplus = 100 < 3M
+        // Total = position + fee + (<= MIN_UTXO_VALUE) surplus -> no change output.
         assert_eq!(blueprint.outputs.len(), 1);
     }
 
     #[test]
     fn open_position_sig_op_counts() {
-        let params = default_open_params(5_000_000, 5_100_000, 5_000_000, 5_100_000);
+        let params = default_open_params(5_000_000, 5_300_000, 5_000_000, 5_300_000);
 
         let (blueprint, _) = build_open_position_tx(&params).unwrap();
         assert_eq!(blueprint.sig_op_counts, vec![0, 0]);
@@ -1260,7 +1270,7 @@ mod tests {
 
     #[test]
     fn open_position_payload_contains_rs() {
-        let params = default_open_params(5_000_000, 5_100_000, 5_000_000, 5_100_000);
+        let params = default_open_params(5_000_000, 5_300_000, 5_000_000, 5_300_000);
 
         let (blueprint, rs) = build_open_position_tx(&params).unwrap();
 

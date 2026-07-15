@@ -221,7 +221,11 @@ pub fn build_lending_match_tx(
 
     // Required = loan_value (collateral) + principal (to borrower) + fee
     // Estimate fee from compute mass: 2 inputs, up to 3 outputs (loan + principal + change).
-    let est_fee = estimate_compute_mass(2, 3, payload.len());
+    // This blueprint is submitted directly by the engine matcher with no
+    // Phase-2 post-sign convergence, so the post-Toccata min-relay floor
+    // must be applied here or the match TX underpays by 100x and the node
+    // rejects it as non-standard.
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(2, 3, payload.len()));
     let required = loan_value
         .checked_add(params.principal)
         .and_then(|v| v.checked_add(est_fee))
@@ -1579,10 +1583,10 @@ mod tests {
 
     #[test]
     fn match_tx_basic() {
-        let mut offer = make_offer(10_100_000); // enough to cover mass-based fee
+        let mut offer = make_offer(10_600_000); // enough to cover mass-based fee
         // Build real RS for the offer
         offer.redeem_script = kob_core::lending::build_loan_offer_redeem_script(
-            &[1; 32], 10_100_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
+            &[1; 32], 10_600_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
         ).unwrap();
         let mut request = make_request(20_000_000, 10_000_000);
         request.redeem_script = kob_core::lending::build_borrow_request_redeem_script(
@@ -1685,7 +1689,7 @@ mod tests {
         // Change: 15M + 20M - 20M(coll) - 10M(principal) - est_fee -> output[2]
         assert_eq!(blueprint.outputs.len(), 3);
         let change = blueprint.outputs[2].value;
-        let est_fee = estimate_compute_mass(2, 3, blueprint.payload.len());
+        let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(2, 3, blueprint.payload.len()));
         assert_eq!(change, 5_000_000 - est_fee);
     }
 
@@ -2166,9 +2170,9 @@ mod tests {
 
     #[test]
     fn match_tx_payload_starts_with_prefix() {
-        let mut offer = make_offer(10_100_000); // enough to cover mass-based fee
+        let mut offer = make_offer(10_600_000); // enough to cover mass-based fee
         offer.redeem_script = kob_core::lending::build_loan_offer_redeem_script(
-            &[1; 32], 10_100_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
+            &[1; 32], 10_600_000, 500, 10000, 15000, 63_000_000, &[0u8; 32], 0, 0,
         ).unwrap();
         let mut request = make_request(20_000_000, 10_000_000);
         request.redeem_script = kob_core::lending::build_borrow_request_redeem_script(

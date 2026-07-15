@@ -213,7 +213,7 @@ pub fn build_create_market_tx(
         .ok_or_else(|| PredictionTxError::Overflow("total output sum".to_string()))?;
 
     // Mass-based fee estimate: 1 input, 4 outputs (3 covenants + change)
-    let estimated_fee = estimate_compute_mass(1, 4, payload.len());
+    let estimated_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 4, payload.len()));
 
     let total_required = total_output
         .checked_add(estimated_fee)
@@ -361,7 +361,7 @@ pub fn build_deploy_redemption_tx(
     let payload = kob_core::prediction::build_prediction_payload(&redemption_rs);
 
     // Mass-based fee estimate: 1 input, 2 outputs (redemption + change)
-    let estimated_fee = estimate_compute_mass(1, 2, payload.len());
+    let estimated_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 2, payload.len()));
 
     let total_required = params.redemption_initial_value
         .checked_add(estimated_fee)
@@ -580,7 +580,7 @@ pub fn build_split_tx(params: &SplitParams) -> Result<PredictionTxBlueprint, Pre
         .ok_or_else(|| PredictionTxError::Overflow("sm + unit_value".to_string()))?;
 
     // Mass-based fee estimate: 2 inputs, 4 outputs (yes + no + continuation + change)
-    let estimated_fee = estimate_compute_mass(2, 4, payload.len());
+    let estimated_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(2, 4, payload.len()));
 
     let required = token_output_total
         .checked_add(continuation_value)
@@ -721,7 +721,7 @@ pub fn build_merge_tx(params: &MergeParams) -> Result<PredictionTxBlueprint, Pre
         .ok_or_else(|| PredictionTxError::Overflow("total inputs".to_string()))?;
 
     // Mass-based fee estimate: 3 inputs, 2 outputs, no payload
-    let estimated_fee = estimate_compute_mass(3, 2, 0);
+    let estimated_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(3, 2, 0));
 
     let total_output = sm.unit_value
         .checked_add(continuation_value)
@@ -1011,7 +1011,7 @@ pub fn build_expire_ballot_tx(
     }
 
     // Mass-based fee: 1 input, 1 output, no payload
-    let estimated_fee = estimate_compute_mass(1, 1, 0);
+    let estimated_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0));
 
     let payout = bb.value.checked_sub(estimated_fee).ok_or_else(|| {
         PredictionTxError::InsufficientFunds {
@@ -1084,7 +1084,7 @@ pub fn build_refund_split_merge_tx(
     }
 
     // Mass-based fee: 1 input, 1 output, no payload
-    let estimated_fee = estimate_compute_mass(1, 1, 0);
+    let estimated_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0));
 
     let payout = sm.value.checked_sub(estimated_fee).ok_or_else(|| {
         PredictionTxError::InsufficientFunds {
@@ -1157,7 +1157,7 @@ pub fn build_refund_redemption_tx(
     }
 
     // Mass-based fee: 1 input, 1 output, no payload
-    let estimated_fee = estimate_compute_mass(1, 1, 0);
+    let estimated_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0));
 
     let payout = r.value.checked_sub(estimated_fee).ok_or_else(|| {
         PredictionTxError::InsufficientFunds {
@@ -1417,7 +1417,7 @@ mod tests {
             split_merge: sm,
             user_tx_id: "user_tx".to_string(),
             user_index: 0,
-            user_value: 200_000_000 + estimate_compute_mass(2, 4, 100) + MIN_UTXO_VALUE,
+            user_value: 200_000_000 + kob_core::mass::min_relay_fee(estimate_compute_mass(2, 4, 100)) + MIN_UTXO_VALUE,
             user_sig_script: vec![0x01],
             user_sig_op_count: 1,
             yes_token_script: vec![0xaa],
@@ -1651,7 +1651,7 @@ mod tests {
         let bp = result.unwrap();
         assert_eq!(bp.inputs.len(), 1);
         assert_eq!(bp.outputs.len(), 1);
-        assert_eq!(bp.outputs[0].value, 10_000_000 - estimate_compute_mass(1, 1, 0));
+        assert_eq!(bp.outputs[0].value, 10_000_000 - kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0)));
         assert_eq!(bp.lock_time, 200_000);
         assert_eq!(bp.sig_op_counts[0], 1);
     }
@@ -1698,7 +1698,7 @@ mod tests {
         let result = build_refund_split_merge_tx(&params);
         assert!(result.is_ok());
         let bp = result.unwrap();
-        assert_eq!(bp.outputs[0].value, 500_000_000 - estimate_compute_mass(1, 1, 0));
+        assert_eq!(bp.outputs[0].value, 500_000_000 - kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0)));
         assert_eq!(bp.lock_time, 200_000);
     }
 
@@ -1730,7 +1730,7 @@ mod tests {
         let result = build_refund_redemption_tx(&params);
         assert!(result.is_ok());
         let bp = result.unwrap();
-        assert_eq!(bp.outputs[0].value, 500_000_000 - estimate_compute_mass(1, 1, 0));
+        assert_eq!(bp.outputs[0].value, 500_000_000 - kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0)));
     }
 
     #[test]

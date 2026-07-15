@@ -1451,24 +1451,15 @@ hand-rolled same-pair build/fee/tamper-inline body, added the planner delegation
 - [x] `cargo test -p kob-core --test toccata_fill_repro` — **4 passed, 0 failed**
       (incl. the two new F6-cap on-chain proofs).
 - [x] `cargo test -p kob-domain --lib` — passed (green; unchanged by this phase).
-- [x] `cargo test -p kob-cli --lib` — **501 passed, 16 failed**. The 16 failures
-      are **all pre-existing** `*_v12_*` RS/sigscript-**size** asserts
-      (`estimate::tests::{buy,sell}_v12_*` ×8, `recover::*_v12_*` ×4,
-      `requote::*_v12_*` ×3, `matching::tests::fill_sigscripts_v12` ×1) that
-      hardcode pre-Toccata byte sizes (e.g. `BUY_RS_SIZE = 387`, now 396) and
-      have been red since the post-Toccata merge — they were never surfaced
-      because Phase 4 only ran kob-core + kob-domain. Verified pre-existing:
-      `git diff 6866c12 HEAD` touches none of `core/src/contract/`,
-      `estimate.rs`, `recover.rs`, or `requote.rs`, and base `6866c12` already
-      asserted `BUY_RS_SIZE = 387` against the (unchanged) builder that now
-      emits 396. They are orthogonal to the matcher consolidation (contract RS
-      byte layout, not matching logic) and are **left untouched** here —
-      blind-updating 16 size constants across 4 files would risk masking a real
-      layout regression. **Flagged for the owner as a separate post-Toccata
-      cleanup.** All consolidation-related tests are green:
+- [x] `cargo test -p kob-cli --lib` — **517 passed, 0 failed**. (Initially 501
+      passed / 16 failed: a batch of pre-existing `*_v12_*` RS/sigscript-**size**
+      asserts that had been red since the post-Toccata merge — never surfaced
+      because Phase 4 only ran kob-core + kob-domain. **Now fixed** — see the
+      "v14 size-constant corrections" section below. All consolidation-related
+      tests green:
       `matching::tests::v16_match_matcher_surplus_is_capped_not_full_spread`,
       `v16_match_within_cap_matcher_keeps_spread`, and
-      `auto_match::tests::detected_order_pair_builds_a_valid_plan` all pass.
+      `auto_match::tests::detected_order_pair_builds_a_valid_plan`.)
 - [ ] Optional on-chain honest within-cap `kob-cli match` via the token fixture
       — not run this session (needs a funded reachable node); the F6-cap
       behaviour is proven off-chain by `toccata_fill_repro` and on-chain by the
@@ -1484,3 +1475,32 @@ hand-rolled same-pair build/fee/tamper-inline body, added the planner delegation
   both `BatchOrder`s from `make_test_order` (shared `a*64:0` outpoint), which
   the planner correctly rejected as a `DuplicateOutpoint`. Gave the sell a
   distinct outpoint.
+
+### v14 size-constant corrections (the 16 pre-existing failures, resolved)
+
+Each stale constant was verified against kob-core's authoritative
+`parse::{BUY_RS_SIZE, SELL_RS_SIZE}` (which its own green tests assert), NOT
+blind-updated. Root cause: the v13→v14 body change added the IOC fill
+sub-dispatch, growing the **buy** body 242→251B (+9) and the **sell** body
+244→304B (+60). Because every sigscript embeds `pushData(RS)`, that RS delta
+propagates uniformly into every fill/cancel/partial sigscript — which is
+exactly the pattern observed (buy +9 everywhere, sell +60 everywhere),
+confirming no independent sigscript-construction bug. **No builder output was
+wrong; all 16 were stale test/estimation constants. Zero real regressions.**
+
+| Constant / assert | old → new | why the new value is correct |
+|---|---|---|
+| `BUY_RS_SIZE` (estimate.rs; + matching/recover/requote asserts) | 387 → **396** | 145 state + 251 v14 body = kob-core `BUY_RS_SIZE` |
+| `SELL_RS_SIZE` (estimate.rs; + asserts) | 356 → **416** | 112 state + 304 v14 body = kob-core `SELL_RS_SIZE` |
+| `BUY_FILL_SS_SIZE` | 394 → **403** | 4 idx/selector opcodes + `pushData(396)` (=399) |
+| `SELL_FILL_SS_SIZE` | 361 → **421** | 2 opcodes + `pushData(416)` (=419) |
+| `BUY_CANCEL_SS_SIZE` | 490 → **499** | 1 + sig(66) + pk(33) + `pushData(396)` (399) |
+| `SELL_CANCEL_SS_SIZE` | 459 → **519** | sig(66) + pk(33) + 1 + `pushData(416)` (419) |
+| `BUY_PARTIAL_SS_SIZE` | 402 → **411** | ri+ti(2) + fk push(9) + selector(1) + `pushData(396)` |
+| `SELL_PARTIAL_SS_SIZE` | 371 → **431** | same shape + `pushData(416)` |
+| `tx_mass_match_v12` expected mass | 2164 → **2233** | recomputed from the corrected fill-SS sizes (sell input 468, buy input 450) |
+| `requote_side_change` premise | `buy_rs.len() > sell_rs.len()` → exact 396/416 + `!=` | the v14 sell body grew more than the buy body, so sell RS (416) is now **larger** than buy RS (396) — the v13 `>` relationship flipped; test now asserts the verified exact sizes |
+
+The `estimate.rs` constants feed **production fee estimation** (coin selection /
+mass budgeting), so this also corrected a small real mass under-estimate, not
+just test hygiene. Final: `cargo test -p kob-cli --lib` = **517 passed, 0 failed**.

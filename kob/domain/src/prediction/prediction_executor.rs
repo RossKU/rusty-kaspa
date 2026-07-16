@@ -657,7 +657,12 @@ pub fn build_vote_tx(params: &VoteParams) -> Result<PredictionTxBlueprint, Predi
         ],
         outputs,
         payload: Vec::new(),
-        lock_time: params.current_daa, // Must be in [start_daa, end_daa) for CLTV
+        // lockTime = start_daa (in the past when voting is active), NOT the
+        // just-read current_daa: keeps the tx immediately final while still
+        // satisfying the vote CLTV window [start_daa, end_daa). (Vote is a
+        // fee==0 miner-inclusion tx and can't enter the mempool, but block
+        // inclusion enforces finality too, so this matters there.)
+        lock_time: bb.start_daa,
         sig_op_counts: vec![0, 0, params.miner_sig_op_count],
     })
 }
@@ -1204,7 +1209,10 @@ pub fn build_expire_ballot_tx(
             script: params.creator_script.clone(),
         }],
         payload: Vec::new(),
-        lock_time: params.current_daa,
+        // lockTime = expiry_daa (see build_refund_split_merge_tx): avoids the
+        // "input #0 is not finalized" race. expire's live success earlier
+        // (TXID 93da68e8...) only got lucky on timing; this makes it robust.
+        lock_time: bb.expiry_daa,
         sig_op_counts: vec![1],
     })
 }
@@ -1278,7 +1286,14 @@ pub fn build_refund_split_merge_tx(
             script: params.creator_script.clone(),
         }],
         payload: Vec::new(),
-        lock_time: params.current_daa,
+        // lockTime = expiry_daa, NOT current_daa: a lockTime equal to the
+        // freshly-read current DAA is only "finalized" once the virtual DAA
+        // advances PAST it, so submitting before the next tick races and the
+        // node rejects with "transaction input #0 is not finalized" (found
+        // live). expiry_daa is guaranteed strictly in the past here (checked
+        // above), so it is immediately final AND satisfies the covenant's
+        // CLTV floor (lockTime >= expiry_daa, with equality).
+        lock_time: sm.expiry_daa,
         sig_op_counts: vec![1],
     })
 }
@@ -1352,7 +1367,9 @@ pub fn build_refund_redemption_tx(
             script: params.creator_script.clone(),
         }],
         payload: Vec::new(),
-        lock_time: params.current_daa,
+        // lockTime = expiry_daa (see build_refund_split_merge_tx): avoids the
+        // "input #0 is not finalized" race from using the just-read current_daa.
+        lock_time: r.expiry_daa,
         sig_op_counts: vec![1],
     })
 }
@@ -1629,7 +1646,7 @@ mod tests {
             current_daa: 5000,
         };
         let bp = build_vote_tx(&params).unwrap();
-        assert_eq!(bp.lock_time, 5000);
+        assert_eq!(bp.lock_time, 1000); // = start_daa (finality-safe), not current_daa
     }
 
     // --- Split TX ---
@@ -1876,7 +1893,7 @@ mod tests {
         assert_eq!(bp.inputs.len(), 1);
         assert_eq!(bp.outputs.len(), 1);
         assert_eq!(bp.outputs[0].value, 10_000_000 - kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0)));
-        assert_eq!(bp.lock_time, 200_000);
+        assert_eq!(bp.lock_time, 100_000); // = expiry_daa (finality-safe), not current_daa
         assert_eq!(bp.sig_op_counts[0], 1);
     }
 
@@ -1923,7 +1940,7 @@ mod tests {
         assert!(result.is_ok());
         let bp = result.unwrap();
         assert_eq!(bp.outputs[0].value, 500_000_000 - kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0)));
-        assert_eq!(bp.lock_time, 200_000);
+        assert_eq!(bp.lock_time, 100_000); // = expiry_daa (finality-safe), not current_daa
     }
 
     #[test]

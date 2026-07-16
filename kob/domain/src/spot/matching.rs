@@ -1,6 +1,7 @@
 //! Crossing pair detection and match output computation.
 
 use kob_core::MIN_UTXO_VALUE;
+use kob_core::contract::spot::order::{BUY_ORDER_V17_MAX_N, BUY_ORDER_V17_RS_EXPECTED_LEN};
 use crate::order_book::{BookOrder, OrderBook, PairBook};
 
 /// OP_CSV maturity window: orders must age at least this many DAA scores
@@ -446,8 +447,18 @@ fn find_sweep_groups(
             // duplicate inputs (TP + SL share the same UTXO).
             let mut sweep_utxo_keys: HashSet<String> = HashSet::new();
 
+            // HIGH DoS #3: a v17 buy's contract has exactly BUY_ORDER_V17_MAX_N
+            // term slots -- collecting more sells than that for a v17 anchor
+            // would later panic (or, since batch.rs now guards it, get
+            // rejected wholesale) at plan time. Cap collection at the
+            // contract's own limit for a v17 anchor so a v17 buy still gets
+            // a good, plannable group instead of losing the whole sweep; any
+            // sells beyond the cap stay unclaimed for a follow-on group.
+            let is_v17_buy = buy.redeem_script().len() == BUY_ORDER_V17_RS_EXPECTED_LEN;
+            let max_sells_for_buy = if is_v17_buy { BUY_ORDER_V17_MAX_N } else { MAX_BATCH_GROUP_SIZE };
+
             for sell in &asks {
-                if sweep_sells.len() >= MAX_BATCH_GROUP_SIZE {
+                if sweep_sells.len() >= max_sells_for_buy {
                     break;
                 }
                 if claimed.contains(&sell.outpoint_key()) {
@@ -1835,6 +1846,45 @@ mod tests {
         let g = &groups[0];
         assert_eq!(g.fills.len(), 2, "only the 2 plain sells swept");
         assert!(g.fills.iter().all(|s| s.oco_path.is_none()), "no OCO sell in the group");
+    }
+
+    /// HIGH DoS #3: find_sweep_groups must cap a v17-anchor buy-sweep
+    /// collection at BUY_ORDER_V17_MAX_N sells, not the generic
+    /// MAX_BATCH_GROUP_SIZE (15) -- otherwise plan_batch_match_v17 would
+    /// have to reject the whole oversized group (or, pre-fix, the sigscript
+    /// builder would panic) instead of settling a good MAX_N-sized one.
+    #[test]
+    fn test_v17_buy_sweep_capped_at_max_n() {
+        let token = FAKE_TOKEN;
+        let mut ob = OrderBook::new();
+
+        let rs = kob_core::contract::spot::order::build_buy_v17_redeem_script(
+            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], 2000, 0, 0,
+        ).unwrap();
+        let mut buy = make_buy(1_000_000_000, 1, 1, token);
+        buy.tx_id = format!("{:064x}", 1);
+        buy.owner_hash = "aa".repeat(32);
+        buy.redeem_script_hex = hex::encode(&rs);
+        ob.add_buy_order(buy);
+
+        // 10 crossing sells (more than MAX_N=8), each easily affordable, so
+        // the MAX_N cap -- not the buy's KAS budget -- is what's tested.
+        for i in 0..10u32 {
+            let mut sell = make_sell(10_000_000, 1, 1, token);
+            sell.tx_id = format!("{:064x}", 9000 + i);
+            sell.owner_hash = format!("{:064x}", 5000 + i);
+            ob.add_sell_order(sell);
+        }
+
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
+        assert!(!groups.is_empty(), "should find a sweep group");
+        let g = &groups[0];
+        assert!(g.is_buy_sweep);
+        assert!(
+            g.fills.len() <= BUY_ORDER_V17_MAX_N,
+            "v17 buy sweep must be capped at MAX_N={}, got {}",
+            BUY_ORDER_V17_MAX_N, g.fills.len(),
+        );
     }
 
     #[test]

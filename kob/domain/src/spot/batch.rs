@@ -43,6 +43,7 @@ use kob_core::contract::spot::oco::{
 };
 use kob_core::contract::spot::order::{
     BUY_ORDER_V16_RS_EXPECTED_LEN,
+    BUY_ORDER_V17_MAX_N,
     BUY_ORDER_V17_RS_EXPECTED_LEN,
     build_buy_fill_sigscript,
     build_buy_ioc_fill_sigscript,
@@ -226,6 +227,13 @@ pub enum BatchError {
     /// fill is unaffected (nothing else shares the token's output index), so
     /// only compositions with 2+ sells are rejected here.
     OcoMultiSellSweepUnsupported { outpoint: String },
+    /// A v17 sweep was asked to include more sells than the contract's
+    /// compile-time `BUY_ORDER_V17_MAX_N` slot count.
+    ///
+    /// `build_buy_v17_fill_sigscript` (core/src/contract/spot/order.rs)
+    /// `assert!`s on this and panics; this variant lets the planner reject
+    /// gracefully with an `Err` well before that point is ever reached.
+    V17TooManySells { count: usize, max: usize },
 }
 
 impl std::fmt::Display for BatchError {
@@ -270,6 +278,9 @@ impl std::fmt::Display for BatchError {
             }
             BatchError::OcoMultiSellSweepUnsupported { outpoint } => {
                 write!(f, "OCO sell {} cannot be composed into a multi-sell sweep (2+ sells in one tx); OCO_SELL_BODY's F4 still uses the pre-Fix-3 shared output index", outpoint)
+            }
+            BatchError::V17TooManySells { count, max } => {
+                write!(f, "v17 sweep has {} sells, exceeds BUY_ORDER_V17_MAX_N={}", count, max)
             }
         }
     }
@@ -1493,6 +1504,15 @@ fn plan_batch_match_v17(
     let buy = &buys[0];
     let n = sells.len();
 
+    // HIGH DoS #3: the v17 contract has exactly BUY_ORDER_V17_MAX_N term
+    // slots; build_buy_v17_fill_sigscript `assert!`s on this and PANICS if
+    // handed more. Reject gracefully here, well before that call, so a
+    // crossing book with more sells than the contract can express never
+    // reaches the panic.
+    if n > BUY_ORDER_V17_MAX_N {
+        return Err(BatchError::V17TooManySells { count: n, max: BUY_ORDER_V17_MAX_N });
+    }
+
     // RELEASE-BLOCKER #1: exclude OCO sells from a multi-sell v17 sweep (see
     // BatchError::OcoMultiSellSweepUnsupported). Checked here too (not just
     // in plan_batch_match's dispatch gate) so the invariant holds for any
@@ -2378,6 +2398,40 @@ mod tests {
         let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 100_000_000u64));
         let r = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000));
         assert!(r.is_ok(), "solo OCO sell must still plan fine: {:?}", r.err());
+    }
+
+    /// HIGH DoS #3: more sells than BUY_ORDER_V17_MAX_N must reject gracefully
+    /// (Err), never reaching build_buy_v17_fill_sigscript's internal
+    /// `assert!(sell_input_indices.len() <= BUY_ORDER_V17_MAX_N)` panic.
+    #[test]
+    fn test_v17_too_many_sells_rejects_not_panics() {
+        let token = [0x47; 32];
+        let n = kob_core::contract::spot::order::BUY_ORDER_V17_MAX_N + 1;
+        let sells: Vec<BatchOrder> = (0..n as u8)
+            .map(|i| make_sell(0x50 + i, 5_000_000, 1, 1, token))
+            .collect();
+        let buys = vec![make_buy_v17(0x20, n as u64 * 5_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 100_000_000u64));
+        let r = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000));
+        assert!(
+            matches!(r, Err(BatchError::V17TooManySells { .. })),
+            "N > MAX_N must reject gracefully, got {:?}", r
+        );
+    }
+
+    /// N == MAX_N (the boundary) must still plan fine (positive control for
+    /// the DoS #3 guard, proving it doesn't over-restrict the honest case).
+    #[test]
+    fn test_v17_exactly_max_n_sells_plans_ok() {
+        let token = [0x48; 32];
+        let n = kob_core::contract::spot::order::BUY_ORDER_V17_MAX_N;
+        let sells: Vec<BatchOrder> = (0..n as u8)
+            .map(|i| make_sell(0x60 + i, 5_000_000, 1, 1, token))
+            .collect();
+        let buys = vec![make_buy_v17(0x20, n as u64 * 5_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 100_000_000u64));
+        let r = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000));
+        assert!(r.is_ok(), "N == MAX_N must plan fine: {:?}", r.err());
     }
 
     // Test 1: Simple same-pair batch (2 sells + 2 buys of same token)

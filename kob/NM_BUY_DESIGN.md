@@ -1,10 +1,14 @@
 # N:M-capable buy covenant — design (Phase 1) + implementation status (Phase 2)
 
-Status: **IMPLEMENTED (Phase 2 complete).** The v17 contract, its full adversarial
+Status: **IMPLEMENTED (Phase 2 complete); v17 is now the SOLE creatable buy
+contract (version-cleanup pass).** The v17 contract, its full adversarial
 matrix, all the recognition wiring, and the `plan_batch_match` N-per-sell emission
 are landed and green against the real post-Toccata `kaspa-txscript` `TxScriptEngine`.
-Phase 1 (design + feasibility spike, `kob/core/tests/nm_buy_spike.rs`) is preserved
-below unchanged; the Phase-2 outcome is summarized here.
+A later pass closed the gap where `deploy_buy` and `requote` still accepted
+`--version 16` for brand-new buy deploys (see "Wiring" below) -- v16 (like
+v14) is now deploy-rejected and retained purely for servicing orders already
+on-chain. Phase 1 (design + feasibility spike, `kob/core/tests/nm_buy_spike.rs`)
+is preserved below unchanged; the Phase-2 outcome is summarized here.
 
 ## Phase 2 outcome (implemented)
 
@@ -21,9 +25,33 @@ below unchanged; the Phase-2 outcome is summarized here.
   terms, over-cap, mixed-price dilution, limit-price-floor violation, IOC theft,
   forged sell price, decoy-uncounted, over-delivery-no-exposure, N=1 parity,
   N=MAX_N boundary, N>MAX_N unrepresentable, RS length/collision) + expire/cancel.
-- **Wiring**: v17 is the new deploy default; v16 stays fully parseable. Landed in
+- **Wiring**: v17 is now the SOLE creatable buy contract -- `deploy_buy`'s
+  version gate (`kob/cli/src/deploy.rs`) rejects both v14 and v16 for new
+  deploys (previously it allowed v16 through as an alternative to v17); v14
+  and v16 stay fully parseable/cancellable for orders already resting
+  on-chain. `kob-cli requote`'s independent new-deploy gate got the same
+  treatment (buy: v17-only; sell: unaffected, single version). Landed in
   `parse.rs`, `scanner.rs`, `executor.rs` (version + cross-pair exclusion), CLI
-  `deploy.rs`/`lib.rs`/`cancel.rs`/`watch.rs`, and the `bytecode_stable` pin.
+  `deploy.rs`/`lib.rs`/`cancel.rs`/`cancel_all.rs`/`requote.rs`/`watch.rs`, and
+  the `bytecode_stable` pin. Fixed along the way: `cancel.rs`/`cancel_all.rs`
+  imported `build_buy_v17_cancel_sigscript` and length-gated on
+  `BUY_ORDER_V17_RS_EXPECTED_LEN` but their version gates still hard-rejected
+  `version == 17` before ever reaching that dispatch, and their RS
+  reconstruction (from cached order params) had no v17 branch at all -- so a
+  v17 order could never actually be cancelled through either command despite
+  the sigscript plumbing already being present. Both gates + reconstruction
+  now handle v17; `requote.rs`'s old-order-side (the leg being cancelled) got
+  the equivalent fix so a v17 order can be requoted, not just deployed.
+  `cancel_mark.rs`'s buy cancel-mark path (hand-inlined Op1-selector
+  sigscript) is NOT yet v17-aware -- v17 dispatches by a different selector
+  scheme and the mark(cpend 0->1) path has no engine-proven test yet, so it
+  was left v14/v16-only rather than hand-derived unverified; flagged here
+  as a residual, not silently patched. `kob-cli batch deploy-buy`, `ifd`/`ifo`
+  conditional deploys, the `kob mm` bot, and `kob-engine --mode deploy-test`
+  all construct buy orders through their own independent, pre-existing
+  hardcoded-v14 (or, for `mm`, v14-only-gated) paths, entirely bypassing
+  `deploy_buy`'s gate; that inconsistency predates this change and is out of
+  its scope.
 - **Matcher emission (`plan_batch_match`)**: a v17 buy routes to a dedicated,
   isolated `plan_batch_match_v17` that emits ONE BuyerTokens output per sell, each
   bound to its own sell input (new `BatchPlan.output_auth_input` +

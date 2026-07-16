@@ -321,11 +321,14 @@ pub async fn deploy_buy(
     mmfee_bps: Option<u64>,
 ) -> anyhow::Result<String> {
     // v14 buy has no on-chain surplus/matcher-fee cap (F6 removed) and lets a
-    // matcher keep the whole spread. New buy deploys must be v17 (the N:M-capable
-    // sweep contract, the new default) or v16 (1:1 F6 cap). v14 remains
-    // parseable/reconstructable for managing already-deployed orders.
-    if version != 16 && version != 17 {
-        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v17 (N:M sweep, default) or v16 (1:1 F6 cap) may be deployed; v14 is retained only for managing pre-existing on-chain orders.", version);
+    // matcher keep the whole spread; v16 has the F6 cap but only reads a single
+    // merged output, so it cannot settle an N-sells:1-buy sweep in one tx
+    // (see NM_BUY_DESIGN.md). v17 is a strict superset of v16 (N=1 degenerates
+    // to identical 1:1 semantics, plus a tighter toi binding), so it is now the
+    // SOLE version new buy deploys may target. v14 and v16 remain fully
+    // parseable/cancellable/servicable for orders already resting on-chain.
+    if version != 17 {
+        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v17 (N:M sweep) may be deployed; v14 and v16 are retained only for managing pre-existing on-chain orders.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;

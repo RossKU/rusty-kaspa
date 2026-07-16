@@ -144,11 +144,13 @@ pub async fn run(
 
     // Reconstruct the redeemScript using the specified contract version.
     // cancel_pending: 0 for normal orders, 1 after cancel-mark transition.
-    if version != 14 && version != 16 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 and v16 are supported.", version);
+    // v17 is not creatable anymore (deploy.rs gate) but MUST stay cancellable
+    // like v14/v16 -- it is real on-chain servicing, not a new deploy.
+    if version != 14 && version != 16 && version != 17 {
+        anyhow::bail!("Unsupported contract version {}. Only v14, v16, and v17 are supported.", version);
     }
     // Resolve max_matcher_fee: CLI override > cache > default.
-    // For v16 buys this is BPS (basis points), same semantics as v15.
+    // For v16/v17 buys this is BPS (basis points), same semantics as v15.
     let max_matcher_fee = max_matcher_fee_override.unwrap_or_else(|| {
         cached.as_ref().map_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE, |c| c.max_matcher_fee)
     });
@@ -156,7 +158,9 @@ pub async fn run(
     let redeem_script = match side {
         "buy" => {
             let tcid = parse_token_cov_id(token_cov_id_resolved.as_deref())?;
-            if version == 16 {
+            if version == 17 {
+                contract::build_buy_v17_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
+            } else if version == 16 {
                 contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
             } else {
                 contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
@@ -318,6 +322,9 @@ pub async fn run(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match side {
+            "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN => {
+                contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script)
+            }
             "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
             _ => unreachable!(),

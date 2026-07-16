@@ -25,7 +25,7 @@ Built as workspace members of [rusty-kaspa](https://github.com/kaspanet/rusty-ka
 
 | Product | Status |
 |---------|--------|
-| Spot (Buy/Sell/Partial/OCO) | v14 contract live; v16 mmfee-bps contract (F6 surplus-cap fix) deploy/cancel-proven on testnet-10, TN12 verified |
+| Spot (Buy/Sell/Partial/OCO) | v17 (N:M sweep, mmfee-bps) is the sole creatable buy contract; v14/v16 remain parse/cancel-serviced for pre-existing orders, TN12 verified |
 | Token layer | KCC20 Standard State Header (draft spec conformant, see below) |
 | Perpetuals | Oracle-free bilateral P2P |
 | Lending | Offer/Borrow/Repay/Default/Liquidate |

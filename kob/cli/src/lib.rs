@@ -690,11 +690,14 @@ pub enum Commands {
         #[arg(long)]
         new_amount: u64,
 
-        /// Contract version of the old order (14 or 16). Resolved from orders cache if omitted (defaults to 14).
+        /// Contract version of the old order being cancelled (14, 16, or 17).
+        /// Resolved from orders cache if omitted (defaults to 14).
         #[arg(long)]
         old_version: Option<u8>,
 
-        /// Contract version for new order (14 or 16).
+        /// Contract version for the new order. Sell: only 14. Buy: only 17
+        /// (v14/v16 are rejected for new deploys, same as `deploy buy`);
+        /// auto-bumped from the default to 17 when --new-side buy.
         #[arg(long, default_value = "14")]
         new_version: u8,
 
@@ -974,10 +977,12 @@ pub enum DeployCommands {
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version. v17 (N:M sweep, the default) or v16 (1:1 F6 cap)
-        /// may be deployed; v14 has no on-chain matcher-fee cap and is rejected
-        /// for new deploys. Both v16 and v17 use --mmfee-bps (BPS) instead of
-        /// --max-matcher-fee (see NM_BUY_DESIGN.md / V16_STATUS.md).
+        /// Contract version. Only v17 (N:M sweep) may be deployed for new
+        /// orders; v14 (no matcher-fee cap) and v16 (1:1-only F6 cap) are
+        /// rejected here and retained solely for managing pre-existing
+        /// on-chain orders via cancel/cancel-all/requote --old-version.
+        /// v17 uses --mmfee-bps (BPS) instead of --max-matcher-fee
+        /// (see NM_BUY_DESIGN.md / V16_STATUS.md).
         #[arg(long, default_value = "17")]
         version: u8,
 
@@ -1015,12 +1020,12 @@ pub enum DeployCommands {
         /// Maximum fee (in sompi) the matcher may extract per fill (v14).
         /// The on-chain F6 check enforces `kas_in - out[0].value <= mmfee`.
         /// mmfee=0 makes partial fills impossible. Default: 10_000_000 (0.1 KAS).
-        /// Ignored when --mmfee-bps is set (v16).
+        /// Ignored when --mmfee-bps is set (v17).
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
 
-        /// Maximum matcher fee in basis points (v16 contract).
-        /// Sets --version to 16 automatically.
+        /// Maximum matcher fee in basis points (v17 contract).
+        /// Sets --version to 17 automatically (no-op given the v17 default).
         /// E.g., 30 = 0.30% of trade value. Range: 0..=10000.
         /// When set, --max-matcher-fee is ignored.
         #[arg(long)]
@@ -1799,10 +1804,10 @@ pub async fn dispatch(
                 max_matcher_fee,
                 mmfee_bps,
             } => {
-                // v17 (N:M sweep) is now the deploy default; --mmfee-bps forces
-                // at least v16 if an older version was passed explicitly.
-                // deploy_buy rejects any non-v16/v17 version for new orders
-                // (v14 has no on-chain F6 cap).
+                // v17 (N:M sweep) is the sole deploy target; --mmfee-bps bumps
+                // an explicit --version 14 up to 17 for convenience.
+                // deploy_buy rejects any non-v17 version for new orders (v14
+                // has no on-chain F6 cap; v16 cannot settle an N:M sweep).
                 let version = if mmfee_bps.is_some() && version == 14 { 17 } else { version };
 
                 // Resolve token alias
@@ -2929,6 +2934,12 @@ pub async fn dispatch(
             };
             deploy::validate_amount_not_dust(new_amount, "--new-amount")?;
             let new_token = token::resolve_token(&new_token, None)?;
+            // v17 is the sole creatable buy contract (mirrors deploy.rs's
+            // deploy_buy gate); auto-bump the shared --new-version flag's
+            // default (14) to 17 for a new buy side so `--new-side buy`
+            // keeps working without requiring an explicit --new-version.
+            // Sell has no v16/v17 analogue and stays at 14.
+            let new_version = if new_side == "buy" && new_version == 14 { 17 } else { new_version };
             let new_params = requote::NewOrderParams {
                 side: new_side,
                 token: new_token,

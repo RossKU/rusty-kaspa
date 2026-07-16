@@ -73,15 +73,20 @@ pub async fn run(
         Ok(tcid)
     };
 
-    if version != 14 && version != 16 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 and v16 are supported.", version);
+    if version != 14 && version != 16 && version != 17 {
+        anyhow::bail!("Unsupported contract version {}. Only v14, v16, and v17 are supported.", version);
+    }
+    if version == 17 && side != "buy" {
+        anyhow::bail!("v17 is a buy-only contract; sell orders are single-version.");
     }
 
     // Reconstruct the current redeemScript (cpend=0, the active order)
     let current_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            if version == 16 {
+            if version == 17 {
+                contract::build_buy_v17_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
+            } else if version == 16 {
                 contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
             } else {
                 contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
@@ -95,7 +100,9 @@ pub async fn run(
     let target_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            if version == 16 {
+            if version == 17 {
+                contract::build_buy_v17_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
+            } else if version == 16 {
                 contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
             } else {
                 contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
@@ -267,6 +274,11 @@ pub async fn run(
 
     // Build the cancel-mark sigscript (inlined -- kob-core no longer exports these)
     let cancel_mark_sigscript = match side {
+        "buy" if version == 17 => {
+            // v17 buy cancel-mark: [pk] [sig] [Op3] [pushData(RS)] (selector at
+            // stack depth 9, so pk/sig go BELOW the selector -- see order.rs).
+            contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
+        }
         "buy" => {
             // buy cancel-mark: [Op1] [pushData(sig65)] [pushData(pk32)] [pushData(RS)]
             let mut ss = Vec::new();
@@ -297,7 +309,9 @@ pub async fn run(
     };
 
     println!("Cancel-Mark SigScript: {} bytes", cancel_mark_sigscript.len());
-    if side == "buy" {
+    if side == "buy" && version == 17 {
+        println!("  (v17 buy cancel-mark uses Op3 selector; pk/sig below the selector)");
+    } else if side == "buy" {
         println!("  (buy cancel-mark uses Op1 selector for MINIMALIF compliance)");
     } else {
         println!("  (sell cancel-mark uses Op3 selector via OpEqual dispatch)");
@@ -333,6 +347,9 @@ pub async fn run(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_mark_sigscript = match side {
+            "buy" if version == 17 => {
+                contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
+            }
             "buy" => {
                 let mut ss = Vec::new();
                 ss.push(0x51);

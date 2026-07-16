@@ -726,3 +726,42 @@ fn v17_cancel_reaches_checksig() {
         "cancel must not have a stack/number error before the signature check: {e}"
     );
 }
+
+/// Item E: the v17 CANCEL-MARK path (selector Op3, `mark=true`) dispatches
+/// correctly and reaches OpCheckSigVerify -- the same choreography as cancel
+/// (selector Op0) but via the distinct mark selector. Proves the cancel-mark
+/// sigscript the CLI now emits for a v17 buy is stack-correct end to end
+/// (a clean signature-class failure, not a stack/number mis-count).
+#[test]
+fn v17_cancel_mark_reaches_checksig() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let buy_rs = build_buy_v17_redeem_script(&arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+    let sig = [0x11u8; 64];
+    // mark=true -> Op3 selector (cancel-mark), not Op0 (cancel).
+    let ss = build_buy_v17_cancel_sigscript(&pubkey, &sig, true, &buy_rs);
+    let inputs = vec![TransactionInput::new(op(0x20, 0), ss, 0, 0)];
+    let outputs = vec![TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), None)];
+    let entries = vec![UtxoEntry { amount: 30_000_000, script_public_key: build_p2sh(&buy_rs), block_daa_score: 0, is_coinbase: false, covenant_id: None }];
+    let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).unwrap();
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let reused = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+    let (input, entry) = populated.populated_input(0);
+    let mut vm = TxScriptEngine::from_transaction_input(&populated, input, 0, entry, ctx, flags);
+    let e = format!("{:?}", vm.execute().unwrap_err());
+    assert!(
+        e.contains("Sig") || e.contains("sig") || e.contains("Verify") || e.contains("Null") || e.contains("Schnorr"),
+        "cancel-mark must reach OpCheckSigVerify (signature failure), got: {e}"
+    );
+    assert!(
+        !e.contains("NumberTooBig") && !e.contains("InvalidStack") && !e.contains("pick"),
+        "cancel-mark must not have a stack/number error before the signature check: {e}"
+    );
+}

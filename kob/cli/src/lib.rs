@@ -205,7 +205,9 @@ pub enum Commands {
         #[arg(long)]
         order_value: Option<u64>,
 
-        /// Contract version (14 or 16). Must match the version used to deploy the order.
+        /// Contract version (14, 16, or 17). Must match the version used to
+        /// deploy the order. For v17, --max-matcher-fee is the deployed
+        /// mmfee_bps (BPS), not sompi, since v17 reconstructs from that.
         #[arg(long, default_value_t = 14)]
         version: u8,
 

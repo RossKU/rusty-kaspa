@@ -42,6 +42,7 @@ pub mod prediction;
 pub mod insurance;
 pub mod swap;
 pub mod watch;
+pub mod listing;
 
 use clap::Subcommand;
 
@@ -529,6 +530,12 @@ pub enum Commands {
     Bracket {
         #[command(subcommand)]
         action: bracket::BracketCommand,
+    },
+
+    /// Listing auction (english/dutch/fixed): deploy, settle.
+    Listing {
+        #[command(subcommand)]
+        action: listing::ListingCommand,
     },
 
     /// Option contracts: deploy-call, deploy-put, exercise, cancel, expire.
@@ -2817,6 +2824,9 @@ pub async fn dispatch(
         },
         Commands::Option { action } => {
             options::run(wallet_path, node, network, &action).await?;
+        }
+        Commands::Listing { action } => {
+            listing::run(&action, wallet_path, node, network).await?;
         }
         Commands::Batch { file } => {
             batch::run(wallet_path, node, network, &file, fee).await?;

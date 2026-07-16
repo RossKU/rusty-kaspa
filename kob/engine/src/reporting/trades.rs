@@ -47,6 +47,26 @@ pub struct RoutingInfo {
     pub surplus: u64,
 }
 
+/// The single canonical pair-id scheme, used everywhere a trading pair is
+/// identified: the order book (`OrderBook::pair_books` is keyed by the raw
+/// `token_cov_id`), the trade log/durable ledger (`Trade::pair_id`), the
+/// candle aggregator, and every API handler's `pair` query param
+/// (`/pairs`, `/depth`, `/spread`, `/trades`, `/klines`, `/ticker`).
+///
+/// P0 fix: `record_trade` used to build a DIFFERENT key --
+/// `format!("{}/KAS", &token_cov_id[..16])`, a truncated 16-hex-char prefix
+/// plus a literal `/KAS` suffix -- while `/pairs`/`/depth`/`/spread` keyed by
+/// the full 64-hex `token_cov_id`. No single `pair` value satisfied both, so
+/// a client following `/pairs` -> `/trades?pair=...` got zero results. This
+/// function is the single source of truth: the canonical pair-id IS the
+/// full `token_cov_id`, unmodified, matching `OrderBook::pair_books`'s key
+/// exactly. (A human-readable `TOKEN/KAS` display symbol is layered on top
+/// by a future symbol registry -- out of scope here -- not baked into the
+/// lookup key.)
+pub fn canonical_pair_id(token_cov_id: &str) -> String {
+    token_cov_id.to_string()
+}
+
 /// A single executed trade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
@@ -1198,6 +1218,16 @@ mod tests {
 
         let result = log.range("pairA", None, None, 100);
         assert_eq!(result.len(), 2);
+    }
+
+    // P0 fix: canonical_pair_id must match OrderBook::pair_books' key exactly
+
+    #[test]
+    fn canonical_pair_id_is_the_full_token_cov_id_unmodified() {
+        let token_cov_id = "ab".repeat(32); // 64-hex, same shape as a real token_cov_id
+        assert_eq!(canonical_pair_id(&token_cov_id), token_cov_id, "must be the identity transform");
+        assert_eq!(canonical_pair_id(&token_cov_id).len(), 64, "must not truncate");
+        assert!(!canonical_pair_id(&token_cov_id).contains("/KAS"), "must not append a display suffix");
     }
 
     // PendingTrades: submission-time staging for confirmation-time persistence

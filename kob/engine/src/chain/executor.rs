@@ -2790,7 +2790,9 @@ async fn record_trade(
         .unwrap_or_default()
         .as_secs();
 
-    let pair_id = format!("{}/KAS", &token_cov_id[..token_cov_id.len().min(16)]);
+    // P0 fix: pair_id must match the order book's pair_books key exactly
+    // (the full token_cov_id) -- see `canonical_pair_id` doc comment.
+    let pair_id = crate::matcher::trades::canonical_pair_id(token_cov_id);
 
     let trade = Trade {
         txid: txid.to_string(),
@@ -6922,6 +6924,88 @@ mod tests {
             "populated counterparty_spk must pass");
     }
 
+    // P0 fix: pair-id consistency between the order book and the trade log
+
+    /// Regression for the pair-id inconsistency: `/api/v1/pairs`/`/depth`
+    /// key by the full 64-hex `token_cov_id` (the `OrderBook::pair_books`
+    /// key); `record_trade` used to build a DIFFERENT truncated key. Prove
+    /// that a `pair` value obtained by listing the order book (simulating
+    /// `/pairs`) now resolves BOTH the book lookup AND the trade-log lookup
+    /// (simulating a client following `/pairs` -> `/trades?pair=...`).
+    #[tokio::test]
+    async fn pair_id_from_order_book_resolves_in_trade_log() {
+        use crate::matcher::api::SharedState;
+        use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+        use crate::matcher::stop_book::StopOrderBook;
+        use crate::matcher::trailing_stop::TrailingStopBook;
+
+        let token_cov_id = "ab".repeat(32); // 64-hex, matches a real token_cov_id shape
+
+        // Discover an order under this token, exactly as the scanner would.
+        let order_book = OrderBook::new();
+        let ob_arc = Arc::new(Mutex::new(order_book));
+        {
+            let mut ob = ob_arc.lock().await;
+            ob.add_sell_order(BookOrder {
+                tx_id: "c".repeat(64),
+                index: 0,
+                value: 10_000_000,
+                token_cov_id: token_cov_id.clone(),
+                price_num: 1,
+                price_den: 2,
+                min_fill: 1_000_000,
+                owner_hash: "dd".repeat(32),
+                spk_hash: "ee".repeat(32),
+                counterparty_spk: None,
+                redeem_script_hex: String::new(),
+                p2sh_script_hex: String::new(),
+                p2sh_version: 0,
+                side: OrderSide::Sell,
+                post_only: false,
+                expiry_daa: None,
+                is_freezable: false,
+                max_matcher_fee: u64::MAX,
+                ifd_order_b_rs_hex: None,
+                oco_path: None,
+                oco_partner_key: None,
+                discovered_daa: 0,
+            });
+        }
+
+        // Simulate `GET /api/v1/pairs`: list the order book's pair keys.
+        let pair_from_listing: String = {
+            let ob = ob_arc.lock().await;
+            ob.pair_books.keys().next().cloned().expect("one pair book must exist")
+        };
+        assert_eq!(pair_from_listing, token_cov_id, "book key must be the full token_cov_id");
+
+        // Record a trade under the SAME token_cov_id, as the executor does
+        // after settling a match on this pair.
+        let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
+        let sb = Arc::new(Mutex::new(StopOrderBook::new()));
+        let tb = Arc::new(Mutex::new(TrailingStopBook::new()));
+        let shared: AppState = Arc::new(tokio::sync::RwLock::new(
+            SharedState::new(ws_tx, ob_arc, sb, tb),
+        ));
+        record_trade(Some(&shared), "settle_tx", &token_cov_id, 1, 2, 10_000_000, Side::Sell, None).await;
+
+        // Simulate `GET /api/v1/trades?pair=<pair_from_listing>`: the value
+        // obtained from the book listing must resolve trades directly, with
+        // NO reformatting needed by the client.
+        let state = shared.read().await;
+        let trades = state.trade_log.recent(&pair_from_listing, 10);
+        assert_eq!(trades.len(), 1, "the pair value from /pairs must resolve in the trade log");
+        assert_eq!(trades[0].txid, "settle_tx");
+
+        // The OLD (pre-fix) truncated-prefix scheme must NOT be what trades
+        // are keyed under any more.
+        let old_scheme_key = format!("{}/KAS", &token_cov_id[..16]);
+        assert!(
+            state.trade_log.recent(&old_scheme_key, 10).is_empty(),
+            "trades must no longer be keyed under the old truncated pair-id scheme"
+        );
+    }
+
     // Trade Bridge Tests (record_trade -> SharedState)
 
     #[tokio::test]
@@ -7057,7 +7141,7 @@ mod tests {
     }
 
     fn h3_pair_id(token_cov_id: &str) -> String {
-        format!("{}/KAS", &token_cov_id[..token_cov_id.len().min(16)])
+        crate::matcher::trades::canonical_pair_id(token_cov_id)
     }
 
     /// Submission-time `record_trade` must NOT write to the durable ledger:

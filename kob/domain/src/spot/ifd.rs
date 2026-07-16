@@ -448,6 +448,99 @@ pub fn compute_oco_b_scripts(
     ))
 }
 
+/// Build order B's redeem script and P2SH from IFD parameters — v18
+/// generation (kob/V18_DESIGN.md "IFD / IFO — MANDATORY").
+///
+/// Same contract as `compute_order_b_scripts`, but the done-leg RS is a v18
+/// buy/sell, so the emitted order is automatically sweep/batch-eligible under
+/// the v18 planners. `max_matcher_fee_bps` is REQUIRED and is basis points
+/// (v18 uniform; the v14 absolute-sompi `DEFAULT_MAX_MATCHER_FEE` is invalid
+/// for v18 builders, which reject bps > 10000). The caller (engine/CLI) must
+/// use ONE fixed value across registration and trigger, or the precomputed
+/// P2SH will not match the deployed order.
+///
+/// Returns (rs_bytes, p2sh_script_hex, spk_hash_hex).
+pub fn compute_order_b_scripts_v18(
+    params: &OrderBParams,
+    owner_hash: &[u8; 32],
+    owner_spk_hash: &[u8; 32],
+    max_matcher_fee_bps: u64,
+) -> Result<(Vec<u8>, String, String), String> {
+    let token_bytes = parse_hex_32(&params.token)?;
+
+    let rs = match params.side {
+        IfdSide::Buy => kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &token_bytes,
+            params.price_num,
+            params.price_den,
+            params.min_fill,
+            owner_hash,
+            owner_spk_hash,
+            max_matcher_fee_bps,
+            0, // cancel_pending
+            params.expiry_daa,
+        )
+        .map_err(|e| e.to_string())?,
+        IfdSide::Sell => kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            params.price_num,
+            params.price_den,
+            params.min_fill,
+            owner_hash,
+            owner_spk_hash,
+            max_matcher_fee_bps,
+            0, // cancel_pending
+            params.expiry_daa,
+        )
+        .map_err(|e| e.to_string())?,
+    };
+
+    let p2sh_spk = kob_core::p2sh::build_p2sh(&rs);
+    let p2sh_hex = hex::encode(p2sh_spk.script());
+    let spk_hash = kob_core::p2sh::compute_spk_hash(p2sh_spk.version, &p2sh_spk.script());
+    let spk_hash_hex = hex::encode(spk_hash);
+
+    Ok((rs, p2sh_hex, spk_hash_hex))
+}
+
+/// Build order B's OCO sell redeem script for IFO — v18 generation.
+///
+/// The done-leg is a v18 OCO sell: both TP and SL branches carry the
+/// canonical price attestation, so (unlike the v1 OCO) the emitted order is
+/// sweep-eligible on BOTH branches. `max_matcher_fee_bps` as in
+/// `compute_order_b_scripts_v18`.
+///
+/// Returns (rs, p2sh_hex).
+pub fn compute_oco_b_scripts_v18(
+    _token: &str,
+    oco: &IfoOcoParams,
+    owner_hash: &[u8; 32],
+    owner_spk: &[u8; 36],
+    max_matcher_fee_bps: u64,
+) -> Result<(Vec<u8>, String), String> {
+    // Seller SPK hash from owner_spk (version 2B LE + script 34B), same
+    // convention as the v1 helper.
+    let seller_spk_hash = kob_core::p2sh::blake2b_256(owner_spk);
+
+    let rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+        oco.tp_price_num,
+        oco.tp_price_den,
+        oco.tp_min_fill,
+        oco.sl_price_num,
+        oco.sl_price_den,
+        oco.sl_min_fill,
+        owner_hash,
+        &seller_spk_hash,
+        max_matcher_fee_bps,
+        0, // cancel_pending
+        0, // expiry_daa (GTC)
+    )
+    .map_err(|e| e.to_string())?;
+
+    let p2sh = kob_core::p2sh::build_p2sh(&rs);
+
+    Ok((rs, hex::encode(p2sh.script())))
+}
+
 fn parse_hex_32(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {}", e))?;
     if bytes.len() != 32 {
@@ -927,6 +1020,68 @@ mod tests {
         assert_eq!(p2sh.len(), 70); // P2SH script hex = 35 bytes * 2
     }
 
+
+    #[test]
+    fn compute_order_b_scripts_v18_buy_and_sell() {
+        let owner_hash = [0xbb; 32];
+        let spk_hash = [0xcc; 32];
+        let mut params = make_order_b_params(); // Sell
+        let (rs, p2sh_hex, spk_hash_hex) =
+            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, 30).unwrap();
+        assert_eq!(
+            rs.len(),
+            kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN,
+            "IFD sell done-leg must be a v18 sell RS"
+        );
+        assert_eq!(p2sh_hex.len(), 70);
+        assert!(!spk_hash_hex.is_empty());
+
+        params.side = IfdSide::Buy;
+        let (rs, p2sh_hex, _) =
+            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, 30).unwrap();
+        assert_eq!(
+            rs.len(),
+            kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN,
+            "IFD buy done-leg must be a v18 buy RS"
+        );
+        assert_eq!(p2sh_hex.len(), 70);
+
+        // v18 mmfee is BPS: the v14 sompi default (10_000_000) must be
+        // rejected by the underlying builder, not silently embedded.
+        assert!(
+            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE).is_err(),
+            "sompi-scale mmfee must be rejected for v18 (bps only)"
+        );
+    }
+
+    #[test]
+    fn compute_oco_b_scripts_v18_produces_v18_oco_sell() {
+        let owner_hash = [0xbb; 32];
+        let mut owner_spk = [0u8; 36];
+        owner_spk[2] = 0x20;
+        owner_spk[3..35].copy_from_slice(&[0xdd; 32]);
+        owner_spk[35] = 0xac;
+
+        let oco = IfoOcoParams {
+            tp_side: IfdSide::Sell,
+            tp_price_num: 150,
+            tp_price_den: 1,
+            tp_min_fill: 100_000,
+            sl_side: IfdSide::Sell,
+            sl_price_num: 80,
+            sl_price_den: 1,
+            sl_min_fill: 100_000,
+        };
+
+        let (rs, p2sh) =
+            compute_oco_b_scripts_v18(&"aa".repeat(32), &oco, &owner_hash, &owner_spk, 30).unwrap();
+        assert_eq!(
+            rs.len(),
+            kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE,
+            "IFO done-leg must be a v18 OCO sell RS (sweep-eligible on both branches)"
+        );
+        assert_eq!(p2sh.len(), 70);
+    }
 
     #[test]
     fn order_b_type_serde_roundtrip_simple() {

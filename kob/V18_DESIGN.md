@@ -52,6 +52,11 @@ State: current 174B + `mmfee_bps` 8B. All-or-nothing legs only (no ring partial 
 ## Version model
 `parse_redeem_script` dispatches on v18 RS lengths (+ bracket 365 + token/perp untouched); `version` u8 reports 18. Deploy paths bail on anything non-v18. After deletion stage, drop `_v18` suffixes → plain names, single `SPOT_GENERATION` const.
 
+## IFD / IFO — MANDATORY (added 2026-07-16, MK directive)
+IFD (if-done) and IFO (IFD-OCO) are release-required, not optional. Port to v18: entry leg = v18 buy/sell; on-fill the done-leg order (plain sell for IFD, OCO sell for IFO) must be emitted with v18 RS. If the existing ifd.rs/bracket mechanism needs a core-side v18 bracket contract, build it (same canonical attestation rules). Done-leg orders are ordinary v18 sells/OCOs ⇒ automatically sweep/batch-eligible.
+
+Note (supersedes any trigger language): KOB has no market-price concept — consistency comes from arbitrage only. OCO SL is simply the alternative limit price; the covenant guarantees execution price, branch selection belongs to matchers/arbitrage. No trigger semantics exist or are needed on-chain.
+
 ## Stages (each ends: build green → commit, RossKU style, no AI mentions)
 - **A core**: order.rs buy/sell v18, oco.rs v18, swap.rs v18, parse.rs v18 arm, adversarial tests (port NM_BUY_DESIGN Sec 6 + new: residual-SPK forgery incl. same-RS dual-buy, attestation mismatch TP/SL/plain, decoy giver_idx, ring slot-0 theft, partial grind arithmetic, mfill boundaries, Op2/Op5 confusion, cpend-partial reject, uniqueness-guard bounds at 16 inputs).
 - **B domain**: planners v18 (batch GTC/IOC, sell-IOC parity, partial planning, plan_ring_match), D pin test, build_tx sigscript emission on canonical layout.

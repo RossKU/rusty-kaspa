@@ -42,22 +42,31 @@ use kob_core::contract::spot::oco::{
     build_oco_sell_sl_fill_sigscript_fixed_offset,
     build_oco_sell_tp_fill_sigscript,
     build_oco_sell_tp_fill_sigscript_fixed_offset,
+    build_oco_sell_v18_sl_fill_sigscript,
+    build_oco_sell_v18_tp_fill_sigscript,
 };
 use kob_core::contract::spot::order::{
     BUY_ORDER_V16_RS_EXPECTED_LEN,
     BUY_ORDER_V17_MAX_N,
     BUY_ORDER_V17_RS_EXPECTED_LEN,
+    BUY_ORDER_V18_MAX_N,
+    BUY_ORDER_V18_RS_EXPECTED_LEN,
     build_buy_fill_sigscript,
     build_buy_ioc_fill_sigscript,
     build_buy_v16_fill_sigscript,
     build_buy_v16_ioc_fill_sigscript,
     build_buy_v16_partial_fill_sigscript,
     build_buy_v17_fill_sigscript,
+    build_buy_v18_fill_sigscript,
+    build_buy_v18_partial_fill_sigscript,
     build_sell_fill_sigscript,
     build_sell_fill_sigscript_fixed_offset,
     build_sell_ioc_fill_sigscript,
     build_sell_ioc_fill_sigscript_fixed_offset,
+    build_sell_v18_fill_sigscript,
+    build_sell_v18_ioc_fill_sigscript,
 };
+use kob_core::contract::spot::swap::{parse_swap_order_v18_rs, build_swap_v18_fill_sigscript, SWAP_V18_RS_SIZE};
 use kob_core::contract::spot::bracket::build_bracket_fill_sigscript;
 use kob_core::contract::spot::parse::BRACKET_RS_SIZE;
 
@@ -156,6 +165,17 @@ pub enum OutputPurpose {
     SellRemainder,
     /// Buyer change (surplus exceeding bps cap returned to buyer).
     BuyerChange,
+    /// v18 buy Op2 partial: the buy's residual continuation. Same P2SH SPK as
+    /// the buy input (byte-exact, enforced on-chain), NO covenant binding —
+    /// the unspent KAS becomes a normal v18 buy UTXO again (chainable).
+    BuyResidual,
+    /// Ring settle: a swap leg's source-token delivery to its receiver.
+    /// Must be auth slot 0 of the giver input (covenant binding attached by
+    /// the executor per `RingPlan::output_auth_input`).
+    RingDelivery,
+    /// Ring settle: matcher token skim, capped by the giver's F4 conservation
+    /// cap. Sits at auth slots >= 1 of the giver input (after its delivery).
+    MatcherSkim,
 }
 
 /// A planned output in the batch TX.
@@ -228,18 +248,58 @@ pub enum BatchError {
     /// `oco_f4_shared_output_drain_rejected` / `oco_f4_honest_per_input_outputs_pass`
     /// in `core/tests/toccata_fill_repro.rs`).
     ///
-    /// This composition-layer exclusion is nonetheless KEPT as the shipping
-    /// boundary (defense-in-depth): fully enabling OCO sweeps additionally
-    /// requires resolving the OCO-SL fixed-offset price-read mismatch -- a
-    /// v16/v17 buy reads the swept sell's price via `OpTxInputScriptSigSubstr`
-    /// at fixed offsets `[7..15)`/`[16..24)`, which land on the OCO RS's
-    /// `pnum_tp`/`pden_tp` (correct for a TP fill, WRONG for an SL fill, which
-    /// executes at `pnum_sl`/`pden_sl`). Composing an OCO-SL sell would let the
-    /// buy fair-price the term at the TP price while the seller delivers at the
-    /// SL price, weakening the buyer's surplus cap. Until that price alignment
-    /// is designed, OCO sells stay excluded from multi-sell sweeps. A solo
-    /// (1-sell) OCO fill is unaffected and always allowed.
+    /// This composition-layer exclusion is KEPT for PRE-v18 generations only.
+    /// The real remaining blocker there is the OCO-SL fixed-offset price-read
+    /// mismatch -- a v16/v17 buy reads the swept sell's price via
+    /// `OpTxInputScriptSigSubstr` at fixed offsets `[7..15)`/`[16..24)`, which
+    /// land on the OCO RS's `pnum_tp`/`pden_tp` (correct for a TP fill, WRONG
+    /// for an SL fill, which executes at `pnum_sl`/`pden_sl`). Composing an
+    /// OCO-SL sell would let the buy fair-price the term at the TP price while
+    /// the seller delivers at the SL price, weakening the buyer's surplus cap.
+    ///
+    /// v18 SOLVES this with the canonical price attestation: every fill-family
+    /// sigscript carries `(pnum, pden)` at fixed offsets [3..11)/[12..20) and
+    /// the OCO body verifies the attested pair equals the *executing branch's*
+    /// state pair (TP: pnum_tp/pden_tp; SL: pnum_sl/pden_sl). v18 OCO sells are
+    /// therefore sweep-eligible on BOTH branches (`plan_batch_match_v18` /
+    /// `plan_ioc_match_v18` / `plan_partial_match_v18`) and this error is never
+    /// returned for them. A solo (1-sell) OCO fill is unaffected in any
+    /// generation.
     OcoMultiSellSweepUnsupported { outpoint: String },
+    /// A v18 sweep was asked to include more sells than the contract's
+    /// compile-time `BUY_ORDER_V18_MAX_N` slot count (same failure mode as
+    /// `V17TooManySells`: the sigscript builder `assert!`s and panics; the
+    /// planner rejects gracefully well before that point).
+    V18TooManySells { count: usize, max: usize },
+    /// More than one v18 buy in a single settle tx (item D, fail-closed BY
+    /// PROOF — see `test_v18_multi_buy_rejected` for the engine-model
+    /// argument: delivery outputs can only bind to tcid inputs, never to a
+    /// buy, so cross-buy disjointness is unprovable on-chain).
+    V18MultiBuyUnsupported { count: usize },
+    /// A v18 sell that would keep a token residual cannot settle against a
+    /// v18 buy covenant in the same tx — STRUCTURAL, not a planner policy:
+    /// the buy derives its delivery as `OpAuthOutputIdx(tii, 0)` (auth slot 0
+    /// of the sell input, buyer-SPK checked) while the sell's IOC/partial F4
+    /// requires that same slot 0 to be its self-SPK residual continuation.
+    /// Both cannot hold at once, so v18 sweeps are full-fill-only (exactly
+    /// the V18_DESIGN.md note). Such books settle when a counterparty fully
+    /// consumes the sell (buy-anchored GTC/IOC/partial planners) or via a
+    /// matcher-as-counterparty sell-partial settle (no buy input).
+    V18SellResidualUnsupported { outpoint: String, utxo_value: u64, filled_tokens: u64 },
+    /// v18 accounting: the buy contract's surplus cap
+    /// (`spent - fair_sum <= spent/10000*mmfee_bps`) cannot be satisfied even
+    /// at zero matcher surplus (integer-rounding gap exceeds the allowance).
+    V18CapInfeasible { spent: u64, fair_sum: u64, cap: u64 },
+    /// Ring: leg count outside `2..=RING_MAX`.
+    RingLegCount { count: usize },
+    /// Ring: the legs do not form a closed cycle (leg i's target token must
+    /// equal leg (i+1)%n's source token, all source tokens pairwise distinct).
+    RingNotClosed { index: usize },
+    /// Ring: a leg's `min_target` floor cannot be met by its giver's amount.
+    RingInfeasible { leg: usize, needed: u64, available: u64 },
+    /// Ring: a leg failed v18 swap-order validation (bad RS, owner SPK
+    /// mismatch, etc.).
+    RingInvalidLeg { outpoint: String, reason: &'static str },
     /// A v17 sweep was asked to include more sells than the contract's
     /// compile-time `BUY_ORDER_V17_MAX_N` slot count.
     ///
@@ -290,10 +350,34 @@ impl std::fmt::Display for BatchError {
                 write!(f, "OCO sell {} cannot be partially filled (utxo_value={} filled_tokens={}); OCO v1 covenant has no IOC path", outpoint, utxo_value, filled_tokens)
             }
             BatchError::OcoMultiSellSweepUnsupported { outpoint } => {
-                write!(f, "OCO sell {} cannot be composed into a multi-sell sweep (2+ sells in one tx); OCO_SELL_BODY's F4 still uses the pre-Fix-3 shared output index", outpoint)
+                write!(f, "OCO sell {} cannot be composed into a pre-v18 multi-sell sweep (2+ sells in one tx); the pre-v18 fixed-offset price read lands on the TP pair even for an SL fill (the F4 drain itself was closed by the per-input Fix-3 rewrite). v18 OCO sells attest the executing branch's price and ARE sweep-eligible", outpoint)
             }
             BatchError::V17TooManySells { count, max } => {
                 write!(f, "v17 sweep has {} sells, exceeds BUY_ORDER_V17_MAX_N={}", count, max)
+            }
+            BatchError::V18TooManySells { count, max } => {
+                write!(f, "v18 sweep has {} sells, exceeds BUY_ORDER_V18_MAX_N={}", count, max)
+            }
+            BatchError::V18MultiBuyUnsupported { count } => {
+                write!(f, "v18 settle has {} buys; only 1 v18 buy per settle tx is provable on-chain (item D fail-closed pin)", count)
+            }
+            BatchError::V18SellResidualUnsupported { outpoint, utxo_value, filled_tokens } => {
+                write!(f, "v18 sell {} would keep a token residual ({} of {} filled); a v18 partial sell cannot settle against a v18 buy in the same tx (auth-slot-0 conflict: buy delivery vs sell residual)", outpoint, filled_tokens, utxo_value)
+            }
+            BatchError::V18CapInfeasible { spent, fair_sum, cap } => {
+                write!(f, "v18 surplus cap infeasible: spent={} fair_sum={} allowed cap={}", spent, fair_sum, cap)
+            }
+            BatchError::RingLegCount { count } => {
+                write!(f, "ring has {} legs; supported range is 2..={}", count, RING_MAX)
+            }
+            BatchError::RingNotClosed { index } => {
+                write!(f, "ring does not close at leg {} (target token != next leg's source token, or duplicate source tokens)", index)
+            }
+            BatchError::RingInfeasible { leg, needed, available } => {
+                write!(f, "ring leg {} needs min_target {} but its giver only holds {}", leg, needed, available)
+            }
+            BatchError::RingInvalidLeg { outpoint, reason } => {
+                write!(f, "ring leg {} invalid: {}", outpoint, reason)
             }
         }
     }
@@ -452,6 +536,16 @@ impl BatchPlan {
                 || b.redeem_script.len() == BUY_ORDER_V17_RS_EXPECTED_LEN
         });
 
+        // v18 detection: a v18 buy reads each swept sell's price at the
+        // CANONICAL attestation offsets (pnum at sigscript [3..11), pden at
+        // [12..20)) on the covenant-authenticated tii, so every sell in a v18
+        // settle must use the v18 attested sigscript builders (which also make
+        // the sell body itself verify the attested pair against the executing
+        // branch's state pair).
+        let has_v18_buy = self.buys.iter().any(|(b, _)| {
+            b.redeem_script.len() == BUY_ORDER_V18_RS_EXPECTED_LEN
+        });
+
         // === Build sell inputs ===
         for (i, (sell, input_idx)) in self.sells.iter().enumerate() {
             // Use merged sell_output_idx if populated, else fall back to input_idx (legacy 1:1).
@@ -469,7 +563,40 @@ impl BatchPlan {
             let has_remainder = self.sell_fill_amounts.get(i)
                 .map_or(false, |&fta| fta < sell.utxo_value);
 
-            let ss = if let Some(oco_path) = sell.oco_path {
+            let ss = if has_v18_buy {
+                // v18 canonical attested sigscripts. The attested (pnum, pden)
+                // is this sell's OWN price pair — for an OCO term that is the
+                // EXECUTING branch's pair (the scanner books each OCO path as
+                // its own order carrying that branch's price), which is what
+                // the OCO v18 body verifies and what unlocked OCO sweep
+                // eligibility on both branches.
+                if let Some(oco_path) = sell.oco_path {
+                    match oco_path {
+                        kob_core::OcoPath::TakeProfit => build_oco_sell_v18_tp_fill_sigscript(
+                            koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
+                        ),
+                        kob_core::OcoPath::StopLoss => build_oco_sell_v18_sl_fill_sigscript(
+                            koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
+                        ),
+                    }
+                } else if has_remainder && !self.sell_fill_amounts.is_empty() {
+                    // v18 sell keeping a residual (Op5 IOC + fta). NOTE: this
+                    // shape is structurally incompatible with being a term of
+                    // a v18 buy in the same tx (the buy reads this input's
+                    // auth slot 0 as its delivery; the sell's F4 requires that
+                    // same slot to be the self-SPK residual). The v18 planners
+                    // never compose it — see
+                    // `BatchError::V18SellResidualUnsupported`.
+                    let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
+                    build_sell_v18_ioc_fill_sigscript(
+                        koi as u16, sell.price_num, sell.price_den, fta, &sell.redeem_script,
+                    )
+                } else {
+                    build_sell_v18_fill_sigscript(
+                        koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
+                    )
+                }
+            } else if let Some(oco_path) = sell.oco_path {
                 if has_remainder {
                     // OCO sell with remainder: use IOC fill (Op5 + fta) instead
                     // of TP/SL full-fill path to avoid F4 value check failure.
@@ -568,7 +695,33 @@ impl BatchPlan {
             // token output via OpAuthOutputIdx (no toi/coi needed here).
             let v17_sells = self.buy_sweep_sells.get(buy_idx).filter(|v| !v.is_empty());
 
-            let ss = if let Some(sell_indices) = v17_sells {
+            // v18 buys are ALWAYS spent via the tii-list sigscript forms
+            // (fill/IOC/partial); the v18 planners populate buy_sweep_sells
+            // for them, so a v18 buy without a sweep list is a planner bug.
+            let is_v18 = buy.redeem_script.len() == BUY_ORDER_V18_RS_EXPECTED_LEN;
+
+            let ss = if is_v18 {
+                let sell_indices = match v17_sells {
+                    Some(s) => s,
+                    None => {
+                        return Err(BatchError::UnsupportedVersion {
+                            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+                            version: 18,
+                        });
+                    }
+                };
+                if let Some(&(_spent, residual_idx, _)) = self.buy_partial_fills.get(&buy_idx) {
+                    // Op2 partial: [tii_1..tii_MAX_N][N][ri][Op2][RS]. The
+                    // second tuple field carries the residual OUTPUT index
+                    // (v14/v16 partials use the same slot for their ri).
+                    build_buy_v18_partial_fill_sigscript(
+                        sell_indices, residual_idx, &buy.redeem_script,
+                    )
+                } else {
+                    let ioc = self.ioc_mode == Some(IocSide::Buy);
+                    build_buy_v18_fill_sigscript(sell_indices, ioc, &buy.redeem_script)
+                }
+            } else if let Some(sell_indices) = v17_sells {
                 let ioc = self.ioc_mode == Some(IocSide::Buy);
                 build_buy_v17_fill_sigscript(sell_indices, ioc, &buy.redeem_script)
             } else if is_bracket {
@@ -708,7 +861,7 @@ impl BatchPlan {
         // missed when v17 landed, silently rejecting an otherwise-correctly
         // planned v17 sweep at this late stage).
         for (sell, _) in &self.sells {
-            if sell.version != 14 {
+            if sell.version != 14 && sell.version != 18 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
                     version: sell.version,
@@ -716,7 +869,7 @@ impl BatchPlan {
             }
         }
         for (buy, _) in &self.buys {
-            if buy.version != 14 && buy.version != 16 && buy.version != 17 {
+            if buy.version != 14 && buy.version != 16 && buy.version != 17 && buy.version != 18 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                     version: buy.version,
@@ -1103,6 +1256,17 @@ pub fn plan_batch_match(
         }
     }
 
+    // v18 (unified spot) is handled by its own planner: ONE v18 buy sweeping
+    // up to BUY_ORDER_V18_MAX_N v18 sells — plain and/or OCO; v18 OCO sells
+    // are sweep-eligible on BOTH branches thanks to the canonical branch
+    // attestation. Dispatch BEFORE the v14 sell-version gate and the pre-v18
+    // OCO exclusion below, which do not apply to v18.
+    if buys.iter().any(|b| b.version == 18) || sells.iter().any(|s| s.version == 18) {
+        return plan_batch_match_v18(
+            sells, buys, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps,
+        );
+    }
+
     // Validate order versions (v14 for buys/sells, v16 for buy (F6-fix) or bracket entry)
     for sell in sells {
         if sell.version != 14 {
@@ -1112,7 +1276,8 @@ pub fn plan_batch_match(
             });
         }
     }
-    // RELEASE-BLOCKER #1: exclude OCO sells from any multi-sell composition.
+    // RELEASE-BLOCKER #1 (pre-v18 generations only; v18 dispatched above):
+    // exclude OCO sells from any multi-sell composition.
     // See BatchError::OcoMultiSellSweepUnsupported for the fund-drain this
     // guards against. A solo OCO sell (sells.len() == 1) is unaffected.
     if sells.len() > 1 {
@@ -2398,6 +2563,1226 @@ pub fn plan_sell_ioc_match(
     })
 }
 
+// ═════════════════════════════════════════════════════════════════════════
+// v18 planners (Stage B, kob/V18_DESIGN.md) — ADDITIVE; pre-v18 planners
+// above are untouched and die with Stage E.
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Parse `mmfee_bps` out of a v18 buy redeemScript (state offset [127..135)).
+///
+/// State layout (145B): `[0x20 tcid][0x08 pnum][0x08 pden][0x08 mfill]`
+/// `[0x20 ohash][0x20 bspkh][0x08 mmfee][cpend][0x08 expiry]` — mmfee bytes
+/// start after 1+32+1+8+1+8+1+8+1+32+1+32+1 = 127.
+fn parse_v18_buy_mmfee_bps(rs: &[u8]) -> Option<u64> {
+    if rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN {
+        return None;
+    }
+    Some(u64::from_le_bytes(rs[127..135].try_into().ok()?))
+}
+
+/// Contract-order fair value of a full-filled sell term, exactly as the v18
+/// buy's PASS 2 computes it: `floor(tokens / pden) * pnum` (read from the
+/// canonical attestation, which equals the sell's own state pair).
+fn v18_fair_kas(tokens: u64, pnum: u64, pden: u64) -> u128 {
+    (tokens as u128 / pden as u128) * pnum as u128
+}
+
+/// Shared v18 sweep validation: exactly one v18 buy, `<= BUY_ORDER_V18_MAX_N`
+/// v18 sells of the buy's token (plain and/or OCO — v18 OCO sells are
+/// sweep-eligible on both branches), no duplicate outpoints.
+fn validate_v18_sweep(sells: &[BatchOrder], buys: &[BatchOrder]) -> Result<(), BatchError> {
+    if sells.is_empty() {
+        return Err(BatchError::NoSellOrders);
+    }
+    if buys.is_empty() {
+        return Err(BatchError::NoBuyOrders);
+    }
+    // Item D pin: never more than ONE v18 buy per settle (fail-closed by
+    // proof — see `test_v18_multi_buy_rejected`).
+    if buys.len() > 1 {
+        return Err(BatchError::V18MultiBuyUnsupported { count: buys.len() });
+    }
+    let buy = &buys[0];
+    if buy.version != 18 {
+        return Err(BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        });
+    }
+    if sells.len() > BUY_ORDER_V18_MAX_N {
+        return Err(BatchError::V18TooManySells {
+            count: sells.len(),
+            max: BUY_ORDER_V18_MAX_N,
+        });
+    }
+    let mut seen = HashSet::new();
+    for o in sells.iter().chain(buys.iter()) {
+        let key = format!("{}:{}", o.outpoint.0, o.outpoint.1);
+        if !seen.insert(key.clone()) {
+            return Err(BatchError::DuplicateOutpoint(key));
+        }
+    }
+    for (i, s) in sells.iter().enumerate() {
+        if s.version != 18 {
+            return Err(BatchError::UnsupportedVersion {
+                outpoint: format!("{}:{}", s.outpoint.0, s.outpoint.1),
+                version: s.version,
+            });
+        }
+        if s.token_cov_id != buy.token_cov_id {
+            return Err(BatchError::MissingTokenUnit {
+                token_cov_id: hex::encode(s.token_cov_id),
+            });
+        }
+        if s.price_den == 0 {
+            return Err(BatchError::ZeroPriceDenominator { index: i, side: "sell" });
+        }
+    }
+    if buy.price_den == 0 {
+        return Err(BatchError::ZeroPriceDenominator { index: sells.len(), side: "buy" });
+    }
+    Ok(())
+}
+
+/// v18 GTC N:1 sweep planner: one v18 buy consumes N (`<= BUY_ORDER_V18_MAX_N`)
+/// fully-filled v18 sells of the same token in ONE tx. Each sell delivers its
+/// full token amount to a SEPARATE BuyerTokens output bound to that sell input
+/// (auth slot 0, per-input Fix-3), and the buy contract SUMS those outputs for
+/// its aggregate limit-price floor and surplus cap.
+///
+/// v18 news vs the v17 sibling:
+///   - OCO sells are sweep-eligible on BOTH branches (canonical branch
+///     attestation; `build_tx` emits the TP/SL v18 sigscript with the
+///     executing branch's price pair).
+///   - `sell_output_idx` is populated so each sell's `koi` points at its
+///     (possibly merged) SellerKas output.
+///   - The buy's on-chain surplus cap is pre-checked exactly
+///     (`kas_in - fair_sum <= kas_in/10000*mmfee_bps`, contract integer
+///     order), so a doomed tx is rejected at plan time.
+///
+/// Layout:
+///   inputs:  [sell_0 .. sell_{N-1}, buy, (wallet?)]
+///   outputs: [SellerKas.. (merged by spk), BuyerTokens_0 .. BuyerTokens_{N-1},
+///            MatcherFee?]
+pub fn plan_batch_match_v18(
+    sells: &[BatchOrder],
+    buys: &[BatchOrder],
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    validate_v18_sweep(sells, buys)?;
+    let buy = &buys[0];
+    let n = sells.len();
+
+    let token_input_map = build_token_input_map(
+        &sells.iter().map(|s| s.token_cov_id).collect::<Vec<_>>(),
+    );
+    let plan_sells: Vec<(BatchOrder, usize)> =
+        sells.iter().enumerate().map(|(i, s)| (s.clone(), i)).collect();
+    let plan_buys: Vec<(BatchOrder, usize)> = vec![(buy.clone(), n)];
+
+    let mut outputs: Vec<PlannedOutput> = Vec::new();
+
+    // SellerKas per sell, merged by (spk, version); koi map populated.
+    let mut total_seller_kas: u64 = 0;
+    let mut fair_sum: u128 = 0;
+    let mut seller_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
+    let mut sell_output_idx: Vec<usize> = Vec::with_capacity(n);
+    for (i, sell) in sells.iter().enumerate() {
+        let expected_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+        if expected_kas_128 > u64::MAX as u128 {
+            return Err(BatchError::Overflow { index: i, side: "sell", detail: "expected_kas" });
+        }
+        let expected_kas = expected_kas_128 as u64;
+        if expected_kas < MIN_UTXO_VALUE {
+            return Err(BatchError::OutputBelowMinimum { index: i, value: expected_kas });
+        }
+        if expected_kas < sell.min_fill {
+            return Err(BatchError::MinFillViolation { index: i, fill_kas: expected_kas, min_fill: sell.min_fill });
+        }
+        total_seller_kas += expected_kas;
+        fair_sum += v18_fair_kas(sell.amount, sell.price_num, sell.price_den);
+        let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
+        if let Some(&existing) = seller_group_idx.get(&key) {
+            outputs[existing].value += expected_kas;
+            sell_output_idx.push(existing);
+        } else {
+            let new_idx = outputs.len();
+            outputs.push(PlannedOutput {
+                value: expected_kas,
+                script_public_key: sell.counterparty_spk.clone(),
+                spk_version: sell.counterparty_spk_version,
+                purpose: OutputPurpose::SellerKas,
+            });
+            seller_group_idx.insert(key, new_idx);
+            sell_output_idx.push(new_idx);
+        }
+    }
+
+    // BuyerTokens per sell (NOT merged) — each auth-bound to its own sell input.
+    let mut total_buyer_tokens: u64 = 0;
+    let mut output_auth_input: HashMap<usize, u16> = HashMap::new();
+    for (i, sell) in sells.iter().enumerate() {
+        let tokens = sell.amount; // full fill
+        if tokens < MIN_UTXO_VALUE {
+            return Err(BatchError::OutputBelowMinimum { index: n + i, value: tokens });
+        }
+        total_buyer_tokens += tokens;
+        let out_idx = outputs.len();
+        outputs.push(PlannedOutput {
+            value: tokens,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerTokens,
+        });
+        output_auth_input.insert(out_idx, i as u16);
+    }
+
+    // Aggregate GTC limit-price floor (contract enforces on-chain; reject
+    // early so the buy covenant never aborts a submitted tx).
+    let expected_tokens = buy.utxo_value as u128 * buy.price_num as u128 / buy.price_den as u128;
+    if (total_buyer_tokens as u128) < expected_tokens {
+        return Err(BatchError::MinFillViolation {
+            index: n,
+            fill_kas: total_buyer_tokens,
+            min_fill: expected_tokens.min(u64::MAX as u128) as u64,
+        });
+    }
+
+    // Aggregate surplus-cap feasibility, contract integer order:
+    // kas_in - fair_sum <= kas_in/10000 * mmfee_bps.
+    let mmfee_bps = parse_v18_buy_mmfee_bps(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+    let cap = (buy.utxo_value as u128 / 10000) * mmfee_bps as u128;
+    let surplus_onchain = (buy.utxo_value as u128).saturating_sub(fair_sum);
+    if surplus_onchain > cap {
+        return Err(BatchError::V18CapInfeasible {
+            spent: buy.utxo_value,
+            fair_sum: fair_sum.min(u64::MAX as u128) as u64,
+            cap: cap.min(u64::MAX as u128) as u64,
+        });
+    }
+
+    // KAS accounting (token sompi cancels: buyer-token outflow == sell inflow).
+    let total_sell_value: u64 = sells.iter().map(|s| s.utxo_value).sum();
+    let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
+    let total_kas_in = total_sell_value + buy.utxo_value + wallet_value;
+    let total_planned_out = total_seller_kas + total_buyer_tokens;
+
+    let num_inputs = 1 + n + if wallet_utxo.is_some() { 1 } else { 0 };
+    let num_outputs = outputs.len() + 1; // + matcher fee
+    let mut total_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
+    );
+    if total_kas_in < total_planned_out + total_fee {
+        return Err(BatchError::InsufficientFee {
+            needed: total_planned_out + total_fee,
+            available: total_kas_in,
+        });
+    }
+    let raw_surplus = total_kas_in - total_planned_out - total_fee;
+    let (capped_matcher_kas, _refund) = apply_bps_cap(raw_surplus, total_seller_kas, fee_bps);
+    let (matcher_surplus, dropped_to_fee) =
+        emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    total_fee += dropped_to_fee;
+    // Surplus beyond the matcher's bps cap is left to the miner fee (same
+    // policy as the v17 sibling: only ever reduces the matcher take).
+    total_fee += raw_surplus.saturating_sub(matcher_surplus + dropped_to_fee);
+
+    let sell_indices: Vec<u16> = (0..n as u16).collect();
+
+    Ok(BatchPlan {
+        sells: plan_sells,
+        buys: plan_buys,
+        wallet_input: wallet_utxo,
+        outputs,
+        total_fee,
+        matcher_surplus,
+        token_input_map,
+        buy_seller_map: HashMap::new(),
+        fee_bps,
+        total_seller_kas,
+        ioc_mode: None,
+        sell_fill_amounts: Vec::new(),
+        buy_partial_fills: HashMap::new(),
+        sell_output_idx,
+        buy_output_idx: Vec::new(),
+        buy_coi: Vec::new(),
+        bracket_receipt: None,
+        bracket_oco_output: None,
+        buy_sweep_sells: vec![sell_indices],
+        output_auth_input,
+    })
+}
+
+/// v18 IOC N:1 sweep planner: one v18 buy (Op5 selector) sweeps up to
+/// `BUY_ORDER_V18_MAX_N` fully-filled v18 sells (plain and/or OCO),
+/// immediately-or-cancel, with a buyer-change output for leftover KAS.
+///
+/// Floor semantics mirror the v17 sibling: the contract relaxes the
+/// aggregate limit-price floor to the buy's own `min_fill` on the IOC
+/// selector, so the planner checks `total_tokens >= buy.min_fill`.
+///
+/// The contract's surplus cap reads the buy's FULL `kas_in` unconditionally
+/// (surplus = kas_in - fair_sum, independent of where the change lands), so
+/// leftover KAS is only recoverable within `mmfee_bps` — the planner
+/// pre-checks that inequality exactly and rejects doomed sweeps.
+pub fn plan_ioc_match_v18(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    if sells.is_empty() {
+        return Err(BatchError::NoSellOrders);
+    }
+    if buy.order_type != OrderType::Buy {
+        return Err(BatchError::NoBuyOrders);
+    }
+    if buy.version != 18 {
+        return Err(BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        });
+    }
+
+    // Greedy affordability sweep: full-fill v18 sells only (a v18 buy is
+    // structurally unable to consume a partial/IOC sell — its delivery is the
+    // sell's auth slot 0, which a partial sell needs for its own residual).
+    // v18 OCO sells are INCLUDED (both branches; full-fill terms).
+    let buy_kas = buy.utxo_value;
+    let mut kas_remaining = buy_kas;
+    let mut filled: Vec<&BatchOrder> = Vec::new();
+    for sell in sells {
+        if filled.len() >= BUY_ORDER_V18_MAX_N {
+            break;
+        }
+        if sell.version != 18 {
+            continue;
+        }
+        if sell.token_cov_id != buy.token_cov_id {
+            continue;
+        }
+        if sell.price_den == 0 {
+            continue;
+        }
+        let sell_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+        if sell_kas_128 > u64::MAX as u128 {
+            continue;
+        }
+        let sell_kas = sell_kas_128 as u64;
+        if sell_kas < MIN_UTXO_VALUE || sell_kas < sell.min_fill {
+            continue;
+        }
+        if kas_remaining >= sell_kas {
+            filled.push(sell);
+            kas_remaining -= sell_kas;
+        } else {
+            break;
+        }
+    }
+
+    if filled.is_empty() {
+        return Err(BatchError::MinFillViolation {
+            index: 0,
+            fill_kas: 0,
+            min_fill: buy.min_fill,
+        });
+    }
+
+    let n = filled.len();
+    let total_tokens: u64 = filled.iter().map(|s| s.amount).sum();
+
+    // IOC floor: aggregate delivered tokens must meet the buy's OWN min_fill.
+    if total_tokens < buy.min_fill {
+        return Err(BatchError::MinFillViolation {
+            index: n,
+            fill_kas: total_tokens,
+            min_fill: buy.min_fill,
+        });
+    }
+
+    // Surplus-cap feasibility (exact contract arithmetic): the cap reads the
+    // full kas_in, so unswept `kas_remaining` counts against it.
+    let mmfee_bps = parse_v18_buy_mmfee_bps(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+    let fair_sum: u128 = filled
+        .iter()
+        .map(|s| v18_fair_kas(s.amount, s.price_num, s.price_den))
+        .sum();
+    let cap = (buy_kas as u128 / 10000) * mmfee_bps as u128;
+    let surplus_onchain = (buy_kas as u128).saturating_sub(fair_sum);
+    if surplus_onchain > cap {
+        return Err(BatchError::V18CapInfeasible {
+            spent: buy_kas,
+            fair_sum: fair_sum.min(u64::MAX as u128) as u64,
+            cap: cap.min(u64::MAX as u128) as u64,
+        });
+    }
+
+    let token_input_map = build_token_input_map(
+        &filled.iter().map(|s| s.token_cov_id).collect::<Vec<_>>(),
+    );
+    let plan_sells: Vec<(BatchOrder, usize)> =
+        filled.iter().enumerate().map(|(i, s)| ((*s).clone(), i)).collect();
+    let plan_buys: Vec<(BatchOrder, usize)> = vec![(buy.clone(), n)];
+
+    let mut outputs: Vec<PlannedOutput> = Vec::new();
+
+    // SellerKas per sell, merged by (spk, version); koi map populated.
+    let mut total_seller_kas: u64 = 0;
+    let mut seller_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
+    let mut sell_output_idx: Vec<usize> = Vec::with_capacity(n);
+    for sell in &filled {
+        let sell_kas = (sell.amount as u128 * sell.price_num as u128
+            / sell.price_den as u128) as u64;
+        total_seller_kas += sell_kas;
+        let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
+        if let Some(&existing) = seller_group_idx.get(&key) {
+            outputs[existing].value += sell_kas;
+            sell_output_idx.push(existing);
+        } else {
+            let new_idx = outputs.len();
+            outputs.push(PlannedOutput {
+                value: sell_kas,
+                script_public_key: sell.counterparty_spk.clone(),
+                spk_version: sell.counterparty_spk_version,
+                purpose: OutputPurpose::SellerKas,
+            });
+            seller_group_idx.insert(key, new_idx);
+            sell_output_idx.push(new_idx);
+        }
+    }
+
+    // BuyerTokens per sell (NOT merged) — auth-bound to its own sell input.
+    let mut output_auth_input: HashMap<usize, u16> = HashMap::new();
+    for (i, sell) in filled.iter().enumerate() {
+        let out_idx = outputs.len();
+        outputs.push(PlannedOutput {
+            value: sell.amount,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerTokens,
+        });
+        output_auth_input.insert(out_idx, i as u16);
+    }
+
+    let total_sell_value: u64 = filled.iter().map(|s| s.utxo_value).sum();
+    let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
+    let total_kas_in = total_sell_value + buy_kas + wallet_value;
+    let total_planned_out = total_seller_kas + total_tokens;
+
+    let num_inputs = 1 + n + if wallet_utxo.is_some() { 1 } else { 0 };
+    let num_outputs = outputs.len() + 2; // + buyer change + matcher fee
+    let mut total_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
+    );
+    if total_kas_in < total_planned_out + total_fee {
+        return Err(BatchError::InsufficientFee {
+            needed: total_planned_out + total_fee,
+            available: total_kas_in,
+        });
+    }
+    let raw_surplus = total_kas_in - total_planned_out - total_fee;
+
+    // Buyer keeps the unswept KAS; matcher takes the rest, bps-capped.
+    let matcher_kas = raw_surplus.saturating_sub(kas_remaining);
+    let (capped_matcher_kas, buyer_refund_from_bps) =
+        apply_bps_cap(matcher_kas, total_seller_kas, fee_bps);
+
+    let total_buyer_change = kas_remaining + buyer_refund_from_bps;
+    if total_buyer_change >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: total_buyer_change,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerChange,
+        });
+    } else if total_buyer_change > 0 {
+        if let Some(tok_out) = outputs.iter_mut().find(|o| o.purpose == OutputPurpose::BuyerTokens) {
+            tok_out.value += total_buyer_change;
+        }
+    }
+
+    let (matcher_surplus, dropped_to_fee) =
+        emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    total_fee += dropped_to_fee;
+    total_fee += raw_surplus
+        .saturating_sub(matcher_surplus + dropped_to_fee + kas_remaining + buyer_refund_from_bps);
+
+    let sell_indices: Vec<u16> = (0..n as u16).collect();
+
+    Ok(BatchPlan {
+        sells: plan_sells,
+        buys: plan_buys,
+        wallet_input: wallet_utxo,
+        outputs,
+        total_fee,
+        matcher_surplus,
+        token_input_map,
+        buy_seller_map: HashMap::new(),
+        fee_bps,
+        total_seller_kas,
+        ioc_mode: Some(IocSide::Buy),
+        sell_fill_amounts: Vec::new(),
+        buy_partial_fills: HashMap::new(),
+        sell_output_idx,
+        buy_output_idx: Vec::new(),
+        buy_coi: Vec::new(),
+        bracket_receipt: None,
+        bracket_oco_output: None,
+        buy_sweep_sells: vec![sell_indices],
+        output_auth_input,
+    })
+}
+
+/// v18 PARTIAL (Op2) planner — item C, NEW capability: the buy spends only
+/// part of its KAS against a subset of fully-filled v18 sells and keeps the
+/// rest in a byte-exact self-SPK residual output, which is a normal v18 buy
+/// UTXO again (chainable across txs).
+///
+/// On-chain semantics being planned for (see `emit_partial_body_v18`):
+///   - `spent = kas_in - residual`, `residual >= 1`;
+///   - floors: `token_sum >= spent/pden*pnum` AND `token_sum >= mfill`
+///     (per-event, blocks dust-grind);
+///   - cap: `(spent - fair_sum) <= spent/10000*mmfee_bps` (proportional, so
+///     splitting one fill into k partials cannot increase total extraction);
+///   - residual output SPK == buy input SPK byte-exact, NO covenant binding.
+///
+/// The planner picks the sell subset greedily (caller pre-sorts best-first),
+/// chooses the matcher surplus as the largest value satisfying BOTH the
+/// contract cap and the `fee_bps` policy cap (clamped so the spent-based
+/// limit floor still holds), and emits the residual at `kas_in - spent`.
+pub fn plan_partial_match_v18(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    if sells.is_empty() {
+        return Err(BatchError::NoSellOrders);
+    }
+    if buy.order_type != OrderType::Buy {
+        return Err(BatchError::NoBuyOrders);
+    }
+    if buy.version != 18 {
+        return Err(BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        });
+    }
+    if buy.price_den == 0 {
+        return Err(BatchError::ZeroPriceDenominator { index: 0, side: "buy" });
+    }
+    let mmfee_bps = parse_v18_buy_mmfee_bps(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+
+    // Greedy subset: full-fill v18 sells (plain/OCO) the buy can pay for
+    // while still keeping a residual.
+    let buy_kas = buy.utxo_value;
+    let mut filled: Vec<&BatchOrder> = Vec::new();
+    let mut base_spent: u64 = 0; // Σ seller_kas
+    for sell in sells {
+        if filled.len() >= BUY_ORDER_V18_MAX_N {
+            break;
+        }
+        if sell.version != 18 || sell.token_cov_id != buy.token_cov_id || sell.price_den == 0 {
+            continue;
+        }
+        let sell_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+        if sell_kas_128 > u64::MAX as u128 {
+            continue;
+        }
+        let sell_kas = sell_kas_128 as u64;
+        if sell_kas < MIN_UTXO_VALUE || sell_kas < sell.min_fill {
+            continue;
+        }
+        if base_spent + sell_kas <= buy_kas {
+            filled.push(sell);
+            base_spent += sell_kas;
+        } else {
+            break;
+        }
+    }
+
+    if filled.is_empty() {
+        return Err(BatchError::MinFillViolation {
+            index: 0,
+            fill_kas: 0,
+            min_fill: buy.min_fill,
+        });
+    }
+
+    let n = filled.len();
+    let token_sum: u64 = filled.iter().map(|s| s.amount).sum();
+
+    // Per-event mfill floor (blocks dust-grind partial events on-chain).
+    if token_sum < buy.min_fill {
+        return Err(BatchError::MinFillViolation {
+            index: n,
+            fill_kas: token_sum,
+            min_fill: buy.min_fill,
+        });
+    }
+
+    // Contract-order fair value and cap feasibility at zero surplus.
+    let fair_sum: u128 = filled
+        .iter()
+        .map(|s| v18_fair_kas(s.amount, s.price_num, s.price_den))
+        .sum();
+    let gap = (base_spent as u128).saturating_sub(fair_sum); // integer-rounding gap >= 0
+    let zero_allow = (base_spent as u128 / 10000) * mmfee_bps as u128;
+    if gap > zero_allow {
+        return Err(BatchError::V18CapInfeasible {
+            spent: base_spent,
+            fair_sum: fair_sum.min(u64::MAX as u128) as u64,
+            cap: zero_allow.min(u64::MAX as u128) as u64,
+        });
+    }
+
+    // Matcher surplus: largest value that stays within BOTH the contract cap
+    // (computed at base_spent — conservative, since the allowance only grows
+    // with spent) and the fee_bps policy cap, then clamped so the spent-based
+    // limit floor `token_sum >= floor(spent/pden)*pnum` still holds and the
+    // residual stays a real UTXO.
+    let policy_cap: u128 = match fee_bps {
+        Some(bps) => base_spent as u128 * bps as u128 / 10000,
+        None => u128::MAX,
+    };
+    let mut surplus = (zero_allow - gap).min(policy_cap);
+    // Floor clamp: max spent with floor(spent/pden) <= floor(token_sum/pnum).
+    let max_spent_floor = (token_sum as u128 / buy.price_num as u128) * buy.price_den as u128
+        + buy.price_den as u128
+        - 1;
+    let max_surplus_floor = max_spent_floor.saturating_sub(base_spent as u128);
+    surplus = surplus.min(max_surplus_floor);
+    // Residual clamp: keep residual >= MIN_UTXO_VALUE.
+    let max_surplus_residual =
+        (buy_kas as u128).saturating_sub(base_spent as u128 + MIN_UTXO_VALUE as u128);
+    surplus = surplus.min(max_surplus_residual);
+    let surplus = surplus.min(u64::MAX as u128) as u64;
+
+    let spent = base_spent + surplus;
+    let residual = buy_kas.saturating_sub(spent);
+
+    // Final exact verification of the three contract inequalities.
+    let spent_128 = spent as u128;
+    if (spent_128 - fair_sum) > (spent_128 / 10000) * mmfee_bps as u128 {
+        return Err(BatchError::V18CapInfeasible {
+            spent,
+            fair_sum: fair_sum.min(u64::MAX as u128) as u64,
+            cap: ((spent_128 / 10000) * mmfee_bps as u128).min(u64::MAX as u128) as u64,
+        });
+    }
+    let floor_tokens = (spent_128 / buy.price_den as u128) * buy.price_num as u128;
+    if (token_sum as u128) < floor_tokens {
+        return Err(BatchError::MinFillViolation {
+            index: n,
+            fill_kas: token_sum,
+            min_fill: floor_tokens.min(u64::MAX as u128) as u64,
+        });
+    }
+    if residual < MIN_UTXO_VALUE {
+        // A partial that leaves no (relayable) residual must use the full
+        // fill / IOC planners instead — Op2 requires residual >= 1 and a
+        // dust residual is an unspendable book entry.
+        return Err(BatchError::OutputBelowMinimum { index: usize::MAX, value: residual });
+    }
+
+    let token_input_map = build_token_input_map(
+        &filled.iter().map(|s| s.token_cov_id).collect::<Vec<_>>(),
+    );
+    let plan_sells: Vec<(BatchOrder, usize)> =
+        filled.iter().enumerate().map(|(i, s)| ((*s).clone(), i)).collect();
+    let plan_buys: Vec<(BatchOrder, usize)> = vec![(buy.clone(), n)];
+
+    let mut outputs: Vec<PlannedOutput> = Vec::new();
+
+    // SellerKas per sell, merged by (spk, version); koi map populated.
+    let mut total_seller_kas: u64 = 0;
+    let mut seller_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
+    let mut sell_output_idx: Vec<usize> = Vec::with_capacity(n);
+    for sell in &filled {
+        let sell_kas = (sell.amount as u128 * sell.price_num as u128
+            / sell.price_den as u128) as u64;
+        total_seller_kas += sell_kas;
+        let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
+        if let Some(&existing) = seller_group_idx.get(&key) {
+            outputs[existing].value += sell_kas;
+            sell_output_idx.push(existing);
+        } else {
+            let new_idx = outputs.len();
+            outputs.push(PlannedOutput {
+                value: sell_kas,
+                script_public_key: sell.counterparty_spk.clone(),
+                spk_version: sell.counterparty_spk_version,
+                purpose: OutputPurpose::SellerKas,
+            });
+            seller_group_idx.insert(key, new_idx);
+            sell_output_idx.push(new_idx);
+        }
+    }
+
+    // BuyerTokens per sell (NOT merged) — auth-bound to its own sell input.
+    let mut output_auth_input: HashMap<usize, u16> = HashMap::new();
+    for (i, sell) in filled.iter().enumerate() {
+        let out_idx = outputs.len();
+        outputs.push(PlannedOutput {
+            value: sell.amount,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerTokens,
+        });
+        output_auth_input.insert(out_idx, i as u16);
+    }
+
+    // Residual continuation: SAME P2SH as the buy input (byte-exact SPK =>
+    // same 145B state carried; the remaining size lives in the UTXO amount).
+    // NO covenant binding — it is plain KAS under the buy's P2SH, i.e. a
+    // normal v18 buy UTXO again.
+    let buy_p2sh = kob_core::p2sh::build_p2sh(&buy.redeem_script);
+    let residual_idx = outputs.len();
+    outputs.push(PlannedOutput {
+        value: residual,
+        script_public_key: buy_p2sh.script().to_vec(),
+        spk_version: buy_p2sh.version(),
+        purpose: OutputPurpose::BuyResidual,
+    });
+
+    let total_sell_value: u64 = filled.iter().map(|s| s.utxo_value).sum();
+    let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
+    let total_kas_in = total_sell_value + buy_kas + wallet_value;
+    let total_planned_out = total_seller_kas + token_sum + residual;
+
+    let num_inputs = 1 + n + if wallet_utxo.is_some() { 1 } else { 0 };
+    let num_outputs = outputs.len() + 1; // + matcher fee
+    let mut total_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
+    );
+    if total_kas_in < total_planned_out + total_fee {
+        return Err(BatchError::InsufficientFee {
+            needed: total_planned_out + total_fee,
+            available: total_kas_in,
+        });
+    }
+    let raw_surplus = total_kas_in - total_planned_out - total_fee;
+    let (capped_matcher_kas, _refund) = apply_bps_cap(raw_surplus, total_seller_kas, fee_bps);
+    let (matcher_surplus, dropped_to_fee) =
+        emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    total_fee += dropped_to_fee;
+    total_fee += raw_surplus.saturating_sub(matcher_surplus + dropped_to_fee);
+
+    let sell_indices: Vec<u16> = (0..n as u16).collect();
+    let mut buy_partial_fills: HashMap<usize, (u64, u16, u16)> = HashMap::new();
+    // (spent, residual OUTPUT index, unused) — build_tx's v18 arm reads the
+    // residual index; `spent` is informational for the executor/logs.
+    buy_partial_fills.insert(0, (spent, residual_idx as u16, 0));
+
+    Ok(BatchPlan {
+        sells: plan_sells,
+        buys: plan_buys,
+        wallet_input: wallet_utxo,
+        outputs,
+        total_fee,
+        matcher_surplus,
+        token_input_map,
+        buy_seller_map: HashMap::new(),
+        fee_bps,
+        total_seller_kas,
+        ioc_mode: None,
+        sell_fill_amounts: Vec::new(),
+        buy_partial_fills,
+        sell_output_idx,
+        buy_output_idx: Vec::new(),
+        buy_coi: Vec::new(),
+        bracket_receipt: None,
+        bracket_oco_output: None,
+        buy_sweep_sells: vec![sell_indices],
+        output_auth_input,
+    })
+}
+
+/// v18 sell-initiated IOC planner — parity entry point for the sell-anchored
+/// flow (`plan_sell_ioc_match` sibling), adapted to the v18 structural rule
+/// that sweeps are FULL-FILL-ONLY on the sell side:
+///
+///   - The v14 shape "sell keeps a token residual, N buys fully consumed" is
+///     NOT expressible in v18: the buy derives its delivery as the sell
+///     input's auth slot 0 (buyer-SPK checked) while the sell's IOC/partial
+///     F4 requires that same slot to be its self-SPK residual. See
+///     `BatchError::V18SellResidualUnsupported`.
+///   - At most ONE v18 buy per settle (item D pin), so the "sweep" selects
+///     the first candidate buy that FULLY absorbs the sell: exact match
+///     settles GTC (Op1/Op1); a larger buy settles via its IOC selector
+///     (Op5) with the sell's full delivery meeting the buy's `min_fill`
+///     floor and the leftover KAS returned as buyer change (recoverable only
+///     within the buy's `mmfee_bps` cap, which is pre-checked exactly).
+pub fn plan_sell_ioc_match_v18(
+    sell: &BatchOrder,
+    buys: &[BatchOrder],
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    if buys.is_empty() {
+        return Err(BatchError::NoBuyOrders);
+    }
+    if sell.order_type != OrderType::Sell {
+        return Err(BatchError::NoSellOrders);
+    }
+    if sell.version != 18 {
+        return Err(BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
+            version: sell.version,
+        });
+    }
+    if sell.price_den == 0 {
+        return Err(BatchError::ZeroPriceDenominator { index: 0, side: "sell" });
+    }
+
+    let seller_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+    if seller_kas_128 > u64::MAX as u128 {
+        return Err(BatchError::Overflow { index: 0, side: "sell", detail: "seller_kas" });
+    }
+    let seller_kas = seller_kas_128 as u64;
+    if seller_kas < MIN_UTXO_VALUE {
+        return Err(BatchError::OutputBelowMinimum { index: 0, value: seller_kas });
+    }
+    if seller_kas < sell.min_fill {
+        return Err(BatchError::MinFillViolation {
+            index: 0,
+            fill_kas: seller_kas,
+            min_fill: sell.min_fill,
+        });
+    }
+    let fair = v18_fair_kas(sell.amount, sell.price_num, sell.price_den);
+
+    // Select the first v18 buy that fully absorbs the sell.
+    let mut selected: Option<(&BatchOrder, bool /* ioc */)> = None;
+    let mut best_smaller_demand: u64 = 0;
+    let mut saw_smaller = false;
+    let mut cap_infeasible: Option<BatchError> = None;
+    for buy in buys {
+        if buy.order_type != OrderType::Buy || buy.version != 18 {
+            continue;
+        }
+        if buy.token_cov_id != sell.token_cov_id || buy.price_den == 0 {
+            continue;
+        }
+        let buy_expected = buy.utxo_value as u128 * buy.price_num as u128 / buy.price_den as u128;
+        if buy_expected < sell.amount as u128 {
+            // Would leave a sell residual — structurally unsupported in v18.
+            saw_smaller = true;
+            best_smaller_demand =
+                best_smaller_demand.max(buy_expected.min(u64::MAX as u128) as u64);
+            continue;
+        }
+        let exact = buy_expected == sell.amount as u128;
+        if !exact && sell.amount < buy.min_fill {
+            continue; // IOC floor unreachable with this sell alone
+        }
+        // Exact contract cap: kas_in - fair <= kas_in/10000*mmfee_bps.
+        let Some(mmfee_bps) = parse_v18_buy_mmfee_bps(&buy.redeem_script) else {
+            continue;
+        };
+        let cap = (buy.utxo_value as u128 / 10000) * mmfee_bps as u128;
+        let surplus_onchain = (buy.utxo_value as u128).saturating_sub(fair);
+        if surplus_onchain > cap {
+            cap_infeasible = Some(BatchError::V18CapInfeasible {
+                spent: buy.utxo_value,
+                fair_sum: fair.min(u64::MAX as u128) as u64,
+                cap: cap.min(u64::MAX as u128) as u64,
+            });
+            continue;
+        }
+        selected = Some((buy, !exact));
+        break;
+    }
+
+    let Some((buy, ioc)) = selected else {
+        if saw_smaller {
+            return Err(BatchError::V18SellResidualUnsupported {
+                outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
+                utxo_value: sell.utxo_value,
+                filled_tokens: best_smaller_demand,
+            });
+        }
+        if let Some(e) = cap_infeasible {
+            return Err(e);
+        }
+        return Err(BatchError::MinFillViolation {
+            index: 0,
+            fill_kas: 0,
+            min_fill: sell.min_fill,
+        });
+    };
+
+    // Layout: inputs [sell(0), buy(1), wallet?];
+    // outputs [SellerKas(0), BuyerTokens(1, auth->sell 0), BuyerChange?, MatcherFee?].
+    let token_input_map = build_token_input_map(&[sell.token_cov_id]);
+    let plan_sells: Vec<(BatchOrder, usize)> = vec![(sell.clone(), 0)];
+    let plan_buys: Vec<(BatchOrder, usize)> = vec![(buy.clone(), 1)];
+
+    let mut outputs: Vec<PlannedOutput> = Vec::new();
+    outputs.push(PlannedOutput {
+        value: seller_kas,
+        script_public_key: sell.counterparty_spk.clone(),
+        spk_version: sell.counterparty_spk_version,
+        purpose: OutputPurpose::SellerKas,
+    });
+    let mut output_auth_input: HashMap<usize, u16> = HashMap::new();
+    output_auth_input.insert(outputs.len(), 0);
+    outputs.push(PlannedOutput {
+        value: sell.amount,
+        script_public_key: buy.counterparty_spk.clone(),
+        spk_version: buy.counterparty_spk_version,
+        purpose: OutputPurpose::BuyerTokens,
+    });
+
+    let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
+    let total_kas_in = sell.utxo_value + buy.utxo_value + wallet_value;
+    let total_planned_out = seller_kas + sell.amount;
+
+    let num_inputs = 2 + if wallet_utxo.is_some() { 1 } else { 0 };
+    let num_outputs = outputs.len() + 2; // + buyer change + matcher fee
+    let mut total_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
+    );
+    if total_kas_in < total_planned_out + total_fee {
+        return Err(BatchError::InsufficientFee {
+            needed: total_planned_out + total_fee,
+            available: total_kas_in,
+        });
+    }
+    let raw_surplus = total_kas_in - total_planned_out - total_fee;
+    let (capped_matcher_kas, buyer_refund_from_bps) =
+        apply_bps_cap(raw_surplus, seller_kas, fee_bps);
+
+    if buyer_refund_from_bps >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: buyer_refund_from_bps,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerChange,
+        });
+    } else if buyer_refund_from_bps > 0 {
+        outputs[1].value += buyer_refund_from_bps; // dust: fold into BuyerTokens
+    }
+
+    let (matcher_surplus, dropped_to_fee) =
+        emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    total_fee += dropped_to_fee;
+
+    Ok(BatchPlan {
+        sells: plan_sells,
+        buys: plan_buys,
+        wallet_input: wallet_utxo,
+        outputs,
+        total_fee,
+        matcher_surplus,
+        token_input_map,
+        buy_seller_map: HashMap::new(),
+        fee_bps,
+        total_seller_kas: seller_kas,
+        ioc_mode: if ioc { Some(IocSide::Buy) } else { None },
+        sell_fill_amounts: Vec::new(),
+        buy_partial_fills: HashMap::new(),
+        sell_output_idx: vec![0],
+        buy_output_idx: Vec::new(),
+        buy_coi: Vec::new(),
+        bracket_receipt: None,
+        bracket_oco_output: None,
+        buy_sweep_sells: vec![vec![0u16]],
+        output_auth_input,
+    })
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// v18 ring planner (item F): 2..=RING_MAX swap-v18 legs, all-or-nothing
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Maximum ring legs (2-cycle = token<->token, 3-cycle = triangle).
+pub const RING_MAX: usize = 3;
+
+/// One leg of a v18 swap ring: a resting swap-v18 order UTXO. Source/target
+/// tokens, `min_target` and `mmfee_bps` are parsed from the redeemScript
+/// (single source of truth); the caller supplies the owner's actual SPK
+/// bytes, validated against the RS's `owner_spk_hash`.
+#[derive(Debug, Clone)]
+pub struct RingLegOrder {
+    /// Outpoint (txid, index) of the swap order UTXO.
+    pub outpoint: (String, u32),
+    /// v18 swap redeemScript (183B state + body).
+    pub redeem_script: Vec<u8>,
+    /// UTXO value = source tokens this leg gives.
+    pub utxo_value: u64,
+    /// Owner SPK script bytes (target-token delivery destination).
+    pub owner_spk: Vec<u8>,
+    /// Owner SPK version.
+    pub owner_spk_version: u16,
+}
+
+/// Planned v18 ring settle.
+///
+/// Layout:
+///   inputs:  `[leg_0 .. leg_{n-1}, wallet(fee)]`
+///   outputs: `[delivery_0 .. delivery_{n-1}, skim.. , WalletChange?]`
+/// where `delivery_j` carries leg j's source token to the RECEIVING leg's
+/// owner and is auth slot 0 of input j (skims sit at higher output indices,
+/// so they land at auth slots >= 1). Leg i's sigscript names giver input
+/// `(i+1) % n` and target output `(i+1) % n`.
+#[derive(Debug, Clone)]
+pub struct RingPlan {
+    /// Legs with their assigned input indices (0..n).
+    pub legs: Vec<(RingLegOrder, usize)>,
+    /// Wallet UTXO paying the miner fee (txid, index, value).
+    pub wallet_input: Option<(String, u32, u64)>,
+    /// Planned outputs (RingDelivery / MatcherSkim / WalletChange).
+    pub outputs: Vec<PlannedOutput>,
+    /// OUTPUT index -> authorizing leg INPUT index. The executor attaches
+    /// `CovenantBinding(authorizing_input, leg_source_tokens[input])` on
+    /// each of these outputs (both deliveries and skims).
+    pub output_auth_input: HashMap<usize, u16>,
+    /// Source token covenant id per leg (parsed from each RS).
+    pub leg_source_tokens: Vec<[u8; 32]>,
+    /// Total miner fee.
+    pub total_fee: u64,
+    /// Total matcher token skim (token-valued sompi, across all legs).
+    pub matcher_surplus: u64,
+}
+
+impl RingPlan {
+    /// Build TX inputs/outputs/sigscripts from the plan.
+    pub fn build_tx(&self) -> Result<BatchTx, BatchError> {
+        let n = self.legs.len();
+        let mut inputs = Vec::new();
+        for (i, (leg, _idx)) in self.legs.iter().enumerate() {
+            let giver = ((i + 1) % n) as u16;
+            let toi = ((i + 1) % n) as u16;
+            let ss = build_swap_v18_fill_sigscript(giver, toi, &leg.redeem_script);
+            inputs.push(BatchTxInput {
+                tx_id: leg.outpoint.0.clone(),
+                index: leg.outpoint.1,
+                sigscript: ss,
+                sig_op_count: 0,
+            });
+        }
+        if let Some((ref tx_id, index, _value)) = self.wallet_input {
+            inputs.push(BatchTxInput {
+                tx_id: tx_id.clone(),
+                index,
+                sigscript: Vec::new(), // P2PK; signed externally
+                sig_op_count: 1,
+            });
+        }
+        let outputs = self
+            .outputs
+            .iter()
+            .map(|planned| BatchTxOutput {
+                value: planned.value,
+                script_public_key: planned.script_public_key.clone(),
+                spk_version: planned.spk_version,
+                purpose: planned.purpose,
+            })
+            .collect();
+        Ok(BatchTx { inputs, outputs, fee: self.total_fee })
+    }
+
+    /// Sanity: inputs == outputs + fee.
+    pub fn validate(&self) -> Result<(), BatchError> {
+        let total_in: u64 = self.legs.iter().map(|(l, _)| l.utxo_value).sum::<u64>()
+            + self.wallet_input.as_ref().map_or(0, |w| w.2);
+        let total_out: u64 = self.outputs.iter().map(|o| o.value).sum();
+        if total_in != total_out + self.total_fee {
+            return Err(BatchError::AmountMismatch {
+                total_in,
+                total_out,
+                fee: self.total_fee,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// v18 ring planner (item F): plan an all-or-nothing settle of 2..=RING_MAX
+/// swap-v18 legs where leg i gives its source token and receives leg
+/// `(i+1) % n`'s source token (which must equal leg i's target — closed
+/// cycle). No ring partial (documented v18 limitation).
+///
+/// Per-leg feasibility enforced at plan time (mirrors the covenant):
+///   - F2 target floor: `delivery >= receiver.min_target`;
+///   - F4 conservation cap: the matcher skim on leg j is at most
+///     `floor(utxo/10000) * mmfee_bps` (contract integer order); the
+///     delivery is `max(receiver.min_target, utxo - cap)` and the skim is
+///     the rest (folded back into the delivery when it would be dust);
+///   - F3: the supplied owner SPK must blake2b-match the RS's
+///     `owner_spk_hash` (checked here so the tx cannot fail on-chain).
+pub fn plan_ring_match(
+    legs: &[RingLegOrder],
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+) -> Result<RingPlan, BatchError> {
+    let n = legs.len();
+    if n < 2 || n > RING_MAX {
+        return Err(BatchError::RingLegCount { count: n });
+    }
+    {
+        let mut seen = HashSet::new();
+        for leg in legs {
+            let key = format!("{}:{}", leg.outpoint.0, leg.outpoint.1);
+            if !seen.insert(key.clone()) {
+                return Err(BatchError::DuplicateOutpoint(key));
+            }
+        }
+    }
+
+    // Parse + validate every leg RS.
+    let mut parsed = Vec::with_capacity(n);
+    for leg in legs {
+        if leg.redeem_script.len() != SWAP_V18_RS_SIZE {
+            return Err(BatchError::RingInvalidLeg {
+                outpoint: format!("{}:{}", leg.outpoint.0, leg.outpoint.1),
+                reason: "redeem script is not a v18 swap order (wrong length)",
+            });
+        }
+        let p = parse_swap_order_v18_rs(&leg.redeem_script).ok_or(BatchError::RingInvalidLeg {
+            outpoint: format!("{}:{}", leg.outpoint.0, leg.outpoint.1),
+            reason: "redeem script failed v18 swap parse",
+        })?;
+        let spk_hash =
+            kob_core::p2sh::compute_spk_hash(leg.owner_spk_version, &leg.owner_spk);
+        if spk_hash != p.owner_spk_hash {
+            return Err(BatchError::RingInvalidLeg {
+                outpoint: format!("{}:{}", leg.outpoint.0, leg.outpoint.1),
+                reason: "owner SPK does not hash to the RS owner_spk_hash (F3 would fail)",
+            });
+        }
+        parsed.push(p);
+    }
+
+    // Closed cycle: leg i's target == leg (i+1)%n's source; sources distinct.
+    for i in 0..n {
+        if parsed[i].target_token_cov_id != parsed[(i + 1) % n].source_token_cov_id {
+            return Err(BatchError::RingNotClosed { index: i });
+        }
+        for j in (i + 1)..n {
+            if parsed[i].source_token_cov_id == parsed[j].source_token_cov_id {
+                return Err(BatchError::RingNotClosed { index: i });
+            }
+        }
+    }
+
+    // Per-leg delivery/skim (giver j delivers its source token to receiver
+    // r = (j+n-1)%n, whose target is token j).
+    let mut outputs: Vec<PlannedOutput> = Vec::new();
+    let mut output_auth_input: HashMap<usize, u16> = HashMap::new();
+    let mut skims: Vec<(usize, u64)> = Vec::new(); // (giver leg, skim value)
+    let mut matcher_surplus: u64 = 0;
+    for j in 0..n {
+        let giver = &legs[j];
+        let receiver_idx = (j + n - 1) % n;
+        let min_target = parsed[receiver_idx].min_target_amount;
+        let amount = giver.utxo_value;
+        if min_target > amount {
+            return Err(BatchError::RingInfeasible {
+                leg: receiver_idx,
+                needed: min_target,
+                available: amount,
+            });
+        }
+        // F4 cap, contract integer order: floor(amount/10000) * mmfee_bps.
+        let cap = ((amount as u128 / 10000) * parsed[j].mmfee_bps as u128)
+            .min(u64::MAX as u128) as u64;
+        let mut delivery = std::cmp::max(min_target, amount.saturating_sub(cap));
+        let mut skim = amount - delivery;
+        if skim > 0 && skim < MIN_UTXO_VALUE {
+            // Dust skim cannot be its own token UTXO — fold back to the
+            // receiver's delivery (only ever increases it; F2/F4 stay GTE).
+            delivery = amount;
+            skim = 0;
+        }
+        if delivery < MIN_UTXO_VALUE {
+            return Err(BatchError::OutputBelowMinimum { index: j, value: delivery });
+        }
+        let out_idx = outputs.len();
+        outputs.push(PlannedOutput {
+            value: delivery,
+            script_public_key: legs[receiver_idx].owner_spk.clone(),
+            spk_version: legs[receiver_idx].owner_spk_version,
+            purpose: OutputPurpose::RingDelivery,
+        });
+        output_auth_input.insert(out_idx, j as u16);
+        if skim > 0 {
+            skims.push((j, skim));
+            matcher_surplus += skim;
+        }
+    }
+    // Skims AFTER all deliveries so each delivery stays auth slot 0.
+    for (giver, skim) in &skims {
+        let out_idx = outputs.len();
+        outputs.push(PlannedOutput {
+            value: *skim,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::MatcherSkim,
+        });
+        output_auth_input.insert(out_idx, *giver as u16);
+    }
+
+    // Fee: token legs are value-conserving, so the miner fee comes from the
+    // wallet input; change back to the matcher when it isn't dust.
+    let num_inputs = n + if wallet_utxo.is_some() { 1 } else { 0 };
+    let num_outputs = outputs.len() + 1; // + change
+    let mut total_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
+    );
+    let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
+    if wallet_value < total_fee {
+        return Err(BatchError::InsufficientFee {
+            needed: total_fee,
+            available: wallet_value,
+        });
+    }
+    let change = wallet_value - total_fee;
+    if change >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: change,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::WalletChange,
+        });
+    } else {
+        total_fee += change; // dust change -> miner fee
+    }
+
+    Ok(RingPlan {
+        legs: legs.iter().enumerate().map(|(i, l)| (l.clone(), i)).collect(),
+        wallet_input: wallet_utxo,
+        outputs,
+        output_auth_input,
+        leg_source_tokens: parsed.iter().map(|p| p.source_token_cov_id).collect(),
+        total_fee,
+        matcher_surplus,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2812,6 +4197,724 @@ mod tests {
         let buy_ss = &tx.inputs[1].sigscript; // input[1] = the single buy (after 1 sell)
         assert!(buy_ss.windows(2).any(|w| w == [0x59, 0x7a]),
             "buy sigscript must embed the v17 selector-dispatch RS (fill path), not a partial-fill");
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // v18 planner tests (Stage B)
+    // ═════════════════════════════════════════════════════════════════════
+
+    /// Create a v18 sell order for testing.
+    fn make_sell_v18(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32]) -> BatchOrder {
+        let tx_id = hex::encode([id_byte; 32]);
+        let owner = [0xBB; 32];
+        let sspkh = [0xCC; 32];
+        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            price_num, price_den, 1_000_000, &owner, &sspkh, 30, 0, 0,
+        ).unwrap();
+        BatchOrder {
+            outpoint: (tx_id, 0),
+            order_type: OrderType::Sell,
+            version: 18,
+            token_cov_id: token,
+            price_num,
+            price_den,
+            amount,
+            redeem_script: rs,
+            utxo_value: amount,
+            counterparty_spk: vec![0xDD; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: None,
+            bracket_meta: None,
+        }
+    }
+
+    /// Create a v18 buy order for testing (mmfee_bps lives in the RS state).
+    fn make_buy_v18(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32], mmfee_bps: u64) -> BatchOrder {
+        let tx_id = hex::encode([id_byte; 32]);
+        let owner = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &token, price_num, price_den, 1_000_000, &owner, &bspkh, mmfee_bps, 0, 0,
+        ).unwrap();
+        BatchOrder {
+            outpoint: (tx_id, 0),
+            order_type: OrderType::Buy,
+            version: 18,
+            token_cov_id: token,
+            price_num,
+            price_den,
+            amount,
+            redeem_script: rs,
+            utxo_value: amount,
+            counterparty_spk: vec![0xEE; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: None,
+            bracket_meta: None,
+        }
+    }
+
+    /// Create a v18 OCO sell order for testing. The BatchOrder carries the
+    /// EXECUTING branch's price pair (the scanner books each OCO path as its
+    /// own order), which is exactly what the attested sigscript must carry.
+    fn make_oco_sell_v18(
+        id_byte: u8,
+        amount: u64,
+        tp: (u64, u64),
+        sl: (u64, u64),
+        path: kob_core::OcoPath,
+        token: [u8; 32],
+    ) -> BatchOrder {
+        let tx_id = hex::encode([id_byte; 32]);
+        let owner = [0xBB; 32];
+        let sspkh = [0xCC; 32];
+        let rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+            tp.0, tp.1, 1, sl.0, sl.1, 1, &owner, &sspkh, 30, 0, 0,
+        ).unwrap();
+        let (pn, pd) = match path {
+            kob_core::OcoPath::TakeProfit => tp,
+            kob_core::OcoPath::StopLoss => sl,
+        };
+        BatchOrder {
+            outpoint: (tx_id, 0),
+            order_type: OrderType::Sell,
+            version: 18,
+            token_cov_id: token,
+            price_num: pn,
+            price_den: pd,
+            amount,
+            redeem_script: rs,
+            utxo_value: amount,
+            counterparty_spk: vec![0xDD; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1,
+            oco_path: Some(path),
+            bracket_meta: None,
+        }
+    }
+
+    /// v18 GTC N:1 sweep via the plan_batch_match dispatch: per-sell
+    /// BuyerTokens outputs auth-bound to their sell inputs, populated koi
+    /// map, canonical v18 sigscripts from build_tx, and a balanced plan.
+    #[test]
+    fn test_v18_nm_sweep_emits_per_sell_outputs() {
+        let token = [0x51; 32];
+        let sells = vec![
+            make_sell_v18(0x10, 10_000_000, 99, 100, token),
+            make_sell_v18(0x11, 20_000_000, 99, 100, token),
+        ];
+        let buys = vec![make_buy_v18(0x20, 30_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("v18 sweep must plan");
+
+        // One BuyerTokens output per sell, each bound to a distinct sell input.
+        let bt: Vec<usize> = plan.outputs.iter().enumerate()
+            .filter(|(_, o)| o.purpose == OutputPurpose::BuyerTokens)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(bt.len(), 2, "must emit 2 per-sell BuyerTokens outputs");
+        let mut auths: Vec<u16> = bt.iter().map(|i| plan.output_auth_input[i]).collect();
+        auths.sort();
+        assert_eq!(auths, vec![0, 1]);
+        assert_eq!(plan.buy_sweep_sells, vec![vec![0u16, 1u16]]);
+
+        // koi map: both sells share one counterparty SPK -> merged SellerKas
+        // output 0, and BOTH koi entries point at it (the v18 planners fix
+        // the fallback-koi hazard the v17 planner left open).
+        assert_eq!(plan.sell_output_idx, vec![0, 0]);
+        assert_eq!(plan.outputs[0].value, 9_900_000 + 19_800_000);
+
+        // Plan balances (validate also checks versions incl. 18).
+        plan.validate().expect("v18 plan must validate");
+
+        // build_tx: canonical v18 sigscripts, byte-exact.
+        let tx = plan.build_tx().expect("build_tx");
+        assert_eq!(tx.inputs.len(), 4, "2 sells + buy + wallet");
+        let sell_rs0 = &plan.sells[0].0.redeem_script;
+        let sell_rs1 = &plan.sells[1].0.redeem_script;
+        assert_eq!(
+            tx.inputs[0].sigscript,
+            kob_core::contract::spot::order::build_sell_v18_fill_sigscript(0, 99, 100, sell_rs0),
+            "sell 0 must use the v18 attested fill sigscript with koi=0"
+        );
+        assert_eq!(
+            tx.inputs[1].sigscript,
+            kob_core::contract::spot::order::build_sell_v18_fill_sigscript(0, 99, 100, sell_rs1),
+            "sell 1 must use the v18 attested fill sigscript with the MERGED koi=0"
+        );
+        assert_eq!(
+            tx.inputs[2].sigscript,
+            build_buy_v18_fill_sigscript(&[0, 1], false, &plan.buys[0].0.redeem_script),
+            "buy must use the v18 GTC fill sigscript over sells [0, 1]"
+        );
+        // Canonical attestation offsets: pnum at [3..11), pden at [12..20).
+        assert_eq!(&tx.inputs[0].sigscript[3..11], &99u64.to_le_bytes());
+        assert_eq!(&tx.inputs[0].sigscript[12..20], &100u64.to_le_bytes());
+    }
+
+    /// Item D pin: >1 v18 buy per settle tx is rejected FAIL-CLOSED, BY PROOF
+    /// (not as a temporary planner limitation).
+    ///
+    /// Engine-model proof (kaspa-txscript covenants.rs model): every token
+    /// delivery output must carry the token's `CovenantBinding`, and a
+    /// binding's `authorizing_input` must be an input whose covenant id
+    /// equals the token's tcid. A buy UTXO is plain KAS P2SH — it carries NO
+    /// covenant id — so no delivery output can ever be bound to a buy input.
+    /// Per-buy delivery attribution therefore has to route through the tcid
+    /// (sell) inputs' auth slots, and the v18 buy hardwires slot 0 of each
+    /// tii term (`OpAuthOutputIdx(tii, 0)`). Two buys listing the same sell
+    /// would both read (and both count) that same slot-0 output into their
+    /// own token_sum/fair_sum, while each buy's floor and surplus cap are
+    /// checked against its own kas_in only — nothing on-chain can prove the
+    /// buys consumed DISJOINT sell subsets. Cross-buy disjointness being
+    /// unprovable, multi-buy settles stay rejected at plan time.
+    #[test]
+    fn test_v18_multi_buy_rejected() {
+        let token = [0x52; 32];
+        let sells = vec![
+            make_sell_v18(0x10, 10_000_000, 1, 1, token),
+            make_sell_v18(0x11, 10_000_000, 1, 1, token),
+        ];
+        let buys = vec![
+            make_buy_v18(0x20, 10_000_000, 1, 1, token, 2000),
+            make_buy_v18(0x21, 10_000_000, 1, 1, token, 2000),
+        ];
+        let r = plan_batch_match(&sells, &buys, None, &matcher_spk(), 0, Some(2000));
+        assert!(
+            matches!(r, Err(BatchError::V18MultiBuyUnsupported { count: 2 })),
+            "2 v18 buys in one settle must be rejected, got {:?}", r
+        );
+        // Direct planner call must enforce the same pin.
+        let sells2 = vec![make_sell_v18(0x12, 10_000_000, 1, 1, token)];
+        let buys2 = vec![
+            make_buy_v18(0x22, 10_000_000, 1, 1, token, 2000),
+            make_buy_v18(0x23, 10_000_000, 1, 1, token, 2000),
+        ];
+        let r2 = plan_batch_match_v18(&sells2, &buys2, None, &matcher_spk(), 0, Some(2000));
+        assert!(matches!(r2, Err(BatchError::V18MultiBuyUnsupported { .. })));
+    }
+
+    /// N > MAX_N rejects gracefully; N == MAX_N plans fine.
+    #[test]
+    fn test_v18_sweep_max_n_bounds() {
+        let token = [0x53; 32];
+        let over = BUY_ORDER_V18_MAX_N + 1;
+        let sells: Vec<BatchOrder> = (0..over as u8)
+            .map(|i| make_sell_v18(0x60 + i, 5_000_000, 1, 1, token))
+            .collect();
+        let buys = vec![make_buy_v18(0x20, over as u64 * 5_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let r = plan_batch_match(&sells, &buys, wallet.clone(), &matcher_spk(), 0, Some(2000));
+        assert!(
+            matches!(r, Err(BatchError::V18TooManySells { .. })),
+            "N > MAX_N must reject gracefully, got {:?}", r
+        );
+
+        let n = BUY_ORDER_V18_MAX_N;
+        let sells: Vec<BatchOrder> = (0..n as u8)
+            .map(|i| make_sell_v18(0x70 + i, 5_000_000, 1, 1, token))
+            .collect();
+        let buys = vec![make_buy_v18(0x21, n as u64 * 5_000_000, 1, 1, token, 2000)];
+        let r = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000));
+        assert!(r.is_ok(), "N == MAX_N must plan fine: {:?}", r.err());
+    }
+
+    /// Mixed generations in a v18 settle are rejected in both directions.
+    #[test]
+    fn test_v18_mixed_generation_rejected() {
+        let token = [0x54; 32];
+        // v18 buy + v14 sell.
+        let r = plan_batch_match(
+            &[make_sell(0x10, 10_000_000, 1, 1, token)],
+            &[make_buy_v18(0x20, 10_000_000, 1, 1, token, 2000)],
+            None, &matcher_spk(), 0, Some(2000),
+        );
+        assert!(matches!(r, Err(BatchError::UnsupportedVersion { .. })), "v14 sell under v18 buy must reject, got {:?}", r);
+        // v18 sell + v14 buy.
+        let r = plan_batch_match(
+            &[make_sell_v18(0x11, 10_000_000, 1, 1, token)],
+            &[make_buy(0x21, 10_000_000, 1, 1, token)],
+            None, &matcher_spk(), 0, Some(2000),
+        );
+        assert!(matches!(r, Err(BatchError::UnsupportedVersion { .. })), "v14 buy over v18 sell must reject, got {:?}", r);
+    }
+
+    /// OCO sweep enablement: a v18 OCO sell composes into a MULTI-sell v18
+    /// sweep (the pre-v18 OcoMultiSellSweepUnsupported guard does not apply),
+    /// and build_tx emits the executing branch's attested TP sigscript.
+    #[test]
+    fn test_v18_oco_multi_sell_sweep_allowed() {
+        let token = [0x55; 32];
+        let sells = vec![
+            make_sell_v18(0x10, 10_000_000, 99, 100, token),
+            // TP is the cheap (crossing) branch here; SL parked at 1/2.
+            make_oco_sell_v18(0x11, 10_000_000, (99, 100), (1, 2), kob_core::OcoPath::TakeProfit, token),
+        ];
+        let buys = vec![make_buy_v18(0x20, 20_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("v18 multi-sell sweep with an OCO term must plan");
+        let tx = plan.build_tx().expect("build_tx");
+        let oco_rs = &plan.sells[1].0.redeem_script;
+        assert_eq!(
+            tx.inputs[1].sigscript,
+            kob_core::contract::spot::oco::build_oco_sell_v18_tp_fill_sigscript(
+                plan.sell_output_idx[1] as u16, 99, 100, oco_rs,
+            ),
+            "OCO TP term must use the v18 attested TP fill sigscript"
+        );
+    }
+
+    /// OCO branch attestation correctness: an SL-path OCO order attests the
+    /// SL pair at the canonical offsets (and NOT the TP pair).
+    #[test]
+    fn test_v18_oco_sl_branch_attests_sl_price() {
+        let token = [0x56; 32];
+        let oco = make_oco_sell_v18(0x10, 10_000_000, (3, 1), (99, 100), kob_core::OcoPath::StopLoss, token);
+        let oco_rs = oco.redeem_script.clone();
+        let sells = vec![oco];
+        // Buy limit at the SL rate (1:1 on the delivered 10M tokens for 9.9M KAS).
+        let buys = vec![make_buy_v18(0x20, 9_900_000, 100, 99, token, 2000)];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("solo v18 OCO SL sweep must plan");
+        let tx = plan.build_tx().expect("build_tx");
+        let ss = &tx.inputs[0].sigscript;
+        assert_eq!(
+            ss,
+            &kob_core::contract::spot::oco::build_oco_sell_v18_sl_fill_sigscript(0, 99, 100, &oco_rs),
+            "SL fill must be the v18 attested SL sigscript"
+        );
+        // The attested pair at the canonical offsets is the SL pair...
+        assert_eq!(&ss[3..11], &99u64.to_le_bytes(), "pnum_sl attested at [3..11)");
+        assert_eq!(&ss[12..20], &100u64.to_le_bytes(), "pden_sl attested at [12..20)");
+        // ...and the selector is Op2 (SL fill), not Op1 (TP).
+        assert_eq!(ss[20], 0x52, "selector byte must be Op2 = SL fill");
+        assert_ne!(
+            ss,
+            &kob_core::contract::spot::oco::build_oco_sell_v18_tp_fill_sigscript(0, 3, 1, &oco_rs),
+            "must not attest the TP pair"
+        );
+    }
+
+    /// v18 IOC sweep: 3 crossing sells, buy affords 2; leftover KAS is
+    /// accounted (buyer change and/or capped matcher surplus).
+    #[test]
+    fn test_v18_ioc_sweep_with_change() {
+        let token = [0x57; 32];
+        let sell1 = make_sell_v18(0x10, 3_000_000, 1, 1, token);
+        let sell2 = make_sell_v18(0x11, 3_000_000, 1, 1, token);
+        let sell3 = make_sell_v18(0x12, 5_000_000, 1, 1, token);
+        let buy = make_buy_v18(0x20, 7_000_000, 1, 1, token, 2000);
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+
+        let plan = plan_ioc_match_v18(&[sell1, sell2, sell3], &buy, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("v18 IOC sweep must plan");
+        assert_eq!(plan.sells.len(), 2, "only the 2 affordable sells are filled");
+        assert_eq!(plan.ioc_mode, Some(IocSide::Buy));
+        assert_eq!(plan.buy_sweep_sells, vec![vec![0u16, 1u16]]);
+        let bt = plan.outputs.iter().filter(|o| o.purpose == OutputPurpose::BuyerTokens).count();
+        assert_eq!(bt, 2, "per-sell BuyerTokens outputs (not merged)");
+        let buyer_change_exists = plan.outputs.iter().any(|o| o.purpose == OutputPurpose::BuyerChange);
+        assert!(buyer_change_exists || plan.matcher_surplus > 0, "leftover KAS must go somewhere");
+
+        // build_tx emits the IOC (Op5) v18 sigscript.
+        let tx = plan.build_tx().expect("build_tx");
+        assert_eq!(
+            tx.inputs[2].sigscript,
+            build_buy_v18_fill_sigscript(&[0, 1], true, &plan.buys[0].0.redeem_script),
+        );
+    }
+
+    /// v18 IOC floor: total delivered tokens below the buy's own min_fill
+    /// rejects (mirrors the contract's ioc_flag ? mfill : expected floor).
+    #[test]
+    fn test_v18_ioc_below_min_fill_rejected() {
+        let token = [0x58; 32];
+        let sell1 = make_sell_v18(0x10, 3_000_000, 1, 1, token);
+        let mut buy = make_buy_v18(0x20, 3_000_000, 1, 1, token, 2000);
+        buy.min_fill = 50_000_000;
+        let r = plan_ioc_match_v18(&[sell1], &buy, None, &matcher_spk(), 0, Some(2000));
+        assert!(matches!(r, Err(BatchError::MinFillViolation { .. })), "below-min_fill IOC must reject, got {:?}", r);
+    }
+
+    /// Non-v18 buy handed to the v18 IOC planner rejects explicitly.
+    #[test]
+    fn test_v18_ioc_rejects_non_v18_buy() {
+        let token = [0x59; 32];
+        let sell1 = make_sell_v18(0x10, 3_000_000, 1, 1, token);
+        let buy = make_buy(0x20, 3_000_000, 1, 1, token); // v14
+        let r = plan_ioc_match_v18(&[sell1], &buy, None, &matcher_spk(), 0, Some(2000));
+        assert!(matches!(r, Err(BatchError::UnsupportedVersion { .. })), "non-v18 buy must reject, got {:?}", r);
+    }
+
+    /// v18 IOC sweep caps at MAX_N even when more sells cross and are
+    /// affordable.
+    #[test]
+    fn test_v18_ioc_sweep_capped_at_max_n() {
+        let token = [0x5a; 32];
+        let n_max = BUY_ORDER_V18_MAX_N;
+        let sells: Vec<BatchOrder> = (0..(n_max as u8 + 2))
+            .map(|i| make_sell_v18(0x50 + i, 5_000_000, 1, 1, token))
+            .collect();
+        // Affords more than MAX_N sells (41M vs 8*5M) but must cap; the
+        // 1M leftover stays within the 2000bps on-chain cap (8.2M).
+        let buy = make_buy_v18(0x20, 41_000_000, 1, 1, token, 2000);
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_ioc_match_v18(&sells, &buy, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("must plan (capped, not error)");
+        assert_eq!(plan.sells.len(), n_max, "sweep must cap at MAX_N");
+    }
+
+    /// v18 IOC cap feasibility: the contract's surplus cap reads the FULL
+    /// kas_in, so a sweep leaving more unswept KAS than mmfee_bps allows is
+    /// rejected at plan time instead of failing on-chain.
+    #[test]
+    fn test_v18_ioc_cap_infeasible_rejected() {
+        let token = [0x5b; 32];
+        let sell1 = make_sell_v18(0x10, 3_000_000, 1, 1, token);
+        // mmfee 30bps: allowance = 30M/10000*30 = 90k << 27M leftover.
+        let buy = make_buy_v18(0x20, 30_000_000, 1, 1, token, 30);
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let r = plan_ioc_match_v18(&[sell1], &buy, wallet, &matcher_spk(), 0, Some(2000));
+        assert!(matches!(r, Err(BatchError::V18CapInfeasible { .. })), "over-cap IOC sweep must reject, got {:?}", r);
+    }
+
+    /// Item C: v18 partial residual accounting. spent = kas_in - residual;
+    /// the residual output is the buy's own P2SH with NO covenant binding;
+    /// build_tx emits the Op2 sigscript with the residual output index.
+    #[test]
+    fn test_v18_partial_residual_accounting() {
+        let token = [0x5c; 32];
+        let sells = vec![make_sell_v18(0x10, 10_000_000, 99, 100, token)];
+        let buy = make_buy_v18(0x20, 30_000_000, 1, 1, token, 2000);
+        let buy_p2sh = kob_core::p2sh::build_p2sh(&buy.redeem_script);
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_partial_match_v18(&sells, &buy, wallet, &matcher_spk(), 0, None)
+            .expect("v18 partial must plan");
+
+        let &(spent, residual_idx, _) = plan.buy_partial_fills.get(&0).expect("partial entry");
+        // Floor clamp pins spent to exactly the token_sum at the buy's 1/1
+        // limit: base 9.9M + 100k matcher surplus = 10M.
+        assert_eq!(spent, 10_000_000, "spent = seller kas + clamped surplus");
+        let residual_out = &plan.outputs[residual_idx as usize];
+        assert_eq!(residual_out.purpose, OutputPurpose::BuyResidual);
+        assert_eq!(residual_out.value, buy.utxo_value - spent, "residual = kas_in - spent");
+        assert_eq!(residual_out.value, 20_000_000);
+        assert_eq!(
+            residual_out.script_public_key,
+            buy_p2sh.script().to_vec(),
+            "residual SPK must be the buy's own P2SH byte-exact"
+        );
+        plan.validate().expect("partial plan must balance");
+
+        let tx = plan.build_tx().expect("build_tx");
+        assert_eq!(
+            tx.inputs[1].sigscript,
+            build_buy_v18_partial_fill_sigscript(&[0], residual_idx, &plan.buys[0].0.redeem_script),
+            "buy must use the v18 Op2 partial sigscript"
+        );
+    }
+
+    /// Item C chaining: the residual UTXO is a normal v18 buy again (same
+    /// RS, same P2SH). Plan a second partial event on it.
+    #[test]
+    fn test_v18_partial_chaining_two_events() {
+        let token = [0x5d; 32];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+
+        // Event 1: 30M buy spends 10M against a 10M-token sell, keeps 20M.
+        let buy1 = make_buy_v18(0x20, 30_000_000, 1, 1, token, 2000);
+        let plan1 = plan_partial_match_v18(
+            &[make_sell_v18(0x10, 10_000_000, 99, 100, token)],
+            &buy1, wallet.clone(), &matcher_spk(), 0, None,
+        ).expect("event 1 must plan");
+        let &(spent1, ri1, _) = plan1.buy_partial_fills.get(&0).unwrap();
+        let residual1 = plan1.outputs[ri1 as usize].value;
+        assert_eq!(residual1, buy1.utxo_value - spent1);
+        assert_eq!(residual1, 20_000_000);
+
+        // Event 2: the residual (same RS => same P2SH continuation) is the
+        // new buy UTXO, spends 15M against a 15M-token sell, keeps 5M.
+        let mut buy2 = make_buy_v18(0x21, residual1, 1, 1, token, 2000);
+        buy2.redeem_script = buy1.redeem_script.clone(); // byte-exact continuation
+        let plan2 = plan_partial_match_v18(
+            &[make_sell_v18(0x11, 15_000_000, 99, 100, token)],
+            &buy2, wallet, &matcher_spk(), 0, None,
+        ).expect("event 2 must plan on the residual");
+        let &(spent2, ri2, _) = plan2.buy_partial_fills.get(&0).unwrap();
+        let residual2 = plan2.outputs[ri2 as usize].value;
+        assert_eq!(spent2, 15_000_000);
+        assert_eq!(residual2, residual1 - spent2);
+        assert_eq!(residual2, 5_000_000);
+        // The chained residual continues the SAME P2SH.
+        assert_eq!(
+            plan2.outputs[ri2 as usize].script_public_key,
+            plan1.outputs[ri1 as usize].script_public_key,
+        );
+    }
+
+    /// Per-event mfill floor (dust-grind block) on the partial planner.
+    #[test]
+    fn test_v18_partial_mfill_floor_rejected() {
+        let token = [0x5e; 32];
+        let sells = vec![make_sell_v18(0x10, 10_000_000, 99, 100, token)];
+        let mut buy = make_buy_v18(0x20, 30_000_000, 1, 1, token, 2000);
+        buy.min_fill = 50_000_000; // event delivers only 10M tokens
+        let r = plan_partial_match_v18(&sells, &buy, None, &matcher_spk(), 0, None);
+        assert!(matches!(r, Err(BatchError::MinFillViolation { .. })), "sub-mfill partial event must reject, got {:?}", r);
+    }
+
+    /// Cap feasibility: with mmfee_bps = 0 and a sell whose integer-rounding
+    /// gap (seller_kas - contract fair_sum) is positive, even a zero-surplus
+    /// partial cannot satisfy the contract cap -> reject at plan time.
+    #[test]
+    fn test_v18_partial_cap_infeasible_rejected() {
+        let token = [0x5f; 32];
+        // amount=10_000_005 @ 3/10: seller_kas = floor(30_000_015/10) = 3_000_001,
+        // fair_sum = floor(10_000_005/10)*3 = 3_000_000 -> gap = 1 > allowance 0.
+        let sells = vec![make_sell_v18(0x10, 10_000_005, 3, 10, token)];
+        let buy = make_buy_v18(0x20, 30_000_000, 1, 1, token, 0);
+        let r = plan_partial_match_v18(&sells, &buy, None, &matcher_spk(), 0, None);
+        assert!(matches!(r, Err(BatchError::V18CapInfeasible { .. })), "rounding gap > 0bps allowance must reject, got {:?}", r);
+    }
+
+    /// A "partial" that would leave no relayable residual must use the full
+    /// fill planners instead (Op2 demands residual >= 1; dust is unbookable).
+    #[test]
+    fn test_v18_partial_no_residual_room_rejected() {
+        let token = [0x60; 32];
+        let sells = vec![make_sell_v18(0x10, 10_000_000, 1, 1, token)];
+        let buy = make_buy_v18(0x20, 11_000_000, 1, 1, token, 2000);
+        let r = plan_partial_match_v18(&sells, &buy, None, &matcher_spk(), 0, None);
+        assert!(matches!(r, Err(BatchError::OutputBelowMinimum { .. })), "sub-MIN_UTXO residual must reject, got {:?}", r);
+    }
+
+    /// v18 sell-IOC parity: exact-consume settles GTC (Op1 both sides).
+    #[test]
+    fn test_v18_sell_ioc_exact_full_fill_plans() {
+        let token = [0x61; 32];
+        let sell = make_sell_v18(0x10, 10_000_000, 1, 1, token);
+        let buys = vec![make_buy_v18(0x20, 10_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_sell_ioc_match_v18(&sell, &buys, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("exact-consume sell IOC must plan");
+        assert_eq!(plan.ioc_mode, None, "exact match settles GTC");
+        assert_eq!(plan.buy_sweep_sells, vec![vec![0u16]]);
+        plan.validate().expect("plan must balance");
+        let tx = plan.build_tx().expect("build_tx");
+        assert_eq!(
+            tx.inputs[0].sigscript,
+            kob_core::contract::spot::order::build_sell_v18_fill_sigscript(0, 1, 1, &plan.sells[0].0.redeem_script),
+        );
+        assert_eq!(
+            tx.inputs[1].sigscript,
+            build_buy_v18_fill_sigscript(&[0], false, &plan.buys[0].0.redeem_script),
+        );
+    }
+
+    /// v18 sell-IOC parity: a larger buy absorbs the sell via its IOC
+    /// selector; leftover recoverable only within the buy's mmfee cap.
+    #[test]
+    fn test_v18_sell_ioc_larger_buy_settles_ioc() {
+        let token = [0x62; 32];
+        let sell = make_sell_v18(0x10, 10_000_000, 1, 1, token);
+        // 12M buy: leftover 2M <= floor(12M/10000)*2000 = 2.4M -> feasible.
+        let buys = vec![make_buy_v18(0x20, 12_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_sell_ioc_match_v18(&sell, &buys, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("larger-buy sell IOC must plan");
+        assert_eq!(plan.ioc_mode, Some(IocSide::Buy));
+        let tx = plan.build_tx().expect("build_tx");
+        assert_eq!(
+            tx.inputs[1].sigscript,
+            build_buy_v18_fill_sigscript(&[0], true, &plan.buys[0].0.redeem_script),
+            "buy must use the Op5 IOC selector"
+        );
+    }
+
+    /// v18 sell-IOC structural rejection: a smaller buy would leave a sell
+    /// residual, which cannot coexist with a v18 buy in one tx (the buy
+    /// reads the sell's auth slot 0 as its delivery; the sell's IOC F4
+    /// demands the same slot for its self-SPK residual).
+    #[test]
+    fn test_v18_sell_ioc_residual_rejected() {
+        let token = [0x63; 32];
+        let sell = make_sell_v18(0x10, 20_000_000, 1, 1, token);
+        let buys = vec![make_buy_v18(0x20, 10_000_000, 1, 1, token, 2000)];
+        let r = plan_sell_ioc_match_v18(&sell, &buys, None, &matcher_spk(), 0, Some(2000));
+        assert!(
+            matches!(r, Err(BatchError::V18SellResidualUnsupported { .. })),
+            "sell-residual composition must reject, got {:?}", r
+        );
+    }
+
+    // ── Ring planner (item F) ──
+
+    /// Fake P2PK owner SPK for ring tests.
+    fn ring_owner_spk(seed: u8) -> Vec<u8> {
+        let mut s = Vec::with_capacity(34);
+        s.push(0x20);
+        s.extend_from_slice(&[seed; 32]);
+        s.push(0xac);
+        s
+    }
+
+    /// Build a ring leg: source -> target with parsed-from-RS parameters.
+    fn make_ring_leg(
+        id_byte: u8,
+        source: [u8; 32],
+        target: [u8; 32],
+        amount: u64,
+        min_target: u64,
+        mmfee_bps: u64,
+        owner_seed: u8,
+    ) -> RingLegOrder {
+        let owner_spk = ring_owner_spk(owner_seed);
+        let owner_spk_hash = kob_core::p2sh::compute_spk_hash(0, &owner_spk);
+        let rs = kob_core::contract::spot::swap::build_swap_v18_redeem_script(
+            &source, &target, min_target, &[0xBB; 32], &owner_spk_hash, &[0xEE; 32], mmfee_bps,
+        ).unwrap();
+        RingLegOrder {
+            outpoint: (hex::encode([id_byte; 32]), 0),
+            redeem_script: rs,
+            utxo_value: amount,
+            owner_spk,
+            owner_spk_version: 0,
+        }
+    }
+
+    const RING_A: [u8; 32] = [0xA1; 32];
+    const RING_B: [u8; 32] = [0xA2; 32];
+    const RING_C: [u8; 32] = [0xA3; 32];
+
+    /// 2-cycle ring with matcher skim exactly at the per-leg F4 cap.
+    #[test]
+    fn test_ring_2cycle_plans_with_capped_skim() {
+        let (a0, a1) = (1_000_000_000u64, 2_000_000_000u64);
+        let fee = |a: u64| a / 10000 * 100; // 100bps caps: 10M / 20M
+        let legs = vec![
+            // leg0 gives A (1e9), wants B with floor = a1 - cap1.
+            make_ring_leg(0x10, RING_A, RING_B, a0, a1 - fee(a1), 100, 0xF0),
+            // leg1 gives B (2e9), wants A with floor = a0 - cap0.
+            make_ring_leg(0x11, RING_B, RING_A, a1, a0 - fee(a0), 100, 0xF1),
+        ];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_ring_match(&legs, wallet, &matcher_spk(), 0)
+            .expect("2-cycle ring must plan");
+        plan.validate().expect("ring plan must balance");
+
+        // Deliveries at outputs 0..2, skimmed exactly to the F4 floor.
+        assert_eq!(plan.outputs[0].purpose, OutputPurpose::RingDelivery);
+        assert_eq!(plan.outputs[0].value, a0 - fee(a0), "leg0 delivery skimmed to its F4 floor");
+        assert_eq!(plan.outputs[1].value, a1 - fee(a1));
+        // Delivery j is auth slot 0 of giver input j (skims come after).
+        assert_eq!(plan.output_auth_input[&0], 0);
+        assert_eq!(plan.output_auth_input[&1], 1);
+        // Skims to the matcher at outputs >= n, auth-bound to their givers.
+        let skims: Vec<usize> = plan.outputs.iter().enumerate()
+            .filter(|(_, o)| o.purpose == OutputPurpose::MatcherSkim)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(skims.len(), 2);
+        assert!(skims.iter().all(|&i| i >= 2), "skims must sit after all deliveries");
+        assert_eq!(plan.matcher_surplus, fee(a0) + fee(a1));
+
+        // build_tx: leg i names giver/toi (i+1) % n.
+        let tx = plan.build_tx().expect("build_tx");
+        assert_eq!(
+            tx.inputs[0].sigscript,
+            kob_core::contract::spot::swap::build_swap_v18_fill_sigscript(1, 1, &legs[0].redeem_script),
+        );
+        assert_eq!(
+            tx.inputs[1].sigscript,
+            kob_core::contract::spot::swap::build_swap_v18_fill_sigscript(0, 0, &legs[1].redeem_script),
+        );
+    }
+
+    /// 3-cycle (triangle) ring plans; dust skims fold back into deliveries.
+    #[test]
+    fn test_ring_3cycle_plans() {
+        let amounts = [10_000_000u64, 20_000_000, 30_000_000];
+        let legs = vec![
+            // min_target = full amount of the target -> no skim room; the
+            // 100bps caps (100k..300k) are all dust (< MIN_UTXO) anyway.
+            make_ring_leg(0x10, RING_A, RING_B, amounts[0], amounts[1], 100, 0xF0),
+            make_ring_leg(0x11, RING_B, RING_C, amounts[1], amounts[2], 100, 0xF1),
+            make_ring_leg(0x12, RING_C, RING_A, amounts[2], amounts[0], 100, 0xF2),
+        ];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let plan = plan_ring_match(&legs, wallet, &matcher_spk(), 0)
+            .expect("3-cycle ring must plan");
+        plan.validate().expect("ring plan must balance");
+        let deliveries: Vec<u64> = plan.outputs.iter()
+            .filter(|o| o.purpose == OutputPurpose::RingDelivery)
+            .map(|o| o.value)
+            .collect();
+        assert_eq!(deliveries, amounts.to_vec(), "full deliveries, dust skims folded back");
+        assert_eq!(plan.matcher_surplus, 0);
+        assert_eq!(plan.leg_source_tokens, vec![RING_A, RING_B, RING_C]);
+    }
+
+    /// Ring feasibility: a receiver's min_target above its giver's amount
+    /// rejects (F2 could never pass).
+    #[test]
+    fn test_ring_infeasible_min_target_rejected() {
+        let legs = vec![
+            // leg0 wants at least 2e9 + 1 of B, but leg1 only holds 2e9.
+            make_ring_leg(0x10, RING_A, RING_B, 1_000_000_000, 2_000_000_001, 100, 0xF0),
+            make_ring_leg(0x11, RING_B, RING_A, 2_000_000_000, 900_000_000, 100, 0xF1),
+        ];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let r = plan_ring_match(&legs, wallet, &matcher_spk(), 0);
+        assert!(
+            matches!(r, Err(BatchError::RingInfeasible { leg: 0, needed: 2_000_000_001, available: 2_000_000_000 })),
+            "unmeetable min_target must reject, got {:?}", r
+        );
+    }
+
+    /// Ring leg-count bounds: 1 and RING_MAX+1 legs reject.
+    #[test]
+    fn test_ring_leg_count_bounds() {
+        let leg = make_ring_leg(0x10, RING_A, RING_B, 10_000_000, 10_000_000, 100, 0xF0);
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let r = plan_ring_match(&[leg.clone()], wallet.clone(), &matcher_spk(), 0);
+        assert!(matches!(r, Err(BatchError::RingLegCount { count: 1 })), "1 leg must reject, got {:?}", r);
+
+        let legs: Vec<RingLegOrder> = (0..4u8)
+            .map(|i| make_ring_leg(0x20 + i, [i; 32], [i + 1; 32], 10_000_000, 10_000_000, 100, 0xF0 + i))
+            .collect();
+        let r = plan_ring_match(&legs, wallet, &matcher_spk(), 0);
+        assert!(matches!(r, Err(BatchError::RingLegCount { count: 4 })), "4 legs must reject, got {:?}", r);
+    }
+
+    /// Ring closure: target/source chain must close into a cycle.
+    #[test]
+    fn test_ring_not_closed_rejected() {
+        let legs = vec![
+            make_ring_leg(0x10, RING_A, RING_B, 10_000_000, 10_000_000, 100, 0xF0),
+            // leg1 gives C (not B) -> leg0's giver has the wrong token.
+            make_ring_leg(0x11, RING_C, RING_A, 20_000_000, 10_000_000, 100, 0xF1),
+        ];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let r = plan_ring_match(&legs, wallet, &matcher_spk(), 0);
+        assert!(matches!(r, Err(BatchError::RingNotClosed { .. })), "open chain must reject, got {:?}", r);
+    }
+
+    /// Ring leg validation: supplied owner SPK must hash to the RS's
+    /// owner_spk_hash (F3 would fail on-chain otherwise).
+    #[test]
+    fn test_ring_owner_spk_mismatch_rejected() {
+        let mut legs = vec![
+            make_ring_leg(0x10, RING_A, RING_B, 10_000_000, 10_000_000, 100, 0xF0),
+            make_ring_leg(0x11, RING_B, RING_A, 20_000_000, 10_000_000, 100, 0xF1),
+        ];
+        legs[0].owner_spk = ring_owner_spk(0x00); // wrong SPK for the RS hash
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
+        let r = plan_ring_match(&legs, wallet, &matcher_spk(), 0);
+        assert!(matches!(r, Err(BatchError::RingInvalidLeg { .. })), "owner SPK mismatch must reject, got {:?}", r);
     }
 
     // Test 1: Simple same-pair batch (2 sells + 2 buys of same token)

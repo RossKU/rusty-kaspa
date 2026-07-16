@@ -1,8 +1,46 @@
 //! Crossing pair detection and match output computation.
 
 use kob_core::MIN_UTXO_VALUE;
-use kob_core::contract::spot::order::{BUY_ORDER_V17_MAX_N, BUY_ORDER_V17_RS_EXPECTED_LEN};
+use kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE;
+use kob_core::contract::spot::order::{
+    BUY_ORDER_V17_MAX_N, BUY_ORDER_V17_RS_EXPECTED_LEN,
+    BUY_ORDER_V18_MAX_N, BUY_ORDER_V18_RS_EXPECTED_LEN,
+    SELL_ORDER_V18_RS_EXPECTED_LEN,
+};
 use crate::order_book::{BookOrder, OrderBook, PairBook};
+
+/// True when a redeem script is a v18 buy (unified spot generation).
+/// RS length is the canonical generation discriminator in this codebase
+/// (version numbers are engine-layer labels; see `is_v17_buy` usage below).
+pub fn is_v18_buy(rs: &[u8]) -> bool {
+    rs.len() == BUY_ORDER_V18_RS_EXPECTED_LEN
+}
+
+/// True when a redeem script is a v18 sell.
+pub fn is_v18_sell(rs: &[u8]) -> bool {
+    rs.len() == SELL_ORDER_V18_RS_EXPECTED_LEN
+}
+
+/// True when a redeem script is a v18 OCO sell — sweep-eligible on BOTH
+/// branches (the canonical branch attestation removed the pre-v18 OCO-SL
+/// fixed-offset price-read blocker).
+pub fn is_v18_oco_sell(rs: &[u8]) -> bool {
+    rs.len() == OCO_SELL_V18_RS_SIZE
+}
+
+/// Sweep-collection cap for a buy anchor: the contract's compile-time term
+/// slot count for v17/v18 sweeps, the generic batch cap otherwise. Collecting
+/// beyond this would be rejected wholesale at plan time (or panic inside the
+/// sigscript builder), losing the whole group.
+pub fn max_sweep_sells_for_buy(rs: &[u8]) -> usize {
+    if is_v18_buy(rs) {
+        BUY_ORDER_V18_MAX_N
+    } else if rs.len() == BUY_ORDER_V17_RS_EXPECTED_LEN {
+        BUY_ORDER_V17_MAX_N
+    } else {
+        MAX_BATCH_GROUP_SIZE
+    }
+}
 
 /// OP_CSV maturity window: orders must age at least this many DAA scores
 /// before they can be spent. Matches the lockTime embedded in deploy TXs.
@@ -447,15 +485,16 @@ fn find_sweep_groups(
             // duplicate inputs (TP + SL share the same UTXO).
             let mut sweep_utxo_keys: HashSet<String> = HashSet::new();
 
-            // HIGH DoS #3: a v17 buy's contract has exactly BUY_ORDER_V17_MAX_N
-            // term slots -- collecting more sells than that for a v17 anchor
-            // would later panic (or, since batch.rs now guards it, get
-            // rejected wholesale) at plan time. Cap collection at the
-            // contract's own limit for a v17 anchor so a v17 buy still gets
-            // a good, plannable group instead of losing the whole sweep; any
-            // sells beyond the cap stay unclaimed for a follow-on group.
-            let is_v17_buy = buy.redeem_script().len() == BUY_ORDER_V17_RS_EXPECTED_LEN;
-            let max_sells_for_buy = if is_v17_buy { BUY_ORDER_V17_MAX_N } else { MAX_BATCH_GROUP_SIZE };
+            // HIGH DoS #3: a v17/v18 buy's contract has exactly MAX_N term
+            // slots -- collecting more sells than that for such an anchor
+            // would later panic (or, since batch.rs guards it, get rejected
+            // wholesale) at plan time. Cap collection at the contract's own
+            // limit so the buy still gets a good, plannable group instead of
+            // losing the whole sweep; any sells beyond the cap stay
+            // unclaimed for a follow-on group.
+            let buy_rs = buy.redeem_script();
+            let is_v18_anchor = is_v18_buy(&buy_rs);
+            let max_sells_for_buy = max_sweep_sells_for_buy(&buy_rs);
 
             for sell in &asks {
                 if sweep_sells.len() >= max_sells_for_buy {
@@ -464,12 +503,25 @@ fn find_sweep_groups(
                 if claimed.contains(&sell.outpoint_key()) {
                     continue;
                 }
-                // RELEASE-BLOCKER #1: OCO sells must never enter a multi-sell
-                // sweep (OCO_SELL_BODY's F4 still uses the pre-Fix-3 shared
-                // output index -- see BatchError::OcoMultiSellSweepUnsupported
-                // in domain/src/spot/batch.rs). A solo OCO fill is unaffected;
-                // it settles via the direct 1:1 book-traversal path instead.
-                if sell.oco_path.is_some() {
+                // Pre-v18 OCO exclusion (RELEASE-BLOCKER #1, historical): the
+                // real multi-sell blocker was the OCO-SL fixed-offset
+                // price-read mismatch — a v16/v17 buy reads the swept sell's
+                // price at fixed sigscript offsets that land on the TP pair
+                // even when the SL branch executes. (The once-cited OCO F4
+                // shared-output drain was already closed by the per-input
+                // Fix-3 rewrite of OCO_SELL_BODY — see
+                // BatchError::OcoMultiSellSweepUnsupported in
+                // domain/src/spot/batch.rs for the full history.)
+                //
+                // v18 solves the price read with the canonical branch
+                // attestation (pnum/pden at sigscript [3..11)/[12..20),
+                // body-verified against the EXECUTING branch's pair), so v18
+                // OCO sells ARE sweep-eligible on both branches under a v18
+                // anchor. Everything pre-v18 stays excluded; a solo OCO fill
+                // is unaffected in any generation.
+                if sell.oco_path.is_some()
+                    && !(is_v18_anchor && is_v18_oco_sell(&sell.redeem_script()))
+                {
                     continue;
                 }
                 // OCO: skip if another path of the same UTXO is already
@@ -1885,6 +1937,131 @@ mod tests {
             "v17 buy sweep must be capped at MAX_N={}, got {}",
             BUY_ORDER_V17_MAX_N, g.fills.len(),
         );
+    }
+
+    /// v18 sibling of the DoS #3 cap test: a v18-anchor buy-sweep collection
+    /// caps at BUY_ORDER_V18_MAX_N via `max_sweep_sells_for_buy`.
+    #[test]
+    fn test_v18_buy_sweep_capped_at_max_n() {
+        let token = FAKE_TOKEN;
+        let mut ob = OrderBook::new();
+
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], 2000, 0, 0,
+        ).unwrap();
+        assert!(is_v18_buy(&rs), "helper must recognize the v18 buy RS");
+        assert_eq!(max_sweep_sells_for_buy(&rs), BUY_ORDER_V18_MAX_N);
+        let mut buy = make_buy(1_000_000_000, 1, 1, token);
+        buy.tx_id = format!("{:064x}", 2);
+        buy.owner_hash = "aa".repeat(32);
+        buy.redeem_script_hex = hex::encode(&rs);
+        ob.add_buy_order(buy);
+
+        for i in 0..12u32 {
+            let mut sell = make_sell(10_000_000, 1, 1, token);
+            sell.tx_id = format!("{:064x}", 9100 + i);
+            sell.owner_hash = format!("{:064x}", 5100 + i);
+            ob.add_sell_order(sell);
+        }
+
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
+        assert!(!groups.is_empty(), "should find a sweep group");
+        let g = &groups[0];
+        assert!(g.is_buy_sweep);
+        assert!(
+            g.fills.len() <= BUY_ORDER_V18_MAX_N,
+            "v18 buy sweep must be capped at MAX_N={}, got {}",
+            BUY_ORDER_V18_MAX_N, g.fills.len(),
+        );
+    }
+
+    /// v18 OCO sweep enablement: a v18 OCO sell IS collected into a
+    /// multi-sell sweep under a v18 buy anchor (the canonical branch
+    /// attestation removed the pre-v18 OCO-SL fixed-offset blocker).
+    #[test]
+    fn test_v18_oco_sell_included_in_v18_sweep() {
+        let token = FAKE_TOKEN;
+        let mut ob = OrderBook::new();
+
+        let buy_rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], 2000, 0, 0,
+        ).unwrap();
+        let mut buy = make_buy(2_000_000_000, 1, 1, token);
+        buy.tx_id = format!("{:064x}", 3);
+        buy.owner_hash = "aa".repeat(32);
+        buy.redeem_script_hex = hex::encode(&buy_rs);
+        ob.add_buy_order(buy);
+
+        let mut sell_plain = make_sell(500_000_000, 1, 1, token);
+        sell_plain.tx_id = format!("{:0>64}", "v18plain");
+        sell_plain.owner_hash = "b1".repeat(32);
+        ob.add_sell_order(sell_plain);
+
+        let oco_rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+            2, 1, 1_000_000, 1, 2, 1_000_000, &[0xBB; 32], &[0xCC; 32], 30, 0, 0,
+        ).unwrap();
+        assert!(is_v18_oco_sell(&oco_rs), "helper must recognize the v18 OCO RS");
+        let mut sell_oco = make_sell(500_000_000, 1, 2, token);
+        sell_oco.tx_id = format!("{:0>64}", "v18oco");
+        sell_oco.owner_hash = "b2".repeat(32);
+        sell_oco.oco_path = Some(kob_core::OcoPath::StopLoss);
+        sell_oco.redeem_script_hex = hex::encode(&oco_rs);
+        ob.add_sell_order(sell_oco);
+
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
+        assert!(!groups.is_empty(), "v18 anchor + plain + OCO must form a sweep group");
+        let g = &groups[0];
+        assert_eq!(g.fills.len(), 2, "both sells swept, incl. the v18 OCO");
+        assert!(
+            g.fills.iter().any(|s| s.oco_path.is_some()),
+            "the v18 OCO sell must be included in the sweep"
+        );
+    }
+
+    /// Pre-v18 OCO sells stay excluded even under a v18 anchor (only the
+    /// v18 OCO body attests the executing branch's price).
+    #[test]
+    fn test_pre_v18_oco_sell_still_excluded_under_v18_anchor() {
+        let token = FAKE_TOKEN;
+        let mut ob = OrderBook::new();
+
+        let buy_rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], 2000, 0, 0,
+        ).unwrap();
+        let mut buy = make_buy(2_000_000_000, 1, 1, token);
+        buy.tx_id = format!("{:064x}", 4);
+        buy.owner_hash = "aa".repeat(32);
+        buy.redeem_script_hex = hex::encode(&buy_rs);
+        ob.add_buy_order(buy);
+
+        let mut sell1 = make_sell(500_000_000, 1, 1, token);
+        sell1.tx_id = format!("{:0>64}", "plain1x");
+        sell1.owner_hash = "b1".repeat(32);
+        ob.add_sell_order(sell1);
+        let mut sell2 = make_sell(500_000_000, 1, 1, token);
+        sell2.tx_id = format!("{:0>64}", "plain2x");
+        sell2.owner_hash = "b2".repeat(32);
+        ob.add_sell_order(sell2);
+
+        // v1 OCO RS (pre-v18): must stay excluded from the multi-sell sweep.
+        let old_oco_rs = kob_core::build_oco_sell_redeem_script(
+            2, 1, 1_000_000, 1, 2, 1_000_000, &[0xBB; 32], &[0xCC; 32], 0, 0, 0,
+        ).unwrap();
+        let mut sell_oco = make_sell(500_000_000, 1, 2, token);
+        sell_oco.tx_id = format!("{:0>64}", "oldoco");
+        sell_oco.owner_hash = "b3".repeat(32);
+        sell_oco.oco_path = Some(kob_core::OcoPath::StopLoss);
+        sell_oco.redeem_script_hex = hex::encode(&old_oco_rs);
+        ob.add_sell_order(sell_oco);
+
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
+        assert!(!groups.is_empty(), "the plain sells still form a group");
+        for g in &groups {
+            assert!(
+                g.fills.iter().all(|s| s.oco_path.is_none()),
+                "a pre-v18 OCO sell must never enter a multi-sell sweep"
+            );
+        }
     }
 
     #[test]

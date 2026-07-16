@@ -3060,6 +3060,58 @@ mod tests {
         assert_eq!(plan.matcher_surplus, old_surplus + delta);
     }
 
+    /// Isolates the Phase-1 estimate vs the real mass directly (bypassing
+    /// `total_fee`, which for a generously-funded wallet input also absorbs
+    /// uncapped matcher surplus and would otherwise mask an under-estimate).
+    /// Checked at both N=1 (tightest margin: only 2 sig-op-bearing... inputs
+    /// assumed vs 1 real) and N=MAX_N (largest buy sigscript).
+    fn v17_fee_estimate_vs_real_mass_at_n(n: usize) -> (u64, u64) {
+        let token = [0x49; 32];
+        let sells: Vec<BatchOrder> = (0..n as u8)
+            .map(|i| make_sell(0x70 + i, 5_000_000, 1, 1, token))
+            .collect();
+        let buys = vec![make_buy_v17(0x20, n as u64 * 5_000_000, 1, 1, token, 2000)];
+        let wallet = (hex::encode(&[0x99u8; 32]), 0u32, 3_000_000u64);
+        let plan = plan_batch_match(&sells, &buys, Some(wallet), &matcher_spk(), 0, Some(2000)).unwrap();
+
+        let num_inputs = 1 + n + 1; // buy + n sells + wallet
+        let num_outputs = plan.outputs.len();
+        let est_mass = kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0);
+
+        let tx = plan.to_transaction();
+        let batch_tx = plan.build_tx().unwrap();
+        let mut sigscripts: Vec<Vec<u8>> = batch_tx.inputs.iter().map(|i| i.sigscript.clone()).collect();
+        let fake_wallet_ss = vec![0x41u8; 66];
+        *sigscripts.last_mut().unwrap() = fake_wallet_ss;
+        let real_mass = kob_core::mass::calc_mass_with_sigscripts(&tx, &sigscripts);
+        (est_mass, real_mass)
+    }
+
+    #[test]
+    fn test_v17_max_n_fee_estimate_vs_real_mass() {
+        let n = kob_core::contract::spot::order::BUY_ORDER_V17_MAX_N;
+        let (est_mass, real_mass) = v17_fee_estimate_vs_real_mass_at_n(n);
+        eprintln!("PROBE v17 N={n}: est_mass={est_mass} real_mass={real_mass}");
+        assert!(
+            real_mass <= est_mass,
+            "v17 N={n}: real mass {real_mass} exceeds the Phase-1 estimate {est_mass} \
+             -- estimate_compute_mass's ~100B/input sigscript assumption is blown by \
+             the v17 buy's real (RS 838B + N tii pushes) sigscript -- Fix 5 under-pay"
+        );
+    }
+
+    #[test]
+    fn test_v17_n1_fee_estimate_vs_real_mass() {
+        // N=1 has the tightest safety margin (fewest inputs to over-count
+        // sig-ops on, relative to the buy's fixed ~850B sigscript cost).
+        let (est_mass, real_mass) = v17_fee_estimate_vs_real_mass_at_n(1);
+        eprintln!("PROBE v17 N=1: est_mass={est_mass} real_mass={real_mass}");
+        assert!(
+            real_mass <= est_mass,
+            "v17 N=1: real mass {real_mass} exceeds the Phase-1 estimate {est_mass} -- Fix 5 under-pay"
+        );
+    }
+
     // Test: Phase 2 convergence respects bps cap
     #[test]
     fn converge_fee_exact_respects_bps_cap() {

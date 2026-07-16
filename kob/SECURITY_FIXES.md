@@ -96,7 +96,16 @@ never share one output.
 - **Residual**: only PATH 6 (the security path) is engine-verified here.
   PATH 1/3 fills are corrected-by-construction but still need their own
   engine harness; the listing covenant as a whole warrants a full
-  correctness+verification pass (it had never been executed on-chain).
+  correctness+verification pass.
+- **Update (release-backlog pass)**: the listing covenant has now been
+  executed on-chain. A `kob-cli listing` subcommand (deploy + settle) was
+  added and live-smoked on testnet-10 — english-auction deploy
+  `cf0db1ff3a23c8144d9fca5b229520284b2bfb23ea01ff70db2b1e3c44630c74`, then the
+  PATH-6 settle after expiry `0aff3da54032a4b4bc40c14e458f450b02a8b60b065988697e3f774b539d1fa8`
+  (accrued value paid to the seller, `lockTime = expiry_daa`). PATH 1/3/5
+  (fill/dutch-buy/english-bid, which transfer ownership of an external
+  position covenant) remain un-exercised — a dedicated listing-with-position
+  flow is still the follow-on.
 
 ### Fix 7 — cross-pair swap surplus was uncapped
 - **File**: `kob/domain/src/spot/matching.rs` (`match_swap_routes`).

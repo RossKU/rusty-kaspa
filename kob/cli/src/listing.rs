@@ -175,7 +175,7 @@ async fn deploy_listing(
     tx.outputs.push(TxOutput::new(change, funding.utxo_entry.script_public_key.version, change_spk, None));
 
     // Sign, then recompute the exact fee and re-sign once (P2PK funding input).
-    let mut sign = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
+    let sign = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
         let sighash = compute_sighash(tx, 0)?;
         let sig = signing::schnorr_sign_secure(&privkey, &sighash)?;
         Ok(vec![signing::build_p2pk_sigscript(&sig)])
@@ -291,7 +291,7 @@ async fn settle_listing(
     tx.outputs.push(TxOutput::new(listing_value, 0, seller_spk.clone(), None));
 
     // Sign the fee input (index 1); the listing input uses the settle sigscript.
-    let mut build_sigs = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
+    let build_sigs = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
         let sighash = compute_sighash(tx, 1)?;
         let sig = signing::schnorr_sign_secure(&privkey, &sighash)?;
         Ok(vec![settle_ss.clone(), signing::build_p2pk_sigscript(&sig)])

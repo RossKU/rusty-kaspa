@@ -38,8 +38,52 @@ to confirm it now lands, unless noted otherwise.
 | `prediction create` (2-step, covenant-binding + fee fix) | PASS (re-verified, release-backlog pass) | step1 `92bbd39d885a69df4c57a310004d19b194248139d90f72f72f6307faf6244f85`, step2 `eee6297b0c013f767ba5d39cf4d7de9d9c8efbaa776e08b2b156eaff515326b6` |
 | `prediction vote` | BUILDER FIXED (3-in/4-out); mempool-blocked BY DESIGN | domain builder rewritten to the deployed 3-in/4-out VoteReceipt contract + a deeper covenant-binding deploy gap fixed (both proven vs the real engine in `prediction_vote_repro.rs`). Live submit reached the node and was refused with `transaction has 0 fees which is under the required amount` -- a standardness/fee rejection, NOT a script failure. The contract's V6 mandates `total_in == total_out` (fee EXACTLY 0), so vote is a fee==0 miner-INCLUSION-only tx by design; it cannot enter the standard RPC mempool. Not a builder bug. |
 | `redemption.rs` / `split_merge.rs` refund paths (CLTV fix) | FIXED, live-verified (release-backlog pass) | OP_CLTV fix confirmed on-chain: SplitMerge refund `87ebbc9fe556fdda96c054613330dfa8d0554f7f04316fa25d2724266874d8c6`, Redemption refund `efd681470db89ff429af3fff7c6dfabcba5bd518737d184459d9029655795d18`. Two follow-on bugs found + fixed en route: refund fee underpayment (Phase-2 exact recompute added, like `expire`) and a tx-finality race (`lockTime = current_daa` -> `expiry_daa`). |
-| `listing` (English/Dutch auction) | NOT EXERCISABLE | no CLI subcommand exists at all; contract-only, off-chain-tested per SECURITY_FIXES.md Fix 5 |
+| `listing` (English/Dutch auction) | CLI ADDED + live deploy+settle (release-backlog pass) | new `kob-cli listing` subcommand (deploy + settle). Live english-auction deploy `cf0db1ff3a23c8144d9fca5b229520284b2bfb23ea01ff70db2b1e3c44630c74`, then PATH-6 settle after expiry `0aff3da54032a4b4bc40c14e458f450b02a8b60b065988697e3f774b539d1fa8` (accrued value paid to seller). Bidding (PATH 5) / buy-fill (PATH 1/3, external position transfer) out of scope for this smoke. |
+| sell IOC honest residual builder (SECURITY_FIXES Fix 1 residual) | WIRED + covenant-engine verified (release-backlog pass) | `plan_sell_ioc_match` now emits the residual self-continuation to the sell order's own P2SH at the sell input's auth[0]; proven against the real `kaspa-txscript` engine (harness `sell_ioc_builder_layout_residual_at_auth0_passes`). Not separately live-smoked (engine harness is the authoritative method); multi-sell batch residual deferred (fail-closed). |
+| bracket single-order fill surplus cap (SECURITY_FIXES Fix 6) | RE-DECIDED: safe-by-limit, no cap (release-backlog pass) | `fill_bracket_v4` is reachable but has no free fill parameter; `output[1] >= et` (et = full deposit * entry_price) to the buyer's own SPK fully bounds it. No F6-style drain; closed, no state change. |
+| dead lending/perp fee builders | FIXED (release-backlog pass) | all 14 un-wired blueprint-builder fees wrapped in `min_relay_fee` so they're correct if wired; dead code today (no caller). |
 | x402 KIP-10 exact CASE R2 (under-threshold continuation) | FIXED, live-verified | root cause + fix in `kob/x402/src/scheme_exact.rs` (see below); re-run of `e2e_x402_exact.sh` after rebuild: 30/30, R2 now correctly refused (`invalid_payment_requirements`); happy-path settle TXID `9d61a47c4180785b8b8e85af9b72c26979471a5c006876e4a1e7279b2c62f78c` |
+
+## FINAL release verdict (release-backlog pass complete)
+
+All six backlog items resolved. Complete TXID table for the release-backlog
+pass (testnet-10, node `ws://65.108.107.30:18210`, wallet
+`kaspatest:qz6qc3j...cfy7qrwa6v8lf`):
+
+| Item | Flow | Result | TXID(s) |
+|---|---|---|---|
+| 1 | prediction create (2-step) | PASS | step1 `92bbd39d885a69df4c57a310004d19b194248139d90f72f72f6307faf6244f85`, step2 `eee6297b0c013f767ba5d39cf4d7de9d9c8efbaa776e08b2b156eaff515326b6` |
+| 1 | prediction vote | BUILDER FIXED; mempool-blocked BY DESIGN (fee==0 miner-inclusion) | rejected `dbde746457bcf678b50a36611fe87e56074ca0a062026519bdebb38fcf427b1c` ("has 0 fees" — standardness, not script failure) |
+| 1 | SplitMerge refund (OP_CLTV) | PASS | `87ebbc9fe556fdda96c054613330dfa8d0554f7f04316fa25d2724266874d8c6` |
+| 1 | Redemption refund (OP_CLTV) | PASS | `efd681470db89ff429af3fff7c6dfabcba5bd518737d184459d9029655795d18` |
+| 2 | sell IOC honest residual | WIRED, covenant-engine verified | (off-chain engine harness; no separate live smoke) |
+| 3 | bracket single-order cap | RE-DECIDED safe-by-limit, no cap | (analysis; no code/tx) |
+| 4 | x402 KIP-10 exact R2 regression | FIXED, live-verified | happy settle `9d61a47c4180785b8b8e85af9b72c26979471a5c006876e4a1e7279b2c62f78c` (30/30 e2e) |
+| 5 | dead lending/perp fee builders | FIXED (min_relay_fee) | (dead code; no live tx) |
+| 6 | listing deploy (english) | PASS | `cf0db1ff3a23c8144d9fca5b229520284b2bfb23ea01ff70db2b1e3c44630c74` |
+| 6 | listing settle (PATH 6) | PASS | `0aff3da54032a4b4bc40c14e458f450b02a8b60b065988697e3f774b539d1fa8` |
+
+**Is prediction vote now green?** The vote *builder* is fixed and correct
+(rewritten to the deployed 3-in/4-out VoteReceipt layout, proven against the
+real engine, and confirmed on-chain up to the fee gate). Vote is NOT
+mempool-submittable and never will be: the deployed contract's V6 mandates
+`total_in == total_out` (fee exactly 0), making it a miner-INCLUSION-only tx
+by design. This is a design property of the deployed contract, not a bug — so
+"prediction vote via kob-cli + RPC mempool" is closed as won't-fix (needs a
+block producer), while every other prediction path (deploy, expire, both
+refunds) is live-green.
+
+**Anything still blocking?** No release blocker remains from this backlog.
+Residuals (tracked, non-blocking): the prediction settle path shares the
+vote/create covenant-binding requirement (fixed at the builder; settle wiring
+not separately live-re-verified here); the multi-sell batch IOC residual is
+fail-closed (dedicated `--ioc` single-sell path is the supported route); the
+x402 `discover_landed_payment` stale-UTXO false-success gap (surfaced by, not
+caused by, R2); and `oco-sell` has no cancel path. Spot lifecycle,
+auto-matching, F6 defense, x402 native/KCC20/exact, listing, and the other
+instruments are live-confirmed.
+
+---
 
 **Release verdict** (updated, release-backlog pass): The prediction module,
 previously the main blocker, is now materially closed. `create` deploys

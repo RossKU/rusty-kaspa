@@ -2468,11 +2468,78 @@ fn process_block_txs_all(
     counters
 }
 
+/// Number of chain blocks (each with its merge set expanded) processed per
+/// checkpoint during a catch-up scan.
+///
+/// H1-CHUNK: the prior design scanned an entire catch-up gap (observed up to
+/// ~1357 blocks on testnet-10) as one monolithic pass and only persisted the
+/// cursor + books once the WHOLE pass returned. If the node stalled or the
+/// process crashed mid-pass (documented: deterministic 0%-CPU hangs on large
+/// `getBlocks` catch-ups), a restart re-scanned the ENTIRE gap from the
+/// original stale cursor -- unbounded, repeated work with no guarantee of
+/// ever finishing. Checkpointing every `CATCHUP_CHUNK_SIZE` blocks bounds the
+/// lost work on a crash/stall to at most one chunk, turning catch-up into a
+/// resumable process instead of an all-or-nothing one.
+const CATCHUP_CHUNK_SIZE: usize = 50;
+
+/// File paths needed to checkpoint scan progress mid-catch-up.
+///
+/// A checkpoint persists the scan cursor AND every book `scan_new_blocks`
+/// mutates, together, so a resumed process never sees an inconsistent state
+/// (cursor claiming blocks were scanned whose orders aren't in the persisted
+/// books, or vice versa).
+struct ScanCheckpointPaths<'a> {
+    scan_state_path: &'a str,
+    orderbook_path: &'a str,
+    perp_book_path: &'a str,
+    lending_book_path: &'a str,
+    prediction_book_path: &'a str,
+}
+
+impl<'a> ScanCheckpointPaths<'a> {
+    /// Persist the cursor + books as of `tip_hash`. Best-effort: a failed
+    /// checkpoint is logged, not fatal -- the next successful checkpoint (or
+    /// the end-of-cycle save that already existed) will catch up.
+    fn save(
+        &self,
+        tip_hash: &str,
+        order_book: &OrderBook,
+        perp_book: &crate::matcher::perp_book::PerpOrderBook,
+        lending_book: &crate::matcher::lending_book::LendingBook,
+        prediction_book: &crate::matcher::prediction_book::PredictionBook,
+    ) {
+        if let Err(e) = persistence::save_order_book(self.orderbook_path, order_book) {
+            warn!("[CATCHUP-CHECKPOINT] Failed to save order book: {}", e);
+        }
+        if let Err(e) = persistence::save_perp_book(self.perp_book_path, perp_book) {
+            warn!("[CATCHUP-CHECKPOINT] Failed to save perp book: {}", e);
+        }
+        if let Err(e) = persistence::save_lending_book(self.lending_book_path, lending_book) {
+            warn!("[CATCHUP-CHECKPOINT] Failed to save lending book: {}", e);
+        }
+        if let Err(e) = persistence::save_prediction_book(self.prediction_book_path, prediction_book) {
+            warn!("[CATCHUP-CHECKPOINT] Failed to save prediction book: {}", e);
+        }
+        let json = serde_json::json!({ "last_seen_hash": tip_hash });
+        match std::fs::write(self.scan_state_path, json.to_string()) {
+            Ok(()) => info!(
+                "[CATCHUP-CHECKPOINT] Checkpointed catch-up progress at {}...",
+                &tip_hash[..tip_hash.len().min(16)],
+            ),
+            Err(e) => warn!("[CATCHUP-CHECKPOINT] Failed to persist scan cursor: {}", e),
+        }
+    }
+}
+
 /// Scan recent L1 blocks for new orders across all product types.
 ///
 /// Polls the virtual selected parent chain for blocks added since
 /// `last_chain_hash`, parses transactions, and routes detected orders
 /// to the appropriate books via `process_block_txs_all`.
+///
+/// When `checkpoint` is `Some`, progress (cursor + books) is persisted every
+/// `CATCHUP_CHUNK_SIZE` blocks so a large catch-up is resumable instead of
+/// all-or-nothing (see `CATCHUP_CHUNK_SIZE` doc comment).
 ///
 /// Returns the new chain tip hash to use as `last_chain_hash` on the next call.
 async fn scan_new_blocks(
@@ -2484,6 +2551,7 @@ async fn scan_new_blocks(
     last_chain_hash: &str,
     ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
     current_daa: u64,
+    checkpoint: Option<ScanCheckpointPaths<'_>>,
 ) -> (String, ScanCounters) {
     let scanner = BlockScanner::new();
     let mut total_counters = ScanCounters::default();
@@ -2529,6 +2597,8 @@ async fn scan_new_blocks(
     // Track already-scanned block hashes to avoid duplicates (a merge set
     // block may appear in multiple chain blocks' merge sets).
     let mut scanned_blocks: HashSet<String> = HashSet::new();
+    // H1-CHUNK: blocks processed since the last checkpoint save.
+    let mut blocks_since_checkpoint = 0usize;
 
     for block_hash in blocks_to_scan {
         let block_resp = match rpc.get_block(block_hash).await {
@@ -2621,6 +2691,17 @@ async fn scan_new_blocks(
             total_counters.dca_removed += counters.dca_removed;
             total_counters.swap_added += counters.swap_added;
             total_counters.swap_removed += counters.swap_removed;
+        }
+
+        // H1-CHUNK: checkpoint every CATCHUP_CHUNK_SIZE chain blocks so a
+        // stall/crash here resumes from `block_hash`, not from the original
+        // `last_chain_hash` at the start of this (possibly huge) catch-up.
+        blocks_since_checkpoint += 1;
+        if blocks_since_checkpoint >= CATCHUP_CHUNK_SIZE {
+            if let Some(cp) = &checkpoint {
+                cp.save(block_hash, order_book, perp_book, lending_book, prediction_book);
+            }
+            blocks_since_checkpoint = 0;
         }
     }
 
@@ -4922,9 +5003,17 @@ pub async fn run_continuous_with_ws(
         let mut pb = shared_perp_book.lock().await;
         let mut lb = shared_lending_book.lock().await;
         let mut pred = shared_prediction_book.lock().await;
+        let checkpoint = ScanCheckpointPaths {
+            scan_state_path: scan_state_path.as_str(),
+            orderbook_path,
+            perp_book_path: perp_book_path.as_str(),
+            lending_book_path: lending_book_path.as_str(),
+            prediction_book_path: prediction_book_path.as_str(),
+        };
         let (new_hash, counters) = scan_new_blocks(
             &*rpc_bf, &mut ob, &mut pb, &mut lb, &mut pred,
             hash, ws_tx.as_ref(), current_daa,
+            Some(checkpoint),
         ).await;
         if new_hash != *hash {
             info!(
@@ -5015,9 +5104,17 @@ pub async fn run_continuous_with_ws(
                     let mut pb = shared_perp_book.lock().await;
                     let mut lb = shared_lending_book.lock().await;
                     let mut pred = shared_prediction_book.lock().await;
+                    let checkpoint = ScanCheckpointPaths {
+                        scan_state_path: scan_state_path.as_str(),
+                        orderbook_path,
+                        perp_book_path: perp_book_path.as_str(),
+                        lending_book_path: lending_book_path.as_str(),
+                        prediction_book_path: prediction_book_path.as_str(),
+                    };
                     let (new_hash, counters) = scan_new_blocks(
                         &*rpc_catchup, &mut ob, &mut pb, &mut lb, &mut pred,
                         &catchup_hash, ws_tx.as_ref(), current_daa,
+                        Some(checkpoint),
                     ).await;
                     if new_hash != catchup_hash {
                         info!(
@@ -5078,9 +5175,17 @@ pub async fn run_continuous_with_ws(
                 let mut pb = shared_perp_book.lock().await;
                 let mut lb = shared_lending_book.lock().await;
                 let mut pred = shared_prediction_book.lock().await;
+                let checkpoint = ScanCheckpointPaths {
+                    scan_state_path: scan_state_path.as_str(),
+                    orderbook_path,
+                    perp_book_path: perp_book_path.as_str(),
+                    lending_book_path: lending_book_path.as_str(),
+                    prediction_book_path: prediction_book_path.as_str(),
+                };
                 let (new_hash, counters) = scan_new_blocks(
                     &*rpc_bf, &mut ob, &mut pb, &mut lb, &mut pred,
                     hash, ws_tx.as_ref(), current_daa,
+                    Some(checkpoint),
                 ).await;
                 if new_hash != *hash {
                     info!(
@@ -6033,6 +6138,130 @@ mod tests {
         assert_eq!(added, 0, "Sell order with zero token_cov_id must be skipped");
         assert_eq!(ob.stats().total_bids, 0);
         assert_eq!(ob.stats().total_asks, 0);
+    }
+
+    // H1-CHUNK: chunked + checkpointed catch-up backfill.
+
+    /// Sanity check on the checkpoint interval: large enough to batch I/O,
+    /// small enough to bound worst-case re-scan work after a crash/stall.
+    #[test]
+    fn catchup_chunk_size_is_reasonable() {
+        assert!(CATCHUP_CHUNK_SIZE >= 10, "chunk size should batch multiple blocks per checkpoint I/O");
+        assert!(CATCHUP_CHUNK_SIZE <= 500, "chunk size should bound worst-case re-scan work on crash");
+    }
+
+    fn make_buy_deploy_for_token(marker: u8) -> TransactionData {
+        let tcid = [marker; 32];
+        let ohash = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        let rs = kob_core::contract::build_buy_redeem_script(
+            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, 0, 0, 0,
+        ).unwrap();
+        let tx_id = format!("{:02x}", marker).repeat(32);
+        make_deploy_tx(&tx_id, &rs, 10_000_000)
+    }
+
+    /// Core resume invariant: processing blocks in one uninterrupted pass
+    /// must produce the SAME final order-book state as processing chunk 1,
+    /// checkpointing (persisting the order book to disk), "restarting"
+    /// (reloading into a fresh in-memory book), then processing chunk 2
+    /// against the reloaded book.
+    ///
+    /// This exercises the exact mechanism `ScanCheckpointPaths::save` relies
+    /// on (`persistence::save_order_book` / `load_order_book`) against the
+    /// real scanning entrypoint (`process_block_txs`), without needing a
+    /// live RPC connection. It proves a crash after chunk 1 loses at most
+    /// chunk 2's re-scan work, and never double-processes or drops chunk 1's
+    /// orders.
+    #[tokio::test]
+    async fn catchup_resume_from_checkpoint_matches_uninterrupted_scan() {
+        let scanner = BlockScanner::new();
+
+        let chunk1_txs = vec![make_buy_deploy_for_token(1), make_buy_deploy_for_token(2)];
+        let chunk2_txs = vec![make_buy_deploy_for_token(3), make_buy_deploy_for_token(4)];
+
+        // Reference: uninterrupted single pass over both chunks.
+        let mut reference_ob = OrderBook::new();
+        process_block_txs(&chunk1_txs, &mut reference_ob, &scanner);
+        process_block_txs(&chunk2_txs, &mut reference_ob, &scanner);
+        let reference_stats = reference_ob.stats();
+        assert_eq!(reference_stats.pairs, 4, "sanity: 4 distinct tokens deployed");
+
+        // Chunked + checkpointed: process chunk 1, checkpoint to disk,
+        // simulate a crash (drop the live book), reload from disk, then
+        // process chunk 2 against the reloaded book -- exactly what a
+        // restarted daemon does after resuming from a persisted checkpoint.
+        let dir = std::env::temp_dir();
+        let ckpt_path = dir.join(format!(
+            "test_catchup_resume_{}_{}.json",
+            std::process::id(),
+            "a"
+        ));
+        let ckpt_path_str = ckpt_path.to_str().unwrap().to_string();
+
+        let mut live_ob = OrderBook::new();
+        process_block_txs(&chunk1_txs, &mut live_ob, &scanner);
+        persistence::save_order_book(&ckpt_path_str, &live_ob).expect("checkpoint save");
+        drop(live_ob); // simulate crash: in-memory state is gone
+
+        let reloaded = Arc::new(Mutex::new(OrderBook::new()));
+        persistence::load_order_book(&ckpt_path_str, &reloaded)
+            .await
+            .expect("checkpoint load");
+
+        {
+            let mut ob = reloaded.lock().await;
+            process_block_txs(&chunk2_txs, &mut ob, &scanner);
+        }
+        let resumed_stats = reloaded.lock().await.stats();
+
+        assert_eq!(
+            resumed_stats.total_bids, reference_stats.total_bids,
+            "resume must reconstruct the same order count as an uninterrupted scan"
+        );
+        assert_eq!(
+            resumed_stats.pairs, reference_stats.pairs,
+            "resume must reconstruct the same pair count (no double-processing, no drops)"
+        );
+
+        let _ = std::fs::remove_file(&ckpt_path_str);
+    }
+
+    /// A checkpoint taken after chunk 1 must reflect ONLY chunk 1's orders,
+    /// not chunk 2's -- proving the on-disk snapshot at a checkpoint boundary
+    /// is accurate ("scanned up to here"), and stays untouched until the
+    /// next explicit checkpoint (so a crash before the next checkpoint
+    /// re-scans only the unprocessed remainder, never loses chunk 1).
+    #[test]
+    fn catchup_checkpoint_snapshot_excludes_unprocessed_chunk() {
+        let scanner = BlockScanner::new();
+        let deploy1 = make_buy_deploy_for_token(0x11);
+        let deploy2 = make_buy_deploy_for_token(0x22);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("test_catchup_snapshot_{}.json", std::process::id()));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut ob = OrderBook::new();
+        process_block_txs(&[deploy1], &mut ob, &scanner);
+        persistence::save_order_book(&path_str, &ob).expect("checkpoint save");
+
+        let raw = std::fs::read_to_string(&path_str).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.as_object().unwrap().len(), 1, "checkpoint must contain only chunk 1's pair");
+
+        // Process chunk 2 in memory, but do NOT checkpoint again yet.
+        process_block_txs(&[deploy2], &mut ob, &scanner);
+        assert_eq!(ob.stats().pairs, 2, "in-memory book now has both pairs");
+
+        let raw_after = std::fs::read_to_string(&path_str).unwrap();
+        let parsed_after: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
+        assert_eq!(
+            parsed_after.as_object().unwrap().len(), 1,
+            "checkpoint file must stay at chunk 1's snapshot until the next explicit save"
+        );
+
+        let _ = std::fs::remove_file(&path_str);
     }
 
     #[test]

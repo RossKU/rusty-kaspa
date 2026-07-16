@@ -2758,6 +2758,62 @@ mod tests {
         assert_eq!(plan.sells.len(), n_max, "sweep must cap at MAX_N even though more sells crossed and were affordable");
     }
 
+    /// Item D: multi-v17-buy allocation is NOT supported and must reject.
+    ///
+    /// A v17 buy's per-term OpAuthOutputIdx binding + aggregate surplus cap is
+    /// designed for exactly ONE buy summing N sells. Allocating N sells across
+    /// M>1 v17 buys in one tx would require each buy to sum a DISJOINT subset of
+    /// sells, but nothing in the v17 covenant prevents two buys from both
+    /// referencing (and both counting) the same sell's authorized output -- a
+    /// cross-buy double-count. Each buy's cap is checked independently against
+    /// its own kas_in, so a matcher could over-allocate one sell's tokens across
+    /// two buys' fair-value sums without any single covenant catching it. Since
+    /// that disjointness is not covenant-provable, the planner rejects >1 v17
+    /// buy (fail-closed) rather than ship an unverifiable allocation.
+    #[test]
+    fn test_v17_multi_buy_rejected() {
+        let token = [0x4e; 32];
+        let sells = vec![
+            make_sell(0x10, 10_000_000, 1, 1, token),
+            make_sell(0x11, 10_000_000, 1, 1, token),
+        ];
+        let buys = vec![
+            make_buy_v17(0x20, 10_000_000, 1, 1, token, 2000),
+            make_buy_v17(0x21, 10_000_000, 1, 1, token, 2000),
+        ];
+        let r = plan_batch_match(&sells, &buys, None, &matcher_spk(), 0, Some(2000));
+        assert!(
+            matches!(r, Err(BatchError::UnsupportedVersion { .. })),
+            "2 v17 buys in one tx must be rejected (no covenant-provable cross-buy disjointness), got {:?}", r
+        );
+    }
+
+    /// Item C: v17 has NO partial-fill (Op2 D&R residual continuation) path --
+    /// its covenant dispatches only expire(4)/cancel(0)/cancel-mark(3)/
+    /// fill(1)/IOC(5). A v17 buy therefore NEVER gets a partial-fill sigscript:
+    /// both v17 planners populate `buy_sweep_sells` (so build_tx takes the v17
+    /// fill branch) and leave `buy_partial_fills` empty. This test pins that
+    /// invariant so no future change silently emits a broken v17 partial-fill.
+    /// (Incremental buy-order consumption across txs for v17 would need a
+    /// covenant redesign -- out of scope per NM_BUY_DESIGN.md Sec 5.)
+    #[test]
+    fn test_v17_never_emits_partial_fill() {
+        let token = [0x4f; 32];
+        let sells = vec![make_sell(0x10, 10_000_000, 1, 1, token)];
+        let buys = vec![make_buy_v17(0x20, 10_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 100_000_000u64));
+        let plan = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000)).unwrap();
+        assert!(plan.buy_partial_fills.is_empty(), "v17 plan must carry no partial-fill entries");
+        assert!(!plan.buy_sweep_sells.is_empty() && !plan.buy_sweep_sells[0].is_empty(),
+            "v17 plan must carry the sweep-sells list so build_tx uses the v17 fill sigscript");
+        // build_tx's buy sigscript is the v17 fill form (selector Op1=0x51 with
+        // the v17 RS embedded), never a partial-fill (Op2) sigscript.
+        let tx = plan.build_tx().unwrap();
+        let buy_ss = &tx.inputs[1].sigscript; // input[1] = the single buy (after 1 sell)
+        assert!(buy_ss.windows(2).any(|w| w == [0x59, 0x7a]),
+            "buy sigscript must embed the v17 selector-dispatch RS (fill path), not a partial-fill");
+    }
+
     // Test 1: Simple same-pair batch (2 sells + 2 buys of same token)
     #[test]
     fn test_simple_same_pair_batch() {

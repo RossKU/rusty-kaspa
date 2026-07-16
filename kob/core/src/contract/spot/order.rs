@@ -1812,15 +1812,24 @@ pub fn build_buy_v17_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
 
 /// Build a v17 buy cancel/cancel-mark sigscript: `[pk][sig][selector][pushData(RS)]`.
 /// selector = Op0 (cancel) or Op3 (cancel-mark).
+///
+/// `signature` is the 64-byte Schnorr signature; the SIGHASH_ALL type byte
+/// (0x01) is appended here, matching the sell/receipt cancel convention. Note
+/// the layout differs from v14/v16 cancel (`[selector][sig][pk][RS]`): v17
+/// dispatches by selector (which must sit at stack depth 9), so pk/sig go
+/// BELOW the selector, not above.
 pub fn build_buy_v17_cancel_sigscript(
     pubkey: &[u8; 32],
-    signature: &[u8],
+    signature: &[u8; 64],
     mark: bool,
     redeem_script: &[u8],
 ) -> Vec<u8> {
-    let mut ss = Vec::with_capacity(2 + 32 + signature.len() + redeem_script.len() + 6);
+    let mut sig_with_type = Vec::with_capacity(65);
+    sig_with_type.extend_from_slice(signature);
+    sig_with_type.push(0x01); // SIGHASH_ALL
+    let mut ss = Vec::with_capacity(2 + 32 + 66 + redeem_script.len() + 6);
     ss.extend_from_slice(&push_data(pubkey));
-    ss.extend_from_slice(&push_data(signature));
+    ss.extend_from_slice(&push_data(&sig_with_type));
     ss.push(if mark { 0x53 } else { 0x00 }); // Op3 / Op0
     ss.extend_from_slice(&push_data(redeem_script));
     ss

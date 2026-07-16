@@ -626,3 +626,103 @@ fn v17_lengths_and_no_collision() {
     // from v14/v16 (0xb9 length dispatch).
     assert_eq!(rs[145], 0x59, "v17 body must start with Op9 (selector dispatch)");
 }
+
+
+// ===== Lifecycle paths (expire / cancel) =====
+
+use kob_core::contract::spot::order::{
+    build_buy_v17_expire_sigscript, build_buy_v17_cancel_sigscript,
+};
+
+/// v17 EXPIRE: after expiry, the buyer reclaims their locked KAS (output[0] to
+/// the buyer's SPK, value >= input). Verifies the selector-dispatched expire path.
+#[test]
+fn v17_expire_refund_passes() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let buy_rs = build_buy_v17_redeem_script(&arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 30, 0, 1000).unwrap();
+    let ss = build_buy_v17_expire_sigscript(&buy_rs);
+    // tx.lockTime = 2000 >= expiry 1000; input sequence != MAX (0).
+    let inputs = vec![TransactionInput::new(op(0x20, 0), ss, 0, 0)];
+    let outputs = vec![TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), None)];
+    let entries = vec![UtxoEntry { amount: 30_000_000, script_public_key: build_p2sh(&buy_rs), block_daa_score: 0, is_coinbase: false, covenant_id: None }];
+    let tx = Transaction::new(1, inputs, outputs, 2000, Default::default(), 0, vec![]);
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).unwrap();
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let reused = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+    let (input, entry) = populated.populated_input(0);
+    let mut vm = TxScriptEngine::from_transaction_input(&populated, input, 0, entry, ctx, flags);
+    let r = vm.execute();
+    assert!(r.is_ok(), "v17 expire refund must pass; got {r:?}");
+}
+
+/// v17 EXPIRE before expiry is rejected (CLTV: expiry > lockTime).
+#[test]
+fn v17_expire_before_expiry_rejected() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let buy_rs = build_buy_v17_redeem_script(&arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 30, 0, 5000).unwrap();
+    let ss = build_buy_v17_expire_sigscript(&buy_rs);
+    let inputs = vec![TransactionInput::new(op(0x20, 0), ss, 0, 0)];
+    let outputs = vec![TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), None)];
+    let entries = vec![UtxoEntry { amount: 30_000_000, script_public_key: build_p2sh(&buy_rs), block_daa_score: 0, is_coinbase: false, covenant_id: None }];
+    let tx = Transaction::new(1, inputs, outputs, 1000, Default::default(), 0, vec![]); // lockTime 1000 < expiry 5000
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).unwrap();
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let reused = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+    let (input, entry) = populated.populated_input(0);
+    let mut vm = TxScriptEngine::from_transaction_input(&populated, input, 0, entry, ctx, flags);
+    assert!(vm.execute().is_err(), "expire before expiry_daa must be rejected");
+}
+
+/// v17 CANCEL structural check: with the REAL owner pubkey, the blake2b(pk)==ohash
+/// gate passes and execution reaches OpCheckSigVerify (which fails on the dummy
+/// signature). A stack bug before that point would surface a different error
+/// class; a clean signature-failure confirms the cancel stack choreography.
+#[test]
+fn v17_cancel_reaches_checksig() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let buy_rs = build_buy_v17_redeem_script(&arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+    // dummy 64-byte sig — well-formed length but invalid signature.
+    let sig = [0x11u8; 64];
+    let ss = build_buy_v17_cancel_sigscript(&pubkey, &sig, false, &buy_rs);
+    let inputs = vec![TransactionInput::new(op(0x20, 0), ss, 0, 0)];
+    let outputs = vec![TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), None)];
+    let entries = vec![UtxoEntry { amount: 30_000_000, script_public_key: build_p2sh(&buy_rs), block_daa_score: 0, is_coinbase: false, covenant_id: None }];
+    let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).unwrap();
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let reused = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+    let (input, entry) = populated.populated_input(0);
+    let mut vm = TxScriptEngine::from_transaction_input(&populated, input, 0, entry, ctx, flags);
+    let e = format!("{:?}", vm.execute().unwrap_err());
+    // Must be a signature-class failure (reached OpCheckSigVerify), not a stack
+    // or number error from a mis-counted pick.
+    assert!(
+        e.contains("Sig") || e.contains("sig") || e.contains("Verify") || e.contains("Null") || e.contains("Schnorr"),
+        "cancel must reach OpCheckSigVerify (signature failure), got a different error: {e}"
+    );
+    assert!(
+        !e.contains("NumberTooBig") && !e.contains("InvalidStack") && !e.contains("pick"),
+        "cancel must not have a stack/number error before the signature check: {e}"
+    );
+}

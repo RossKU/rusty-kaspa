@@ -354,11 +354,12 @@ impl BlockScanner {
                 }
                 zk
             },
-            // V16 buy orders store max_matcher_fee as BPS (basis points of
-            // trade value). Convert to absolute sompi so the matching engine
+            // V16 and V17 buy orders store max_matcher_fee as BPS (basis points
+            // of trade value). Convert to absolute sompi so the matching engine
             // can use it uniformly: mmfee_sompi = value * bps / 10000.
             // For v14 buys and all sells: use raw value (already in sompi).
             max_matcher_fee: if parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
+                || parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
             {
                 value.saturating_mul(parsed._max_matcher_fee) / 10000
             } else {

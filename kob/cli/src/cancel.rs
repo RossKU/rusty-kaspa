@@ -290,6 +290,9 @@ pub async fn run(
 
     // Build the cancel sigscript for the order input
     let cancel_sigscript = match side {
+        "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN => {
+            contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script)
+        }
         "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
         _ => unreachable!(),
@@ -331,7 +334,13 @@ pub async fn run(
     let output_value = tx.outputs[0].value;
 
     println!("Cancel SigScript: {} bytes", cancel_sigscript.len());
-    if side == "buy" {
+    if side == "buy"
+        && redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
+    {
+        // v17 dispatches by an explicit selector (Op0 = cancel), not by a sigLen
+        // threshold, so there is no T2 to report.
+        println!("  (v17 selector dispatch: Op0 cancel)");
+    } else if side == "buy" {
         // T2 (the sigLen threshold that routes to the cancel/cancel-mark
         // path) differs per buy contract version; pick the real one instead
         // of a stale hardcoded constant left over from an older version.

@@ -426,11 +426,13 @@ pub(crate) fn pair_to_batch_orders(
     }
     if buy_rs.len() != BUY_RS_SIZE
         && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
+        && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
         && buy_rs.len() != BRACKET_RS_SIZE
     {
-        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v16={}, bracket={})",
+        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v16={}, v17={}, bracket={})",
             label, buy_rs.len(), BUY_RS_SIZE,
             kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN,
+            kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN,
             BRACKET_RS_SIZE);
         return None;
     }
@@ -467,7 +469,9 @@ pub(crate) fn pair_to_batch_orders(
         bracket_meta: None,
     };
 
-    let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
+    let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
+        17u8
+    } else if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
         // NOTE: v16 (F6-fix buy contract) and bracket entries both report
         // version 16 here -- that number alone does not distinguish the two
         // contracts. `BatchOrder.version` is downstream engine/domain
@@ -539,6 +543,7 @@ pub(crate) fn book_order_to_batch_order(
         crate::matcher::order_book::OrderSide::Buy => {
             if rs.len() != BUY_RS_SIZE
                 && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
+                && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
                 && rs.len() != BRACKET_RS_SIZE
             {
                 warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
@@ -560,7 +565,9 @@ pub(crate) fn book_order_to_batch_order(
         crate::matcher::order_book::OrderSide::Sell => crate::matcher::batch::OrderType::Sell,
     };
 
-    let version = if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
+    let version = if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
+        17u8
+    } else if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
         // See buy_version comment above: v16-buy and bracket share the
         // numeric label 16, disambiguated downstream by RS length.
         16u8
@@ -1281,14 +1288,17 @@ pub async fn execute_swap_fill(
         return None;
     };
 
-    // V16 buy not supported in cross-pair swap: its F6 surplus check reads
-    // the counterparty sell's price via a fixed-offset sigscript read (see
-    // order.rs), which requires buy and sell to be the same token — not the
-    // case in a cross-pair swap fill (formerly also true of v15, now removed).
+    // V16/V17 buy not supported in cross-pair swap: their F6 surplus check
+    // reads the counterparty sell's price via a fixed-offset sigscript read
+    // (see order.rs), which requires buy and sell to be the same token — not
+    // the case in a cross-pair swap fill (formerly also true of v15, now
+    // removed; v17 sums per-sell prices the same fixed-offset way).
     if buy_source.redeem_script.len()
         == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
+        || buy_source.redeem_script.len()
+            == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
     {
-        warn!("[SWAP-FILL] v16 buy not supported in cross-pair swap — skip");
+        warn!("[SWAP-FILL] v16/v17 buy not supported in cross-pair swap — skip");
         for k in keys_of().iter() { spent_tracker.mark_failed(k); }
         return None;
     }

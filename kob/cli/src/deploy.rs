@@ -321,10 +321,11 @@ pub async fn deploy_buy(
     mmfee_bps: Option<u64>,
 ) -> anyhow::Result<String> {
     // v14 buy has no on-chain surplus/matcher-fee cap (F6 removed) and lets a
-    // matcher keep the whole spread. New buy deploys must be v16 (F6 cap). v14
-    // remains parseable/reconstructable for managing already-deployed orders.
-    if version != 16 {
-        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v16 (F6 surplus cap) may be deployed; v14 is retained only for managing pre-existing on-chain orders.", version);
+    // matcher keep the whole spread. New buy deploys must be v17 (the N:M-capable
+    // sweep contract, the new default) or v16 (1:1 F6 cap). v14 remains
+    // parseable/reconstructable for managing already-deployed orders.
+    if version != 16 && version != 17 {
+        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v17 (N:M sweep, default) or v16 (1:1 F6 cap) may be deployed; v14 is retained only for managing pre-existing on-chain orders.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;
@@ -400,7 +401,20 @@ pub async fn deploy_buy(
     let owner_hash = blake2b_256(&pubkey);
     let buyer_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
-    let redeem_script = if version == 16 {
+    let redeem_script = if version == 17 {
+        let bps = mmfee_bps.unwrap_or(30); // default 0.3%
+        contract::build_buy_v17_redeem_script(
+            &token_cov_id,
+            price_num,
+            price_den,
+            min_fill,
+            &owner_hash,
+            &buyer_spk_hash,
+            bps,
+            0, // cancel_pending = 0 (active order)
+            expiry_daa.unwrap_or(0),
+        )?
+    } else if version == 16 {
         let bps = mmfee_bps.unwrap_or(30); // default 0.3% for v16
         contract::build_buy_v16_redeem_script(
             &token_cov_id,
@@ -444,7 +458,7 @@ pub async fn deploy_buy(
         amount,
         amount as f64 / 1e8
     );
-    if version == 16 {
+    if version == 16 || version == 17 {
         let bps = mmfee_bps.unwrap_or(30);
         println!("Max Matcher Fee: {} bps ({}%)", bps, bps as f64 / 100.0);
     } else {

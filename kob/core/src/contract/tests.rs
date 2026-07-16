@@ -2061,6 +2061,17 @@ mod adversarial_tests {
                 mismatches.push(format!("{} len={}B actual={}", name, body.len(), actual));
             }
         }
+        // v17 buy body is generated programmatically (MAX_N conditional slots),
+        // so it is pinned here rather than in the const table above.
+        {
+            use crate::contract::spot::order::{build_buy_v17_body, BUY_ORDER_V17_BODY_EXPECTED_LEN};
+            let body = build_buy_v17_body();
+            let actual = hex::encode(blake2b_256(&body));
+            let expected = "0a5ea3c8df5fda221638027853615e2513a3fc03d10843d4cd6f1ed22d8b5305";
+            if body.len() != BUY_ORDER_V17_BODY_EXPECTED_LEN || actual != expected {
+                mismatches.push(format!("BUY_ORDER_V17 len={}B actual={}", body.len(), actual));
+            }
+        }
         assert!(mismatches.is_empty(), "bytecode pins stale:\n{}", mismatches.join("\n"));
     }
 }

@@ -974,10 +974,11 @@ pub enum DeployCommands {
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version. Only v16 (F6 surplus cap) may be deployed; v14 has
-        /// no on-chain matcher-fee cap and is rejected for new deploys. v16 uses
-        /// --mmfee-bps instead of --max-matcher-fee (see V16_STATUS.md).
-        #[arg(long, default_value = "16")]
+        /// Contract version. v17 (N:M sweep, the default) or v16 (1:1 F6 cap)
+        /// may be deployed; v14 has no on-chain matcher-fee cap and is rejected
+        /// for new deploys. Both v16 and v17 use --mmfee-bps (BPS) instead of
+        /// --max-matcher-fee (see NM_BUY_DESIGN.md / V16_STATUS.md).
+        #[arg(long, default_value = "17")]
         version: u8,
 
         /// Time-in-force: GTC (default), IOC, or FOK.
@@ -1798,10 +1799,11 @@ pub async fn dispatch(
                 max_matcher_fee,
                 mmfee_bps,
             } => {
-                // v16 is now the deploy default; --mmfee-bps also forces v16 if
-                // an older version was passed explicitly. deploy_buy rejects any
-                // non-v16 version for new orders (v14 has no on-chain F6 cap).
-                let version = if mmfee_bps.is_some() && version == 14 { 16 } else { version };
+                // v17 (N:M sweep) is now the deploy default; --mmfee-bps forces
+                // at least v16 if an older version was passed explicitly.
+                // deploy_buy rejects any non-v16/v17 version for new orders
+                // (v14 has no on-chain F6 cap).
+                let version = if mmfee_bps.is_some() && version == 14 { 17 } else { version };
 
                 // Resolve token alias
                 let token = token::resolve_token(&token, None)?;

@@ -2,7 +2,7 @@
 
 use crate::types::OrderSide;
 use crate::contract::spot::oco::{OCO_SELL_STATE_SIZE, OCO_SELL_RS_SIZE, OcoPath};
-use crate::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN;
+use crate::contract::spot::order::{BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_V17_RS_EXPECTED_LEN};
 
 /// OpZkPrecompile opcode byte (0xa6).
 pub const OP_ZK_PRECOMPILE: u8 = 0xa6;
@@ -97,6 +97,15 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
             if rs[BUY_STATE_SIZE] == 0xb9 && rs[BUY_STATE_SIZE + 1] == 0xc9
                 && rs[BUY_STATE_SIZE + 2] == 0x76
             {
+                return parse_buy_state(rs);
+            }
+            None
+        }
+        BUY_ORDER_V17_RS_EXPECTED_LEN => {
+            // Buy v17 (N:M sweep, 838B): SAME 145B state layout, but the body
+            // dispatches by selector (starts with Op9 OpRoll = 0x59 0x7a) rather
+            // than the length-based 0xb9 0xc9 0x76 preamble.
+            if rs[BUY_STATE_SIZE] == 0x59 && rs[BUY_STATE_SIZE + 1] == 0x7a {
                 return parse_buy_state(rs);
             }
             None
@@ -490,6 +499,26 @@ mod tests {
         assert_eq!(parsed.owner_hash, ohash);
         assert_eq!(parsed.spk_hash, sspkh);
         assert_eq!(parsed.cpend, 0);
+    }
+
+    #[test]
+    fn roundtrip_buy_v17() {
+        use crate::contract::spot::order::{build_buy_v17_redeem_script, BUY_ORDER_V17_RS_EXPECTED_LEN};
+        let tcid = [0xAA; 32];
+        let ohash = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        let rs = build_buy_v17_redeem_script(&tcid, 3, 2, 1_000_000, &ohash, &bspkh, 30, 0, 555_000).unwrap();
+        assert_eq!(rs.len(), BUY_ORDER_V17_RS_EXPECTED_LEN);
+        let parsed = parse_redeem_script(&rs).expect("should parse v17 buy");
+        assert_eq!(parsed.order_type, OrderSide::Buy);
+        assert_eq!(parsed.token_cov_id, tcid);
+        assert_eq!(parsed.price_num, 3);
+        assert_eq!(parsed.price_den, 2);
+        assert_eq!(parsed.min_fill, 1_000_000);
+        assert_eq!(parsed.owner_hash, ohash);
+        assert_eq!(parsed.spk_hash, bspkh);
+        assert_eq!(parsed._max_matcher_fee, 30);
+        assert_eq!(parsed.expiry_daa, Some(555_000));
     }
 
     #[test]

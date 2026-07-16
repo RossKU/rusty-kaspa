@@ -162,6 +162,14 @@ pub fn detect_fill_from_sigscript(sigscript: &[u8]) -> Option<(String, u64, u64,
             return None;
         }
         Some(off)
+    } else if len == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
+        // V17 buy (N:M sweep contract). Body is generated programmatically.
+        let v17_body = kob_core::contract::spot::order::build_buy_v17_body();
+        let off = len - v17_body.len();
+        if last_push[off..] != v17_body[..] {
+            return None;
+        }
+        Some(off)
     } else if len == SELL_RS_SIZE {
         let off = len - kob_core::SELL_ORDER_BODY.len();
         if last_push[off..] != *kob_core::SELL_ORDER_BODY {

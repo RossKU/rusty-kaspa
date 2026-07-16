@@ -2541,6 +2541,27 @@ impl<'a> ScanCheckpointPaths<'a> {
 /// `CATCHUP_CHUNK_SIZE` blocks so a large catch-up is resumable instead of
 /// all-or-nothing (see `CATCHUP_CHUNK_SIZE` doc comment).
 ///
+/// Update the `/api/v1/health` + `/api/v1/sync` snapshot in `SharedState`.
+/// Best-effort: `shared_state` is `None` in tests / RPC-less configurations.
+async fn update_sync_snapshot(
+    shared_state: Option<&AppState>,
+    cursor_daa: u64,
+    cursor_block_hash: &str,
+    sink_daa: u64,
+    node_connected: bool,
+) {
+    if let Some(state) = shared_state {
+        let mut s = state.write().await;
+        s.sync.update(
+            cursor_daa,
+            cursor_block_hash.to_string(),
+            sink_daa,
+            node_connected,
+            crate::matcher::api::DEFAULT_CAUGHT_UP_THRESHOLD,
+        );
+    }
+}
+
 /// Returns the new chain tip hash to use as `last_chain_hash` on the next call.
 async fn scan_new_blocks(
     rpc: &RpcClient,
@@ -2552,6 +2573,7 @@ async fn scan_new_blocks(
     ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
     current_daa: u64,
     checkpoint: Option<ScanCheckpointPaths<'_>>,
+    shared_state: Option<&AppState>,
 ) -> (String, ScanCounters) {
     let scanner = BlockScanner::new();
     let mut total_counters = ScanCounters::default();
@@ -2600,7 +2622,8 @@ async fn scan_new_blocks(
     // H1-CHUNK: blocks processed since the last checkpoint save.
     let mut blocks_since_checkpoint = 0usize;
 
-    for block_hash in blocks_to_scan {
+    let total_blocks_to_scan = blocks_to_scan.len();
+    for (scan_pos, block_hash) in blocks_to_scan.iter().enumerate() {
         let block_resp = match rpc.get_block(block_hash).await {
             Ok(b) => b,
             Err(e) => {
@@ -2701,6 +2724,15 @@ async fn scan_new_blocks(
             if let Some(cp) = &checkpoint {
                 cp.save(block_hash, order_book, perp_book, lending_book, prediction_book);
             }
+            // H4-SYNC: also refresh /health + /sync at this checkpoint, so a
+            // long catch-up shows real, advancing progress (not a frozen
+            // snapshot) even while stuck inside this one (possibly hours-long)
+            // call. cursor_daa is an ESTIMATE: current_daa (the sink DAA at
+            // the start of this catch-up) minus the blocks not yet scanned --
+            // the scanner does not parse a per-block DAA score.
+            let remaining = (total_blocks_to_scan - (scan_pos + 1)) as u64;
+            let cursor_daa_estimate = current_daa.saturating_sub(remaining);
+            update_sync_snapshot(shared_state, cursor_daa_estimate, block_hash, current_daa, true).await;
             blocks_since_checkpoint = 0;
         }
     }
@@ -2724,6 +2756,10 @@ async fn scan_new_blocks(
             total_counters.prediction_added, total_counters.prediction_removed,
         );
     }
+
+    // H4-SYNC: this call is now fully caught up to `current_daa` (the sink
+    // DAA read at its start) -- final, non-estimated snapshot update.
+    update_sync_snapshot(shared_state, current_daa, &new_tip, current_daa, true).await;
 
     (new_tip, total_counters)
 }
@@ -3481,11 +3517,21 @@ async fn run_scan_cycle(
         // Plan using the appropriate planner based on GroupKind
         let plan_result = match group.kind {
             matching::GroupKind::BuySweep => {
-                // 1 buy (in buys[0]) sweeps N sells
-                crate::matcher::batch::plan_ioc_match(
-                    &sells, &buys[0], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                )
+                // 1 buy (in buys[0]) sweeps N sells. v17 buys use the
+                // dedicated per-sell-output IOC planner (plan_ioc_match's
+                // single merged BuyerTokens output doesn't match what the
+                // v17 contract's per-term OpAuthOutputIdx binding expects).
+                if buys[0].version == 17 {
+                    crate::matcher::batch::plan_ioc_match_v17(
+                        &sells, &buys[0], wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else {
+                    crate::matcher::batch::plan_ioc_match(
+                        &sells, &buys[0], wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                }
             }
             matching::GroupKind::SellSweep => {
                 // 1 sell (in sells[0]) sweeps N buys
@@ -3495,11 +3541,19 @@ async fn run_scan_cycle(
                 )
             }
             matching::GroupKind::PartialBuy => {
-                // 1:1 partial buy: buy IOC sweeps 1 sell
-                crate::matcher::batch::plan_ioc_match(
-                    &sells, &buys[0], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                )
+                // 1:1 partial buy: buy IOC sweeps 1 sell (same v17 routing
+                // as BuySweep above -- plan_ioc_match_v17 handles N=1 fine).
+                if buys[0].version == 17 {
+                    crate::matcher::batch::plan_ioc_match_v17(
+                        &sells, &buys[0], wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else {
+                    crate::matcher::batch::plan_ioc_match(
+                        &sells, &buys[0], wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                }
             }
             matching::GroupKind::PartialSell => {
                 // 1:1 partial sell: sell IOC sweeps 1 buy
@@ -5112,7 +5166,7 @@ pub async fn run_continuous_with_ws(
         let (new_hash, counters) = scan_new_blocks(
             &*rpc_bf, &mut ob, &mut pb, &mut lb, &mut pred,
             hash, ws_tx.as_ref(), current_daa,
-            Some(checkpoint),
+            Some(checkpoint), shared_state.as_ref(),
         ).await;
         if new_hash != *hash {
             info!(
@@ -5213,7 +5267,7 @@ pub async fn run_continuous_with_ws(
                     let (new_hash, counters) = scan_new_blocks(
                         &*rpc_catchup, &mut ob, &mut pb, &mut lb, &mut pred,
                         &catchup_hash, ws_tx.as_ref(), current_daa,
-                        Some(checkpoint),
+                        Some(checkpoint), shared_state.as_ref(),
                     ).await;
                     if new_hash != catchup_hash {
                         info!(
@@ -5232,6 +5286,14 @@ pub async fn run_continuous_with_ws(
                     }
                 }
             }
+        }
+
+        // H4-SYNC: cheap per-cycle connectivity refresh (local atomic flag,
+        // no network call) so /health's node_connected never goes stale
+        // during quiet cycles with no new blocks to process.
+        if let Some(ref state) = shared_state {
+            let connected = !rpc.lock().await.needs_reconnect();
+            state.write().await.sync.node_connected = connected;
         }
 
         cycle += 1;
@@ -5302,7 +5364,7 @@ pub async fn run_continuous_with_ws(
                 let (new_hash, counters) = scan_new_blocks(
                     &*rpc_bf, &mut ob, &mut pb, &mut lb, &mut pred,
                     hash, ws_tx.as_ref(), current_daa,
-                    Some(checkpoint),
+                    Some(checkpoint), shared_state.as_ref(),
                 ).await;
                 if new_hash != *hash {
                     info!(
@@ -5461,8 +5523,10 @@ pub async fn run_continuous_with_ws(
             // Process all collected block TXs in one batch with a single DAA score fetch
             if !block_txs_batch.is_empty() {
                 let rpc_lock = rpc.lock().await;
-                let current_daa = rpc_lock.get_daa_score().await.unwrap_or(0);
+                let daa_result = rpc_lock.get_daa_score().await;
                 drop(rpc_lock);
+                let node_connected = daa_result.is_ok();
+                let current_daa = daa_result.unwrap_or(0);
 
                 let mut ob = order_book.lock().await;
                 let mut pb = shared_perp_book.lock().await;
@@ -5527,6 +5591,14 @@ pub async fn run_continuous_with_ws(
                     total_counters.dca_removed += counters.dca_removed;
                     total_counters.swap_added += counters.swap_added;
                     total_counters.swap_removed += counters.swap_removed;
+                }
+
+                // H4-SYNC: steady-state update (these are fresh,
+                // notification-driven near-tip blocks, so cursor_daa ==
+                // current_daa is exact, not an estimate). Uses the last
+                // block in this batch as the cursor hash.
+                if let Some(last_hash) = block_txs_batch.iter().rev().find_map(|(bh, _)| bh.clone()) {
+                    update_sync_snapshot(shared_state.as_ref(), current_daa, &last_hash, current_daa, node_connected).await;
                 }
             }
 
@@ -7195,6 +7267,73 @@ mod tests {
         let mut legs: Vec<u32> = trades.iter().map(|t| t.leg_index).collect();
         legs.sort();
         assert_eq!(legs, (0..(sell_count + buy_count) as u32).collect::<Vec<_>>());
+    }
+
+    // H4-SYNC: /health + /sync snapshot wiring
+
+    /// `update_sync_snapshot` (called from the scan loop / scan_new_blocks)
+    /// must land in SharedState exactly as the /health and /sync handlers
+    /// read it -- proving the executor-side hook and the API-side read
+    /// agree on the same snapshot.
+    #[tokio::test]
+    async fn update_sync_snapshot_writes_state_the_api_can_read() {
+        use crate::matcher::api::SharedState;
+        use crate::matcher::order_book::OrderBook;
+        use crate::matcher::stop_book::StopOrderBook;
+        use crate::matcher::trailing_stop::TrailingStopBook;
+
+        let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
+        let ob = Arc::new(Mutex::new(OrderBook::new()));
+        let sb = Arc::new(Mutex::new(StopOrderBook::new()));
+        let tb = Arc::new(Mutex::new(TrailingStopBook::new()));
+        let shared: AppState = Arc::new(tokio::sync::RwLock::new(SharedState::new(ws_tx, ob, sb, tb)));
+
+        update_sync_snapshot(Some(&shared), 1000, "cursor_hash_abc", 1005, true).await;
+
+        let s = shared.read().await;
+        assert_eq!(s.sync.cursor_daa, 1000);
+        assert_eq!(s.sync.cursor_block_hash, "cursor_hash_abc");
+        assert_eq!(s.sync.sink_daa, 1005);
+        assert!(s.sync.node_connected);
+        assert_eq!(s.sync.lag_blocks(), 5);
+        assert!(s.sync.caught_up(10), "lag of 5 must be within the default threshold of 10");
+    }
+
+    /// A large lag must NOT be reported as caught up, proving /sync would
+    /// have flagged the documented catch-up-hangs failure mode.
+    #[tokio::test]
+    async fn update_sync_snapshot_reports_large_lag_as_not_caught_up() {
+        use crate::matcher::api::SharedState;
+        use crate::matcher::order_book::OrderBook;
+        use crate::matcher::stop_book::StopOrderBook;
+        use crate::matcher::trailing_stop::TrailingStopBook;
+
+        let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
+        let ob = Arc::new(Mutex::new(OrderBook::new()));
+        let sb = Arc::new(Mutex::new(StopOrderBook::new()));
+        let tb = Arc::new(Mutex::new(TrailingStopBook::new()));
+        let shared: AppState = Arc::new(tokio::sync::RwLock::new(SharedState::new(ws_tx, ob, sb, tb)));
+
+        // Simulates a stalled catch-up: cursor stuck far behind the sink.
+        update_sync_snapshot(Some(&shared), 100, "stuck_hash", 5000, true).await;
+        {
+            let s = shared.read().await;
+            assert_eq!(s.sync.lag_blocks(), 4900);
+            assert!(!s.sync.caught_up(10));
+            assert_eq!(s.sync.scanning_state, crate::matcher::api::ScanningState::CatchingUp);
+        }
+
+        // A second update with the SAME cursor (no progress) must flip to
+        // Stalled -- the exact signal for a hung getBlocks catch-up.
+        update_sync_snapshot(Some(&shared), 100, "stuck_hash", 5000, true).await;
+        let s = shared.read().await;
+        assert_eq!(s.sync.scanning_state, crate::matcher::api::ScanningState::Stalled);
+    }
+
+    #[tokio::test]
+    async fn update_sync_snapshot_noop_when_shared_state_is_none() {
+        // Must not panic when shared_state is None (RPC-less/test configs).
+        update_sync_snapshot(None, 1, "h", 1, true).await;
     }
 
     // H3-TRADES: confirmation-time durable persistence + reorg-retract

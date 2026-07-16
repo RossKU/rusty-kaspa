@@ -41,6 +41,110 @@ fn generate_cancel_secret() -> String {
 }
 use crate::matcher::trailing_stop::TrailingStopBook;
 
+// Sync / liveness snapshot (H4-SYNC: GET /health, GET /sync)
+
+/// Default `lag_blocks` threshold under which the scanner is considered
+/// caught up. Matches the design's `caught_up_threshold` knob.
+pub const DEFAULT_CAUGHT_UP_THRESHOLD: u64 = 10;
+
+/// Scan-loop liveness classification exposed via `/api/v1/sync`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanningState {
+    /// `lag_blocks <= caught_up_threshold`.
+    Steady,
+    /// Behind, but the lag is shrinking (or this is the first reading).
+    CatchingUp,
+    /// Behind, and the lag has NOT shrunk since the previous reading --
+    /// exactly the signal that would have caught the documented
+    /// deterministic 0%-CPU `getBlocks` hangs on large catch-up gaps.
+    Stalled,
+}
+
+/// Pure state-machine step for `scanning_state`, factored out from
+/// `SyncSnapshot::update` so it can be unit-tested directly without a scan
+/// loop or RPC client.
+pub fn compute_scanning_state(
+    lag_blocks: u64,
+    caught_up_threshold: u64,
+    previous_lag: Option<u64>,
+) -> ScanningState {
+    if lag_blocks <= caught_up_threshold {
+        return ScanningState::Steady;
+    }
+    match previous_lag {
+        // Lag did not shrink since the last reading -- stalled.
+        Some(prev) if lag_blocks >= prev => ScanningState::Stalled,
+        _ => ScanningState::CatchingUp,
+    }
+}
+
+/// Snapshot of scan-loop progress, updated by the executor once per scan
+/// cycle -- and, during a large catch-up, once per checkpoint chunk (see
+/// `CATCHUP_CHUNK_SIZE` in `chain::executor`) -- so `/api/v1/health` and
+/// `/api/v1/sync` never need a live RPC call or the order-book mutex to
+/// answer, and stay informative even while a catch-up is in progress.
+#[derive(Debug, Clone)]
+pub struct SyncSnapshot {
+    /// DAA score of the last block the scanner has processed (the
+    /// persisted H1 cursor). During a catch-up this is an estimate derived
+    /// from the sink DAA and the count of not-yet-processed blocks in the
+    /// current catch-up batch -- the scanner does not parse a per-block DAA
+    /// score today (same "best-effort" caveat as `Trade::daa_score`).
+    pub cursor_daa: u64,
+    /// Hash of the block `cursor_daa` corresponds to.
+    pub cursor_block_hash: String,
+    /// Node's sink/virtual DAA as of the last time the scan loop checked.
+    pub sink_daa: u64,
+    /// Whether the RPC connection was healthy as of the last check.
+    pub node_connected: bool,
+    pub scanning_state: ScanningState,
+    /// `lag_blocks` as of the previous update; used to detect "stalled".
+    last_lag_blocks: Option<u64>,
+}
+
+impl Default for SyncSnapshot {
+    fn default() -> Self {
+        SyncSnapshot {
+            cursor_daa: 0,
+            cursor_block_hash: String::new(),
+            sink_daa: 0,
+            node_connected: false,
+            scanning_state: ScanningState::CatchingUp,
+            last_lag_blocks: None,
+        }
+    }
+}
+
+impl SyncSnapshot {
+    /// Record a fresh reading, recomputing `scanning_state` against
+    /// `caught_up_threshold` and the previous lag.
+    pub fn update(
+        &mut self,
+        cursor_daa: u64,
+        cursor_block_hash: String,
+        sink_daa: u64,
+        node_connected: bool,
+        caught_up_threshold: u64,
+    ) {
+        let lag_blocks = sink_daa.saturating_sub(cursor_daa);
+        self.scanning_state = compute_scanning_state(lag_blocks, caught_up_threshold, self.last_lag_blocks);
+        self.last_lag_blocks = Some(lag_blocks);
+        self.cursor_daa = cursor_daa;
+        self.cursor_block_hash = cursor_block_hash;
+        self.sink_daa = sink_daa;
+        self.node_connected = node_connected;
+    }
+
+    pub fn lag_blocks(&self) -> u64 {
+        self.sink_daa.saturating_sub(self.cursor_daa)
+    }
+
+    pub fn caught_up(&self, threshold: u64) -> bool {
+        self.lag_blocks() <= threshold
+    }
+}
+
 // Shared State
 
 /// Shared application state, accessible by all API handlers.
@@ -92,6 +196,11 @@ pub struct SharedState {
     /// `None` in tests (SharedState constructed without RPC) and when the
     /// engine was built without passing an RPC handle via `with_rpc`.
     pub rpc: Option<Arc<Mutex<crate::rpc::RpcClient>>>,
+
+    // === Sync / liveness (H4-SYNC) ===
+    /// Scan-loop progress snapshot backing `/api/v1/health` and
+    /// `/api/v1/sync`. Updated by the executor, not by API handlers.
+    pub sync: SyncSnapshot,
 }
 
 impl SharedState {
@@ -131,6 +240,7 @@ impl SharedState {
             prediction_book: None,
             market_tracker: None,
             rpc: None,
+            sync: SyncSnapshot::default(),
         }
     }
 
@@ -185,6 +295,7 @@ impl SharedState {
             prediction_book: None,
             market_tracker: None,
             rpc: None,
+            sync: SyncSnapshot::default(),
         }
     }
 }
@@ -501,6 +612,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/ifo", post(handle_submit_ifo))
         .route("/api/v1/ifo/cancel", post(handle_cancel_ifo))
         .route("/api/v1/status", get(handle_status))
+        .route("/api/v1/health", get(handle_health))
+        .route("/api/v1/sync", get(handle_sync))
         .route("/api/v1/wallet/utxos", get(handle_wallet_utxos))
         // --- Perp endpoints ---
         .route("/api/v1/perp/orderbook", get(handle_perp_orderbook))
@@ -700,6 +813,30 @@ struct StatusResponse {
     pairs: usize,
     total_orders: usize,
     total_trades: usize,
+}
+
+/// `GET /api/v1/health` response.
+#[derive(Serialize)]
+struct HealthResponse {
+    status: &'static str,
+    node_connected: bool,
+    uptime_secs: u64,
+}
+
+/// `GET /api/v1/sync` response.
+#[derive(Serialize)]
+struct SyncResponse {
+    cursor_daa: u64,
+    sink_daa: u64,
+    lag_blocks: u64,
+    caught_up: bool,
+    caught_up_threshold: u64,
+    scanning_state: ScanningState,
+    last_block_hash: String,
+    node_connected: bool,
+    uptime_secs: u64,
+    pairs: usize,
+    total_orders: usize,
 }
 
 #[derive(Serialize)]
@@ -1165,6 +1302,54 @@ async fn handle_status(
         pairs: stats.pairs,
         total_orders: stats.total_bids + stats.total_asks,
         total_trades: s.trade_log.total_count(),
+    })
+}
+
+/// `GET /api/v1/health` -- cheap liveness/readiness probe for process
+/// supervisors / load balancers. Reads only the SharedState RwLock and
+/// plain fields; deliberately does NOT touch the order-book mutex (which
+/// can be held for the duration of settlement logic) so a busy matcher
+/// never makes this endpoint look down. Returns 503 when the node
+/// connection is unhealthy.
+async fn handle_health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
+    let s = state.read().await;
+    let node_connected = s.sync.node_connected;
+    let uptime_secs = s.start_time.elapsed().as_secs();
+    let status = if node_connected { "ok" } else { "down" };
+    let code = if node_connected { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    (
+        code,
+        Json(HealthResponse { status, node_connected, uptime_secs }),
+    )
+}
+
+/// `GET /api/v1/sync` -- is the scanner caught up? Exposes the gap between
+/// the persisted scan cursor and the node's sink DAA (`lag_blocks`), the
+/// derived `scanning_state` (steady/catching_up/stalled -- see
+/// `compute_scanning_state`), and book/pair counts + node connectivity.
+/// This is precisely the signal that would have flagged the documented
+/// catch-up-hangs-at-0%-CPU failure mode before it silently stalled
+/// discovery for hours.
+async fn handle_sync(State(state): State<AppState>) -> Json<SyncResponse> {
+    let s = state.read().await;
+    let lag_blocks = s.sync.lag_blocks();
+    let (pairs, total_orders) = {
+        let ob = s.order_book.lock().await;
+        let stats = ob.stats();
+        (stats.pairs, stats.total_bids + stats.total_asks)
+    };
+    Json(SyncResponse {
+        cursor_daa: s.sync.cursor_daa,
+        sink_daa: s.sync.sink_daa,
+        lag_blocks,
+        caught_up: s.sync.caught_up(DEFAULT_CAUGHT_UP_THRESHOLD),
+        caught_up_threshold: DEFAULT_CAUGHT_UP_THRESHOLD,
+        scanning_state: s.sync.scanning_state,
+        last_block_hash: s.sync.cursor_block_hash.clone(),
+        node_connected: s.sync.node_connected,
+        uptime_secs: s.start_time.elapsed().as_secs(),
+        pairs,
+        total_orders,
     })
 }
 
@@ -2723,6 +2908,147 @@ mod tests {
         assert_eq!(response.0.pairs, 0);
         assert_eq!(response.0.total_orders, 0);
         assert_eq!(response.0.total_trades, 0);
+    }
+
+    // H4-SYNC: compute_scanning_state pure state machine
+
+    #[test]
+    fn scanning_state_steady_when_within_threshold() {
+        assert_eq!(compute_scanning_state(0, 10, None), ScanningState::Steady);
+        assert_eq!(compute_scanning_state(10, 10, None), ScanningState::Steady, "exactly at threshold is steady");
+        assert_eq!(compute_scanning_state(5, 10, Some(1000)), ScanningState::Steady, "steady regardless of prior lag");
+    }
+
+    #[test]
+    fn scanning_state_catching_up_on_first_reading_beyond_threshold() {
+        assert_eq!(compute_scanning_state(500, 10, None), ScanningState::CatchingUp, "no prior reading yet -- assume progress");
+    }
+
+    #[test]
+    fn scanning_state_catching_up_when_lag_shrinking() {
+        assert_eq!(compute_scanning_state(400, 10, Some(500)), ScanningState::CatchingUp);
+    }
+
+    #[test]
+    fn scanning_state_stalled_when_lag_not_decreasing() {
+        assert_eq!(compute_scanning_state(500, 10, Some(500)), ScanningState::Stalled, "unchanged lag == stalled");
+        assert_eq!(compute_scanning_state(600, 10, Some(500)), ScanningState::Stalled, "growing lag == stalled");
+    }
+
+    // H4-SYNC: SyncSnapshot
+
+    #[test]
+    fn sync_snapshot_default_is_not_yet_steady() {
+        let snap = SyncSnapshot::default();
+        assert_eq!(snap.cursor_daa, 0);
+        assert_eq!(snap.sink_daa, 0);
+        assert!(!snap.node_connected);
+        assert_eq!(snap.scanning_state, ScanningState::CatchingUp);
+    }
+
+    #[test]
+    fn sync_snapshot_update_computes_lag_and_caught_up() {
+        let mut snap = SyncSnapshot::default();
+        snap.update(1000, "hash_a".to_string(), 1005, true, 10);
+        assert_eq!(snap.lag_blocks(), 5);
+        assert!(snap.caught_up(10));
+        assert_eq!(snap.scanning_state, ScanningState::Steady);
+        assert_eq!(snap.cursor_block_hash, "hash_a");
+    }
+
+    #[test]
+    fn sync_snapshot_update_detects_stall_across_calls() {
+        let mut snap = SyncSnapshot::default();
+        snap.update(1000, "h1".to_string(), 2000, true, 10); // lag=1000, first reading -> catching_up
+        assert_eq!(snap.scanning_state, ScanningState::CatchingUp);
+        snap.update(1000, "h1".to_string(), 2000, true, 10); // same lag again -> stalled
+        assert_eq!(snap.scanning_state, ScanningState::Stalled);
+    }
+
+    // H4-SYNC: /api/v1/health
+
+    #[tokio::test]
+    async fn test_health_endpoint_ok_when_connected() {
+        let state = make_state();
+        {
+            let mut s = state.write().await;
+            s.sync.node_connected = true;
+        }
+        let (code, response) = handle_health(State(state)).await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(response.0.status, "ok");
+        assert!(response.0.node_connected);
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_down_when_disconnected() {
+        let state = make_state();
+        {
+            let mut s = state.write().await;
+            s.sync.node_connected = false;
+        }
+        let (code, response) = handle_health(State(state)).await;
+        assert_eq!(code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.0.status, "down");
+        assert!(!response.0.node_connected);
+    }
+
+    #[tokio::test]
+    async fn test_health_endpoint_reports_uptime() {
+        let state = make_state();
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let (_, response) = handle_health(State(state)).await;
+        // uptime is measured in whole seconds; just prove the field is wired
+        // (>= 0 always true for u64, so assert the type/field access compiles
+        // and the endpoint does not panic on a freshly-created state).
+        let _ = response.0.uptime_secs;
+    }
+
+    // H4-SYNC: /api/v1/sync
+
+    #[tokio::test]
+    async fn test_sync_endpoint_reports_caught_up_state() {
+        let state = make_state();
+        {
+            let mut s = state.write().await;
+            s.sync.update(100, "tip_hash".to_string(), 105, true, 10);
+        }
+        let response = handle_sync(State(state)).await;
+        assert_eq!(response.0.cursor_daa, 100);
+        assert_eq!(response.0.sink_daa, 105);
+        assert_eq!(response.0.lag_blocks, 5);
+        assert!(response.0.caught_up);
+        assert_eq!(response.0.caught_up_threshold, DEFAULT_CAUGHT_UP_THRESHOLD);
+        assert_eq!(response.0.scanning_state, ScanningState::Steady);
+        assert_eq!(response.0.last_block_hash, "tip_hash");
+        assert!(response.0.node_connected);
+    }
+
+    #[tokio::test]
+    async fn test_sync_endpoint_reports_catching_up_state() {
+        let state = make_state();
+        {
+            let mut s = state.write().await;
+            s.sync.update(100, "cursor_hash".to_string(), 5000, true, 10);
+        }
+        let response = handle_sync(State(state)).await;
+        assert_eq!(response.0.lag_blocks, 4900);
+        assert!(!response.0.caught_up);
+        assert_eq!(response.0.scanning_state, ScanningState::CatchingUp);
+    }
+
+    #[tokio::test]
+    async fn test_sync_endpoint_includes_book_pair_counts() {
+        let state = make_state();
+        {
+            let s = state.write().await;
+            s.order_book.lock().await.add_buy_order(make_buy_order(
+                &"a".repeat(64), &"ab".repeat(32), 100, 1, 5_000_000,
+            ));
+        }
+        let response = handle_sync(State(state)).await;
+        assert_eq!(response.0.pairs, 1);
+        assert_eq!(response.0.total_orders, 1);
     }
 
     #[tokio::test]

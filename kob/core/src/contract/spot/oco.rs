@@ -390,3 +390,346 @@ pub enum OcoPath {
     /// Stop-loss path (selector = Op2).
     StopLoss,
 }
+
+// ============================================================================
+// V18 OCO SELL — 139B state unchanged; TP/SL canonical price attestation
+// ============================================================================
+//
+// v18 (see kob/V18_DESIGN.md) makes the OCO sell sweep-eligible on BOTH
+// branches: every fill sigscript carries the canonical attestation prefix
+// `[0x01,koi][0x08 pnum][0x08 pden]` (pnum at [3..11), pden at [12..20)) and
+// the body verifies the attested pair equals the *executing branch's* state
+// pair (TP: pnum_tp/pden_tp; SL: pnum_sl/pden_sl). A v18 buy reading the
+// fixed offsets therefore always sees the price the branch actually executes
+// at — this removes the old OCO-SL fixed-offset mismatch (the historic sweep
+// blocker) at L1.
+
+use crate::contract::spot::order::{e_num, e_pick, e_roll, v17op};
+
+/// Build the v18 OCO sell body.
+///
+/// Stack after state push (identical to v1, 11 items):
+///   expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4),
+///   mfill_sl(5), pden_sl(6), pnum_sl(7),
+///   mfill_tp(8), pden_tp(9), pnum_tp(10)
+/// with the selector at depth 11 in every sigscript form.
+///
+/// Selectors: 0=CANCEL, 1=TP FILL, 2=SL FILL, 4=EXPIRE.
+pub fn build_oco_sell_v18_body() -> Vec<u8> {
+    use v17op::*;
+    let mut b: Vec<u8> = Vec::with_capacity(512);
+
+    e_roll(&mut b, 11);
+    b.push(DUP);
+    e_num(&mut b, 4);
+    b.push(EQUAL);
+    b.push(IF); // selector == 4 -> EXPIRE
+    {
+        b.push(DROP);
+        b.push(DUP);
+        b.push(VERIFY); // expiry != 0
+        b.push(CLTV);
+        b.push(OP0);
+        b.push(TXOUTPUTSPK);
+        b.push(BLAKE2B);
+        e_pick(&mut b, 3); // sspkh
+        b.push(EQUAL);
+        b.push(VERIFY);
+        b.push(OP0);
+        b.push(TXOUTPUTAMOUNT);
+        b.push(TXINPUTINDEX);
+        b.push(TXINPUTAMOUNT);
+        b.push(GTE);
+        b.push(VERIFY);
+        b.push(TXINPUTINDEX);
+        b.push(INPUTCOVENANTID);
+        b.push(COVOUTCOUNT);
+        b.push(OP1);
+        b.push(GTE);
+        b.push(VERIFY);
+        for _ in 0..5 {
+            b.push(TWO_DROP); // 10 items
+        }
+    }
+    b.push(ELSE);
+    {
+        b.push(DUP);
+        e_num(&mut b, 2);
+        b.push(LT);
+        b.push(IF); // selector < 2 (TP fill or cancel)
+        {
+            e_num(&mut b, 1);
+            b.push(EQUAL);
+            b.push(IF); // selector == 1 -> TP FILL
+            {
+                emit_oco_v18_fill(&mut b, true);
+            }
+            b.push(ELSE); // selector == 0 -> CANCEL
+            {
+                emit_oco_v18_cancel(&mut b);
+            }
+            b.push(ENDIF);
+        }
+        b.push(ELSE); // selector >= 2 -> SL FILL (must be exactly 2)
+        {
+            e_num(&mut b, 2);
+            b.push(EQUAL);
+            b.push(VERIFY);
+            emit_oco_v18_fill(&mut b, false);
+        }
+        b.push(ENDIF);
+    }
+    b.push(ENDIF);
+    b.push(OP1);
+    b
+}
+
+/// v18 OCO fill (TP when `tp`, else SL). Sigscript:
+/// `[0x01,koi][0x08 pnum][0x08 pden][Op1|Op2][pushData(RS)]`.
+///
+/// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
+///   ohash(4), mfill_sl(5), pden_sl(6), pnum_sl(7), mfill_tp(8), pden_tp(9),
+///   pnum_tp(10), pden_att(11), pnum_att(12), koi(13)
+fn emit_oco_v18_fill(b: &mut Vec<u8>, tp: bool) {
+    use v17op::*;
+    // time gate
+    b.push(DUP);
+    b.push(OP0);
+    b.push(NUMEQUAL);
+    b.push(NOTIF);
+    b.push(DUP);
+    b.push(TXLOCKTIME);
+    b.push(GT);
+    b.push(VERIFY);
+    b.push(ENDIF);
+    b.push(DROP);
+    // exposure delay
+    e_num(b, 50);
+    b.push(CSV);
+    // F5: cpend == 0
+    b.push(OP0);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // base(12): mmfee(0), sspkh(1), ohash(2), mfill_sl(3), pden_sl(4),
+    //           pnum_sl(5), mfill_tp(6), pden_tp(7), pnum_tp(8), pden_att(9),
+    //           pnum_att(10), koi(11)
+    let (pnum_d, pden_d, mfill_d) = if tp { (8usize, 7usize, 6usize) } else { (5, 4, 3) };
+    // ATTESTATION: attested pair == the EXECUTING branch's state pair
+    e_pick(b, 10); // pnum_att
+    e_pick(b, pnum_d + 1);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    e_pick(b, 9); // pden_att
+    e_pick(b, pden_d + 1);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // price: expected_kas = token_in * pnum / pden, >= mfill
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_pick(b, pnum_d + 1);
+    b.push(MUL);
+    e_pick(b, pden_d + 1);
+    b.push(DIV);
+    b.push(DUP);
+    e_pick(b, mfill_d + 2);
+    b.push(GTE);
+    b.push(VERIFY);
+    // KAS output >= expected_kas
+    e_pick(b, 12); // koi (11 + 1)
+    b.push(TXOUTPUTAMOUNT);
+    b.push(SWAP);
+    b.push(GTE);
+    b.push(VERIFY);
+    // F2: seller SPK hash
+    e_pick(b, 11); // koi
+    b.push(TXOUTPUTSPK);
+    b.push(BLAKE2B);
+    e_pick(b, 2); // sspkh (1 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // F4: per-input token conservation (Fix-3, unchanged from v1's fixed form)
+    b.push(TXINPUTINDEX);
+    b.push(OP0);
+    b.push(AUTHOUTPUTIDX);
+    b.push(DUP);
+    b.push(OUTPUTCOVENANTID);
+    b.push(TXINPUTINDEX);
+    b.push(INPUTCOVENANTID);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    b.push(TXOUTPUTAMOUNT);
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    b.push(GTE);
+    b.push(VERIFY);
+    // cleanup: 12 items
+    for _ in 0..6 {
+        b.push(TWO_DROP);
+    }
+}
+
+/// v18 OCO cancel (selector 0) — owner signature.
+/// Sigscript: `[sig][pk][Op0][pushData(RS)]` (same shape as v1).
+fn emit_oco_v18_cancel(b: &mut Vec<u8>) {
+    use v17op::*;
+    // entry: expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4), mfill_sl(5),
+    //        pden_sl(6), pnum_sl(7), mfill_tp(8), pden_tp(9), pnum_tp(10),
+    //        pk(11), sig(12)
+    b.push(TWO_DROP); // expiry + cpend
+    e_pick(b, 9); // pk
+    b.push(BLAKE2B);
+    e_pick(b, 3); // ohash (2 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    e_roll(b, 10); // sig
+    e_roll(b, 10); // pk
+    b.push(CHECKSIG);
+    b.push(VERIFY);
+    // 9 items
+    for _ in 0..4 {
+        b.push(TWO_DROP);
+    }
+    b.push(DROP);
+}
+
+/// Expected v18 OCO sell body length.
+pub const OCO_SELL_V18_BODY_EXPECTED_LEN: usize = 220;
+
+/// v18 OCO sell redeemScript size (139B state + v18 body).
+pub const OCO_SELL_V18_RS_SIZE: usize = OCO_SELL_STATE_SIZE + OCO_SELL_V18_BODY_EXPECTED_LEN;
+
+/// Build the v18 single-UTXO OCO sell redeemScript (139B state + v18 body).
+///
+/// State layout identical to v1. `max_matcher_fee` is BPS in v18 (uniform).
+pub fn build_oco_sell_v18_redeem_script(
+    price_num_tp: u64,
+    price_den_tp: u64,
+    min_fill_tp: u64,
+    price_num_sl: u64,
+    price_den_sl: u64,
+    min_fill_sl: u64,
+    owner_hash: &[u8; 32],
+    seller_spk_hash: &[u8; 32],
+    max_matcher_fee_bps: u64,
+    cancel_pending: u8,
+    expiry_daa: u64,
+) -> crate::Result<Vec<u8>> {
+    if price_num_tp == 0 || price_den_tp == 0 {
+        return Err(crate::KobError::Contract("TP price must be > 0".into()));
+    }
+    if price_num_sl == 0 || price_den_sl == 0 {
+        return Err(crate::KobError::Contract("SL price must be > 0".into()));
+    }
+    if min_fill_tp == 0 || min_fill_sl == 0 {
+        return Err(crate::KobError::Contract("min_fill must be > 0".into()));
+    }
+    if cancel_pending > 1 {
+        return Err(crate::KobError::Contract("cancel_pending must be 0 or 1".into()));
+    }
+    if max_matcher_fee_bps > 10000 {
+        return Err(crate::KobError::Contract("max_matcher_fee_bps must be <= 10000".into()));
+    }
+    let g_tp = gcd(price_num_tp, price_den_tp);
+    let pnum_tp = if g_tp > 0 { price_num_tp / g_tp } else { price_num_tp };
+    let pden_tp = if g_tp > 0 { price_den_tp / g_tp } else { price_den_tp };
+    let g_sl = gcd(price_num_sl, price_den_sl);
+    let pnum_sl = if g_sl > 0 { price_num_sl / g_sl } else { price_num_sl };
+    let pden_sl = if g_sl > 0 { price_den_sl / g_sl } else { price_den_sl };
+
+    let body = build_oco_sell_v18_body();
+    let mut rs = Vec::with_capacity(OCO_SELL_STATE_SIZE + body.len());
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(pnum_tp));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(pden_tp));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(min_fill_tp));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(pnum_sl));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(pden_sl));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(min_fill_sl));
+    rs.push(0x20);
+    rs.extend_from_slice(owner_hash);
+    rs.push(0x20);
+    rs.extend_from_slice(seller_spk_hash);
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(max_matcher_fee_bps));
+    if cancel_pending == 0 {
+        rs.push(0x00);
+    } else {
+        rs.push(0x51);
+    }
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(expiry_daa));
+    rs.extend_from_slice(&body);
+    debug_assert_eq!(rs.len(), OCO_SELL_V18_RS_SIZE);
+    Ok(rs)
+}
+
+/// Build v18 OCO TP fill sigscript (canonical attestation layout).
+///
+/// Layout: `[0x01,koi][0x08 pnum_tp][0x08 pden_tp][Op1][pushData(RS)]`.
+pub fn build_oco_sell_v18_tp_fill_sigscript(
+    kas_output_idx: u16,
+    price_num_tp: u64,
+    price_den_tp: u64,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    assert!(kas_output_idx <= 255, "koi must fit in 1 byte for the canonical convention");
+    let g = gcd(price_num_tp, price_den_tp);
+    let pnum = if g > 0 { price_num_tp / g } else { price_num_tp };
+    let pden = if g > 0 { price_den_tp / g } else { price_den_tp };
+    let mut ss = Vec::with_capacity(21 + redeem_script.len() + 3);
+    ss.push(0x01);
+    ss.push(kas_output_idx as u8);
+    ss.push(0x08);
+    ss.extend_from_slice(&u64_le(pnum));
+    ss.push(0x08);
+    ss.extend_from_slice(&u64_le(pden));
+    ss.push(0x51); // Op1 (selector = TP fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build v18 OCO SL fill sigscript (canonical attestation layout).
+///
+/// Layout: `[0x01,koi][0x08 pnum_sl][0x08 pden_sl][Op2][pushData(RS)]`.
+pub fn build_oco_sell_v18_sl_fill_sigscript(
+    kas_output_idx: u16,
+    price_num_sl: u64,
+    price_den_sl: u64,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    assert!(kas_output_idx <= 255, "koi must fit in 1 byte for the canonical convention");
+    let g = gcd(price_num_sl, price_den_sl);
+    let pnum = if g > 0 { price_num_sl / g } else { price_num_sl };
+    let pden = if g > 0 { price_den_sl / g } else { price_den_sl };
+    let mut ss = Vec::with_capacity(21 + redeem_script.len() + 3);
+    ss.push(0x01);
+    ss.push(kas_output_idx as u8);
+    ss.push(0x08);
+    ss.extend_from_slice(&u64_le(pnum));
+    ss.push(0x08);
+    ss.extend_from_slice(&u64_le(pden));
+    ss.push(0x52); // Op2 (selector = SL fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build v18 OCO expire sigscript: `[Op4][pushData(RS)]` (same shape as v1;
+/// provided for naming symmetry).
+pub fn build_oco_sell_v18_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
+    build_oco_sell_expire_sigscript(redeem_script)
+}
+
+/// Build v18 OCO cancel sigscript: `[sig][pk][Op0][pushData(RS)]` (same shape
+/// as v1; provided for naming symmetry).
+pub fn build_oco_sell_v18_cancel_sigscript(
+    signature: &[u8; 64],
+    pubkey: &[u8; 32],
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    build_oco_sell_cancel_sigscript(signature, pubkey, redeem_script)
+}

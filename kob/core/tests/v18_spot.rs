@@ -1,0 +1,1178 @@
+//! v18 unified spot contracts — adversarial matrix against the real
+//! post-Toccata `kaspa-txscript` `TxScriptEngine` (`covenants_enabled = true`).
+//!
+//! Covers (Stage A, kob/V18_DESIGN.md):
+//!   - buy v18 N:M GTC/IOC happy paths + duplicate-tii + decoy price input,
+//!   - sell v18 canonical price attestation (mismatch fails) + partial Fix-3,
+//!   - buy v18 Op2 partial: happy path multi-event, residual-SPK forgery,
+//!     same-RS dual-buy uniqueness guard, residual==0, spent-based floor/cap
+//!     boundaries, mfill boundary, cpend=1 reject, 17-input guard reject,
+//!     grind-split non-increase arithmetic,
+//!   - OCO v18: SL swept at SL price passes / at TP price fails,
+//!   - swap v18: 2-cycle + 3-cycle ring settle, slot-0 theft, giver decoy,
+//!     F4 conservation-cap boundary.
+
+use kaspa_consensus_core::hashing::sighash::SigHashReusedValuesUnsync;
+use kaspa_consensus_core::mass::Gram;
+use kaspa_consensus_core::tx::{
+    CovenantBinding, PopulatedTransaction, ScriptPublicKey, Transaction, TransactionInput,
+    TransactionOutpoint, TransactionOutput, UtxoEntry, VerifiableTransaction,
+};
+use kaspa_hashes::Hash;
+use kaspa_txscript::caches::Cache;
+use kaspa_txscript::covenants::CovenantsContext;
+use kaspa_txscript::engine_context::EngineCtx;
+use kaspa_txscript::{EngineFlags, TxScriptEngine};
+
+use kob_core::contract::spot::oco::{
+    build_oco_sell_v18_redeem_script, build_oco_sell_v18_sl_fill_sigscript,
+    build_oco_sell_v18_tp_fill_sigscript,
+};
+use kob_core::contract::spot::order::{
+    build_buy_v18_cancel_sigscript, build_buy_v18_expire_sigscript,
+    build_buy_v18_fill_sigscript, build_buy_v18_partial_fill_sigscript,
+    build_buy_v18_redeem_script, build_sell_v18_fill_sigscript,
+    build_sell_v18_partial_fill_sigscript, build_sell_v18_redeem_script, BUY_ORDER_V18_MAX_N,
+};
+use kob_core::contract::spot::swap::{build_swap_v18_fill_sigscript, build_swap_v18_redeem_script};
+use kob_core::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
+
+const PUBKEY_HEX: &str = "b40c46552bc5fcf450d7026e8933b78b6f32b6812c9a94bcbf075cfcb4c249e0";
+const TOKEN_HEX: &str = "0c113120cb56668a5aa984752496f8cc4ac65e9044f2fa85d64e7bbcb5fc6039";
+
+fn hash32(hex: &str) -> Hash {
+    let b = hex::decode(hex).unwrap();
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&b);
+    Hash::from_bytes(a)
+}
+fn arr32(hex: &str) -> [u8; 32] {
+    let b = hex::decode(hex).unwrap();
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&b);
+    a
+}
+fn p2pk_spk(pubkey: &[u8; 32]) -> ScriptPublicKey {
+    let mut s = Vec::with_capacity(34);
+    s.push(0x20);
+    s.extend_from_slice(pubkey);
+    s.push(0xac);
+    ScriptPublicKey::new(0, s.into())
+}
+
+/// Execute the scripts of inputs `0..=last_idx` and return per-input results.
+fn exec_inputs(
+    tx: &Transaction,
+    entries: Vec<UtxoEntry>,
+    last_idx: usize,
+) -> Vec<Result<(), String>> {
+    let populated = PopulatedTransaction::new(tx, entries);
+    let cov_ctx = match CovenantsContext::from_tx(&populated) {
+        Ok(c) => c,
+        Err(e) => return vec![Err(format!("ctx: {e:?}")); last_idx + 1],
+    };
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let mut results = Vec::new();
+    for idx in 0..=last_idx {
+        let reused = SigHashReusedValuesUnsync::new();
+        let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+        let (input, entry) = populated.populated_input(idx);
+        let mut vm =
+            TxScriptEngine::from_transaction_input(&populated, input, idx, entry, ctx, flags);
+        results.push(vm.execute().map_err(|e| format!("{e:?}")));
+    }
+    results
+}
+
+// ===========================================================================
+// Buy v18 sweep harness (GTC / IOC / Op2 partial)
+// ===========================================================================
+
+#[derive(Clone)]
+enum TokenOut {
+    /// value = sell's tokens, spk = buyer wallet, covenant auth = the sell.
+    Honest,
+    /// Deliver a specific amount instead.
+    Amount(u64),
+    /// Route the tokens to a non-buyer SPK.
+    WrongSpk,
+    /// No covenant binding at all (plain output).
+    NoCovenant,
+}
+
+#[derive(Clone)]
+struct SellSpec {
+    price_num: u64,
+    price_den: u64,
+    tokens: u64,
+    /// Attested (pnum, pden) in the sigscript; None = the state price.
+    attested: Option<(u64, u64)>,
+    token_out: TokenOut,
+}
+
+impl SellSpec {
+    fn honest(price_num: u64, price_den: u64, tokens: u64) -> Self {
+        SellSpec { price_num, price_den, tokens, attested: None, token_out: TokenOut::Honest }
+    }
+}
+
+#[derive(Clone)]
+enum BuyMode {
+    Fill { ioc: bool },
+    /// Op2 partial with the given residual amount on the residual output.
+    Partial { residual: u64 },
+}
+
+#[derive(Clone)]
+struct Scn {
+    sells: Vec<SellSpec>,
+    /// Sell input indices the buy sigscript references (default 0..N).
+    tii: Vec<u16>,
+    mode: BuyMode,
+    buy_price_num: u64,
+    buy_price_den: u64,
+    buy_mfill: u64,
+    buy_mmfee_bps: u64,
+    buy_kas_in: u64,
+    buy_cpend: u8,
+    /// Add a second identical-RS buy input (uniqueness-guard tests).
+    dual_buy: bool,
+    /// Pad the tx with extra (non-executed) wallet inputs.
+    extra_wallet_inputs: usize,
+    /// Residual output carries a DIFFERENT buy RS's P2SH (forgery test).
+    forge_residual_spk: bool,
+}
+
+impl Scn {
+    fn gtc(sells: Vec<SellSpec>, kas_in: u64) -> Self {
+        let n = sells.len();
+        Scn {
+            sells,
+            tii: (0..n as u16).collect(),
+            mode: BuyMode::Fill { ioc: false },
+            buy_price_num: 1,
+            buy_price_den: 1,
+            buy_mfill: 1_000_000,
+            buy_mmfee_bps: 2000,
+            buy_kas_in: kas_in,
+            buy_cpend: 0,
+            dual_buy: false,
+            extra_wallet_inputs: 0,
+            forge_residual_spk: false,
+        }
+    }
+}
+
+/// Honest N-sell GTC sweep: sells at 99/100, buy limit 1/1, kas_in = tokens.
+fn honest(n: usize) -> Scn {
+    let sells: Vec<SellSpec> =
+        (0..n).map(|i| SellSpec::honest(99, 100, 10_000_000 * (i as u64 + 1))).collect();
+    let total: u64 = sells.iter().map(|s| s.tokens).sum();
+    Scn::gtc(sells, total)
+}
+
+/// Standard sweep-tx builder. Layout:
+///   inputs:  [sell_0 .. sell_{N-1}, buy, (buy2), fee, extra...]
+///   outputs: [sellerKas_0 .. sellerKas_{N-1}, buyerTokens_0 .. _{N-1},
+///             (residual), change]
+/// Returns (results for inputs 0..=buy, buy input index).
+fn run18(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let tcid_arr = arr32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let decoy_spk = p2pk_spk(&[0xcc; 32]);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let n = scn.sells.len();
+
+    let mut inputs = Vec::new();
+    let mut entries = Vec::new();
+    for (i, s) in scn.sells.iter().enumerate() {
+        let rs = build_sell_v18_redeem_script(
+            s.price_num, s.price_den, 1, &owner_hash, &spk_hash, 30, 0, 0,
+        )
+        .unwrap();
+        let (att_pn, att_pd) = s.attested.unwrap_or((s.price_num, s.price_den));
+        let ss = build_sell_v18_fill_sigscript(i as u16, att_pn, att_pd, &rs);
+        inputs.push(TransactionInput::new(op(0x10 + i as u8, 0), ss, 50, 0));
+        entries.push(UtxoEntry {
+            amount: s.tokens,
+            script_public_key: build_p2sh(&rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: Some(token_cov_id),
+        });
+    }
+
+    let buy_rs = build_buy_v18_redeem_script(
+        &tcid_arr,
+        scn.buy_price_num,
+        scn.buy_price_den,
+        scn.buy_mfill,
+        &owner_hash,
+        &spk_hash,
+        scn.buy_mmfee_bps,
+        scn.buy_cpend,
+        0,
+    )
+    .unwrap();
+    let residual_idx = (2 * n) as u16;
+    let buy_ss = match &scn.mode {
+        BuyMode::Fill { ioc } => build_buy_v18_fill_sigscript(&scn.tii, *ioc, &buy_rs),
+        BuyMode::Partial { .. } => {
+            build_buy_v18_partial_fill_sigscript(&scn.tii, residual_idx, &buy_rs)
+        }
+    };
+    let buy_idx = inputs.len();
+    inputs.push(TransactionInput::new(op(0x20, 0), buy_ss, 50, 0));
+    entries.push(UtxoEntry {
+        amount: scn.buy_kas_in,
+        script_public_key: build_p2sh(&buy_rs),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: None,
+    });
+
+    if scn.dual_buy {
+        // A second UTXO with the SAME redeem script (same P2SH SPK). Its own
+        // script is not executed here; its mere presence must trip the
+        // spending buy's uniqueness guard.
+        inputs.push(TransactionInput::new(op(0x21, 0), vec![0x01, 0x00], 50, 0));
+        entries.push(UtxoEntry {
+            amount: scn.buy_kas_in,
+            script_public_key: build_p2sh(&buy_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        });
+    }
+
+    // Fee/change placeholder input (not executed).
+    inputs.push(TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1));
+    entries.push(UtxoEntry {
+        amount: 1_000_000_000,
+        script_public_key: wallet_spk.clone(),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: None,
+    });
+    for j in 0..scn.extra_wallet_inputs {
+        inputs.push(TransactionInput::new(op(0x40 + j as u8, 0), vec![0x41; 66], 0, 1));
+        entries.push(UtxoEntry {
+            amount: 1_000_000,
+            script_public_key: wallet_spk.clone(),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        });
+    }
+
+    // Outputs.
+    let mut outputs = Vec::new();
+    for s in &scn.sells {
+        let kas = s.tokens * s.price_num / s.price_den;
+        outputs.push(TransactionOutput::with_covenant(kas, wallet_spk.clone(), None));
+    }
+    for (i, s) in scn.sells.iter().enumerate() {
+        let (val, spk, cov) = match &s.token_out {
+            TokenOut::Honest => (
+                s.tokens,
+                wallet_spk.clone(),
+                Some(CovenantBinding::new(i as u16, token_cov_id)),
+            ),
+            TokenOut::Amount(v) => (
+                *v,
+                wallet_spk.clone(),
+                Some(CovenantBinding::new(i as u16, token_cov_id)),
+            ),
+            TokenOut::WrongSpk => (
+                s.tokens,
+                decoy_spk.clone(),
+                Some(CovenantBinding::new(i as u16, token_cov_id)),
+            ),
+            TokenOut::NoCovenant => (s.tokens, wallet_spk.clone(), None),
+        };
+        outputs.push(TransactionOutput::with_covenant(val, spk, cov));
+    }
+    if let BuyMode::Partial { residual } = &scn.mode {
+        let res_spk = if scn.forge_residual_spk {
+            // A buy RS with a different state (price 3/1) — different P2SH.
+            let other = build_buy_v18_redeem_script(
+                &tcid_arr, 3, 1, scn.buy_mfill, &owner_hash, &spk_hash, scn.buy_mmfee_bps, 0, 0,
+            )
+            .unwrap();
+            build_p2sh(&other)
+        } else {
+            build_p2sh(&buy_rs)
+        };
+        outputs.push(TransactionOutput::with_covenant(*residual, res_spk, None));
+    }
+    outputs.push(TransactionOutput::with_covenant(500_000_000, wallet_spk.clone(), None));
+
+    let tx = Transaction::new(1, inputs, outputs, 50, Default::default(), 0, vec![]);
+    let results = exec_inputs(&tx, entries, buy_idx);
+    (results, buy_idx)
+}
+
+// ===========================================================================
+// N:M GTC / IOC happy paths + core sweep adversarial cases
+// ===========================================================================
+
+#[test]
+fn v18_gtc_sweeps_all_arities_pass() {
+    for n in 1..=BUY_ORDER_V18_MAX_N {
+        let (res, buy) = run18(&honest(n));
+        assert!(res[buy].is_ok(), "N={n} v18 buy must pass: {:?}", res[buy]);
+        for i in 0..buy {
+            assert!(res[i].is_ok(), "N={n} v18 sell {i} must pass: {:?}", res[i]);
+        }
+    }
+}
+
+#[test]
+fn v18_ioc_sweep_passes() {
+    let mut scn = honest(2);
+    scn.mode = BuyMode::Fill { ioc: true };
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_ok(), "IOC sweep must pass: {:?}", res[buy]);
+    for i in 0..buy {
+        assert!(res[i].is_ok(), "sell {i} must pass: {:?}", res[i]);
+    }
+}
+
+#[test]
+fn v18_duplicate_tii_adjacent_rejected() {
+    let mut scn = honest(2);
+    scn.tii = vec![0, 0];
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "duplicate adjacent tii must be rejected; got {:?}", res[buy]);
+}
+
+#[test]
+fn v18_duplicate_tii_nonadjacent_rejected() {
+    let mut scn = honest(3);
+    scn.tii = vec![0, 1, 0];
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "non-adjacent duplicate tii must be rejected; got {:?}", res[buy]);
+}
+
+/// Decoy price input: the buy's price reads happen on the covenant-
+/// authenticated `tii` only. A matcher-controlled plain-KAS input carrying a
+/// canonical-looking sigscript prefix (forged cheap price at [3..11)/[12..20))
+/// must NOT be usable as a summation term: `OpInputCovenantId(tii) != tcid`.
+#[test]
+fn v18_decoy_price_input_rejected() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    let sell_rs =
+        build_sell_v18_redeem_script(99, 100, 1, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+    let sell_ss = build_sell_v18_fill_sigscript(0, 99, 100, &sell_rs);
+    let buy_rs = build_buy_v18_redeem_script(
+        &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 2000, 0, 0,
+    )
+    .unwrap();
+    // Decoy wallet input whose sigscript mimics the canonical attested prefix
+    // with an absurdly cheap forged price (1/1000000).
+    let decoy_ss = build_sell_v18_fill_sigscript(0, 1, 1_000_000, &sell_rs);
+    // The buy references the decoy (input 1) as its second term.
+    let buy_ss = build_buy_v18_fill_sigscript(&[0, 1], false, &buy_rs);
+
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), sell_ss, 50, 0),
+        TransactionInput::new(op(0x11, 0), decoy_ss, 50, 0),
+        TransactionInput::new(op(0x20, 0), buy_ss, 50, 0),
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1),
+    ];
+    let outputs = vec![
+        TransactionOutput::with_covenant(9_900_000, wallet_spk.clone(), None),
+        TransactionOutput::with_covenant(
+            10_000_000,
+            wallet_spk.clone(),
+            Some(CovenantBinding::new(0, token)),
+        ),
+        TransactionOutput::with_covenant(500_000_000, wallet_spk.clone(), None),
+    ];
+    let entries = vec![
+        UtxoEntry {
+            amount: 10_000_000,
+            script_public_key: build_p2sh(&sell_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: Some(token),
+        },
+        UtxoEntry {
+            amount: 1_000_000,
+            script_public_key: wallet_spk.clone(),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None, // decoy has NO covenant id
+        },
+        UtxoEntry {
+            amount: 20_000_000,
+            script_public_key: build_p2sh(&buy_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        },
+        UtxoEntry {
+            amount: 1_000_000_000,
+            script_public_key: wallet_spk.clone(),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        },
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 50, Default::default(), 0, vec![]);
+    let res = exec_inputs(&tx, entries, 2);
+    assert!(res[2].is_err(), "decoy price input must be rejected; got {:?}", res[2]);
+}
+
+#[test]
+fn v18_limit_price_floor_violation_rejected() {
+    let mut scn = honest(2);
+    // Sells priced worse than the buyer's 1/1 limit; cap wide open.
+    scn.sells = vec![SellSpec::honest(3, 2, 8_000_000), SellSpec::honest(3, 2, 12_000_000)];
+    scn.buy_mmfee_bps = 10000;
+    scn.buy_kas_in = 30_000_000; // floor 30M tokens, only 20M delivered
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "limit floor violation must be rejected; got {:?}", res[buy]);
+}
+
+#[test]
+fn v18_over_cap_sweep_rejected() {
+    let mut scn = honest(2);
+    scn.sells = vec![SellSpec::honest(1, 2, 10_000_000), SellSpec::honest(1, 2, 20_000_000)];
+    scn.buy_mmfee_bps = 30;
+    scn.buy_kas_in = 30_000_000; // fair 15M, surplus 15M >> cap
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "over-cap sweep must be rejected; got {:?}", res[buy]);
+}
+
+/// IOC theft: the matcher consumes the full kas_in but delivers only dust
+/// (above nothing but the IOC floor). The surplus cap on the DELIVERED fair
+/// value rejects it.
+#[test]
+fn v18_ioc_underdelivery_theft_rejected() {
+    let mut scn = honest(2);
+    scn.mode = BuyMode::Fill { ioc: true };
+    scn.sells[0].token_out = TokenOut::Amount(1_000_000);
+    scn.sells[1].token_out = TokenOut::Amount(2_000_000);
+    scn.buy_mmfee_bps = 30;
+    scn.buy_kas_in = 30_000_000;
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "IOC under-delivery theft must be rejected; got {:?}", res[buy]);
+}
+
+/// A term's output is correctly priced/authorized but routed to a non-buyer
+/// SPK: the per-term buyer-SPK check rejects the sweep.
+#[test]
+fn v18_wrong_spk_delivery_rejected() {
+    let mut scn = honest(2);
+    scn.sells[1].token_out = TokenOut::WrongSpk;
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "tokens routed away from the buyer must be rejected; got {:?}", res[buy]);
+}
+
+/// A drained sell (its tokens leave the covenant entirely) fails its OWN F4.
+#[test]
+fn v18_drained_sell_fails_own_f4() {
+    let mut scn = honest(2);
+    scn.sells[1].token_out = TokenOut::NoCovenant;
+    let (res, _buy) = run18(&scn);
+    assert!(res[1].is_err(), "drained sell must fail its own F4; got {:?}", res[1]);
+}
+
+// ===========================================================================
+// Sell v18 attestation
+// ===========================================================================
+
+/// A plain sell whose sigscript attests a DIFFERENT price than its state must
+/// fail its own script (the attestation equality), even though the sell's own
+/// price calc uses the state price.
+#[test]
+fn v18_sell_attestation_mismatch_rejected() {
+    let mut scn = honest(2);
+    // Sell 1 attests 1/2 while its state says 99/100. Give the sweep a wide
+    // cap so the (cheaper) attested price could only HELP the buy — the sell
+    // itself must be the one that rejects.
+    scn.sells[1].attested = Some((1, 2));
+    scn.buy_mmfee_bps = 10000;
+    let (res, _buy) = run18(&scn);
+    assert!(res[1].is_err(), "attestation mismatch must fail the sell; got {:?}", res[1]);
+}
+
+/// Companion: honest attestation passes (covered by the happy path, pinned
+/// here at N=1 for a minimal repro).
+#[test]
+fn v18_sell_attestation_honest_passes() {
+    let (res, buy) = run18(&honest(1));
+    assert!(res[0].is_ok(), "honest attested sell must pass: {:?}", res[0]);
+    assert!(res[buy].is_ok(), "buy must pass: {:?}", res[buy]);
+}
+
+// ===========================================================================
+// Buy v18 Op2 partial fill
+// ===========================================================================
+
+/// Event 1 of a partial chain: buy holds 30M KAS, spends 10M against one
+/// 10M-token sell at 99/100, keeps a 20M self-SPK residual.
+fn partial_event(kas_in: u64, residual: u64, tokens: u64) -> Scn {
+    let mut scn = Scn::gtc(vec![SellSpec::honest(99, 100, tokens)], kas_in);
+    scn.mode = BuyMode::Partial { residual };
+    scn
+}
+
+#[test]
+fn v18_partial_happy_path_multi_event() {
+    // Event 1: 30M -> spend 10M, residual 20M (10M tokens delivered).
+    let (res, buy) = run18(&partial_event(30_000_000, 20_000_000, 10_000_000));
+    assert!(res[buy].is_ok(), "partial event 1 must pass: {:?}", res[buy]);
+    assert!(res[0].is_ok(), "event-1 sell must pass: {:?}", res[0]);
+    // Event 2: the residual UTXO (20M) spends 15M, keeps 5M.
+    let (res, buy) = run18(&partial_event(20_000_000, 5_000_000, 15_000_000));
+    assert!(res[buy].is_ok(), "partial event 2 must pass: {:?}", res[buy]);
+    assert!(res[0].is_ok(), "event-2 sell must pass: {:?}", res[0]);
+}
+
+#[test]
+fn v18_partial_multi_sell_passes() {
+    // One partial event sweeping TWO sells at once.
+    let mut scn = Scn::gtc(
+        vec![SellSpec::honest(99, 100, 4_000_000), SellSpec::honest(99, 100, 6_000_000)],
+        30_000_000,
+    );
+    scn.mode = BuyMode::Partial { residual: 20_000_000 };
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_ok(), "multi-sell partial must pass: {:?}", res[buy]);
+    for i in 0..buy {
+        assert!(res[i].is_ok(), "sell {i} must pass: {:?}", res[i]);
+    }
+}
+
+/// Residual-SPK forgery: the residual output pays a DIFFERENT buy RS (other
+/// state, e.g. a worse price). Byte-exact SPK equality must reject it.
+#[test]
+fn v18_partial_residual_spk_forgery_rejected() {
+    let mut scn = partial_event(30_000_000, 20_000_000, 10_000_000);
+    scn.forge_residual_spk = true;
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "forged residual SPK must be rejected; got {:?}", res[buy]);
+}
+
+/// Two identical-RS buy UTXOs in one tx sharing one residual output: the
+/// self-instance uniqueness guard (count == 1) must fail the spend.
+#[test]
+fn v18_partial_same_rs_dual_buy_rejected() {
+    let mut scn = partial_event(30_000_000, 20_000_000, 10_000_000);
+    scn.dual_buy = true;
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "same-RS dual buy must be rejected; got {:?}", res[buy]);
+}
+
+/// residual == 0 must use selector 1/5; Op2 rejects it (residual >= 1).
+#[test]
+fn v18_partial_zero_residual_rejected() {
+    // Sell delivers the full 30M-worth so the floor would hold if this were
+    // a fill; the zero residual alone must kill the Op2 path.
+    let (res, buy) = run18(&partial_event(30_000_000, 0, 30_000_000));
+    assert!(res[buy].is_err(), "zero residual on Op2 must be rejected; got {:?}", res[buy]);
+}
+
+/// Spent-based floor boundary: token_sum == spent/pden*pnum passes; one token
+/// less fails. (buy 1/1, spent = 10M.)
+#[test]
+fn v18_partial_floor_boundary() {
+    // Exactly at the floor: 10M tokens for 10M spent.
+    let (res, buy) = run18(&partial_event(30_000_000, 20_000_000, 10_000_000));
+    assert!(res[buy].is_ok(), "at-floor partial must pass: {:?}", res[buy]);
+    // One below: sell holds (and fully delivers) 9_999_999 tokens.
+    let (res, buy) = run18(&partial_event(30_000_000, 20_000_000, 9_999_999));
+    assert!(res[buy].is_err(), "one-below-floor partial must fail; got {:?}", res[buy]);
+}
+
+/// Per-event mfill floor: token_sum >= mfill even when the spent-based floor
+/// is lower (blocks dust-grind events).
+#[test]
+fn v18_partial_mfill_boundary() {
+    // buy 1/1, mfill 5M. spent = 3M -> spent-floor 3M < mfill.
+    // Sell at 1/2 (cheap) delivering 5M tokens: passes (== mfill).
+    let mk = |tokens: u64| {
+        let mut scn = Scn::gtc(vec![SellSpec::honest(1, 2, tokens)], 30_000_000);
+        scn.buy_mfill = 5_000_000;
+        scn.mode = BuyMode::Partial { residual: 27_000_000 }; // spent = 3M
+        scn
+    };
+    let (res, buy) = run18(&mk(5_000_000));
+    assert!(res[buy].is_ok(), "token_sum == mfill must pass: {:?}", res[buy]);
+    let (res, buy) = run18(&mk(4_999_999));
+    assert!(res[buy].is_err(), "token_sum < mfill must fail; got {:?}", res[buy]);
+}
+
+/// Spent-based surplus cap boundary: surplus == spent/10000*mmfee passes; one
+/// sompi more fails. (buy 9/10 so the limit floor isn't the binding check.)
+#[test]
+fn v18_partial_cap_boundary() {
+    let mk = |tokens: u64| {
+        // Sell at 1/1: fair = tokens. spent = 10M, cap(100bps) = 100_000.
+        let mut scn = Scn::gtc(vec![SellSpec::honest(1, 1, tokens)], 30_000_000);
+        scn.buy_price_num = 9;
+        scn.buy_price_den = 10; // spent-floor = 9M
+        scn.buy_mmfee_bps = 100;
+        scn.mode = BuyMode::Partial { residual: 20_000_000 }; // spent = 10M
+        scn
+    };
+    // surplus = 10M - 9_900_000 = 100_000 == cap -> pass.
+    let (res, buy) = run18(&mk(9_900_000));
+    assert!(res[buy].is_ok(), "surplus == cap must pass: {:?}", res[buy]);
+    // surplus = 100_001 > cap -> fail (floor 9M still satisfied).
+    let (res, buy) = run18(&mk(9_899_999));
+    assert!(res[buy].is_err(), "surplus > cap must fail; got {:?}", res[buy]);
+}
+
+/// Grind-split non-increase (pure arithmetic, mirrors the covenant's integer
+/// ops): splitting one fill into k partial events cannot increase the total
+/// extractable surplus, because floor division is superadditive-compatible:
+/// sum(floor(x_i/10000)*bps) <= floor(sum(x_i)/10000)*bps.
+#[test]
+fn v18_partial_grind_split_no_extra_extraction() {
+    let cap = |spent: u64, bps: u64| spent / 10000 * bps;
+    let cases: &[(&[u64], u64)] = &[
+        (&[10_000_000], 30),
+        (&[5_000_000, 5_000_000], 30),
+        (&[3_333_333, 3_333_333, 3_333_334], 30),
+        (&[9_999, 9_999, 9_980_002], 30), // sub-10000 dust events cap at 0
+        (&[1, 1, 1, 9_999_997], 250),
+        (&[123_456, 654_321, 9_222_223], 250),
+    ];
+    for (parts, bps) in cases {
+        let total: u64 = parts.iter().sum();
+        let whole_cap = cap(total, *bps);
+        let split_cap: u64 = parts.iter().map(|p| cap(*p, *bps)).sum();
+        assert!(
+            split_cap <= whole_cap,
+            "split extraction {split_cap} must not exceed whole-fill cap {whole_cap} ({parts:?})"
+        );
+    }
+}
+
+/// cpend == 1 (cancel-pending) must reject Op2 partial (F5).
+#[test]
+fn v18_partial_cpend_rejected() {
+    let mut scn = partial_event(30_000_000, 20_000_000, 10_000_000);
+    scn.buy_cpend = 1;
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "cpend=1 partial must be rejected; got {:?}", res[buy]);
+}
+
+/// 17-input tx: the uniqueness guard scans only i=0..15, so it requires
+/// OpTxInputCount <= 16 — a 17th input (which could hide a second identical
+/// buy beyond the scan) fails the spend. 16 inputs exactly still pass.
+#[test]
+fn v18_partial_input_count_guard() {
+    // sells(1) + buy + fee = 3 inputs; pad to exactly 16 -> pass.
+    let mut scn = partial_event(30_000_000, 20_000_000, 10_000_000);
+    scn.extra_wallet_inputs = 13;
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_ok(), "16-input partial must pass: {:?}", res[buy]);
+    // Pad to 17 -> guard rejects.
+    let mut scn = partial_event(30_000_000, 20_000_000, 10_000_000);
+    scn.extra_wallet_inputs = 14;
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "17-input partial must be rejected; got {:?}", res[buy]);
+}
+
+/// The partial path also carries the anti-double-count guard.
+#[test]
+fn v18_partial_duplicate_tii_rejected() {
+    let mut scn = Scn::gtc(
+        vec![SellSpec::honest(99, 100, 4_000_000), SellSpec::honest(99, 100, 6_000_000)],
+        30_000_000,
+    );
+    scn.mode = BuyMode::Partial { residual: 20_000_000 };
+    scn.tii = vec![0, 0];
+    let (res, buy) = run18(&scn);
+    assert!(res[buy].is_err(), "partial duplicate tii must be rejected; got {:?}", res[buy]);
+}
+
+// ===========================================================================
+// Sell v18 partial (Fix-3 F4)
+// ===========================================================================
+
+/// Build a solo sell-partial tx: sell input (token_in), fee input; outputs:
+/// [0] seller KAS (fta*pnum/pden), [1] residual token continuation.
+/// `residual_cfg`: (bind_to_self, spk_is_self, value).
+fn run_sell_partial(
+    token_in: u64,
+    fta: u64,
+    residual_cfg: (bool, bool, u64),
+) -> Vec<Result<(), String>> {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let (pnum, pden) = (99u64, 100u64);
+    let rs = build_sell_v18_redeem_script(pnum, pden, 1, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+    let ss = build_sell_v18_partial_fill_sigscript(0, pnum, pden, fta, 1, &rs);
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), ss, 50, 0),
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1),
+    ];
+    let (bind_self, spk_self, value) = residual_cfg;
+    let res_spk = if spk_self { build_p2sh(&rs) } else { wallet_spk.clone() };
+    let res_cov = if bind_self { Some(CovenantBinding::new(0, token)) } else { None };
+    let outputs = vec![
+        TransactionOutput::with_covenant(fta * pnum / pden, wallet_spk.clone(), None),
+        TransactionOutput::with_covenant(value, res_spk, res_cov),
+        TransactionOutput::with_covenant(500_000_000, wallet_spk.clone(), None),
+    ];
+    let entries = vec![
+        UtxoEntry {
+            amount: token_in,
+            script_public_key: build_p2sh(&rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: Some(token),
+        },
+        UtxoEntry {
+            amount: 1_000_000_000,
+            script_public_key: wallet_spk.clone(),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        },
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 50, Default::default(), 0, vec![]);
+    exec_inputs(&tx, entries, 0)
+}
+
+#[test]
+fn v18_sell_partial_fix3_honest_passes() {
+    // 10M tokens, fill 4M -> residual 6M, covenant-bound to the sell input,
+    // self-SPK continuation.
+    let res = run_sell_partial(10_000_000, 4_000_000, (true, true, 6_000_000));
+    assert!(res[0].is_ok(), "honest Fix-3 sell partial must pass: {:?}", res[0]);
+}
+
+#[test]
+fn v18_sell_partial_fix3_unbound_residual_rejected() {
+    // Residual output not covenant-bound to the sell (the old count-only F4
+    // could be satisfied by ANOTHER input's outputs; Fix-3 demands OWN auth).
+    let res = run_sell_partial(10_000_000, 4_000_000, (false, true, 6_000_000));
+    assert!(res[0].is_err(), "unbound residual must fail Fix-3 F4; got {:?}", res[0]);
+}
+
+#[test]
+fn v18_sell_partial_fix3_wrong_spk_residual_rejected() {
+    // Residual bound to the sell but routed to a non-self SPK (drain).
+    let res = run_sell_partial(10_000_000, 4_000_000, (true, false, 6_000_000));
+    assert!(res[0].is_err(), "wrong-SPK residual must fail; got {:?}", res[0]);
+}
+
+#[test]
+fn v18_sell_partial_fix3_short_residual_rejected() {
+    // Residual value below token_in - fta.
+    let res = run_sell_partial(10_000_000, 4_000_000, (true, true, 5_999_999));
+    assert!(res[0].is_err(), "short residual must fail; got {:?}", res[0]);
+}
+
+// ===========================================================================
+// OCO v18: sweep-eligible on both branches
+// ===========================================================================
+
+/// Build a 1-OCO-sell : 1-buy sweep. `sl_branch` picks the OCO selector;
+/// `attest_wrong` attests the OTHER branch's price pair (must fail the
+/// attestation). Prices: TP 2/1, SL 1/2. Buy limit adapts per branch.
+fn run_oco_sweep(sl_branch: bool, attest_wrong: bool) -> (Vec<Result<(), String>>, usize) {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let (pn_tp, pd_tp, pn_sl, pd_sl) = (2u64, 1u64, 1u64, 2u64);
+    let tokens = 10_000_000u64;
+    let oco_rs = build_oco_sell_v18_redeem_script(
+        pn_tp, pd_tp, 1, pn_sl, pd_sl, 1, &owner_hash, &spk_hash, 30, 0, 0,
+    )
+    .unwrap();
+    let branch_pair = if sl_branch { (pn_sl, pd_sl) } else { (pn_tp, pd_tp) };
+    let other_pair = if sl_branch { (pn_tp, pd_tp) } else { (pn_sl, pd_sl) };
+    let (att_pn, att_pd) = if attest_wrong { other_pair } else { branch_pair };
+    let oco_ss = if sl_branch {
+        build_oco_sell_v18_sl_fill_sigscript(0, att_pn, att_pd, &oco_rs)
+    } else {
+        build_oco_sell_v18_tp_fill_sigscript(0, att_pn, att_pd, &oco_rs)
+    };
+    // Seller KAS at the executing branch's price (sell convention: KAS/token).
+    let branch_price = if sl_branch { (pn_sl, pd_sl) } else { (pn_tp, pd_tp) };
+    let seller_kas = tokens * branch_price.0 / branch_price.1;
+    // Buy limit at the same rate. Buy convention is tokens/KAS, i.e. the
+    // sell price inverted: floor = kas_in/pden*pnum == tokens exactly.
+    let buy_rs = build_buy_v18_redeem_script(
+        &arr32(TOKEN_HEX),
+        branch_price.1,
+        branch_price.0,
+        1_000_000,
+        &owner_hash,
+        &spk_hash,
+        2000,
+        0,
+        0,
+    )
+    .unwrap();
+    let buy_ss = build_buy_v18_fill_sigscript(&[0], false, &buy_rs);
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), oco_ss, 50, 0),
+        TransactionInput::new(op(0x20, 0), buy_ss, 50, 0),
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1),
+    ];
+    let outputs = vec![
+        TransactionOutput::with_covenant(seller_kas, wallet_spk.clone(), None),
+        TransactionOutput::with_covenant(
+            tokens,
+            wallet_spk.clone(),
+            Some(CovenantBinding::new(0, token)),
+        ),
+        TransactionOutput::with_covenant(500_000_000, wallet_spk.clone(), None),
+    ];
+    let entries = vec![
+        UtxoEntry {
+            amount: tokens,
+            script_public_key: build_p2sh(&oco_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: Some(token),
+        },
+        UtxoEntry {
+            amount: seller_kas,
+            script_public_key: build_p2sh(&buy_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        },
+        UtxoEntry {
+            amount: 1_000_000_000,
+            script_public_key: wallet_spk.clone(),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        },
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 50, Default::default(), 0, vec![]);
+    (exec_inputs(&tx, entries, 1), 1)
+}
+
+/// OCO SL swept at the SL price: both the OCO sell (SL branch, SL attestation)
+/// and the sweeping buy pass — the historic OCO-SL sweep blocker is gone.
+#[test]
+fn v18_oco_sl_swept_at_sl_price_passes() {
+    let (res, buy) = run_oco_sweep(true, false);
+    assert!(res[0].is_ok(), "OCO SL fill must pass: {:?}", res[0]);
+    assert!(res[buy].is_ok(), "buy sweeping OCO SL must pass: {:?}", res[buy]);
+}
+
+/// OCO SL branch with the TP price attested: the attestation check (attested
+/// pair == the EXECUTING branch's pair) must fail the OCO input.
+#[test]
+fn v18_oco_sl_swept_at_tp_price_rejected() {
+    let (res, _buy) = run_oco_sweep(true, true);
+    assert!(res[0].is_err(), "SL fill attesting the TP price must fail; got {:?}", res[0]);
+}
+
+/// TP branch happy path (attested TP pair) for completeness.
+#[test]
+fn v18_oco_tp_swept_at_tp_price_passes() {
+    let (res, buy) = run_oco_sweep(false, false);
+    assert!(res[0].is_ok(), "OCO TP fill must pass: {:?}", res[0]);
+    assert!(res[buy].is_ok(), "buy sweeping OCO TP must pass: {:?}", res[buy]);
+}
+
+/// TP branch with the SL price attested must fail the attestation too
+/// (mismatch is symmetric — attested pair must equal the EXECUTING branch's).
+#[test]
+fn v18_oco_tp_swept_at_sl_price_rejected() {
+    let (res, _buy) = run_oco_sweep(false, true);
+    assert!(res[0].is_err(), "TP fill attesting the SL price must fail; got {:?}", res[0]);
+}
+
+// ===========================================================================
+// Swap v18 rings
+// ===========================================================================
+
+/// Build an n-cycle ring: swap leg i gives token T_i and receives T_{i+1 mod n}.
+/// Each leg's slot-0 delivery is output i (bound to input i) which is leg
+/// (i-1 mod n)'s target... concretely: output[i] carries token T_i to the
+/// owner, authorized by input i; leg j receives T_{j+1} via output[j+1 mod n].
+///
+/// Knobs:
+///   * `theft_slot0`: route output[0] (leg 1's target) to the matcher SPK.
+///   * `giver_override`: per-leg giver index override (decoy tests).
+///   * `slot0_value_delta`: subtract from output[0]'s value (F4 boundary on
+///     leg 0's own delivery... note output[0] is authorized by input 0).
+fn run_ring(
+    n: usize,
+    mmfee_bps: u64,
+    theft_slot0: bool,
+    giver_override: Option<Vec<u16>>,
+    slot0_value_delta: u64,
+) -> Vec<Result<(), String>> {
+    assert!(n >= 2 && n <= 3);
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let decoy_spk = p2pk_spk(&[0xcc; 32]);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    // n distinct tokens; leg i holds amounts[i] of token i.
+    let tokens: Vec<Hash> = (0..n).map(|i| Hash::from_bytes([0xd0 + i as u8; 32])).collect();
+    let token_arrs: Vec<[u8; 32]> = (0..n).map(|i| [0xd0 + i as u8; 32]).collect();
+    let amounts: Vec<u64> = (0..n).map(|i| 10_000_000 * (i as u64 + 1)).collect();
+
+    // Leg i: source = token i, target = token (i+1) % n.
+    // Output j carries token j (amount j, possibly minus fee skim) to the
+    // owner wallet, authorized by input j. Leg i's target output index is
+    // (i + 1) % n; its giver is input (i + 1) % n.
+    let fee = |amt: u64| amt / 10000 * mmfee_bps;
+    let mut rss = Vec::new();
+    for i in 0..n {
+        let tgt = (i + 1) % n;
+        let min_target = amounts[tgt] - fee(amounts[tgt]);
+        let rs = build_swap_v18_redeem_script(
+            &token_arrs[i],
+            &token_arrs[tgt],
+            min_target,
+            &owner_hash,
+            &spk_hash,
+            &[0xee; 32],
+            mmfee_bps,
+        )
+        .unwrap();
+        rss.push(rs);
+    }
+    let mut inputs = Vec::new();
+    let mut entries = Vec::new();
+    for i in 0..n {
+        let tgt = (i + 1) % n;
+        let giver = giver_override
+            .as_ref()
+            .map(|g| g[i])
+            .unwrap_or(tgt as u16);
+        let ss = build_swap_v18_fill_sigscript(giver, tgt as u16, &rss[i]);
+        inputs.push(TransactionInput::new(op(0x60 + i as u8, 0), ss, 50, 0));
+        entries.push(UtxoEntry {
+            amount: amounts[i],
+            script_public_key: build_p2sh(&rss[i]),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: Some(tokens[i]),
+        });
+    }
+    // Matcher input (not executed).
+    inputs.push(TransactionInput::new(op(0x70, 0), vec![0x41; 66], 0, 1));
+    entries.push(UtxoEntry {
+        amount: 1_000_000_000,
+        script_public_key: wallet_spk.clone(),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: None,
+    });
+
+    let mut outputs = Vec::new();
+    for j in 0..n {
+        let spk = if j == 0 && theft_slot0 { decoy_spk.clone() } else { wallet_spk.clone() };
+        let val = if j == 0 { amounts[j] - slot0_value_delta } else { amounts[j] };
+        outputs.push(TransactionOutput::with_covenant(
+            val,
+            spk,
+            Some(CovenantBinding::new(j as u16, tokens[j])),
+        ));
+    }
+    outputs.push(TransactionOutput::with_covenant(500_000_000, wallet_spk.clone(), None));
+
+    let tx = Transaction::new(1, inputs, outputs, 50, Default::default(), 0, vec![]);
+    exec_inputs(&tx, entries, n - 1)
+}
+
+#[test]
+fn v18_ring_2cycle_settles() {
+    let res = run_ring(2, 100, false, None, 0);
+    for (i, r) in res.iter().enumerate() {
+        assert!(r.is_ok(), "2-cycle leg {i} must pass: {r:?}");
+    }
+}
+
+#[test]
+fn v18_ring_3cycle_settles() {
+    let res = run_ring(3, 100, false, None, 0);
+    for (i, r) in res.iter().enumerate() {
+        assert!(r.is_ok(), "3-cycle leg {i} must pass: {r:?}");
+    }
+}
+
+/// Slot-0 theft: output[0] (token 0, leg 0's own delivery = leg n-1's target)
+/// is routed to the matcher's SPK. The RECEIVER leg (n-1) must fail its F3
+/// owner-SPK check on the derived slot-0 output.
+#[test]
+fn v18_ring_slot0_theft_rejected() {
+    let res = run_ring(2, 100, true, None, 0);
+    assert!(
+        res[1].is_err(),
+        "receiver must reject a slot-0 delivery routed to the matcher; got {:?}",
+        res[1]
+    );
+}
+
+/// Giver-idx decoy: leg 0 claims its giver is input 0 (its own input — token
+/// 0, not its target token 1). `OpInputCovenantId(giver) == target_tcid`
+/// must reject it.
+#[test]
+fn v18_ring_giver_decoy_rejected() {
+    let res = run_ring(2, 100, false, Some(vec![0, 0]), 0);
+    assert!(res[0].is_err(), "wrong-covenant giver must be rejected; got {:?}", res[0]);
+}
+
+/// Giver-idx decoy pointing at a NON-covenant input (the matcher's wallet
+/// input): covenant id reads as zero and the giver auth fails.
+#[test]
+fn v18_ring_giver_noncovenant_decoy_rejected() {
+    // In a 2-ring, input 2 is the matcher wallet input.
+    let res = run_ring(2, 100, false, Some(vec![2, 0]), 0);
+    assert!(res[0].is_err(), "non-covenant giver must be rejected; got {:?}", res[0]);
+}
+
+/// F4 conservation-cap boundary: leg 0's own slot-0 delivery may be skimmed
+/// down to exactly source_in - source_in/10000*mmfee_bps; one sompi more
+/// fails leg 0's F4. (The receiver's min_target is set at the floor, so the
+/// at-floor case still satisfies its F2.)
+#[test]
+fn v18_ring_f4_cap_boundary() {
+    // amounts[0] = 10M, 100bps -> fee 100_000, floor 9_900_000.
+    let res = run_ring(2, 100, false, None, 100_000);
+    for (i, r) in res.iter().enumerate() {
+        assert!(r.is_ok(), "at-cap skim leg {i} must pass: {r:?}");
+    }
+    let res = run_ring(2, 100, false, None, 100_001);
+    assert!(res[0].is_err(), "over-cap skim must fail the giver's F4; got {:?}", res[0]);
+}
+
+// ===========================================================================
+// Buy v18 lifecycle sanity (dispatch integrity of the new 6-way selector)
+// ===========================================================================
+
+#[test]
+fn v18_buy_expire_refund_passes_and_early_expire_rejected() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    for (lock_time, expect_ok) in [(2000u64, true), (500u64, false)] {
+        let buy_rs = build_buy_v18_redeem_script(
+            &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 30, 0, 1000,
+        )
+        .unwrap();
+        let ss = build_buy_v18_expire_sigscript(&buy_rs);
+        let inputs = vec![TransactionInput::new(op(0x20, 0), ss, 0, 0)];
+        let outputs =
+            vec![TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), None)];
+        let entries = vec![UtxoEntry {
+            amount: 30_000_000,
+            script_public_key: build_p2sh(&buy_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        }];
+        let tx = Transaction::new(1, inputs, outputs, lock_time, Default::default(), 0, vec![]);
+        let res = exec_inputs(&tx, entries, 0);
+        assert_eq!(
+            res[0].is_ok(),
+            expect_ok,
+            "expire at lockTime {lock_time} expected ok={expect_ok}, got {:?}",
+            res[0]
+        );
+    }
+}
+
+#[test]
+fn v18_buy_cancel_reaches_checksig() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    for mark in [false, true] {
+        let buy_rs = build_buy_v18_redeem_script(
+            &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 30, 0, 0,
+        )
+        .unwrap();
+        let sig = [0x11u8; 64];
+        let ss = build_buy_v18_cancel_sigscript(&pubkey, &sig, mark, &buy_rs);
+        let inputs = vec![TransactionInput::new(op(0x20, 0), ss, 0, 0)];
+        let outputs =
+            vec![TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), None)];
+        let entries = vec![UtxoEntry {
+            amount: 30_000_000,
+            script_public_key: build_p2sh(&buy_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        }];
+        let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+        let res = exec_inputs(&tx, entries, 0);
+        let e = res[0].as_ref().unwrap_err();
+        assert!(
+            e.contains("Sig") || e.contains("sig") || e.contains("Verify") || e.contains("Null")
+                || e.contains("Schnorr"),
+            "cancel(mark={mark}) must reach OpCheckSigVerify, got: {e}"
+        );
+        assert!(
+            !e.contains("NumberTooBig") && !e.contains("InvalidStack") && !e.contains("pick"),
+            "cancel(mark={mark}) must not stack-error before the signature check: {e}"
+        );
+    }
+}
+
+#[test]
+fn v18_sell_cancel_reaches_checksig() {
+    use kob_core::contract::spot::receipt::build_sell_cancel_sigscript;
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let token = hash32(TOKEN_HEX);
+    let rs = build_sell_v18_redeem_script(99, 100, 1, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+    let sig = [0x11u8; 64];
+    let ss = build_sell_cancel_sigscript(&sig, &pubkey, &rs);
+    let inputs = vec![TransactionInput::new(op(0x10, 0), ss, 0, 0)];
+    let outputs = vec![TransactionOutput::with_covenant(
+        10_000_000,
+        wallet_spk.clone(),
+        Some(CovenantBinding::new(0, token)),
+    )];
+    let entries = vec![UtxoEntry {
+        amount: 10_000_000,
+        script_public_key: build_p2sh(&rs),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: Some(token),
+    }];
+    let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+    let res = exec_inputs(&tx, entries, 0);
+    let e = res[0].as_ref().unwrap_err();
+    assert!(
+        e.contains("Sig") || e.contains("sig") || e.contains("Verify") || e.contains("Null")
+            || e.contains("Schnorr"),
+        "v18 sell cancel must reach OpCheckSig, got: {e}"
+    );
+}

@@ -2074,4 +2074,180 @@ mod adversarial_tests {
         }
         assert!(mismatches.is_empty(), "bytecode pins stale:\n{}", mismatches.join("\n"));
     }
+
+    // ===== V18 unified spot generation pins =====
+
+    /// v18 body lengths are deterministic; pin them so the RS-length version
+    /// tags (parse.rs dispatch) can never silently drift.
+    #[test]
+    fn v18_body_lengths_pinned() {
+        use crate::contract::spot::order::{
+            build_buy_v18_body, build_sell_v18_body,
+            BUY_ORDER_V18_BODY_EXPECTED_LEN, SELL_ORDER_V18_BODY_EXPECTED_LEN,
+        };
+        use crate::contract::spot::oco::{build_oco_sell_v18_body, OCO_SELL_V18_BODY_EXPECTED_LEN};
+        use crate::contract::spot::swap::{build_swap_v18_body, SWAP_V18_BODY_EXPECTED_LEN};
+        assert_eq!(build_buy_v18_body().len(), BUY_ORDER_V18_BODY_EXPECTED_LEN, "buy v18 body");
+        assert_eq!(build_sell_v18_body().len(), SELL_ORDER_V18_BODY_EXPECTED_LEN, "sell v18 body");
+        assert_eq!(build_oco_sell_v18_body().len(), OCO_SELL_V18_BODY_EXPECTED_LEN, "OCO v18 body");
+        assert_eq!(build_swap_v18_body().len(), SWAP_V18_BODY_EXPECTED_LEN, "swap v18 body");
+    }
+
+    /// Every v18 RS length must be distinct from every other dispatch length
+    /// in the crate (v14 buy 396, sell 427, v16 buy 476, v17 buy 838, bracket
+    /// 365, OCO v1 333, swap v1 243) AND from each other — the RS length is
+    /// the version tag throughout parse/scan/match.
+    #[test]
+    fn v18_rs_lengths_no_collision() {
+        use crate::contract::spot::order::{
+            BUY_ORDER_RS_EXPECTED_LEN, BUY_ORDER_V16_RS_EXPECTED_LEN,
+            BUY_ORDER_V17_RS_EXPECTED_LEN, BUY_ORDER_V18_RS_EXPECTED_LEN,
+            SELL_ORDER_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
+        };
+        use crate::contract::spot::parse::BRACKET_RS_SIZE;
+        use crate::contract::spot::oco::{OCO_SELL_RS_SIZE, OCO_SELL_V18_RS_SIZE};
+        use crate::contract::spot::swap::{SWAP_RS_SIZE, SWAP_V18_RS_SIZE};
+        let v18 = [
+            BUY_ORDER_V18_RS_EXPECTED_LEN,
+            SELL_ORDER_V18_RS_EXPECTED_LEN,
+            OCO_SELL_V18_RS_SIZE,
+            SWAP_V18_RS_SIZE,
+        ];
+        let existing = [
+            BUY_ORDER_RS_EXPECTED_LEN,
+            SELL_ORDER_RS_EXPECTED_LEN,
+            BUY_ORDER_V16_RS_EXPECTED_LEN,
+            BUY_ORDER_V17_RS_EXPECTED_LEN,
+            BRACKET_RS_SIZE,
+            OCO_SELL_RS_SIZE,
+            SWAP_RS_SIZE,
+        ];
+        for (i, a) in v18.iter().enumerate() {
+            for b in existing.iter() {
+                assert_ne!(a, b, "v18 RS length {a} collides with an existing dispatch length");
+            }
+            for (j, b) in v18.iter().enumerate() {
+                if i != j {
+                    assert_ne!(a, b, "two v18 RS lengths collide");
+                }
+            }
+        }
+    }
+
+    /// v18 bodies are generated programmatically; pin their hashes like v17.
+    #[test]
+    fn v18_bytecode_stable() {
+        use crate::p2sh::blake2b_256;
+        use crate::contract::spot::order::{build_buy_v18_body, build_sell_v18_body};
+        use crate::contract::spot::oco::build_oco_sell_v18_body;
+        use crate::contract::spot::swap::build_swap_v18_body;
+        let pins: &[(&str, Vec<u8>, &str)] = &[
+            ("BUY_ORDER_V18", build_buy_v18_body(),
+             "a21222d90b10c6a38f139a183da6e24b3106a06d2a6b0773d340706142ebd2d4"),
+            ("SELL_ORDER_V18", build_sell_v18_body(),
+             "de71334d1adb9b12caeb8a533496d5a73b35a2dc77f89dcef4496202bb4d1082"),
+            ("OCO_SELL_V18", build_oco_sell_v18_body(),
+             "c2cd219b2c12832e6b1a057e9ad1c5bc96bf0afc82b15b1b7cb85ec9f3f382f5"),
+            ("SWAP_ORDER_V18", build_swap_v18_body(),
+             "47552d56319a3b8a523ae4d467192db1496347ff4243f1eae5b31e36729eb0b3"),
+        ];
+        let mut mismatches = Vec::new();
+        for (name, body, expected_hex) in pins {
+            let actual = hex::encode(blake2b_256(body));
+            if actual != *expected_hex {
+                mismatches.push(format!("{} len={}B actual={}", name, body.len(), actual));
+            }
+        }
+        assert!(mismatches.is_empty(), "v18 bytecode pins stale:\n{}", mismatches.join("\n"));
+    }
+
+    /// The canonical v18 attestation layout: for EVERY canonical fill-family
+    /// sigscript builder (plain sell fill, sell IOC, sell partial, OCO TP,
+    /// OCO SL), the attested pnum bytes sit at sigscript [3..11) and the
+    /// attested pden bytes at [12..20), with the forced 2-byte koi push at
+    /// [0..2) and 0x08 push prefixes at 2 and 11. These are the offsets every
+    /// v18 buy reads via OpTxInputScriptSigSubstr — they must never move.
+    #[test]
+    fn v18_canonical_sigscript_offsets() {
+        use crate::contract::spot::order::{
+            build_sell_v18_redeem_script, build_sell_v18_fill_sigscript,
+            build_sell_v18_ioc_fill_sigscript, build_sell_v18_partial_fill_sigscript,
+        };
+        use crate::contract::spot::oco::{
+            build_oco_sell_v18_redeem_script, build_oco_sell_v18_tp_fill_sigscript,
+            build_oco_sell_v18_sl_fill_sigscript,
+        };
+        let oh = [0xAA; 32];
+        let sh = [0xBB; 32];
+        // Prices chosen coprime so gcd normalization is a no-op and the
+        // expected bytes are literal.
+        let (pnum, pden) = (12345678901u64, 987654321u64);
+        let (pnum_sl, pden_sl) = (7u64, 3u64);
+        let sell_rs = build_sell_v18_redeem_script(pnum, pden, 1, &oh, &sh, 30, 0, 0).unwrap();
+        let oco_rs = build_oco_sell_v18_redeem_script(
+            pnum, pden, 1, pnum_sl, pden_sl, 1, &oh, &sh, 30, 0, 0,
+        ).unwrap();
+        let koi = 7u16;
+        let cases: Vec<(&str, Vec<u8>, u64, u64)> = vec![
+            ("sell fill", build_sell_v18_fill_sigscript(koi, pnum, pden, &sell_rs), pnum, pden),
+            ("sell ioc", build_sell_v18_ioc_fill_sigscript(koi, pnum, pden, 55, &sell_rs), pnum, pden),
+            ("sell partial", build_sell_v18_partial_fill_sigscript(koi, pnum, pden, 55, 2, &sell_rs), pnum, pden),
+            ("oco tp", build_oco_sell_v18_tp_fill_sigscript(koi, pnum, pden, &oco_rs), pnum, pden),
+            ("oco sl", build_oco_sell_v18_sl_fill_sigscript(koi, pnum_sl, pden_sl, &oco_rs), pnum_sl, pden_sl),
+        ];
+        for (name, ss, pn, pd) in cases {
+            assert_eq!(ss[0], 0x01, "{name}: koi must be a forced 2-byte push");
+            assert_eq!(ss[1], koi as u8, "{name}: koi value");
+            assert_eq!(ss[2], 0x08, "{name}: pnum push prefix at byte 2");
+            assert_eq!(&ss[3..11], &pn.to_le_bytes(), "{name}: attested pnum at [3..11)");
+            assert_eq!(ss[11], 0x08, "{name}: pden push prefix at byte 11");
+            assert_eq!(&ss[12..20], &pd.to_le_bytes(), "{name}: attested pden at [12..20)");
+        }
+    }
+
+    /// v18 RS roundtrips: parse_redeem_script tags version 18 by RS length;
+    /// OCO v18 parses through the shared OCO parser; swap v18 parses mmfee.
+    #[test]
+    fn v18_parse_roundtrips() {
+        use crate::contract::spot::order::{
+            build_buy_v18_redeem_script, build_sell_v18_redeem_script,
+            BUY_ORDER_V18_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
+        };
+        use crate::contract::spot::oco::build_oco_sell_v18_redeem_script;
+        use crate::contract::spot::swap::{build_swap_v18_redeem_script, parse_swap_order_v18_rs, SWAP_V18_RS_SIZE};
+        use crate::contract::spot::parse_redeem_script;
+        use crate::contract::spot::parse::parse_oco_sell_redeem_script;
+        let tcid = [0x11; 32];
+        let oh = [0x22; 32];
+        let sh = [0x33; 32];
+        let buy = build_buy_v18_redeem_script(&tcid, 3, 2, 1_000_000, &oh, &sh, 30, 0, 555).unwrap();
+        assert_eq!(buy.len(), BUY_ORDER_V18_RS_EXPECTED_LEN);
+        let p = parse_redeem_script(&buy).expect("v18 buy parses");
+        assert_eq!(p.version, 18);
+        assert_eq!(p.order_type, crate::types::OrderSide::Buy);
+        assert_eq!(p.price_num, 3);
+        assert_eq!(p.price_den, 2);
+        assert_eq!(p.expiry_daa, Some(555));
+
+        let sell = build_sell_v18_redeem_script(5, 3, 2_000_000, &oh, &sh, 25, 0, 0).unwrap();
+        assert_eq!(sell.len(), SELL_ORDER_V18_RS_EXPECTED_LEN);
+        let p = parse_redeem_script(&sell).expect("v18 sell parses");
+        assert_eq!(p.version, 18);
+        assert_eq!(p.order_type, crate::types::OrderSide::Sell);
+        assert_eq!(p.price_num, 5);
+        assert_eq!(p.price_den, 3);
+        assert_eq!(p._max_matcher_fee, 25);
+
+        let oco = build_oco_sell_v18_redeem_script(5, 1, 500, 2, 1, 200, &oh, &sh, 30, 0, 0).unwrap();
+        let p = parse_oco_sell_redeem_script(&oco).expect("v18 OCO parses");
+        assert_eq!(p.price_num_tp, 5);
+        assert_eq!(p.price_num_sl, 2);
+
+        let swap = build_swap_v18_redeem_script(&tcid, &[0x44; 32], 9_000, &oh, &sh, &[0x55; 32], 40).unwrap();
+        assert_eq!(swap.len(), SWAP_V18_RS_SIZE);
+        let p = parse_swap_order_v18_rs(&swap).expect("v18 swap parses");
+        assert_eq!(p.min_target_amount, 9_000);
+        assert_eq!(p.mmfee_bps, 40);
+        assert_eq!(p.target_token_cov_id, [0x44; 32]);
+    }
 }

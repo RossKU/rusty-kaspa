@@ -1,8 +1,13 @@
 //! Parse spot order redeemScripts to extract on-chain state.
 
 use crate::types::OrderSide;
-use crate::contract::spot::oco::{OCO_SELL_STATE_SIZE, OCO_SELL_RS_SIZE, OcoPath};
-use crate::contract::spot::order::{BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_V17_RS_EXPECTED_LEN};
+use crate::contract::spot::oco::{
+    OCO_SELL_STATE_SIZE, OCO_SELL_RS_SIZE, OCO_SELL_V18_RS_SIZE, OcoPath,
+};
+use crate::contract::spot::order::{
+    BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_V17_RS_EXPECTED_LEN,
+    BUY_ORDER_V18_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
+};
 
 /// OpZkPrecompile opcode byte (0xa6).
 pub const OP_ZK_PRECOMPILE: u8 = 0xa6;
@@ -110,10 +115,34 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
             }
             None
         }
+        BUY_ORDER_V18_RS_EXPECTED_LEN => {
+            // Buy v18 (unified spot: N:M sweep + Op2 partial): SAME 145B state
+            // layout and the same selector-dispatch signature as v17 (Op9
+            // OpRoll = 0x59 0x7a); the RS length is the version tag.
+            if rs[BUY_STATE_SIZE] == 0x59 && rs[BUY_STATE_SIZE + 1] == 0x7a {
+                return parse_buy_state(rs).map(|mut o| {
+                    o.version = 18;
+                    o
+                });
+            }
+            None
+        }
         SELL_RS_SIZE => {
             // Sell: body starts at offset 112, signature 0x58 0x7a (Op8 OpRoll)
             if rs[SELL_STATE_SIZE] == 0x58 && rs[SELL_STATE_SIZE + 1] == 0x7a {
                 return parse_sell_state(rs);
+            }
+            None
+        }
+        SELL_ORDER_V18_RS_EXPECTED_LEN => {
+            // Sell v18 (canonical price attestation + Fix-3 partial F4): SAME
+            // 112B state layout and dispatch signature (Op8 OpRoll) as v14;
+            // the RS length is the version tag.
+            if rs[SELL_STATE_SIZE] == 0x58 && rs[SELL_STATE_SIZE + 1] == 0x7a {
+                return parse_sell_state(rs).map(|mut o| {
+                    o.version = 18;
+                    o
+                });
             }
             None
         }
@@ -132,11 +161,12 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
     }
 }
 
-/// Try to parse an OCO sell redeemScript.
+/// Try to parse an OCO sell redeemScript (v1 or v18 — same 139B state layout;
+/// the RS length is the version tag, the dispatch signature is shared).
 ///
 /// Returns `None` if the RS is not an OCO sell (wrong size or signature).
 pub fn parse_oco_sell_redeem_script(rs: &[u8]) -> Option<ParsedOcoSell> {
-    if rs.len() != OCO_SELL_RS_SIZE {
+    if rs.len() != OCO_SELL_RS_SIZE && rs.len() != OCO_SELL_V18_RS_SIZE {
         return None;
     }
     // Body signature: 0x5b 0x7a (Op11 OpRoll) at offset 139

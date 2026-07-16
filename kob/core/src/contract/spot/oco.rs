@@ -90,13 +90,22 @@ pub const OCO_SELL_BODY: &[u8] = &[
     0x59, 0x79, 0xc3,             // Op9 OpPick(koi) OpTxOutputSpk
     0xaa,                         // OpBlake2b
     0x52, 0x79, 0x87, 0x69,       // Op2 OpPick(sspkh) OpEqual OpVerify
-    // F4: token conservation (14B)
-    0xb9, 0xcf, 0x76,             // OpTxInputIndex OpInputCovenantId OpDup
-    0xd2, 0x51, 0xa2, 0x69,       // OpCovOutCount Op1 OpGTE OpVerify
-    0x00, 0xd3,                   // Op0 OpCovOutputIdx(T,0)
-    0xc2,                         // OpTxOutputAmount
-    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount
-    0xa2, 0x69,                   // OpGTE OpVerify
+    // F4: token conservation bound to THIS input's OWN authorized output via
+    // per-input OpAuthOutputIdx (mirroring the plain sell contract's Fix 3),
+    // NOT the transaction-wide shared OpCovOutputIdx(T,0). The old shared
+    // index let a matcher satisfy an OCO sell's F4 with a token output that
+    // ANOTHER same-token sell authorized, draining the OCO seller's tokens
+    // out as KAS in a multi-sell sweep. Each output has exactly one
+    // authorizing_input, so per-input binding makes that impossible.
+    // Length-neutral: new F4 is 14B == old F4 14B. (14B)
+    0xb9, 0x00, 0xcc,             // OpTxInputIndex Op0 OpAuthOutputIdx -> my out idx
+    0x76,                         // OpDup
+    0xd5,                         // OpOutputCovenantId(idx) -> covid
+    0xb9, 0xcf,                   // OpTxInputIndex OpInputCovenantId -> T
+    0x87, 0x69,                   // OpEqual OpVerify (out covid == my token)
+    0xc2,                         // OpTxOutputAmount(idx)
+    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> token_in
+    0xa2, 0x69,                   // OpGTE OpVerify (my out >= token_in)
     // Cleanup: 10 items (5B)
     0x6d, 0x6d, 0x6d, 0x6d, 0x6d, // Op2Drop x5
 
@@ -150,13 +159,22 @@ pub const OCO_SELL_BODY: &[u8] = &[
     0x59, 0x79, 0xc3,             // Op9 OpPick(koi) OpTxOutputSpk
     0xaa,                         // OpBlake2b
     0x52, 0x79, 0x87, 0x69,       // Op2 OpPick(sspkh) OpEqual OpVerify
-    // F4: token conservation (14B)
-    0xb9, 0xcf, 0x76,             // OpTxInputIndex OpInputCovenantId OpDup
-    0xd2, 0x51, 0xa2, 0x69,       // OpCovOutCount Op1 OpGTE OpVerify
-    0x00, 0xd3,                   // Op0 OpCovOutputIdx(T,0)
-    0xc2,                         // OpTxOutputAmount
-    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount
-    0xa2, 0x69,                   // OpGTE OpVerify
+    // F4: token conservation bound to THIS input's OWN authorized output via
+    // per-input OpAuthOutputIdx (mirroring the plain sell contract's Fix 3),
+    // NOT the transaction-wide shared OpCovOutputIdx(T,0). The old shared
+    // index let a matcher satisfy an OCO sell's F4 with a token output that
+    // ANOTHER same-token sell authorized, draining the OCO seller's tokens
+    // out as KAS in a multi-sell sweep. Each output has exactly one
+    // authorizing_input, so per-input binding makes that impossible.
+    // Length-neutral: new F4 is 14B == old F4 14B. (14B)
+    0xb9, 0x00, 0xcc,             // OpTxInputIndex Op0 OpAuthOutputIdx -> my out idx
+    0x76,                         // OpDup
+    0xd5,                         // OpOutputCovenantId(idx) -> covid
+    0xb9, 0xcf,                   // OpTxInputIndex OpInputCovenantId -> T
+    0x87, 0x69,                   // OpEqual OpVerify (out covid == my token)
+    0xc2,                         // OpTxOutputAmount(idx)
+    0xb9, 0xbe,                   // OpTxInputIndex OpTxInputAmount -> token_in
+    0xa2, 0x69,                   // OpGTE OpVerify (my out >= token_in)
     // Cleanup: 10 items (5B)
     0x6d, 0x6d, 0x6d, 0x6d, 0x6d, // Op2Drop x5
 

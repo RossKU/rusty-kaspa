@@ -219,15 +219,26 @@ pub enum BatchError {
     OcoRemainderUnsupported { outpoint: String, utxo_value: u64, filled_tokens: u64 },
     /// An OCO sell was composed into a multi-sell sweep (2+ sells in one tx).
     ///
-    /// `OCO_SELL_BODY`'s fill F4 (`core/src/contract/spot/oco.rs`) still uses
-    /// the pre-Fix-3 transaction-wide shared index (`OpCovOutputIdx(T,0)`),
-    /// not the per-input `OpAuthOutputIdx` binding the plain sell contract
-    /// got in Fix 3. When 2+ sells of the same token share one tx, an OCO
-    /// sell's F4 can resolve to a DIFFERENT sell's authorized output and be
-    /// satisfied without the OCO seller's own tokens ever landing in any
-    /// output a buyer actually paid for -- a fund-drain. A solo (1-sell) OCO
-    /// fill is unaffected (nothing else shares the token's output index), so
-    /// only compositions with 2+ sells are rejected here.
+    /// History: `OCO_SELL_BODY`'s fill F4 originally used the pre-Fix-3
+    /// transaction-wide shared index (`OpCovOutputIdx(T,0)`), so a matcher
+    /// could satisfy an OCO sell's F4 with a DIFFERENT same-token sell's
+    /// authorized output and drain the OCO seller's tokens out as KAS. That
+    /// L1 drain is now CLOSED: `OCO_SELL_BODY`'s F4 was rewritten to the
+    /// per-input `OpAuthOutputIdx` binding (Item A, engine-proven by
+    /// `oco_f4_shared_output_drain_rejected` / `oco_f4_honest_per_input_outputs_pass`
+    /// in `core/tests/toccata_fill_repro.rs`).
+    ///
+    /// This composition-layer exclusion is nonetheless KEPT as the shipping
+    /// boundary (defense-in-depth): fully enabling OCO sweeps additionally
+    /// requires resolving the OCO-SL fixed-offset price-read mismatch -- a
+    /// v16/v17 buy reads the swept sell's price via `OpTxInputScriptSigSubstr`
+    /// at fixed offsets `[7..15)`/`[16..24)`, which land on the OCO RS's
+    /// `pnum_tp`/`pden_tp` (correct for a TP fill, WRONG for an SL fill, which
+    /// executes at `pnum_sl`/`pden_sl`). Composing an OCO-SL sell would let the
+    /// buy fair-price the term at the TP price while the seller delivers at the
+    /// SL price, weakening the buyer's surplus cap. Until that price alignment
+    /// is designed, OCO sells stay excluded from multi-sell sweeps. A solo
+    /// (1-sell) OCO fill is unaffected and always allowed.
     OcoMultiSellSweepUnsupported { outpoint: String },
     /// A v17 sweep was asked to include more sells than the contract's
     /// compile-time `BUY_ORDER_V17_MAX_N` slot count.

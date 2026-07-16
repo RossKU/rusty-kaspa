@@ -679,3 +679,84 @@ fn oco_sell_tp_non_fixed_offset_plus_v16_buy_fill_fails() {
          (byte-shifted price read); got Ok -- MED #4 regression"
     );
 }
+
+/// Build a 2-OCO-sell + fee tx exercising the REWRITTEN OCO F4 (per-input
+/// `OpAuthOutputIdx` binding, Item A). Both sells price 1/1 (A=30M, B=20M
+/// tokens); output[0]=A KAS, output[1]=B KAS. When `shared_output`, a single
+/// token output (output[2], 30M) is authorized by input 0 ONLY -- the exact
+/// drain shape `sell_f4_shared_output_drain_rejected_honest_passes` uses for
+/// the plain sell. Otherwise each sell gets its OWN authorized token output
+/// (the honest multi-sell sweep the composition-layer exclusion previously
+/// had to forbid). Returns (result_input_0, result_input_1).
+fn run_oco_f4(shared_output: bool) -> (Result<(), String>, Result<(), String>) {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+
+    // OCO TP+SL both 1/1 (only the TP path, Op1 selector, is exercised).
+    let oco_rs = build_oco_sell_redeem_script(1, 1, 1, 1, 1, 1, &owner_hash, &spk_hash, 10_000_000, 0, 0).unwrap();
+    let oco_p2sh = build_p2sh(&oco_rs);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    let ss_a = build_oco_sell_tp_fill_sigscript(0, &oco_rs); // koi=0 (A KAS at output 0)
+    let ss_b = build_oco_sell_tp_fill_sigscript(1, &oco_rs); // koi=1 (B KAS at output 1)
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), ss_a, 50, 0),          // OCO sell A (30M tokens)
+        TransactionInput::new(op(0x11, 0), ss_b, 50, 0),          // OCO sell B (20M tokens)
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1), // fee placeholder
+    ];
+
+    let mut outputs = vec![
+        TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), None), // A KAS
+        TransactionOutput::with_covenant(20_000_000, wallet_spk.clone(), None), // B KAS
+        // A's token output, authorized by input 0.
+        TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), Some(CovenantBinding::new(0, token_cov_id))),
+    ];
+    if !shared_output {
+        // Honest sweep: B gets its OWN token output, authorized by input 1.
+        outputs.push(TransactionOutput::with_covenant(20_000_000, wallet_spk.clone(), Some(CovenantBinding::new(1, token_cov_id))));
+    }
+    let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+    let entries = vec![
+        UtxoEntry { amount: 30_000_000, script_public_key: oco_p2sh.clone(), block_daa_score: 0, is_coinbase: false, covenant_id: Some(token_cov_id) },
+        UtxoEntry { amount: 20_000_000, script_public_key: oco_p2sh, block_daa_score: 0, is_coinbase: false, covenant_id: Some(token_cov_id) },
+        UtxoEntry { amount: 260_000_000, script_public_key: wallet_spk, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+    ];
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).expect("CovenantsContext::from_tx");
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let run = |idx: usize| {
+        let reused = SigHashReusedValuesUnsync::new();
+        let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+        let (input, entry) = populated.populated_input(idx);
+        let mut vm = TxScriptEngine::from_transaction_input(&populated, input, idx, entry, ctx, flags);
+        vm.execute().map_err(|e| format!("{e:?}"))
+    };
+    (run(0), run(1))
+}
+
+/// Item A: the rewritten OCO F4 (per-input `OpAuthOutputIdx`) rejects the
+/// shared-output drain. Two OCO sells of the same token, one shared token
+/// output authorized by input 0 only -> input 0 (owns its output) PASSES,
+/// input 1 (drained) FAILS. Under the pre-Fix-3 shared OpCovOutputIdx(T,0)
+/// this drain PASSED, silently converting the OCO seller's tokens to KAS.
+#[test]
+fn oco_f4_shared_output_drain_rejected() {
+    let (a, b) = run_oco_f4(true);
+    assert!(a.is_ok(), "OCO sell A (owns its authorized token output) must PASS; got {a:?}");
+    assert!(b.is_err(), "OCO sell B MUST FAIL: its tokens were drained to KAS with no output authorized by input 1 (rewritten per-input F4)");
+}
+
+/// Item A companion: with the rewritten F4, an HONEST multi-OCO-sell sweep
+/// (each sell delivering to its OWN authorized token output) passes both
+/// covenant scripts -- so an OCO sell can now safely participate in a
+/// multi-sell composition (the composition-layer exclusion's follow-up).
+#[test]
+fn oco_f4_honest_per_input_outputs_pass() {
+    let (a, b) = run_oco_f4(false);
+    assert!(a.is_ok(), "OCO sell A must PASS with its own authorized output; got {a:?}");
+    assert!(b.is_ok(), "OCO sell B must PASS with its own authorized output; got {b:?}");
+}

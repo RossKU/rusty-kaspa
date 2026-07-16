@@ -765,22 +765,31 @@ pub async fn execute_batch_match(
         // BuyerTokens and SellRemainder outputs need covenant bindings
         // (sell covenant F4 checks: covenant_output_value >= sell_input_value)
         if out.purpose == OutputPurpose::BuyerTokens {
-            // output[N+j] corresponds to buy[j]
-            let buy_j = i.saturating_sub(n);
-            if buy_j < plan.buys.len() {
-                let (buy, _) = &plan.buys[buy_j];
-                let token_hex = hex::encode(buy.token_cov_id);
-                if let Some(&tii) = plan.token_input_map.get(&token_hex) {
-                    rpc_outputs.push(deploy::build_rpc_output_with_covenant(
-                        out.value,
-                        out.spk_version,
-                        &spk_hex,
-                        tii as u16,
-                        &token_hex,
-                    ));
-                    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(out.value, out.spk_version, out.script_public_key.clone(), Some(kob_core::tx::CovenantBinding::new(tii as u16, kob_core::compat::parse_hash(&token_hex).unwrap()))));
-                    continue;
-                }
+            // v17 N:M sweep: each BuyerTokens output is authorized by its OWN
+            // sell input (per-input F4), given by output_auth_input[i]. The
+            // token id is the (single) v17 buy's token. Legacy (v14/v16): the
+            // merged output binds to the shared token_input_map tii.
+            let per_output = plan.output_auth_input.get(&i).copied();
+            let binding = if let Some(auth) = per_output {
+                plan.buys.first().map(|(b, _)| (auth, hex::encode(b.token_cov_id)))
+            } else {
+                // output[N+j] corresponds to buy[j]
+                let buy_j = i.saturating_sub(n);
+                plan.buys.get(buy_j).and_then(|(buy, _)| {
+                    let token_hex = hex::encode(buy.token_cov_id);
+                    plan.token_input_map.get(&token_hex).map(|&tii| (tii as u16, token_hex))
+                })
+            };
+            if let Some((auth_input, token_hex)) = binding {
+                rpc_outputs.push(deploy::build_rpc_output_with_covenant(
+                    out.value,
+                    out.spk_version,
+                    &spk_hex,
+                    auth_input,
+                    &token_hex,
+                ));
+                sighash_tx.outputs.push(kob_core::tx::TxOutput::new(out.value, out.spk_version, out.script_public_key.clone(), Some(kob_core::tx::CovenantBinding::new(auth_input, kob_core::compat::parse_hash(&token_hex).unwrap()))));
+                continue;
             }
             warn!("[BATCH] BuyerTokens output[{}] missing covenant binding", i);
             rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
@@ -867,24 +876,31 @@ pub async fn execute_batch_match(
                 let spk_hex = hex::encode(&out.script_public_key);
 
                 if out.purpose == OutputPurpose::BuyerTokens {
-                    let buy_j = i.saturating_sub(n);
-                    if buy_j < plan.buys.len() {
-                        let (buy, _) = &plan.buys[buy_j];
-                        let token_hex = hex::encode(buy.token_cov_id);
-                        if let Some(&tii) = plan.token_input_map.get(&token_hex) {
-                            rpc_outputs.push(deploy::build_rpc_output_with_covenant(
-                                out.value, out.spk_version, &spk_hex,
-                                tii as u16, &token_hex,
-                            ));
-                            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
-                                out.value, out.spk_version, out.script_public_key.clone(),
-                                Some(kob_core::tx::CovenantBinding::new(
-                                    tii as u16,
-                                    kob_core::compat::parse_hash(&token_hex).unwrap(),
-                                )),
-                            ));
-                            continue;
-                        }
+                    // v17: per-output authorizing sell input (see the initial
+                    // build above); legacy: shared token_input_map tii.
+                    let per_output = plan.output_auth_input.get(&i).copied();
+                    let binding = if let Some(auth) = per_output {
+                        plan.buys.first().map(|(b, _)| (auth, hex::encode(b.token_cov_id)))
+                    } else {
+                        let buy_j = i.saturating_sub(n);
+                        plan.buys.get(buy_j).and_then(|(buy, _)| {
+                            let token_hex = hex::encode(buy.token_cov_id);
+                            plan.token_input_map.get(&token_hex).map(|&tii| (tii as u16, token_hex))
+                        })
+                    };
+                    if let Some((auth_input, token_hex)) = binding {
+                        rpc_outputs.push(deploy::build_rpc_output_with_covenant(
+                            out.value, out.spk_version, &spk_hex,
+                            auth_input, &token_hex,
+                        ));
+                        sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                            out.value, out.spk_version, out.script_public_key.clone(),
+                            Some(kob_core::tx::CovenantBinding::new(
+                                auth_input,
+                                kob_core::compat::parse_hash(&token_hex).unwrap(),
+                            )),
+                        ));
+                        continue;
                     }
                     rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
                 } else if out.purpose == OutputPurpose::SellRemainder {

@@ -35,24 +35,31 @@ to confirm it now lands, unless noted otherwise.
 | `prediction expire` -- OP_CLTV consumption bug (stack underflow) | FIXED, live-verified | see required-step TXID below |
 | `prediction expire` -- fee estimate too low for actual sigscript size | FIXED, live-verified | see required-step TXID below |
 | **`prediction expire` (required step, after all 3 fixes)** | **PASS** | **`93da68e841c7036981b7c9143ae301df58242b2607f23892f34ce3a2985c161a`** |
-| `prediction vote` | NOT FIXED (found broken, out of scope) | domain builder is a stale 2-in/2-out "v4" blueprint; deployed contract requires 3-in/4-out with VoteReceipt minting -- real feature gap, not a bugfix |
-| `redemption.rs` / `split_merge.rs` refund paths (same CLTV bug family) | FIXED in code, NOT live-verified | fix derived by rigorous stack-trace + confirmed against 63/63 passing `cargo test -p kob-core` (construction-level only, cannot catch VM-level bugs) |
+| `prediction create` (2-step, covenant-binding + fee fix) | PASS (re-verified, release-backlog pass) | step1 `92bbd39d885a69df4c57a310004d19b194248139d90f72f72f6307faf6244f85`, step2 `eee6297b0c013f767ba5d39cf4d7de9d9c8efbaa776e08b2b156eaff515326b6` |
+| `prediction vote` | BUILDER FIXED (3-in/4-out); mempool-blocked BY DESIGN | domain builder rewritten to the deployed 3-in/4-out VoteReceipt contract + a deeper covenant-binding deploy gap fixed (both proven vs the real engine in `prediction_vote_repro.rs`). Live submit reached the node and was refused with `transaction has 0 fees which is under the required amount` -- a standardness/fee rejection, NOT a script failure. The contract's V6 mandates `total_in == total_out` (fee EXACTLY 0), so vote is a fee==0 miner-INCLUSION-only tx by design; it cannot enter the standard RPC mempool. Not a builder bug. |
+| `redemption.rs` / `split_merge.rs` refund paths (CLTV fix) | FIXED, live-verified (release-backlog pass) | OP_CLTV fix confirmed on-chain: SplitMerge refund `87ebbc9fe556fdda96c054613330dfa8d0554f7f04316fa25d2724266874d8c6`, Redemption refund `efd681470db89ff429af3fff7c6dfabcba5bd518737d184459d9029655795d18`. Two follow-on bugs found + fixed en route: refund fee underpayment (Phase-2 exact recompute added, like `expire`) and a tx-finality race (`lockTime = current_daa` -> `expiry_daa`). |
 | `listing` (English/Dutch auction) | NOT EXERCISABLE | no CLI subcommand exists at all; contract-only, off-chain-tested per SECURITY_FIXES.md Fix 5 |
 | x402 KIP-10 exact CASE R2 (under-threshold continuation) | FIXED, live-verified | root cause + fix in `kob/x402/src/scheme_exact.rs` (see below); re-run of `e2e_x402_exact.sh` after rebuild: 30/30, R2 now correctly refused (`invalid_payment_requirements`); happy-path settle TXID `9d61a47c4180785b8b8e85af9b72c26979471a5c006876e4a1e7279b2c62f78c` |
 
-**Release verdict**: NOT ready to ship as-is. Spot lifecycle, auto-matching,
-F6 adversarial defense, and most secondary instruments are solid and
-live-confirmed. But this pass found **5 live bugs in the prediction
-market module alone** (malformed SPK, two independent CLTV-consumption
-stack bugs, an undersized fee estimate, and a structurally stale vote
-path) -- the prediction contract family in particular was very likely
-non-functional end-to-end before this pass, and `vote` still is. Ship
-spot/x402/other instruments; block on a real audit + fix pass for
-prediction's vote path before treating that module as production-ready.
-(Update, release-backlog pass: the x402 CASE R2 `has_continuation` regression
-is now FIXED + live-verified -- see below. The unrelated
-`discover_landed_payment` stale-UTXO false-success gap it surfaced is still
-open, tracked separately.)
+**Release verdict** (updated, release-backlog pass): The prediction module,
+previously the main blocker, is now materially closed. `create` deploys
+clean on-chain (covenant-binding + fee fix), and BOTH CLTV creator-reclaim
+families -- `expire` and the `refund` (SplitMerge + Redemption) paths -- are
+live-verified on testnet-10. `vote`'s builder is now correct (rewritten to
+the deployed 3-in/4-out VoteReceipt layout, proven against the real
+`kaspa-txscript` engine), and the live test established definitively that
+`vote` is a fee==0 miner-INCLUSION-only tx by contract design (V6 forces
+`total_in == total_out`), so it cannot be admitted to the standard RPC
+mempool -- a design constraint of the deployed contract, not a builder bug.
+The x402 CASE R2 `has_continuation` regression is FIXED + live-verified.
+
+Remaining known gaps (tracked, not blocking spot/x402): the prediction
+settle path shares the same covenant-binding requirement as vote (same root
+cause, fixed at the builder for create/vote; settle wiring not re-verified
+live here); the x402 `discover_landed_payment` stale-UTXO false-success gap
+(surfaced by, not caused by, R2); and `oco-sell` has no cancel path. Spot
+lifecycle, auto-matching, F6 adversarial defense, x402 native/KCC20/exact,
+and the other instruments remain solid and live-confirmed.
 
 ## Post-hardening full run — running log
 

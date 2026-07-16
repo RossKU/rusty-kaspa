@@ -45,9 +45,12 @@ CREATE INDEX IF NOT EXISTS idx_candles_1m_time ON candles_1m(pair_id, open_time)
 -- those rows (retract_trades_by_block). This is the data source
 -- /api/v1/trades (deep history) and /api/v1/gecko/historical_trades need;
 -- the in-memory TradeLog stays the low-latency hot path for recent/WS data.
+-- P1 fix: leg_index disambiguates multiple trade rows sharing one txid
+-- (cross-pair swaps, v17 N:M sweeps). (txid, leg_index) is the trade key.
 CREATE TABLE IF NOT EXISTS trades (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     txid         TEXT    NOT NULL,
+    leg_index    INTEGER NOT NULL DEFAULT 0,
     pair_id      TEXT    NOT NULL,
     price_num    INTEGER NOT NULL,
     price_den    INTEGER NOT NULL,
@@ -57,7 +60,8 @@ CREATE TABLE IF NOT EXISTS trades (
     timestamp    INTEGER NOT NULL,
     block_hash   TEXT    NOT NULL,
     routing_json TEXT,
-    confirmed_at INTEGER NOT NULL
+    confirmed_at INTEGER NOT NULL,
+    UNIQUE(txid, leg_index)
 );
 CREATE INDEX IF NOT EXISTS idx_trades_pair_time ON trades(pair_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_trades_pair_daa ON trades(pair_id, daa_score);
@@ -414,10 +418,11 @@ impl HistoryStore {
 
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         conn.execute(
-            "INSERT INTO trades (txid, pair_id, price_num, price_den, quantity, side, daa_score, timestamp, block_hash, routing_json, confirmed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            "INSERT INTO trades (txid, leg_index, pair_id, price_num, price_den, quantity, side, daa_score, timestamp, block_hash, routing_json, confirmed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 trade.txid,
+                trade.leg_index,
                 trade.pair_id,
                 trade.price_num as i64,
                 trade.price_den as i64,
@@ -444,27 +449,28 @@ impl HistoryStore {
     }
 
     fn row_to_trade(row: &rusqlite::Row) -> rusqlite::Result<Trade> {
-        let side_str: String = row.get(5)?;
+        let side_str: String = row.get(6)?;
         let side = if side_str == "sell" { Side::Sell } else { Side::Buy };
-        let routing_json: Option<String> = row.get(9)?;
+        let routing_json: Option<String> = row.get(10)?;
         let routing: Option<RoutingInfo> = routing_json
             .as_deref()
             .and_then(|s| serde_json::from_str(s).ok());
         Ok(Trade {
             txid: row.get(0)?,
-            pair_id: row.get(1)?,
-            price_num: row.get::<_, i64>(2)? as u64,
-            price_den: row.get::<_, i64>(3)? as u64,
-            quantity: row.get::<_, i64>(4)? as u64,
+            leg_index: row.get::<_, i64>(1)? as u32,
+            pair_id: row.get(2)?,
+            price_num: row.get::<_, i64>(3)? as u64,
+            price_den: row.get::<_, i64>(4)? as u64,
+            quantity: row.get::<_, i64>(5)? as u64,
             side,
-            daa_score: row.get::<_, i64>(6)? as u64,
-            timestamp: row.get::<_, i64>(7)? as u64,
+            daa_score: row.get::<_, i64>(7)? as u64,
+            timestamp: row.get::<_, i64>(8)? as u64,
             routing,
         })
     }
 
     const TRADE_SELECT_COLS: &'static str =
-        "txid, pair_id, price_num, price_den, quantity, side, daa_score, timestamp, block_hash, routing_json";
+        "txid, leg_index, pair_id, price_num, price_den, quantity, side, daa_score, timestamp, block_hash, routing_json";
 
     /// Most recent `limit` durably-confirmed trades for a pair, newest first.
     pub fn recent_trades(&self, pair_id: &str, limit: usize) -> Result<Vec<Trade>, rusqlite::Error> {
@@ -787,8 +793,13 @@ mod tests {
     // Durable trade ledger (H3-TRADES)
 
     fn make_trade(txid: &str, pair: &str, price_num: u64, daa: u64) -> Trade {
+        make_trade_leg(txid, 0, pair, price_num, daa)
+    }
+
+    fn make_trade_leg(txid: &str, leg_index: u32, pair: &str, price_num: u64, daa: u64) -> Trade {
         Trade {
             txid: txid.to_string(),
+            leg_index,
             pair_id: pair.to_string(),
             price_num,
             price_den: 1,
@@ -812,6 +823,40 @@ mod tests {
         assert_eq!(recent[1].txid, "tx1");
         assert_eq!(store.trade_count("T/KAS").unwrap(), 2);
         assert_eq!(store.total_trade_count().unwrap(), 2);
+    }
+
+    /// P1 fix: multiple legs of a v17 N:M sweep sharing one txid must
+    /// persist as distinct durable rows, keyed by (txid, leg_index).
+    #[test]
+    fn test_insert_multiple_legs_same_txid_are_distinct_durable_rows() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        for leg in 0..4u32 {
+            store
+                .insert_confirmed_trade(&make_trade_leg("sweep_tx", leg, "T/KAS", 10 + leg as u64, 100), "blockA")
+                .unwrap();
+        }
+
+        let recent = store.recent_trades("T/KAS", 10).unwrap();
+        assert_eq!(recent.len(), 4, "all 4 legs must persist as distinct rows");
+        let mut legs: Vec<u32> = recent.iter().map(|t| t.leg_index).collect();
+        legs.sort();
+        assert_eq!(legs, vec![0, 1, 2, 3]);
+        assert!(recent.iter().all(|t| t.txid == "sweep_tx"));
+
+        let ids: std::collections::HashSet<String> = recent.iter().map(|t| t.trade_id()).collect();
+        assert_eq!(ids.len(), 4, "(txid, leg_index) must be unique per row");
+    }
+
+    /// The UNIQUE(txid, leg_index) constraint rejects a duplicate leg for
+    /// the same txid (defends against double-confirmation re-inserting the
+    /// same leg).
+    #[test]
+    fn test_duplicate_leg_index_for_same_txid_is_rejected() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        store.insert_confirmed_trade(&make_trade_leg("tx1", 0, "T/KAS", 10, 100), "blockA").unwrap();
+        let result = store.insert_confirmed_trade(&make_trade_leg("tx1", 0, "T/KAS", 10, 100), "blockA");
+        assert!(result.is_err(), "inserting the same (txid, leg_index) twice must fail the UNIQUE constraint");
+        assert_eq!(store.trade_count("T/KAS").unwrap(), 1, "only the first insert must have landed");
     }
 
     #[test]

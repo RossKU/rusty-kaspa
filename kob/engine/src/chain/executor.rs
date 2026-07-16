@@ -2770,9 +2770,15 @@ pub fn parse_block_notification(notification: &serde_json::Value) -> Vec<Transac
 ///
 /// Called after every successful match TX submission to keep the REST API
 /// `/trades` and `/klines` endpoints populated with live data.
+/// `leg_index` disambiguates multiple trade records that share one
+/// settlement `txid` (cross-pair swaps: 2 legs; v17 N:M buy sweeps: up to
+/// 9 legs in one TX). Callers recording several legs of the SAME txid must
+/// pass a distinct, incrementing `leg_index` per leg -- `(txid, leg_index)`
+/// is the stable trade key everywhere (ledger + API).
 async fn record_trade(
     shared_state: Option<&AppState>,
     txid: &str,
+    leg_index: u32,
     token_cov_id: &str,
     price_num: u64,
     price_den: u64,
@@ -2796,6 +2802,7 @@ async fn record_trade(
 
     let trade = Trade {
         txid: txid.to_string(),
+        leg_index,
         pair_id: pair_id.clone(),
         price_num,
         price_den,
@@ -2836,6 +2843,7 @@ async fn record_trade(
     let _ = state.ws_broadcaster.send(WsEvent::Trade {
         pair: pair_id.clone(),
         txid: txid.to_string(),
+        leg_index,
         price: price_str,
         qty: quantity.to_string(),
         side,
@@ -3256,10 +3264,13 @@ async fn run_scan_cycle(
                             );
                         }
 
-                        // Record trades for both legs
+                        // Record trades for both legs. P1 fix: both legs
+                        // share batch_result.tx_id, so each needs a distinct
+                        // leg_index to avoid colliding trade ids.
                         record_trade(
                             shared_state,
                             &batch_result.tx_id,
+                            0,
                             &sg.buy_source.token_cov_id,
                             sg.buy_source.price_num, sg.buy_source.price_den,
                             sg.buy_source.value,
@@ -3269,6 +3280,7 @@ async fn run_scan_cycle(
                         record_trade(
                             shared_state,
                             &batch_result.tx_id,
+                            1,
                             &sg.sell_target.token_cov_id,
                             sg.sell_target.price_num, sg.sell_target.price_den,
                             sg.sell_target.value,
@@ -3626,8 +3638,14 @@ async fn run_scan_cycle(
                     batch_result.matcher_surplus,
                 );
 
-                // Mark all sells as spent + emit events + record trades
+                // Mark all sells as spent + emit events + record trades.
+                // P1 fix: a v17 N:M sweep settles ALL these legs under ONE
+                // batch_result.tx_id, so every leg (sells AND buys) needs a
+                // distinct, incrementing leg_index sharing one counter --
+                // otherwise an N-sell sweep would collide on a single
+                // (txid) "trade id" across up to 9 legs.
                 let mut unified_marked_keys: Vec<String> = Vec::new();
+                let mut trade_leg_index: u32 = 0;
                 for sell in &group.sells {
                     let sk = sell.outpoint_key();
                     if let Some(ws) = ws_tx {
@@ -3642,12 +3660,14 @@ async fn run_scan_cycle(
                     record_trade(
                         shared_state,
                         &batch_result.tx_id,
+                        trade_leg_index,
                         &sell.token_cov_id,
                         sell.price_num, sell.price_den,
                         sell.value,
                         Side::Sell,
                         None,
                     ).await;
+                    trade_leg_index += 1;
                     // C5 fix: Use BookOrder clone partner key directly
                     let sell_oco_partner = sell.oco_partner_key.clone();
                     spent_tracker.mark_spent(&sk);
@@ -3659,7 +3679,9 @@ async fn run_scan_cycle(
                     }
                 }
 
-                // Mark all buys as spent + emit events + record trades
+                // Mark all buys as spent + emit events + record trades.
+                // trade_leg_index continues from the sells loop above (same
+                // txid, one shared leg-index space).
                 for buy in &group.buys {
                     let bk = buy.outpoint_key();
                     if let Some(ws) = ws_tx {
@@ -3674,12 +3696,14 @@ async fn run_scan_cycle(
                     record_trade(
                         shared_state,
                         &batch_result.tx_id,
+                        trade_leg_index,
                         &buy.token_cov_id,
                         buy.price_num, buy.price_den,
                         buy.value,
                         Side::Buy,
                         None,
                     ).await;
+                    trade_leg_index += 1;
                     spent_tracker.mark_spent(&bk);
                     unified_marked_keys.push(bk);
                 }
@@ -6987,7 +7011,7 @@ mod tests {
         let shared: AppState = Arc::new(tokio::sync::RwLock::new(
             SharedState::new(ws_tx, ob_arc, sb, tb),
         ));
-        record_trade(Some(&shared), "settle_tx", &token_cov_id, 1, 2, 10_000_000, Side::Sell, None).await;
+        record_trade(Some(&shared), "settle_tx", 0, &token_cov_id, 1, 2, 10_000_000, Side::Sell, None).await;
 
         // Simulate `GET /api/v1/trades?pair=<pair_from_listing>`: the value
         // obtained from the book listing must resolve trades directly, with
@@ -7035,6 +7059,7 @@ mod tests {
         record_trade(
             Some(&shared),
             "abc123def456",
+            0,
             "test_token_cov_id_hex_64chars_padded_to_be_long_enough_here000",
             100, 1,
             50_000,
@@ -7082,6 +7107,7 @@ mod tests {
         record_trade(
             Some(&shared),
             "tx_ws_test",
+            0,
             "token_ws_test_64char_padding_000000000000000000000000000000",
             200, 3,
             10_000,
@@ -7110,12 +7136,65 @@ mod tests {
         record_trade(
             None,
             "tx_noop",
+            0,
             "token_noop",
             1, 1,
             100,
             Side::Buy,
             None,
         ).await;
+    }
+
+    // P1 fix: leg_index disambiguates multiple trades sharing one txid
+
+    /// v17 N:M sweep regression: N sells + M buys settling under ONE txid
+    /// (exactly the shape `execute_batch_match`'s caller produces for a v17
+    /// buy sweep) must yield N+M trade records with DISTINCT (txid,
+    /// leg_index) trade ids -- not N+M records colliding on a bare txid.
+    /// Mirrors the exact leg_index increment pattern used there: one shared
+    /// counter across the sells loop, continued into the buys loop.
+    #[tokio::test]
+    async fn v17_sweep_n_legs_yield_n_distinct_trade_ids() {
+        use crate::matcher::api::SharedState;
+        use crate::matcher::order_book::OrderBook;
+        use crate::matcher::stop_book::StopOrderBook;
+        use crate::matcher::trailing_stop::TrailingStopBook;
+
+        let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
+        let ob = Arc::new(Mutex::new(OrderBook::new()));
+        let sb = Arc::new(Mutex::new(StopOrderBook::new()));
+        let tb = Arc::new(Mutex::new(TrailingStopBook::new()));
+        let shared: AppState = Arc::new(tokio::sync::RwLock::new(SharedState::new(ws_tx, ob, sb, tb)));
+
+        let sweep_tx = "v17_sweep_tx";
+        let token = "sweep_token_cov_id_64char_pad_00000000000000000000000000000a";
+        let sell_count = 3usize;
+        let buy_count = 1usize;
+
+        let mut leg_index: u32 = 0;
+        for _ in 0..sell_count {
+            record_trade(Some(&shared), sweep_tx, leg_index, token, 99, 100, 30_000_000, Side::Sell, None).await;
+            leg_index += 1;
+        }
+        for _ in 0..buy_count {
+            record_trade(Some(&shared), sweep_tx, leg_index, token, 1, 1, 90_000_000, Side::Buy, None).await;
+            leg_index += 1;
+        }
+
+        let state = shared.read().await;
+        let trades = state.trade_log.recent_all(10);
+        assert_eq!(trades.len(), sell_count + buy_count, "N sells + M buys must all be recorded");
+        assert!(trades.iter().all(|t| t.txid == sweep_tx), "all legs share the one settlement txid");
+
+        let ids: std::collections::HashSet<String> = trades.iter().map(|t| t.trade_id()).collect();
+        assert_eq!(
+            ids.len(), sell_count + buy_count,
+            "all (txid, leg_index) trade ids must be DISTINCT -- no collision across an N-leg sweep"
+        );
+
+        let mut legs: Vec<u32> = trades.iter().map(|t| t.leg_index).collect();
+        legs.sort();
+        assert_eq!(legs, (0..(sell_count + buy_count) as u32).collect::<Vec<_>>());
     }
 
     // H3-TRADES: confirmation-time durable persistence + reorg-retract
@@ -7151,7 +7230,7 @@ mod tests {
         let (shared, history) = h3_test_shared_state_with_history();
         let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a1";
 
-        record_trade(Some(&shared), "confirm_tx_1", token, 100, 1, 50_000, Side::Buy, None).await;
+        record_trade(Some(&shared), "confirm_tx_1", 0, token, 100, 1, 50_000, Side::Buy, None).await;
 
         assert_eq!(
             history.trade_count(&h3_pair_id(token)).unwrap(), 0,
@@ -7169,7 +7248,7 @@ mod tests {
         let (shared, history) = h3_test_shared_state_with_history();
         let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a2";
 
-        record_trade(Some(&shared), "confirm_tx_2", token, 100, 1, 50_000, Side::Buy, None).await;
+        record_trade(Some(&shared), "confirm_tx_2", 0, token, 100, 1, 50_000, Side::Buy, None).await;
 
         let mut confirmed_txids = HashSet::new();
         confirmed_txids.insert("confirm_tx_2".to_string());
@@ -7191,7 +7270,7 @@ mod tests {
         let (shared, history) = h3_test_shared_state_with_history();
         let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a3";
 
-        record_trade(Some(&shared), "confirm_tx_3", token, 100, 1, 50_000, Side::Buy, None).await;
+        record_trade(Some(&shared), "confirm_tx_3", 0, token, 100, 1, 50_000, Side::Buy, None).await;
 
         let mut confirmed_txids = HashSet::new();
         confirmed_txids.insert("some_other_txid".to_string());
@@ -7209,7 +7288,7 @@ mod tests {
         let (shared, history) = h3_test_shared_state_with_history();
         let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a4";
 
-        record_trade(Some(&shared), "confirm_tx_4", token, 100, 1, 50_000, Side::Buy, None).await;
+        record_trade(Some(&shared), "confirm_tx_4", 0, token, 100, 1, 50_000, Side::Buy, None).await;
         let mut confirmed_txids = HashSet::new();
         confirmed_txids.insert("confirm_tx_4".to_string());
         confirm_pending_trades(&shared, &confirmed_txids, "block_to_be_reorged").await;
@@ -7231,8 +7310,8 @@ mod tests {
         let (shared, history) = h3_test_shared_state_with_history();
         let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a5";
 
-        record_trade(Some(&shared), "confirm_tx_5a", token, 100, 1, 50_000, Side::Buy, None).await;
-        record_trade(Some(&shared), "confirm_tx_5b", token, 200, 1, 60_000, Side::Sell, None).await;
+        record_trade(Some(&shared), "confirm_tx_5a", 0, token, 100, 1, 50_000, Side::Buy, None).await;
+        record_trade(Some(&shared), "confirm_tx_5b", 0, token, 200, 1, 60_000, Side::Sell, None).await;
 
         let mut confirmed_a = HashSet::new();
         confirmed_a.insert("confirm_tx_5a".to_string());

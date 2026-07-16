@@ -210,6 +210,11 @@ pub enum WsEvent {
     Trade {
         pair: String,
         txid: String,
+        /// P1 fix: disambiguates multiple trade events sharing one txid
+        /// (cross-pair swaps, v17 N:M sweeps) -- `(txid, leg_index)` is the
+        /// stable trade key everywhere (ledger + API + WS).
+        #[serde(rename = "legIndex")]
+        leg_index: u32,
         price: String,
         qty: String,
         side: Side,
@@ -632,6 +637,11 @@ struct DepthResponse {
 #[derive(Serialize)]
 struct TradeResponse {
     txid: String,
+    /// P1 fix: disambiguates multiple trade records that share one
+    /// settlement txid (cross-pair swaps, v17 N:M sweeps).
+    /// `(txid, leg_index)` is the stable trade key.
+    #[serde(rename = "legIndex")]
+    leg_index: u32,
     price: String,
     qty: String,
     side: Side,
@@ -695,6 +705,8 @@ struct StatusResponse {
 #[derive(Serialize)]
 struct CrossPairTradeResponse {
     txid: String,
+    #[serde(rename = "legIndex")]
+    leg_index: u32,
     #[serde(rename = "pairId")]
     pair_id: String,
     price: String,
@@ -861,6 +873,7 @@ async fn handle_trades(
                 .into_iter()
                 .map(|t| TradeResponse {
                     txid: t.txid.clone(),
+                    leg_index: t.leg_index,
                     price: price_str(t.price_num, t.price_den),
                     qty: t.quantity.to_string(),
                     side: t.side,
@@ -1114,6 +1127,7 @@ async fn handle_cross_pair_trades(
                 let routing = t.routing.as_ref()?;
                 Some(CrossPairTradeResponse {
                     txid: t.txid.clone(),
+                    leg_index: t.leg_index,
                     pair_id: t.pair_id.clone(),
                     price: price_str(t.price_num, t.price_den),
                     qty: t.quantity.to_string(),
@@ -2591,6 +2605,7 @@ mod tests {
         let event = WsEvent::Trade {
             pair: "abcd".to_string(),
             txid: "tx123".to_string(),
+            leg_index: 0,
             price: "100/1".to_string(),
             qty: "50".to_string(),
             side: Side::Buy,
@@ -2647,6 +2662,7 @@ mod tests {
         let ev = WsEvent::Trade {
             pair: "pairA".to_string(),
             txid: "tx1".to_string(),
+            leg_index: 0,
             price: "1/1".to_string(),
             qty: "1".to_string(),
             side: Side::Sell,
@@ -2907,6 +2923,7 @@ mod tests {
     fn make_normal_trade(txid: &str, pair: &str, daa: u64) -> Trade {
         Trade {
             txid: txid.to_string(),
+            leg_index: 0,
             pair_id: pair.to_string(),
             price_num: 1,
             price_den: 2,
@@ -2921,6 +2938,7 @@ mod tests {
     fn make_cp_trade(txid: &str, daa: u64) -> Trade {
         Trade {
             txid: txid.to_string(),
+            leg_index: 0,
             pair_id: "cross:TOKEN_A->TOKEN_B".to_string(),
             price_num: 1,
             price_den: 2,
@@ -2987,6 +3005,7 @@ mod tests {
     fn test_cross_pair_response_serialization() {
         let resp = CrossPairTradeResponse {
             txid: "tx_cp1".to_string(),
+            leg_index: 0,
             pair_id: "cross:A->B".to_string(),
             price: "1/2".to_string(),
             qty: "10000000".to_string(),
@@ -3058,6 +3077,7 @@ mod tests {
         let event = WsEvent::Trade {
             pair: "TOKEN_B/KAS".to_string(),
             txid: "abcd1234".to_string(),
+            leg_index: 0,
             price: "3/2".to_string(),
             qty: "10000000".to_string(),
             side: Side::Buy,
@@ -3110,14 +3130,14 @@ mod tests {
 
         let trade_b = WsEvent::Trade {
             pair: "TOKEN_B/KAS".to_string(),
-            txid: "t".to_string(), price: "1".to_string(),
+            txid: "t".to_string(), leg_index: 0, price: "1".to_string(),
             qty: "1".to_string(), side: Side::Buy, daa_score: 0,
         };
         assert!(should_forward(&trade_b, &subs), "subscribed trade should forward");
 
         let trade_a = WsEvent::Trade {
             pair: "TOKEN_A/KAS".to_string(),
-            txid: "t".to_string(), price: "1".to_string(),
+            txid: "t".to_string(), leg_index: 0, price: "1".to_string(),
             qty: "1".to_string(), side: Side::Buy, daa_score: 0,
         };
         assert!(!should_forward(&trade_a, &subs), "unsubscribed trade stream should not forward");
@@ -3132,6 +3152,7 @@ mod tests {
         let event = WsEvent::Trade {
             pair: "TOKEN_A/KAS".to_string(),
             txid: "tx123".to_string(),
+            leg_index: 0,
             price: "1/2".to_string(),
             qty: "5000000".to_string(),
             side: Side::Sell,
@@ -3191,6 +3212,7 @@ mod tests {
             let mut s = state.write().await;
             let trade = crate::matcher::trades::Trade {
                 txid: "match1".to_string(),
+                leg_index: 0,
                 pair_id: "TOKEN_A/KAS".to_string(),
                 price_num: 100,
                 price_den: 1,

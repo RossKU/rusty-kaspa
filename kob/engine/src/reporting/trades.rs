@@ -71,6 +71,14 @@ pub fn canonical_pair_id(token_cov_id: &str) -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Trade {
     pub txid: String,
+    /// P1 fix: disambiguates multiple trade records that share one
+    /// settlement `txid` -- already true for cross-pair swaps (2 legs) and
+    /// v17 N:M buy sweeps (up to 9 legs in one TX). `(txid, leg_index)` is
+    /// the stable trade key everywhere (ledger + API); see `trade_id()`.
+    /// Backward-compatible: absent in old JSON/JSONL rows deserializes as 0
+    /// (correct for the pre-leg_index era, when every trade was 1 leg = 1 TX).
+    #[serde(default)]
+    pub leg_index: u32,
     pub pair_id: String,
     pub price_num: u64,
     pub price_den: u64,
@@ -81,6 +89,15 @@ pub struct Trade {
     /// Present only for cross-pair routed trades.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub routing: Option<RoutingInfo>,
+}
+
+impl Trade {
+    /// The stable, collision-free trade identifier: `(txid, leg_index)`.
+    /// A plain `txid` is NOT sufficient once one settlement TX carries
+    /// multiple fills (v17 N:M sweeps, cross-pair swaps).
+    pub fn trade_id(&self) -> String {
+        format!("{}:{}", self.txid, self.leg_index)
+    }
 }
 
 /// In-memory trade history with per-pair indexing and optional file persistence.
@@ -553,6 +570,7 @@ mod tests {
     fn make_trade(txid: &str, pair: &str, price_num: u64, daa: u64) -> Trade {
         Trade {
             txid: txid.to_string(),
+            leg_index: 0,
             pair_id: pair.to_string(),
             price_num,
             price_den: 1,
@@ -567,6 +585,7 @@ mod tests {
     fn make_cross_pair_trade(txid: &str, daa: u64) -> Trade {
         Trade {
             txid: txid.to_string(),
+            leg_index: 0,
             pair_id: "cross:TOKEN_A->TOKEN_B".to_string(),
             price_num: 1,
             price_den: 2,
@@ -987,6 +1006,7 @@ mod tests {
         // Simulate recording a trade after a successful match
         let trade = Trade {
             txid: "match_tx_001".to_string(),
+            leg_index: 0,
             pair_id: "TOKEN_A/KAS".to_string(),
             price_num: 3,
             price_den: 2,
@@ -1037,6 +1057,7 @@ mod tests {
         // Cross-pair trade
         let cp_trade = Trade {
             txid: "tx_cross".to_string(),
+            leg_index: 0,
             pair_id: "cross:TOKEN_A->TOKEN_B".to_string(),
             price_num: 1,
             price_den: 1,
@@ -1103,6 +1124,7 @@ mod tests {
     fn e2e_trade_log_cross_pair_serialization() {
         let trade = Trade {
             txid: "tx_cp".to_string(),
+            leg_index: 0,
             pair_id: "cross:A->B".to_string(),
             price_num: 5,
             price_den: 3,
@@ -1139,6 +1161,7 @@ mod tests {
     fn make_trade_ts(txid: &str, pair: &str, ts: u64) -> Trade {
         Trade {
             txid: txid.to_string(),
+            leg_index: 0,
             pair_id: pair.to_string(),
             price_num: 1,
             price_den: 1,
@@ -1228,6 +1251,40 @@ mod tests {
         assert_eq!(canonical_pair_id(&token_cov_id), token_cov_id, "must be the identity transform");
         assert_eq!(canonical_pair_id(&token_cov_id).len(), 64, "must not truncate");
         assert!(!canonical_pair_id(&token_cov_id).contains("/KAS"), "must not append a display suffix");
+    }
+
+    // P1 fix: leg_index / Trade::trade_id()
+
+    #[test]
+    fn trade_id_combines_txid_and_leg_index() {
+        let mut t = make_trade("sweep_tx", "pairA", 1, 100);
+        t.leg_index = 0;
+        assert_eq!(t.trade_id(), "sweep_tx:0");
+        t.leg_index = 5;
+        assert_eq!(t.trade_id(), "sweep_tx:5");
+    }
+
+    #[test]
+    fn trade_id_distinguishes_legs_sharing_one_txid() {
+        let legs: Vec<Trade> = (0..4)
+            .map(|i| {
+                let mut t = make_trade("shared_tx", "pairA", i as u64, 100);
+                t.leg_index = i;
+                t
+            })
+            .collect();
+        let ids: std::collections::HashSet<String> = legs.iter().map(|t| t.trade_id()).collect();
+        assert_eq!(ids.len(), 4, "each leg of the same txid must have a distinct trade_id");
+        assert!(legs.iter().all(|t| t.txid == "shared_tx"));
+    }
+
+    #[test]
+    fn leg_index_defaults_to_zero_on_backward_compat_deserialization() {
+        // Pre-leg_index JSON (no "leg_index" field) must still deserialize.
+        let json = r#"{"txid":"tx1","pair_id":"pairA","price_num":10,"price_den":1,"quantity":100,"side":"buy","daa_score":100,"timestamp":100}"#;
+        let parsed: Trade = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.leg_index, 0);
+        assert_eq!(parsed.trade_id(), "tx1:0");
     }
 
     // PendingTrades: submission-time staging for confirmation-time persistence

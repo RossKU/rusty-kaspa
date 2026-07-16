@@ -251,6 +251,7 @@ mod tests {
     fn make_trade(pair: &str, price_num: u64, price_den: u64, qty: u64, ts: u64) -> Trade {
         Trade {
             txid: format!("tx_{}", ts),
+            leg_index: 0,
             pair_id: pair.to_string(),
             price_num,
             price_den,

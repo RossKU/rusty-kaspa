@@ -63,6 +63,56 @@ is preserved below unchanged; the Phase-2 outcome is summarized here.
   agreed. The exact planner output shape+values equal the engine-proven
   `honest(2)` case, so the pipeline (planner → tx → contract) is established.
 
+## Phase 3 — composition-layer hardening (adversarial-audit follow-up)
+
+Fixes to the composition layer (matching/batch/oco/cli) surfaced by an
+adversarial audit of how v17 interacts with the rest of the matcher. The v17
+buy bytecode itself is unchanged (already proven in `v17_nm_buy.rs`); the one
+covenant change here is to `OCO_SELL_BODY` (Item A), which was NOT a v17
+contract but a same-token sell whose stale F4 was reachable via v17 sweeps.
+
+- **RELEASE-BLOCKER #1 — OCO-sell fund-drain via unfiltered sweep**: OCO sells
+  are now excluded from any multi-sell sweep composition (`plan_batch_match`,
+  `plan_batch_match_v17`, and `find_sweep_groups`'s buy-sweep collection). A
+  `[plain sell + OCO sell]` sweep by a v17 buy could otherwise satisfy the OCO
+  sell's (pre-Fix-3) shared-index F4 via the OTHER sell's output and drain the
+  OCO seller's tokens. Solo (1-sell) OCO fills are unaffected.
+- **Item A — OCO F4 rewritten to per-input `OpAuthOutputIdx`**: closes the
+  above drain at L1 (both TP and SL paths, length-neutral 14B == 14B, pin
+  updated). Engine-proven: `oco_f4_shared_output_drain_rejected` /
+  `oco_f4_honest_per_input_outputs_pass`. The composition exclusion is kept as
+  the shipping boundary (now defense-in-depth): fully re-enabling OCO sweeps
+  additionally needs the OCO-SL fixed-offset price-read mismatch resolved (a
+  v16/v17 buy reads the swept sell price at offsets landing on `pnum_tp`/
+  `pden_tp` — correct for TP, wrong for an SL fill).
+- **DoS #3 — MAX_N enforced**: `plan_batch_match_v17` rejects `N > MAX_N(8)`
+  gracefully (`BatchError::V17TooManySells`, not the sigscript builder's
+  `assert!` panic); `find_sweep_groups` caps a v17-anchor sweep at MAX_N.
+- **MED #4 — OCO fixed-offset**: `build_oco_sell_tp/sl_fill_sigscript_fixed_offset`
+  added; the OCO no-remainder fill branch gates on `has_fixed_offset_buy` like
+  the sibling sell branches. Engine-proven byte-shift regression.
+- **HIGH #2 / Item B — v17 IOC BuySweep wired**: dedicated `plan_ioc_match_v17`
+  (per-sell BuyerTokens outputs bound to their own sell inputs; IOC floor =
+  buy's own `min_fill`), routed at the executor's BuySweep/PartialBuy dispatch
+  and CLI `--ioc`, gated on `version == 17`. Engine-proven end to end
+  (`domain/tests/v17_ioc_planner_engine_repro.rs`).
+- **#5 — v17 fee estimate**: probed at N=1 and N=MAX_N; the generic
+  per-input sig-op estimate over-shoots the real v17 sigscript mass, so no
+  under-pay. Two permanent regression guards, no code change.
+- **Item C — v17 partial-fill**: not implemented; the v17 covenant has no Op2
+  D&R path (only expire/cancel/cancel-mark/fill/IOC), and no code path emits a
+  v17 partial-fill sigscript (`test_v17_never_emits_partial_fill`). Incremental
+  v17 buy consumption across txs would need a covenant redesign — out of scope.
+- **Item D — multi-v17-buy allocation**: rejected (fail-closed). No
+  covenant-provable cross-buy disjointness of the shared sell outputs, so the
+  planner refuses `>1` v17 buy (`test_v17_multi_buy_rejected`).
+- **Item E — v17 cancel-mark**: wired in `kob-cli cancel-mark`
+  (`build_buy_v17_cancel_sigscript`, selector Op3). Engine-proven
+  (`v17_cancel_mark_reaches_checksig`).
+- **Item F — v17 cross-pair leg**: still excluded (fail-closed) at
+  `execute_swap_fill` — the buy's fixed-offset same-token price read can't span
+  two tokens. Cross-pair-capable v17 remains a distinct follow-on (Sec 5).
+
 ---
 
 Status (Phase 1, historical): design + feasibility spike only. Nothing in

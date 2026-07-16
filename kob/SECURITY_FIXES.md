@@ -226,6 +226,41 @@ never share one output.
   dispatch, parse, pin) and an engine harness. Treat as a bracket-hardening
   project, not a covenant one-liner.
 
+### Fix 6 — re-decision for the SINGLE-order fill path (release-backlog pass): NO cap, safe-by-limit, closed
+- **Question re-opened**: audit finding #9 said the bracket *batch* path is
+  dead/fails-closed, but the SINGLE-order fill path
+  (`kob/cli/src/bracket.rs::fill_bracket_v4`, wired at `kob/cli/src/lib.rs`
+  `BracketCommand::Fill`) is LIVE and permissionless. Re-checked whether it is
+  uncapped-drainable.
+- **Finding — it is NOT an F6-style drain, and a cap does not fit**:
+  1. **No free fill parameter.** The bracket fill sigscript is `[Op1
+     pushData(RS)]` (`build_bracket_fill_sigscript`) — there is NO partial-fill
+     amount like the v16-buy IOC path's free `mfill`/`fta` (the exact gap F6/
+     Fix 4 close for the buy contract). The buy entry computes `et = kas *
+     entry_price` from `OpTxInputIndex OpTxInputAmount` — the bracket input's
+     ENTIRE deposit — and enforces `output[1].value >= et`. The whole principal
+     is bound to the buyer's own `entry_price`; a matcher cannot deliver less
+     than the buyer's full entitlement.
+  2. **Delivered to the buyer's own SPK.** N5 (`blake2b(output[1].spk) ==
+     trade_spk_hash`) forces `output[1]` to the buyer's designated destination,
+     so a matcher can neither redirect nor underpay it.
+  3. **No counterparty price to cap against** (single-order, fills at the
+     buyer's own limit against matcher inventory) — a v16-F6 surplus cap has no
+     fair reference price, same as the batch analysis above.
+  - The only matcher "take" is the `kas - et` differential that appears when
+    `entry_price != 1`, which is a consequence of bracket's **value-based**
+    `output[1]` (sompi value, not a KCC20 token-unit covenant continuation),
+    NOT an unbounded drain beyond the buyer's stated terms. A surplus cap would
+    not correct this — only redefining `output[1]` as a real token covenant
+    (the "Recommended slice" above) would. Capping a value-based, self-priced
+    output would mask that model gap rather than fix it.
+- **Decision**: do NOT add the `mmfee_bps` surplus cap or the 224→232 / RS
+  365→373 state bump. The single-order fill is safe-by-limit (buyer protected
+  by `output[1] >= et` to their own SPK over their full deposit); the residual
+  concern is the value-based token model, tracked as the dedicated
+  bracket-hardening slice above, not a covenant surplus-cap patch. Fix 6 closed
+  as "won't-fix via cap; model redesign is the only correct lever."
+
 ---
 
 # Phase 2 — x402 facilitator hardening

@@ -453,6 +453,14 @@ fn find_sweep_groups(
                 if claimed.contains(&sell.outpoint_key()) {
                     continue;
                 }
+                // RELEASE-BLOCKER #1: OCO sells must never enter a multi-sell
+                // sweep (OCO_SELL_BODY's F4 still uses the pre-Fix-3 shared
+                // output index -- see BatchError::OcoMultiSellSweepUnsupported
+                // in domain/src/spot/batch.rs). A solo OCO fill is unaffected;
+                // it settles via the direct 1:1 book-traversal path instead.
+                if sell.oco_path.is_some() {
+                    continue;
+                }
                 // OCO: skip if another path of the same UTXO is already
                 // in this sweep (prevents duplicate inputs in the TX).
                 let utxo_key = sell.utxo_outpoint_key();
@@ -1751,6 +1759,82 @@ mod tests {
 
         // Total cost: 1B + 1.5B + 2B = 4.5B <= 5B
         assert_eq!(g.total_fill_cost, 4_500_000_000);
+    }
+
+    /// RELEASE-BLOCKER #1 regression: an OCO sell must never be collected
+    /// into a multi-sell buy-sweep group. `OCO_SELL_BODY`'s F4 still uses the
+    /// pre-Fix-3 transaction-wide shared output index (see
+    /// `BatchError::OcoMultiSellSweepUnsupported` in `domain/spot/batch.rs`),
+    /// so combining it with any other same-token sell in one sweep tx risks
+    /// the OCO seller's tokens never landing anywhere a buyer actually paid
+    /// for. With the OCO sell excluded, only 1 non-OCO sell remains, which
+    /// can't form a 2+ sweep group on its own.
+    #[test]
+    fn test_oco_sell_excluded_from_multi_sell_sweep() {
+        let token = FAKE_TOKEN;
+        let mut ob = OrderBook::new();
+
+        let mut buy = make_buy(5_000_000_000, 4, 1, token);
+        buy.tx_id = format!("{:0>64}", "buy_big");
+        buy.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy);
+
+        let mut sell_plain = make_sell(500_000_000, 2, 1, token);
+        sell_plain.tx_id = format!("{:0>64}", "sell_plain");
+        sell_plain.owner_hash = "b1".repeat(32);
+        ob.add_sell_order(sell_plain);
+
+        let mut sell_oco = make_sell(500_000_000, 2, 1, token);
+        sell_oco.tx_id = format!("{:0>64}", "sell_oco");
+        sell_oco.owner_hash = "b2".repeat(32);
+        sell_oco.oco_path = Some(kob_core::OcoPath::TakeProfit);
+        ob.add_sell_order(sell_oco);
+
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
+
+        for g in &groups {
+            for s in &g.fills {
+                assert!(s.oco_path.is_none(), "OCO sell must never be swept into a multi-sell group");
+            }
+        }
+        assert!(groups.is_empty(), "a single remaining non-OCO sell can't form a 2+ sweep group");
+    }
+
+    /// Same fixture but with 2 plain sells + 1 OCO sell (cheapest price, so
+    /// it would be picked first if not excluded): the OCO sell is skipped and
+    /// the 2 plain sells still sweep together.
+    #[test]
+    fn test_oco_sell_excluded_but_plain_sells_still_sweep() {
+        let token = FAKE_TOKEN;
+        let mut ob = OrderBook::new();
+
+        let mut buy = make_buy(5_000_000_000, 4, 1, token);
+        buy.tx_id = format!("{:0>64}", "buy_big2");
+        buy.owner_hash = "aa".repeat(32);
+        ob.add_buy_order(buy);
+
+        let mut sell1 = make_sell(500_000_000, 2, 1, token);
+        sell1.tx_id = format!("{:0>64}", "sell1b");
+        sell1.owner_hash = "b1".repeat(32);
+        ob.add_sell_order(sell1);
+
+        let mut sell2 = make_sell(500_000_000, 3, 1, token);
+        sell2.tx_id = format!("{:0>64}", "sell2b");
+        sell2.owner_hash = "b2".repeat(32);
+        ob.add_sell_order(sell2);
+
+        // Cheapest of all three -- would sort first if not excluded.
+        let mut sell_oco = make_sell(500_000_000, 1, 1, token);
+        sell_oco.tx_id = format!("{:0>64}", "sell_oco2");
+        sell_oco.owner_hash = "b3".repeat(32);
+        sell_oco.oco_path = Some(kob_core::OcoPath::StopLoss);
+        ob.add_sell_order(sell_oco);
+
+        let groups = find_sweep_groups(&ob, true, None, CSV_MATURITY_DAA);
+        assert!(!groups.is_empty(), "the 2 plain sells should still form a sweep group");
+        let g = &groups[0];
+        assert_eq!(g.fills.len(), 2, "only the 2 plain sells swept");
+        assert!(g.fills.iter().all(|s| s.oco_path.is_none()), "no OCO sell in the group");
     }
 
     #[test]

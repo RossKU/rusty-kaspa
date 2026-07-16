@@ -214,6 +214,18 @@ pub enum BatchError {
     /// cycle when a counterparty that consumes the full 200M-token value is
     /// available, or when OCO gets rewritten with an IOC path (future HF).
     OcoRemainderUnsupported { outpoint: String, utxo_value: u64, filled_tokens: u64 },
+    /// An OCO sell was composed into a multi-sell sweep (2+ sells in one tx).
+    ///
+    /// `OCO_SELL_BODY`'s fill F4 (`core/src/contract/spot/oco.rs`) still uses
+    /// the pre-Fix-3 transaction-wide shared index (`OpCovOutputIdx(T,0)`),
+    /// not the per-input `OpAuthOutputIdx` binding the plain sell contract
+    /// got in Fix 3. When 2+ sells of the same token share one tx, an OCO
+    /// sell's F4 can resolve to a DIFFERENT sell's authorized output and be
+    /// satisfied without the OCO seller's own tokens ever landing in any
+    /// output a buyer actually paid for -- a fund-drain. A solo (1-sell) OCO
+    /// fill is unaffected (nothing else shares the token's output index), so
+    /// only compositions with 2+ sells are rejected here.
+    OcoMultiSellSweepUnsupported { outpoint: String },
 }
 
 impl std::fmt::Display for BatchError {
@@ -255,6 +267,9 @@ impl std::fmt::Display for BatchError {
             }
             BatchError::OcoRemainderUnsupported { outpoint, utxo_value, filled_tokens } => {
                 write!(f, "OCO sell {} cannot be partially filled (utxo_value={} filled_tokens={}); OCO v1 covenant has no IOC path", outpoint, utxo_value, filled_tokens)
+            }
+            BatchError::OcoMultiSellSweepUnsupported { outpoint } => {
+                write!(f, "OCO sell {} cannot be composed into a multi-sell sweep (2+ sells in one tx); OCO_SELL_BODY's F4 still uses the pre-Fix-3 shared output index", outpoint)
             }
         }
     }
@@ -1063,6 +1078,18 @@ pub fn plan_batch_match(
             });
         }
     }
+    // RELEASE-BLOCKER #1: exclude OCO sells from any multi-sell composition.
+    // See BatchError::OcoMultiSellSweepUnsupported for the fund-drain this
+    // guards against. A solo OCO sell (sells.len() == 1) is unaffected.
+    if sells.len() > 1 {
+        for sell in sells {
+            if sell.oco_path.is_some() {
+                return Err(BatchError::OcoMultiSellSweepUnsupported {
+                    outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
+                });
+            }
+        }
+    }
     for buy in buys {
         if buy.version != 14 && buy.version != 16 && buy.version != 17 {
             return Err(BatchError::UnsupportedVersion {
@@ -1465,6 +1492,20 @@ fn plan_batch_match_v17(
     }
     let buy = &buys[0];
     let n = sells.len();
+
+    // RELEASE-BLOCKER #1: exclude OCO sells from a multi-sell v17 sweep (see
+    // BatchError::OcoMultiSellSweepUnsupported). Checked here too (not just
+    // in plan_batch_match's dispatch gate) so the invariant holds for any
+    // future direct caller of this planner.
+    if n > 1 {
+        for s in sells {
+            if s.oco_path.is_some() {
+                return Err(BatchError::OcoMultiSellSweepUnsupported {
+                    outpoint: format!("{}:{}", s.outpoint.0, s.outpoint.1),
+                });
+            }
+        }
+    }
 
     // All sells must be the same token as the buy (same-token sweep).
     for (i, s) in sells.iter().enumerate() {
@@ -2258,6 +2299,85 @@ mod tests {
         ];
         let r = plan_batch_match(&sells, &buys, None, &matcher_spk(), 0, Some(2000));
         assert!(matches!(r, Err(BatchError::UnsupportedVersion { .. })), "mixed v17 batch must be rejected");
+    }
+
+    /// Create a fake OCO sell order (TP path) for testing.
+    fn make_oco_sell(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32]) -> BatchOrder {
+        let tx_id = hex::encode(&[id_byte; 32]);
+        let owner = [0xBB; 32];
+        let sspkh = [0xCC; 32];
+        let rs = kob_core::build_oco_sell_redeem_script(
+            price_num, price_den, 1_000_000,
+            price_num, price_den, 1_000_000,
+            &owner, &sspkh, 0, 0, 0,
+        ).unwrap();
+        BatchOrder {
+            outpoint: (tx_id, 0),
+            order_type: OrderType::Sell,
+            version: 14,
+            token_cov_id: token,
+            price_num,
+            price_den,
+            amount,
+            redeem_script: rs,
+            utxo_value: amount,
+            counterparty_spk: vec![0xDD; 34],
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: Some(kob_core::OcoPath::TakeProfit),
+            bracket_meta: None,
+        }
+    }
+
+    /// RELEASE-BLOCKER #1: an OCO sell composed alongside another sell of the
+    /// same token into one v17 sweep must be rejected, not silently planned.
+    /// OCO_SELL_BODY's F4 still uses the pre-Fix-3 transaction-wide shared
+    /// output index, so a matcher could otherwise satisfy the OCO sell's F4
+    /// via the OTHER sell's authorized output, without ever delivering the
+    /// OCO seller's own tokens anywhere a buyer paid for.
+    #[test]
+    fn test_v17_oco_multi_sell_sweep_rejected() {
+        let token = [0x44; 32];
+        let sells = vec![
+            make_sell(0x10, 10_000_000, 99, 100, token),
+            make_oco_sell(0x11, 20_000_000, 99, 100, token),
+        ];
+        let buys = vec![make_buy_v17(0x20, 30_000_000, 1, 1, token, 2000)];
+        let r = plan_batch_match(&sells, &buys, None, &matcher_spk(), 0, Some(2000));
+        assert!(
+            matches!(r, Err(BatchError::OcoMultiSellSweepUnsupported { .. })),
+            "plain sell + OCO sell swept by a v17 buy must be rejected, got {:?}", r
+        );
+    }
+
+    /// Same exclusion must hold for the legacy (non-v17) merge planner too --
+    /// the composition-layer guard is not v17-specific.
+    #[test]
+    fn test_legacy_batch_oco_multi_sell_sweep_rejected() {
+        let token = [0x45; 32];
+        let sells = vec![
+            make_sell(0x10, 10_000_000, 99, 100, token),
+            make_oco_sell(0x11, 10_000_000, 99, 100, token),
+        ];
+        let buys = vec![make_buy(0x20, 20_000_000, 1, 1, token)];
+        let r = plan_batch_match(&sells, &buys, None, &matcher_spk(), 0, Some(2000));
+        assert!(
+            matches!(r, Err(BatchError::OcoMultiSellSweepUnsupported { .. })),
+            "plain sell + OCO sell in a legacy batch must be rejected, got {:?}", r
+        );
+    }
+
+    /// A SOLO OCO sell (no other same-token sell in the tx) is unaffected --
+    /// there's no shared output index to collide with, so 1:1 fills keep
+    /// working through the v17 planner exactly as before this fix.
+    #[test]
+    fn test_v17_solo_oco_sell_still_plans() {
+        let token = [0x46; 32];
+        let sells = vec![make_oco_sell(0x10, 10_000_000, 99, 100, token)];
+        let buys = vec![make_buy_v17(0x20, 10_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 100_000_000u64));
+        let r = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000));
+        assert!(r.is_ok(), "solo OCO sell must still plan fine: {:?}", r.err());
     }
 
     // Test 1: Simple same-pair batch (2 sells + 2 buys of same token)

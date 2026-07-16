@@ -1,9 +1,46 @@
-# N:M-capable buy covenant — design (Phase 1)
+# N:M-capable buy covenant — design (Phase 1) + implementation status (Phase 2)
 
-Status: design + feasibility spike only. Nothing in `kob/core/src/contract/spot/order.rs`
-is changed by this document; the mechanism is proven in a standalone harness test,
-`kob/core/tests/nm_buy_spike.rs`, run against the real post-Toccata `kaspa-txscript`
-`TxScriptEngine`. See "Feasibility spike result" below for the go/no-go.
+Status: **IMPLEMENTED (Phase 2 complete).** The v17 contract, its full adversarial
+matrix, all the recognition wiring, and the `plan_batch_match` N-per-sell emission
+are landed and green against the real post-Toccata `kaspa-txscript` `TxScriptEngine`.
+Phase 1 (design + feasibility spike, `kob/core/tests/nm_buy_spike.rs`) is preserved
+below unchanged; the Phase-2 outcome is summarized here.
+
+## Phase 2 outcome (implemented)
+
+- **Contract**: `BUY_ORDER_V17` in `kob/core/src/contract/spot/order.rs`
+  (`build_buy_v17_body`/`build_buy_v17_redeem_script` + fill/IOC/expire/cancel
+  sigscript builders). **MAX_N = 8** (justified from the tx compute-mass budget:
+  an 8-sell sweep ≈ 12k grams ≈ 12% of the pre-Toccata 100k standard cap). Body
+  693B, RS 838B, pinned in `bytecode_stable`. Selector dispatch (Op9 OpRoll), not
+  length-based. Both buyer protections carried: aggregate limit-price floor AND
+  aggregate surplus cap. Every summation term per-input bound via
+  `OpAuthOutputIdx(tii,0)` + covenant-id + buyer-SPK; strict-increasing `tii`.
+- **Adversarial matrix**: `kob/core/tests/v17_nm_buy.rs`, 26 engine tests, all the
+  §6 items green (double-count, non-covenant/ wrong-token/ wrong-SPK/ mis-authorized
+  terms, over-cap, mixed-price dilution, limit-price-floor violation, IOC theft,
+  forged sell price, decoy-uncounted, over-delivery-no-exposure, N=1 parity,
+  N=MAX_N boundary, N>MAX_N unrepresentable, RS length/collision) + expire/cancel.
+- **Wiring**: v17 is the new deploy default; v16 stays fully parseable. Landed in
+  `parse.rs`, `scanner.rs`, `executor.rs` (version + cross-pair exclusion), CLI
+  `deploy.rs`/`lib.rs`/`cancel.rs`/`watch.rs`, and the `bytecode_stable` pin.
+- **Matcher emission (`plan_batch_match`)**: a v17 buy routes to a dedicated,
+  isolated `plan_batch_match_v17` that emits ONE BuyerTokens output per sell, each
+  bound to its own sell input (new `BatchPlan.output_auth_input` +
+  `buy_sweep_sells`); `build_tx` emits the v17 fill sigscript; the engine executor
+  binds each output per its authorizing sell input. The v14/v16 merge path is
+  untouched (zero regression: kob-domain 634, kob-engine 369, kob-cli 517 green).
+- **Live N:M** remains blocked by the node's bulk-`getBlocks` catch-up hang (noted
+  in `E2E_LIVE_RESULTS.md`); the harness is the authoritative verification, as
+  agreed. The exact planner output shape+values equal the engine-proven
+  `honest(2)` case, so the pipeline (planner → tx → contract) is established.
+
+---
+
+Status (Phase 1, historical): design + feasibility spike only. Nothing in
+`kob/core/src/contract/spot/order.rs` was changed by the Phase-1 document; the
+mechanism was proven in `kob/core/tests/nm_buy_spike.rs`. See "Feasibility spike
+result" below for the original go/no-go.
 
 ## 1. The problem (recap)
 

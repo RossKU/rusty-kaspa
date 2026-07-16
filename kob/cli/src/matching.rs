@@ -290,13 +290,30 @@ pub async fn run(
     };
 
     // Reconstruct redeemScripts. v13/v14 share a layout (build_buy_redeem_script);
-    // v16 is the F6-fix buy contract (mmfee_bps semantics, see V16_STATUS.md).
-    // There is no v16 sell contract -- sell is always v14.
-    if version != 13 && version != 14 && version != 16 {
-        anyhow::bail!("Unsupported contract version {}. Supported: 13, 14 (legacy alias of 14), 16.", version);
+    // v16 is the F6-fix buy contract (mmfee_bps semantics, see V16_STATUS.md);
+    // v18 is the unified spot generation (BOTH sides v18, BPS-uniform,
+    // canonical price attestation — see V18_DESIGN.md).
+    if version != 13 && version != 14 && version != 16 && version != 18 {
+        anyhow::bail!("Unsupported contract version {}. Supported: 13, 14 (legacy alias of 14), 16, 18.", version);
     }
-    let buy_version: u8 = if version == 16 { 16 } else { 14 };
-    let buy_rs = if buy_version == 16 {
+    let buy_version: u8 = match version {
+        18 => 18,
+        16 => 16,
+        _ => 14,
+    };
+    let buy_rs = if buy_version == 18 {
+        contract::spot::order::build_buy_v18_redeem_script(
+            &tcid,
+            buy_price_num,
+            buy_price_den,
+            buy_min_fill,
+            &buy_owner_hash,
+            &buy_spk_hash,
+            mmfee_bps.unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
+            0,
+            buy_expiry,
+        )?
+    } else if buy_version == 16 {
         contract::build_buy_v16_redeem_script(
             &tcid,
             buy_price_num,
@@ -321,16 +338,29 @@ pub async fn run(
             buy_expiry,
         )?
     };
-    let sell_rs = contract::build_sell_redeem_script(
-        sell_price_num,
-        sell_price_den,
-        sell_min_fill,
-        &sell_owner_hash,
-        &sell_spk_hash,
-        max_matcher_fee,
-        0,
-        sell_expiry,
-    )?;
+    let sell_rs = if version == 18 {
+        contract::spot::order::build_sell_v18_redeem_script(
+            sell_price_num,
+            sell_price_den,
+            sell_min_fill,
+            &sell_owner_hash,
+            &sell_spk_hash,
+            mmfee_bps.unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
+            0,
+            sell_expiry,
+        )?
+    } else {
+        contract::build_sell_redeem_script(
+            sell_price_num,
+            sell_price_den,
+            sell_min_fill,
+            &sell_owner_hash,
+            &sell_spk_hash,
+            max_matcher_fee,
+            0,
+            sell_expiry,
+        )?
+    };
 
     let buy_p2sh = build_p2sh(&buy_rs);
     let sell_p2sh = build_p2sh(&sell_rs);
@@ -343,7 +373,7 @@ pub async fn run(
     println!("Buy Price:    {}/{}", buy_price_num, buy_price_den);
     println!("Sell Price:   {}/{}", sell_price_num, sell_price_den);
     println!("Buy RS:       {} bytes (v{})", buy_rs.len(), buy_version);
-    println!("Sell RS:      {} bytes (v14)", sell_rs.len());
+    println!("Sell RS:      {} bytes (v{})", sell_rs.len(), if version == 18 { 18 } else { 14 });
     println!("Matcher:      {}", wallet.address);
     println!();
 
@@ -408,7 +438,7 @@ pub async fn run(
     let sell_order = BatchOrder {
         outpoint: (sell_outpoint.transaction_id.clone(), sell_outpoint.index),
         order_type: OrderType::Sell,
-        version: 14,
+        version: if version == 18 { 18 } else { 14 },
         token_cov_id: tcid,
         price_num: sell_price_num,
         price_den: sell_price_den,
@@ -439,7 +469,7 @@ pub async fn run(
     // uncapped, matching v14's existing "matcher takes the full spread"
     // semantics.
     let effective_fee_bps = fee_bps.or_else(|| {
-        if buy_version == 16 {
+        if buy_version == 16 || buy_version == 18 {
             Some(mmfee_bps.unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS) as u16)
         } else {
             None

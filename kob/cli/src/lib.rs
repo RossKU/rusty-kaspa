@@ -393,10 +393,10 @@ pub enum Commands {
         #[arg(long)]
         buy_token: Option<String>,
 
-        /// Contract version: 13/14 (legacy, shared RS layout) or 16 (F6-fix
-        /// buy contract, --mmfee-bps semantics). Sell orders are always v14
-        /// -- there is no v16 sell contract.
-        #[arg(long, default_value = "14")]
+        /// Contract version: 18 (unified spot, both sides v18, BPS-uniform),
+        /// 16 (F6-fix buy contract, --mmfee-bps semantics), or 13/14
+        /// (legacy, shared RS layout; sell side is v14 for 13/14/16).
+        #[arg(long, default_value = "18")]
         version: u8,
 
         /// Buy order expiry DAA score (for v14 RS reconstruction). 0 = GTC.
@@ -471,6 +471,26 @@ pub enum Commands {
         /// Requires exactly one --buy-outpoints entry.
         #[arg(long)]
         ioc: bool,
+
+        /// v18 Op2 PARTIAL fill: the (single, v18) buy spends only part of
+        /// its KAS against the sells and keeps a byte-exact self-SPK
+        /// residual UTXO that continues as a live buy order. Mutually
+        /// exclusive with --ioc.
+        #[arg(long, conflicts_with = "ioc")]
+        partial: bool,
+    },
+
+    /// Settle a v18 swap ring: 2-cycle (token<->token) or 3-cycle (triangle)
+    /// of resting v18 swap orders, all-or-nothing, token->token directly.
+    MatchRing {
+        /// Ring legs in cycle order: leg i's target token must equal leg
+        /// (i+1)%n's source token. Repeatable; format per leg:
+        /// `txid:index:rs_hex[:owner_spk_hex]`. `owner_spk_hex` (2B version
+        /// LE + script) is required when the leg owner is NOT this wallet;
+        /// otherwise the wallet's P2PK SPK is used (and hash-checked
+        /// against the RS's owner_spk_hash).
+        #[arg(long = "leg", required = true)]
+        legs: Vec<String>,
     },
 
     /// Trade receipt operations: create, consume (v3), trigger, consume-v1 (legacy).
@@ -699,10 +719,9 @@ pub enum Commands {
         #[arg(long)]
         old_version: Option<u8>,
 
-        /// Contract version for the new order. Sell: only 14. Buy: only 17
-        /// (v14/v16 are rejected for new deploys, same as `deploy buy`);
-        /// auto-bumped from the default to 17 when --new-side buy.
-        #[arg(long, default_value = "14")]
+        /// Contract version for the new order. Only v18 (unified spot) may
+        /// be deployed (same as `deploy buy`/`deploy sell`).
+        #[arg(long, default_value = "18")]
         new_version: u8,
 
         /// Old order expiry DAA score. Resolved from orders cache if omitted (0 = GTC).
@@ -725,8 +744,9 @@ pub enum Commands {
         #[arg(long)]
         old_max_matcher_fee: Option<u64>,
 
-        /// Max matcher fee (sompi) for the new order's redeemScript.
-        #[arg(long, default_value = "10000000")]
+        /// Max matcher fee for the new order's redeemScript. v18: BASIS
+        /// POINTS (default 30 = 0.30%); pre-v18 semantics were sompi.
+        #[arg(long, default_value = "30")]
         new_max_matcher_fee: u64,
     },
 
@@ -842,8 +862,8 @@ pub enum Commands {
         #[arg(long, default_value = "10")]
         interval: u64,
 
-        /// Contract version (only 14 is supported).
-        #[arg(long, default_value = "14")]
+        /// Contract version (only 18 is supported — new quotes are v18).
+        #[arg(long, default_value = "18")]
         version: u8,
 
         /// Print orders without deploying.
@@ -981,13 +1001,13 @@ pub enum DeployCommands {
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version. Only v17 (N:M sweep) may be deployed for new
-        /// orders; v14 (no matcher-fee cap) and v16 (1:1-only F6 cap) are
+        /// Contract version. Only v18 (unified spot: N:M sweep + Op2 partial
+        /// + OCO sweep) may be deployed for new orders; v14/v16/v17 are
         /// rejected here and retained solely for managing pre-existing
         /// on-chain orders via cancel/cancel-all/requote --old-version.
-        /// v17 uses --mmfee-bps (BPS) instead of --max-matcher-fee
-        /// (see NM_BUY_DESIGN.md / V16_STATUS.md).
-        #[arg(long, default_value = "17")]
+        /// v18 uses --mmfee-bps (BPS) instead of --max-matcher-fee
+        /// (see V18_DESIGN.md).
+        #[arg(long, default_value = "18")]
         version: u8,
 
         /// Time-in-force: GTC (default), IOC, or FOK.
@@ -1028,10 +1048,9 @@ pub enum DeployCommands {
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
 
-        /// Maximum matcher fee in basis points (v17 contract).
-        /// Sets --version to 17 automatically (no-op given the v17 default).
+        /// Maximum matcher fee in basis points (v17/v18 contracts).
         /// E.g., 30 = 0.30% of trade value. Range: 0..=10000.
-        /// When set, --max-matcher-fee is ignored.
+        /// When set, --max-matcher-fee is ignored. Default: 30.
         #[arg(long)]
         mmfee_bps: Option<u64>,
     },
@@ -1072,8 +1091,10 @@ pub enum DeployCommands {
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version (only 14 is supported).
-        #[arg(long, default_value = "14")]
+        /// Contract version. Only v18 (unified spot) may be deployed for new
+        /// orders; v14 is retained solely for managing pre-existing on-chain
+        /// orders via cancel/cancel-all/requote.
+        #[arg(long, default_value = "18")]
         version: u8,
 
         /// Time-in-force: GTC (default), IOC, or FOK.
@@ -1096,7 +1117,7 @@ pub enum DeployCommands {
         matcher_url: Option<String>,
 
         /// GTD expiry: DAA score after which the order is considered expired.
-        /// For v14, this is enforced on-chain via CLTV (0 = GTC, no expiry).
+        /// Enforced on-chain via CLTV (0 = GTC, no expiry).
         #[arg(long)]
         expiry: Option<u64>,
 
@@ -1117,11 +1138,15 @@ pub enum DeployCommands {
         #[arg(long)]
         fee_utxo: Option<String>,
 
-        /// Maximum fee (in sompi) the matcher may extract per fill.
-        /// The on-chain F6 check enforces `kas_in - out[0].value <= mmfee`.
-        /// mmfee=0 makes partial fills impossible. Default: 10_000_000 (0.1 KAS).
+        /// Maximum fee (in sompi) the matcher may extract per fill (pre-v18).
+        /// Ignored for v18 (which uses --mmfee-bps). Default: 10_000_000.
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
+
+        /// Maximum matcher fee in basis points (v18 contract).
+        /// E.g., 30 = 0.30% of trade value. Range: 0..=10000. Default: 30.
+        #[arg(long)]
+        mmfee_bps: Option<u64>,
     },
 
     /// Deploy a bracket order (OTOCO: entry + take-profit + stop-loss).
@@ -1322,8 +1347,9 @@ pub enum DeployCommands {
         #[arg(long, default_value = "0")]
         expiry: u64,
 
-        /// Maximum fee (in sompi) the matcher may extract per fill.
-        #[arg(long, default_value = "10000000")]
+        /// Maximum matcher fee in BASIS POINTS (v18; 30 = 0.30%). Legacy
+        /// sompi-scale values (> 10000) fall back to the 30 bps default.
+        #[arg(long, default_value = "30")]
         max_matcher_fee: u64,
     },
 
@@ -1369,8 +1395,9 @@ pub enum DeployCommands {
         #[arg(long, default_value = "0")]
         expiry: u64,
 
-        /// Maximum fee (in sompi) the matcher may extract per fill.
-        #[arg(long, default_value = "10000000")]
+        /// Maximum matcher fee in BASIS POINTS (v18; 30 = 0.30%). Legacy
+        /// sompi-scale values (> 10000) fall back to the 30 bps default.
+        #[arg(long, default_value = "30")]
         max_matcher_fee: u64,
 
         /// Token UTXO outpoint (txid:index) for covenant binding.
@@ -1808,11 +1835,10 @@ pub async fn dispatch(
                 max_matcher_fee,
                 mmfee_bps,
             } => {
-                // v17 (N:M sweep) is the sole deploy target; --mmfee-bps bumps
-                // an explicit --version 14 up to 17 for convenience.
-                // deploy_buy rejects any non-v17 version for new orders (v14
-                // has no on-chain F6 cap; v16 cannot settle an N:M sweep).
-                let version = if mmfee_bps.is_some() && version == 14 { 17 } else { version };
+                // v18 (unified spot) is the sole deploy target; --mmfee-bps
+                // bumps an explicit --version 14 up to 18 for convenience.
+                // deploy_buy rejects any non-v18 version for new orders.
+                let version = if mmfee_bps.is_some() && version == 14 { 18 } else { version };
 
                 // Resolve token alias
                 let token = token::resolve_token(&token, None)?;
@@ -1940,6 +1966,7 @@ pub async fn dispatch(
                 token_utxo,
                 fee_utxo,
                 max_matcher_fee,
+                mmfee_bps,
             } => {
                 // Resolve token alias
                 let token = if let Some(t) = token {
@@ -2013,8 +2040,11 @@ pub async fn dispatch(
                 if post_only {
                     println!("Post-only order: will be rejected if it would cross the spread.");
                 }
-                if max_matcher_fee == 0 {
-                    println!("WARNING: --max-matcher-fee=0 prevents partial fills (F6 constraint).");
+                if let Some(bps) = mmfee_bps {
+                    if bps > 10000 {
+                        anyhow::bail!("--mmfee-bps must be 0..=10000 (basis points). Got {}.", bps);
+                    }
+                    println!("V{} sell order: mmfee_bps = {} ({}%)", version, bps, bps as f64 / 100.0);
                 }
                 let min_fill = min_fill.unwrap_or_else(kob_core::minimum_sell_min_fill);
                 let deploy_txid = deploy::deploy_sell(
@@ -2031,6 +2061,7 @@ pub async fn dispatch(
                     post_only,
                     expiry,
                     max_matcher_fee,
+                    mmfee_bps,
                     token_utxo.as_deref(),
                     fee_utxo.as_deref(),
                 )
@@ -2491,6 +2522,7 @@ pub async fn dispatch(
             max_matcher_fee,
             fee_bps,
             ioc,
+            partial,
         } => {
             let token = token::resolve_token(&token, None)?;
             match_batch::run(
@@ -2503,8 +2535,12 @@ pub async fn dispatch(
                 max_matcher_fee,
                 fee_bps,
                 ioc,
+                partial,
             )
             .await?;
+        }
+        Commands::MatchRing { legs } => {
+            match_batch::run_ring(wallet_path, node, network, &legs).await?;
         }
         Commands::Receipt { action } => match action {
             receipt::ReceiptCommand::Create {
@@ -2799,6 +2835,7 @@ pub async fn dispatch(
                 oco_value,
                 receipt_rs,
                 fee_input,
+                token_utxo,
             } => {
                 bracket::fill_bracket_v4(
                     wallet_path,
@@ -2814,6 +2851,7 @@ pub async fn dispatch(
                     oco_value,
                     &receipt_rs,
                     fee_input.as_deref(),
+                    token_utxo.as_deref(),
                 )
                 .await?;
             }
@@ -2938,12 +2976,10 @@ pub async fn dispatch(
             };
             deploy::validate_amount_not_dust(new_amount, "--new-amount")?;
             let new_token = token::resolve_token(&new_token, None)?;
-            // v17 is the sole creatable buy contract (mirrors deploy.rs's
-            // deploy_buy gate); auto-bump the shared --new-version flag's
-            // default (14) to 17 for a new buy side so `--new-side buy`
-            // keeps working without requiring an explicit --new-version.
-            // Sell has no v16/v17 analogue and stays at 14.
-            let new_version = if new_side == "buy" && new_version == 14 { 17 } else { new_version };
+            // v18 is the sole creatable contract generation (mirrors
+            // deploy.rs's gates); legacy explicit --new-version 14/17 are
+            // auto-bumped to 18 so old invocations keep working.
+            let new_version = if new_version == 14 || new_version == 17 { 18 } else { new_version };
             let new_params = requote::NewOrderParams {
                 side: new_side,
                 token: new_token,

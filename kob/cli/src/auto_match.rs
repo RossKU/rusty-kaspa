@@ -1256,7 +1256,31 @@ pub async fn run(
                             if pair_bytes.len() != 32 { continue; }
                             let mut tcid = [0u8; 32];
                             tcid.copy_from_slice(&pair_bytes);
-                            if cached_version == 16 {
+                            if cached_version == 18 {
+                                kob_core::contract::spot::order::build_buy_v18_redeem_script(
+                                    &tcid,
+                                    cached.price_num,
+                                    cached.price_den,
+                                    cached.min_fill,
+                                    &owner_hash,
+                                    &spk_hash,
+                                    cached.max_matcher_fee, // bps for v18
+                                    0,
+                                    cached.expiry_daa,
+                                )?
+                            } else if cached_version == 17 {
+                                kob_core::contract::build_buy_v17_redeem_script(
+                                    &tcid,
+                                    cached.price_num,
+                                    cached.price_den,
+                                    cached.min_fill,
+                                    &owner_hash,
+                                    &spk_hash,
+                                    cached.max_matcher_fee, // bps for v17
+                                    0,
+                                    cached.expiry_daa,
+                                )?
+                            } else if cached_version == 16 {
                                 kob_core::contract::build_buy_v16_redeem_script(
                                     &tcid,
                                     cached.price_num,
@@ -1283,17 +1307,31 @@ pub async fn run(
                             }
                         }
                         OrderSide::Sell => {
-                            // No v16 sell contract exists -- always v14.
-                            kob_core::contract::build_sell_redeem_script(
-                                cached.price_num,
-                                cached.price_den,
-                                cached.min_fill,
-                                &owner_hash,
-                                &spk_hash,
-                                cached.max_matcher_fee,
-                                0,
-                                cached.expiry_daa,
-                            )?
+                            // Sells: v18 (unified spot) or the single legacy
+                            // v14 layout.
+                            if cached_version == 18 {
+                                kob_core::contract::spot::order::build_sell_v18_redeem_script(
+                                    cached.price_num,
+                                    cached.price_den,
+                                    cached.min_fill,
+                                    &owner_hash,
+                                    &spk_hash,
+                                    cached.max_matcher_fee, // bps for v18
+                                    0,
+                                    cached.expiry_daa,
+                                )?
+                            } else {
+                                kob_core::contract::build_sell_redeem_script(
+                                    cached.price_num,
+                                    cached.price_den,
+                                    cached.min_fill,
+                                    &owner_hash,
+                                    &spk_hash,
+                                    cached.max_matcher_fee,
+                                    0,
+                                    cached.expiry_daa,
+                                )?
+                            }
                         }
                     };
 
@@ -1310,7 +1348,7 @@ pub async fn run(
                         p2sh_hash: hash.clone(),
                         redeem_script: rs,
                         token_cov_id: cached.pair_id.clone(),
-                        version: if side == OrderSide::Buy { cached_version } else { 14 },
+                        version: if side == OrderSide::Buy || cached_version == 18 { cached_version } else { 14 },
                         max_matcher_fee: cached.max_matcher_fee,
                     });
 

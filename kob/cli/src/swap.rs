@@ -200,6 +200,44 @@ async fn query_swap_utxo_value(
     Ok(utxo.utxo_entry.amount)
 }
 
+/// Version-agnostic view of a swap order RS (v1 243B or v18 260B).
+/// v18 adds `mmfee_bps`; every other state field is layout-identical.
+struct SwapRsView {
+    source_token_cov_id: [u8; 32],
+    target_token_cov_id: [u8; 32],
+    min_target_amount: u64,
+    owner_hash: [u8; 32],
+    owner_spk_hash: [u8; 32],
+    receipt_cov_id: [u8; 32],
+    /// Some(bps) for v18; None for v1.
+    mmfee_bps: Option<u64>,
+}
+
+/// Parse a swap RS of either generation into the common view.
+fn parse_swap_rs_any(rs: &[u8]) -> Option<SwapRsView> {
+    if let Some(p) = contract::parse_swap_order_rs(rs) {
+        return Some(SwapRsView {
+            source_token_cov_id: p.source_token_cov_id,
+            target_token_cov_id: p.target_token_cov_id,
+            min_target_amount: p.min_target_amount,
+            owner_hash: p.owner_hash,
+            owner_spk_hash: p.owner_spk_hash,
+            receipt_cov_id: p.receipt_cov_id,
+            mmfee_bps: None,
+        });
+    }
+    let p = contract::spot::swap::parse_swap_order_v18_rs(rs)?;
+    Some(SwapRsView {
+        source_token_cov_id: p.source_token_cov_id,
+        target_token_cov_id: p.target_token_cov_id,
+        min_target_amount: p.min_target_amount,
+        owner_hash: p.owner_hash,
+        owner_spk_hash: p.owner_spk_hash,
+        receipt_cov_id: p.receipt_cov_id,
+        mmfee_bps: Some(p.mmfee_bps),
+    })
+}
+
 // swap deploy
 
 #[allow(clippy::too_many_arguments)]
@@ -242,19 +280,21 @@ async fn deploy(
     // owner_spk_hash = blake2b_256(P2PK SPK) -- where target tokens are sent
     let owner_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
-    // Build RS
-    let redeem_script = contract::build_swap_redeem_script(
+    // Build RS — v18 swap (ring-eligible: token<->token 2-cycle / triangle
+    // settles, per-leg F4 conservation cap in BPS; V18_DESIGN.md item F).
+    let redeem_script = contract::spot::swap::build_swap_v18_redeem_script(
         &source_tcid,
         &target_tcid,
         min_receive,
         &owner_hash,
         &owner_spk_hash,
         &receipt_cid,
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
     )?;
     let p2sh = build_p2sh(&redeem_script);
 
-    println!("Deploy Swap Order");
-    println!("==================");
+    println!("Deploy Swap Order (v18)");
+    println!("========================");
     println!("Source Token: {}", source_token_hex);
     println!("Target Token: {}", target_token_hex);
     println!("Amount:       {} sompi ({:.8} KAS)", amount, amount as f64 / 1e8);
@@ -598,11 +638,13 @@ async fn cancel(
     let outpoint = Outpoint::parse(outpoint_str)?;
     let redeem_script = hex::decode(rs_hex)?;
 
-    // Parse and validate the RS
-    let parsed = contract::parse_swap_order_rs(&redeem_script)
+    // Parse and validate the RS (v1 or v18 — cancel sigscript shape is
+    // identical in both generations).
+    let parsed = parse_swap_rs_any(&redeem_script)
         .ok_or_else(|| anyhow::anyhow!(
-            "Invalid swap order RS: expected {} bytes, got {}",
+            "Invalid swap order RS: expected {} (v1) or {} (v18) bytes, got {}",
             contract::SWAP_RS_SIZE,
+            contract::spot::swap::SWAP_V18_RS_SIZE,
             redeem_script.len(),
         ))?;
 
@@ -796,10 +838,11 @@ async fn info_cmd(
     let outpoint = Outpoint::parse(outpoint_str)?;
     let redeem_script = hex::decode(rs_hex)?;
 
-    let parsed = contract::parse_swap_order_rs(&redeem_script)
+    let parsed = parse_swap_rs_any(&redeem_script)
         .ok_or_else(|| anyhow::anyhow!(
-            "Invalid swap order RS: expected {} bytes, got {}",
+            "Invalid swap order RS: expected {} (v1) or {} (v18) bytes, got {}",
             contract::SWAP_RS_SIZE,
+            contract::spot::swap::SWAP_V18_RS_SIZE,
             redeem_script.len(),
         ))?;
 
@@ -837,6 +880,10 @@ async fn info_cmd(
     println!("Owner Hash:   {}", hex::encode(parsed.owner_hash));
     println!("Owner SPK:    {}", hex::encode(parsed.owner_spk_hash));
     println!("Receipt Cov:  {}", hex::encode(parsed.receipt_cov_id));
+    match parsed.mmfee_bps {
+        Some(bps) => println!("Version:      v18 (ring-eligible, mmfee {} bps)", bps),
+        None => println!("Version:      v1 (KAS-bridged route)"),
+    }
     println!("RS Size:      {} bytes", redeem_script.len());
     println!("Mine:         {}", if is_mine { "YES" } else { "no" });
 

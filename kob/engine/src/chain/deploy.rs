@@ -70,7 +70,9 @@ pub fn create_book_order(
     }
 }
 
-/// Build buy_order v14 redeemScript and P2SH.
+/// Build buy_order v18 redeemScript and P2SH (new deployments are v18-only).
+///
+/// `max_matcher_fee_bps` is BASIS POINTS (v18 uniform; builder rejects > 10000).
 pub fn build_buy_order_scripts(
     token_cov_id: &[u8; 32],
     price_num: u64,
@@ -78,28 +80,31 @@ pub fn build_buy_order_scripts(
     min_fill: u64,
     owner_hash: &[u8; 32],
     buyer_spk_hash: &[u8; 32],
-    max_matcher_fee: u64,
+    max_matcher_fee_bps: u64,
 ) -> (String, String, u16) {
-    let rs = kob_core::contract::build_buy_redeem_script(
-        token_cov_id, price_num, price_den, min_fill, owner_hash, buyer_spk_hash, max_matcher_fee,
-        0, 0,).unwrap();
+    let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        token_cov_id, price_num, price_den, min_fill, owner_hash, buyer_spk_hash,
+        max_matcher_fee_bps, 0, 0,).unwrap();
     let rs_hex = hex::encode(&rs);
     let spk = kob_core::build_p2sh(&rs);
     let p2sh_hex = hex::encode(&spk.script());
     (rs_hex, p2sh_hex, spk.version)
 }
 
-/// Build sell_order v14 redeemScript and P2SH.
+/// Build sell_order v18 redeemScript and P2SH (new deployments are v18-only).
+///
+/// `max_matcher_fee_bps` is BASIS POINTS (v18 uniform; builder rejects > 10000).
 pub fn build_sell_order_scripts(
     price_num: u64,
     price_den: u64,
     min_fill: u64,
     owner_hash: &[u8; 32],
     seller_spk_hash: &[u8; 32],
-    max_matcher_fee: u64,
+    max_matcher_fee_bps: u64,
 ) -> (String, String, u16) {
-    let rs = kob_core::contract::build_sell_redeem_script(
-        price_num, price_den, min_fill, owner_hash, seller_spk_hash, max_matcher_fee, 0, 0,).unwrap();
+    let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        price_num, price_den, min_fill, owner_hash, seller_spk_hash, max_matcher_fee_bps,
+        0, 0,).unwrap();
     let rs_hex = hex::encode(&rs);
     let spk = kob_core::build_p2sh(&rs);
     let p2sh_hex = hex::encode(&spk.script());
@@ -162,8 +167,11 @@ async fn deploy_test_pair(
     let owner_hash = config.owner_hash();
     let privkey = config.private_key_bytes();
 
-    let buy_value = 30_000_000u64;  // 0.3 KAS
-    let sell_value = 30_000_000u64; // 0.3 KAS
+    // v18 accounting: the buy's surplus cap is `kas_in - fair_sum <=
+    // kas_in/10000*mmfee_bps`, so the test buy must be sized to the sell's
+    // fair value (sell_value tokens at price 1/2 -> 15M sompi KAS).
+    let buy_value = 15_000_000u64;  // 0.15 KAS == fair value of the sell below
+    let sell_value = 30_000_000u64; // 0.3 (token sompi)
     // Estimate miner fee for deploy TX (1 input, 2 outputs, ~100 byte payload)
     let estimated_fee = kob_core::mass::estimate_compute_mass(1, 2, 100);
     let kas_needed = buy_value + estimated_fee;
@@ -257,9 +265,9 @@ async fn deploy_test_pair(
         _ => { error!("Invalid covenant ID hex"); return None; }
     };
     let (buy_rs_hex, buy_p2sh_hex, buy_p2sh_ver) =
-        build_buy_order_scripts(&cov_id_bytes, price_num, price_den, min_fill, &owner_hash, &buyer_spk_hash, 0);
+        build_buy_order_scripts(&cov_id_bytes, price_num, price_den, min_fill, &owner_hash, &buyer_spk_hash, kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS);
     let (sell_rs_hex, sell_p2sh_hex, sell_p2sh_ver) =
-        build_sell_order_scripts(price_num, price_den, min_fill, &owner_hash, &seller_spk_hash, 0);
+        build_sell_order_scripts(price_num, price_den, min_fill, &owner_hash, &seller_spk_hash, kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS);
 
     // Find a wallet UTXO for the buy order + fee
     let wallet_utxo = utxos.iter().find(|u| u.utxo_entry.amount >= kas_needed);

@@ -127,10 +127,14 @@ pub fn build_cancel_tx(
     let sig_0 = signing::schnorr_sign(privkey, &sighash_0)?;
 
     let cancel_sigscript = match order.side.as_str() {
+        "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN => {
+            contract::spot::order::build_buy_v18_cancel_sigscript(pubkey, &sig_0, false, &redeem_script)
+        }
         "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN => {
             contract::build_buy_v17_cancel_sigscript(pubkey, &sig_0, false, &redeem_script)
         }
         "buy" => contract::build_buy_cancel_sigscript(&sig_0, pubkey, &redeem_script),
+        // v18 sell cancel keeps the v14 [sig][pk][Op0][RS] shape.
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, pubkey, &redeem_script),
         _ => anyhow::bail!("Unknown order side '{}'. Expected 'buy' or 'sell'.", order.side),
     };
@@ -152,6 +156,9 @@ pub fn build_cancel_tx(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(privkey, &sighash_0)?;
         let cancel_sigscript = match order.side.as_str() {
+            "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN => {
+                contract::spot::order::build_buy_v18_cancel_sigscript(pubkey, &sig_0, false, &redeem_script)
+            }
             "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN => {
                 contract::build_buy_v17_cancel_sigscript(pubkey, &sig_0, false, &redeem_script)
             }
@@ -497,8 +504,8 @@ pub fn build_redeem_script_for_order(
     let spk_hash = compute_p2pk_spk_hash(pubkey);
 
 
-    if order.version != 14 && order.version != 16 && order.version != 17 {
-        anyhow::bail!("Unsupported contract version {}. Only v14, v16, and v17 are supported.", order.version);
+    if order.version != 14 && order.version != 16 && order.version != 17 && order.version != 18 {
+        anyhow::bail!("Unsupported contract version {}. Only v14, v16, v17, and v18 are supported.", order.version);
     }
 
     match order.side.as_str() {
@@ -508,7 +515,11 @@ pub fn build_redeem_script_for_order(
             let token_bytes = hex::decode(token_hex)?;
             let mut tcid = [0u8; 32];
             tcid.copy_from_slice(&token_bytes);
-            if order.version == 17 {
+            if order.version == 18 {
+                Ok(contract::spot::order::build_buy_v18_redeem_script(
+                    &tcid, order.price_num, order.price_den, order.min_fill,
+                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+            } else if order.version == 17 {
                 Ok(contract::build_buy_v17_redeem_script(
                     &tcid, order.price_num, order.price_den, order.min_fill,
                     &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
@@ -523,9 +534,15 @@ pub fn build_redeem_script_for_order(
             }
         }
         "sell" => {
-            Ok(contract::build_sell_redeem_script(
-                order.price_num, order.price_den, order.min_fill,
-                &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+            if order.version == 18 {
+                Ok(contract::spot::order::build_sell_v18_redeem_script(
+                    order.price_num, order.price_den, order.min_fill,
+                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+            } else {
+                Ok(contract::build_sell_redeem_script(
+                    order.price_num, order.price_den, order.min_fill,
+                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+            }
         }
         _ => anyhow::bail!("Unknown order side '{}'. Expected 'buy' or 'sell'.", order.side),
     }

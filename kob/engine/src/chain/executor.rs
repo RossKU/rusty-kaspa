@@ -22,6 +22,11 @@ use crate::matcher::scanner::{
     PerpDeploySide, LendingOrderType, PredictionItemType,
     BUY_RS_SIZE, SELL_RS_SIZE, BRACKET_RS_SIZE,
 };
+use kob_core::contract::spot::bracket::BRACKET_V18_RS_SIZE;
+use kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE;
+use kob_core::contract::spot::order::{
+    BUY_ORDER_V18_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
+};
 
 // CovenantCache / SpentTracker / fetch_wallet_utxos / check_mass_presubmit
 // moved to `kob-settle` (Phase 1 extraction, see kob/x402/X402_STATUS.md) —
@@ -303,9 +308,14 @@ fn planned_output_plurality(out: &crate::matcher::batch::PlannedOutput) -> u64 {
     const UTXO_UNIT_SIZE: usize = 100;
     const COVENANT_HASH_SIZE: usize = 32;
 
+    // v18: RingDelivery and MatcherSkim are token outputs (covenant-bound);
+    // BuyResidual is plain KAS under the buy's P2SH (NO covenant binding).
     let has_covenant = matches!(
         out.purpose,
-        OutputPurpose::BuyerTokens | OutputPurpose::SellRemainder
+        OutputPurpose::BuyerTokens
+            | OutputPurpose::SellRemainder
+            | OutputPurpose::RingDelivery
+            | OutputPurpose::MatcherSkim
     );
     let total = UTXO_CONST_STORAGE
         + out.script_public_key.len()
@@ -419,21 +429,30 @@ pub(crate) fn pair_to_batch_orders(
     let sell_rs = hex::decode(&pair.sell.redeem_script_hex).unwrap_or_default();
     let buy_rs = hex::decode(&pair.buy.redeem_script_hex).unwrap_or_default();
 
-    // sell RS: v14=416, OCO=333; buy RS: v14=396, v16=476
-    if sell_rs.len() != SELL_RS_SIZE && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE {
-        warn!("[{}] Unsupported sell RS size {}, skipping (v14={}, oco={})", label, sell_rs.len(), SELL_RS_SIZE, kob_core::OCO_SELL_RS_SIZE);
+    // sell RS: v14=416, OCO=333, v18=477, OCO-v18=359; buy RS: v14=396, v16=476, v17, v18
+    if sell_rs.len() != SELL_RS_SIZE
+        && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE
+        && sell_rs.len() != SELL_ORDER_V18_RS_EXPECTED_LEN
+        && sell_rs.len() != OCO_SELL_V18_RS_SIZE
+    {
+        warn!("[{}] Unsupported sell RS size {}, skipping (v14={}, oco={}, v18={}, oco18={})",
+            label, sell_rs.len(), SELL_RS_SIZE, kob_core::OCO_SELL_RS_SIZE,
+            SELL_ORDER_V18_RS_EXPECTED_LEN, OCO_SELL_V18_RS_SIZE);
         return None;
     }
     if buy_rs.len() != BUY_RS_SIZE
         && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
         && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
+        && buy_rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN
         && buy_rs.len() != BRACKET_RS_SIZE
+        && buy_rs.len() != BRACKET_V18_RS_SIZE
     {
-        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v16={}, v17={}, bracket={})",
+        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v16={}, v17={}, v18={}, bracket={}, bracket18={})",
             label, buy_rs.len(), BUY_RS_SIZE,
             kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN,
             kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN,
-            BRACKET_RS_SIZE);
+            BUY_ORDER_V18_RS_EXPECTED_LEN,
+            BRACKET_RS_SIZE, BRACKET_V18_RS_SIZE);
         return None;
     }
 
@@ -452,10 +471,20 @@ pub(crate) fn pair_to_batch_orders(
         }
     };
 
+    // Sell version: RS length is the canonical generation discriminator.
+    // v18 sells AND v18 OCO sells report 18 (the v18 planners accept both);
+    // everything pre-v18 keeps the legacy label 14.
+    let sell_version = if sell_rs.len() == SELL_ORDER_V18_RS_EXPECTED_LEN
+        || sell_rs.len() == OCO_SELL_V18_RS_SIZE
+    {
+        18u8
+    } else {
+        14u8
+    };
     let sell_order = crate::matcher::batch::BatchOrder {
         outpoint: (pair.sell.tx_id.clone(), pair.sell.index),
         order_type: crate::matcher::batch::OrderType::Sell,
-        version: 14,
+        version: sell_version,
         token_cov_id: token_bytes,
         price_num: pair.sell.price_num,
         price_den: pair.sell.price_den,
@@ -469,7 +498,9 @@ pub(crate) fn pair_to_batch_orders(
         bracket_meta: None,
     };
 
-    let buy_version = if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
+    let buy_version = if buy_rs.len() == BUY_ORDER_V18_RS_EXPECTED_LEN {
+        18u8
+    } else if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
         17u8
     } else if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
         // NOTE: v16 (F6-fix buy contract) and bracket entries both report
@@ -480,12 +511,17 @@ pub(crate) fn pair_to_batch_orders(
         // BUY_ORDER_V16_RS_EXPECTED_LEN), not this field. See
         // V16_STATUS.md Phase 0 for the full collision writeup.
         16u8
-    } else if buy_rs.len() == BRACKET_RS_SIZE {
+    } else if buy_rs.len() == BRACKET_RS_SIZE || buy_rs.len() == BRACKET_V18_RS_SIZE {
+        // Bracket entries (v1 365B and v18 372B) keep the legacy 16 label:
+        // brackets are NOT fillable by the batch planners (their fill needs a
+        // receipt input + OCO spawn, wired by the CLI `bracket fill` path),
+        // and labeling a v18 bracket 18 would mis-dispatch it into
+        // `plan_batch_match_v18` (which expects a 1670B v18 buy RS).
         16u8
     } else {
         14u8
     };
-    let bracket_meta = if buy_version == 16 {
+    let bracket_meta = if buy_rs.len() == BRACKET_RS_SIZE || buy_rs.len() == BRACKET_V18_RS_SIZE {
         extract_bracket_meta(&buy_rs)
     } else {
         None
@@ -532,10 +568,15 @@ pub(crate) fn book_order_to_batch_order(
 
     let rs = hex::decode(&order.redeem_script_hex).unwrap_or_default();
 
-    // RS sizes: sell v14=416, OCO=333; buy v14=396, v16=476, bracket=365
+    // RS sizes: sell v14=416, OCO=333, v18=477, OCO-v18=359;
+    //           buy v14=396, v16=476, v17, v18, bracket=365, bracket-v18=372
     match order.side {
         crate::matcher::order_book::OrderSide::Sell => {
-            if rs.len() != SELL_RS_SIZE && rs.len() != kob_core::OCO_SELL_RS_SIZE {
+            if rs.len() != SELL_RS_SIZE
+                && rs.len() != kob_core::OCO_SELL_RS_SIZE
+                && rs.len() != SELL_ORDER_V18_RS_EXPECTED_LEN
+                && rs.len() != OCO_SELL_V18_RS_SIZE
+            {
                 warn!("[{}] Unsupported sell RS size {} for {}", label, rs.len(), order.outpoint_key());
                 return None;
             }
@@ -544,7 +585,9 @@ pub(crate) fn book_order_to_batch_order(
             if rs.len() != BUY_RS_SIZE
                 && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
                 && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
+                && rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN
                 && rs.len() != BRACKET_RS_SIZE
+                && rs.len() != BRACKET_V18_RS_SIZE
             {
                 warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
                 return None;
@@ -565,18 +608,24 @@ pub(crate) fn book_order_to_batch_order(
         crate::matcher::order_book::OrderSide::Sell => crate::matcher::batch::OrderType::Sell,
     };
 
-    let version = if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
+    let version = if rs.len() == BUY_ORDER_V18_RS_EXPECTED_LEN
+        || rs.len() == SELL_ORDER_V18_RS_EXPECTED_LEN
+        || rs.len() == OCO_SELL_V18_RS_SIZE
+    {
+        18u8
+    } else if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
         17u8
     } else if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
         // See buy_version comment above: v16-buy and bracket share the
         // numeric label 16, disambiguated downstream by RS length.
         16u8
-    } else if rs.len() == BRACKET_RS_SIZE {
+    } else if rs.len() == BRACKET_RS_SIZE || rs.len() == BRACKET_V18_RS_SIZE {
+        // v18 brackets keep the 16 label too — see pair_to_batch_orders.
         16u8
     } else {
         14u8
     };
-    let bracket_meta = if version == 16 {
+    let bracket_meta = if rs.len() == BRACKET_RS_SIZE || rs.len() == BRACKET_V18_RS_SIZE {
         extract_bracket_meta(&rs)
     } else {
         None
@@ -612,7 +661,9 @@ pub(crate) fn book_order_to_batch_order(
 ///   [0x08][min_receipt_val 8B]   = bytes 116..125
 ///   [0x20][receipt_cov_id 32B]   = bytes 125..158
 fn extract_bracket_meta(rs: &[u8]) -> Option<crate::matcher::batch::BracketMeta> {
-    if rs.len() != BRACKET_RS_SIZE {
+    // v1 (365B) and v18 (372B) brackets share the identical 224B state
+    // layout — only the body differs — so one extractor serves both.
+    if rs.len() != BRACKET_RS_SIZE && rs.len() != BRACKET_V18_RS_SIZE {
         return None;
     }
 
@@ -1598,6 +1649,265 @@ pub async fn execute_swap_fill(
     })
 }
 
+/// Build the sighash TX + RPC inputs/outputs for a v18 ring settle from a
+/// `RingPlan`. Pure (no RPC, no signing) — the caller signs the wallet fee
+/// input (last input) and appends its RPC input afterwards. Factored out of
+/// `execute_ring_fill` so tests can pin the covenant-binding topology
+/// (delivery AND skim outputs both carry the GIVER leg's token covenant,
+/// authorized by that leg's input) without a node.
+///
+/// Returns `(sighash_tx, rpc_inputs_covenant_only, rpc_outputs)`.
+pub(crate) fn build_ring_fill_tx(
+    plan: &crate::matcher::batch::RingPlan,
+) -> Result<(kob_core::tx::Transaction, Vec<serde_json::Value>, Vec<serde_json::Value>), String> {
+    let batch_tx = plan.build_tx().map_err(|e| e.to_string())?;
+    let n = plan.legs.len();
+    let (ref wallet_tx_id, wallet_index, wallet_value) = *plan
+        .wallet_input
+        .as_ref()
+        .ok_or_else(|| "ring fill requires a wallet fee input".to_string())?;
+
+    let mut sighash_tx = kob_core::tx::Transaction::new(1);
+    sighash_tx.lock_time = 50;
+
+    // Ring leg inputs: covenant spends, CSV(50) exposure gate, sigOp=0.
+    for (leg, _idx) in &plan.legs {
+        let p2sh = kob_core::build_p2sh(&leg.redeem_script);
+        sighash_tx.inputs.push(kob_core::tx::TxInput {
+            prev_tx_id: leg.outpoint.0.clone(),
+            prev_index: leg.outpoint.1,
+            sequence: 50,
+            sig_op_count: 0,
+            script_version: p2sh.version,
+            script_bytes: p2sh.script().to_vec(),
+            value: leg.utxo_value,
+        });
+    }
+    // Wallet fee input (P2PK) — placeholder SPK bytes are supplied by the
+    // caller via plan-independent context; here we only need value/outpoint
+    // for the sighash structure, and the caller fills script fields before
+    // signing. To keep this helper self-contained we carry the SPK inside
+    // the RingLegOrder-free wallet slot: the caller MUST overwrite
+    // script_version/script_bytes before computing the sighash.
+    sighash_tx.inputs.push(kob_core::tx::TxInput {
+        prev_tx_id: wallet_tx_id.clone(),
+        prev_index: wallet_index,
+        sequence: 0,
+        sig_op_count: 1,
+        script_version: 0,
+        script_bytes: Vec::new(),
+        value: wallet_value,
+    });
+
+    // Outputs: every output named in output_auth_input (deliveries at slots
+    // 0..n-1 = each giver leg's auth slot 0, skims after) carries the GIVER
+    // leg's source-token covenant; WalletChange is plain KAS.
+    let mut rpc_outputs = Vec::with_capacity(batch_tx.outputs.len());
+    for (i, out) in batch_tx.outputs.iter().enumerate() {
+        let spk_hex = hex::encode(&out.script_public_key);
+        if let Some(&auth) = plan.output_auth_input.get(&i) {
+            let token = plan
+                .leg_source_tokens
+                .get(auth as usize)
+                .ok_or_else(|| format!("output {} authorized by unknown leg {}", i, auth))?;
+            let token_hex = hex::encode(token);
+            rpc_outputs.push(deploy::build_rpc_output_with_covenant(
+                out.value, out.spk_version, &spk_hex, auth, &token_hex,
+            ));
+            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                out.value,
+                out.spk_version,
+                out.script_public_key.clone(),
+                Some(kob_core::tx::CovenantBinding::new(
+                    auth,
+                    kob_core::compat::parse_hash(&token_hex)
+                        .map_err(|e| format!("bad token hash: {e:?}"))?,
+                )),
+            ));
+        } else {
+            rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
+            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                out.value,
+                out.spk_version,
+                out.script_public_key.clone(),
+                None,
+            ));
+        }
+    }
+
+    // RPC inputs: covenant legs only (sequence=50); wallet appended by the
+    // caller after signing.
+    let mut rpc_inputs = Vec::with_capacity(n);
+    for inp in batch_tx.inputs.iter().take(n) {
+        rpc_inputs.push(deploy::build_rpc_input_with_sequence(
+            &inp.tx_id,
+            inp.index,
+            &hex::encode(&inp.sigscript),
+            0,
+            50,
+        ));
+    }
+
+    Ok((sighash_tx, rpc_inputs, rpc_outputs))
+}
+
+/// Execute a v18 ring settle (item F): 2-cycle token<->token or 3-cycle
+/// triangle of v18 swap legs, all-or-nothing, planned by `plan_ring_match`.
+///
+/// Replaces the KAS-bridged `execute_swap_fill` route for v18 swaps: the
+/// legs settle token->token directly (leg i's source tokens deliver to leg
+/// (i+n-1)%n's owner; the per-leg matcher skim is F4-capped), with the miner
+/// fee paid by the matcher's wallet input.
+pub async fn execute_ring_fill(
+    rpc: &RpcClient,
+    legs: &[crate::matcher::batch::RingLegOrder],
+    wallet_utxo: Option<(String, u32, u64)>,
+    wallet_spk: &[u8],
+    wallet_spk_version: u16,
+    config: &AppConfig,
+    spent_tracker: &mut SpentTracker,
+) -> Option<BatchMatchResult> {
+    let keys: Vec<String> = legs
+        .iter()
+        .map(|l| format!("{}:{}", l.outpoint.0, l.outpoint.1))
+        .collect();
+
+    let wallet = match wallet_utxo {
+        Some(w) => w,
+        None => {
+            warn!("[RING-FILL] No wallet UTXO (deferred)");
+            for k in &keys { spent_tracker.mark_transient(k); }
+            return None;
+        }
+    };
+
+    // Plan (re-validates every leg RS + F2/F3/F4 feasibility exactly).
+    let plan = match crate::matcher::batch::plan_ring_match(
+        legs, Some(wallet.clone()), wallet_spk, wallet_spk_version,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("[RING-FILL] Ring plan failed: {}", e);
+            for k in &keys { spent_tracker.mark_failed(k); }
+            return None;
+        }
+    };
+    if let Err(e) = plan.validate() {
+        warn!("[RING-FILL] Ring plan validation failed: {}", e);
+        for k in &keys { spent_tracker.mark_failed(k); }
+        return None;
+    }
+
+    let (mut sighash_tx, mut rpc_inputs, rpc_outputs) = match build_ring_fill_tx(&plan) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("[RING-FILL] TX build failed: {}", e);
+            for k in &keys { spent_tracker.mark_failed(k); }
+            return None;
+        }
+    };
+    // Fill in the wallet input's SPK (build_ring_fill_tx leaves it blank).
+    let wallet_input_idx = legs.len();
+    sighash_tx.inputs[wallet_input_idx].script_version = wallet_spk_version;
+    sighash_tx.inputs[wallet_input_idx].script_bytes = wallet_spk.to_vec();
+
+    // Mass pre-check: leg inputs and wallet are p=1; token outputs
+    // (deliveries + skims) carry a covenant (bigger plurality), change none.
+    let in_cells: Vec<(u64, u64)> = legs
+        .iter()
+        .map(|l| (l.utxo_value, 1u64))
+        .chain(std::iter::once((wallet.2, 1u64)))
+        .collect();
+    let out_cells: Vec<(u64, u64)> = plan
+        .outputs
+        .iter()
+        .map(|o| (o.value, planned_output_plurality(o)))
+        .collect();
+    if check_mass_presubmit(&in_cells, &out_cells, "RING-FILL").is_none() {
+        for k in &keys { spent_tracker.mark_failed(k); }
+        return None;
+    }
+
+    // Sign the wallet fee input (last input).
+    let mut privkey = config.private_key_bytes();
+    let sighash = match kob_core::compute_sighash(&sighash_tx, wallet_input_idx) {
+        Ok(sh) => sh,
+        Err(e) => {
+            privkey.zeroize();
+            error!("[RING-FILL] Sighash failed: {}", e);
+            for k in &keys { spent_tracker.mark_failed(k); }
+            return None;
+        }
+    };
+    let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
+        Ok(s) => s,
+        Err(e) => {
+            privkey.zeroize();
+            error!("[RING-FILL] Signing failed: {}", e);
+            for k in &keys { spent_tracker.mark_failed(k); }
+            return None;
+        }
+    };
+    privkey.zeroize();
+    let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
+    rpc_inputs.push(deploy::build_rpc_input(&wallet.0, wallet.1, &hex::encode(&wallet_ss), 1));
+
+    info!("======================================================================");
+    info!("EXECUTING v18 RING SETTLE: {} legs (all-or-nothing)", legs.len());
+    info!("======================================================================");
+    for (i, leg) in legs.iter().enumerate() {
+        info!(
+            "  leg[{}]={}:{} (tokens={})",
+            i, &leg.outpoint.0[..16.min(leg.outpoint.0.len())], leg.outpoint.1, leg.utxo_value,
+        );
+    }
+    info!("  fee={} matcher_skim={}", plan.total_fee, plan.matcher_surplus);
+
+    // Submit (version 1 for covenant bindings, lockTime 50 for the CSV gate).
+    let payload = deploy::build_submit_payload_with_lock_time(1, rpc_inputs, rpc_outputs, 50);
+    let mark = |tracker: &mut SpentTracker, transient: bool, keys: &[String]| {
+        for k in keys {
+            if transient { tracker.mark_transient(k); } else { tracker.mark_failed(k); }
+        }
+    };
+    let result = match rpc.submit_transaction(payload).await {
+        Ok(r) => r,
+        Err(e) => {
+            let err_str = e.to_string();
+            let is_transient = err_str.contains("sequence locks");
+            if is_transient {
+                warn!("[RING-FILL] CSV not yet mature (transient): {}", err_str);
+            } else {
+                error!("[RING-FILL] Submit failed: {}", err_str);
+            }
+            mark(spent_tracker, is_transient, &keys);
+            return None;
+        }
+    };
+    if !result.ok {
+        let err_str = result.error.clone().unwrap_or_else(|| "unknown".to_string());
+        let is_transient = err_str.contains("sequence locks");
+        if is_transient {
+            warn!("[RING-FILL] CSV not yet mature (TX rejected, transient): {}", err_str);
+        } else {
+            error!("[RING-FILL] TX rejected: {}", err_str);
+        }
+        mark(spent_tracker, is_transient, &keys);
+        return None;
+    }
+
+    let tx_id = result.tx_id.unwrap_or_default();
+    info!("[RING-FILL] SUCCESS! TXID: {}", tx_id);
+
+    Some(BatchMatchResult {
+        tx_id,
+        sell_count: legs.len(),
+        buy_count: 0,
+        total_seller_kas: 0,
+        matcher_surplus: plan.matcher_surplus,
+    })
+}
+
 // L1 Block Scanning — Order Discovery
 
 /// Process a batch of transactions from a block notification.
@@ -2462,6 +2772,52 @@ fn process_block_txs_all(
                     counters.swap_added += 1;
                 }
             }
+            ScanResult::SwapV18(parsed, p2sh_idx, p2sh_value) => {
+                // v18 swap (260B RS): ring-eligible leg. Same SwapEntry shape
+                // as v1 — the RS length in redeem_script_hex is the generation
+                // discriminator (find_v18_rings filters on it; mmfee_bps is
+                // re-parsed from the RS at plan time).
+                let outpoint_key = format!("{}:{}", tx.tx_id, p2sh_idx);
+                if let Some(ref mut sb) = swap_book {
+                    if sb.contains(&outpoint_key) {
+                        continue; // dedup
+                    }
+                    let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
+                    let owner_spk = crate::matcher::scanner::extract_owner_spk(tx, &parsed.owner_spk_hash);
+                    if owner_spk.is_none() {
+                        debug!(
+                            "[SWAP-V18] owner_spk not found in deploy TX for {}:{} — ring fill will be deferred",
+                            &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                        );
+                    }
+                    let entry = crate::matcher::swap_book::SwapEntry {
+                        tx_id: tx.tx_id.clone(),
+                        index: p2sh_idx,
+                        value: p2sh_value,
+                        source_cov_id: hex::encode(parsed.source_token_cov_id),
+                        target_cov_id: hex::encode(parsed.target_token_cov_id),
+                        min_target_amount: parsed.min_target_amount,
+                        owner_hash: hex::encode(parsed.owner_hash),
+                        owner_spk_hash: hex::encode(parsed.owner_spk_hash),
+                        receipt_cov_id: hex::encode(parsed.receipt_cov_id),
+                        redeem_script_hex: hex::encode(&parsed.redeem_script),
+                        p2sh_script_hex: hex::encode(&p2sh_spk.script()),
+                        p2sh_version: p2sh_spk.version,
+                        discovered_daa: current_daa,
+                        owner_spk,
+                    };
+                    info!(
+                        "[SCANNER-ALL] Discovered v18 swap order: {} source={} target={} min_ta={} mmfee_bps={}",
+                        &outpoint_key[..outpoint_key.len().min(20)],
+                        &entry.source_cov_id[..entry.source_cov_id.len().min(12)],
+                        &entry.target_cov_id[..entry.target_cov_id.len().min(12)],
+                        parsed.min_target_amount,
+                        parsed.mmfee_bps,
+                    );
+                    sb.add(entry);
+                    counters.swap_added += 1;
+                }
+            }
         }
     }
 
@@ -3192,6 +3548,10 @@ async fn run_scan_cycle(
             let swap_groups = matching::match_swap_routes(
                 order_book, &swab, Some(&swap_spent_keys), &std::collections::HashSet::new(),
             );
+            // v18 rings settle token->token directly (2-cycle / triangle),
+            // WITHOUT the KAS-bridged buy/sell counterparties the v1 route
+            // needs — detected purely from the swap book.
+            let v18_rings = matching::find_v18_rings(&swab, Some(&swap_spent_keys));
             drop(swab);
 
             if !swap_groups.is_empty() {
@@ -3363,6 +3723,102 @@ async fn run_scan_cycle(
                     }
                 }
             }
+
+            // --- v18 ring settles (item F) ---
+            if !v18_rings.is_empty() {
+                info!("[SCAN] Found {} v18 swap ring(s)", v18_rings.len());
+            }
+            for ring in &v18_rings {
+                // Skip rings touching outpoints consumed earlier this cycle.
+                if ring.iter().any(|e| spent_tracker.is_spent(&e.outpoint_key())) {
+                    continue;
+                }
+
+                // SwapEntry -> RingLegOrder (owner_spk presence is guaranteed
+                // by find_v18_rings; decode defensively anyway).
+                let mut leg_orders: Vec<crate::matcher::batch::RingLegOrder> = Vec::new();
+                let mut convert_ok = true;
+                for e in ring {
+                    let rs = match hex::decode(&e.redeem_script_hex) {
+                        Ok(v) if !v.is_empty() => v,
+                        _ => { convert_ok = false; break; }
+                    };
+                    let owner_spk_raw = match e.owner_spk.as_ref().map(hex::decode) {
+                        Some(Ok(v)) if v.len() > 2 => v,
+                        _ => { convert_ok = false; break; }
+                    };
+                    leg_orders.push(crate::matcher::batch::RingLegOrder {
+                        outpoint: (e.tx_id.clone(), e.index),
+                        redeem_script: rs,
+                        utxo_value: e.value,
+                        owner_spk: owner_spk_raw[2..].to_vec(),
+                        owner_spk_version: u16::from_le_bytes([owner_spk_raw[0], owner_spk_raw[1]]),
+                    });
+                }
+                if !convert_ok {
+                    for e in ring {
+                        spent_tracker.mark_failed(&e.outpoint_key());
+                    }
+                    continue;
+                }
+
+                // Wallet fee UTXO (largest non-token, not already spent).
+                let ring_utxos = match rpc.get_spendable_utxos(&config.address, Some(0)).await {
+                    Ok(u) if !u.is_empty() => u,
+                    Ok(_) => {
+                        warn!("[RING] No wallet UTXOs available, skipping ring");
+                        continue;
+                    }
+                    Err(e) => {
+                        warn!("[RING] Failed to get wallet UTXOs: {}, skipping ring", e);
+                        continue;
+                    }
+                };
+                let (ring_wallet_spk_version, ring_wallet_spk) = ring_utxos[0].parse_spk();
+                let ring_token_p2sh_hex =
+                    hex::encode(kob_core::build_p2sh(kob_core::TOKEN_RS).script());
+                let ring_wallet_utxo = ring_utxos.iter()
+                    .filter(|u| {
+                        let (_, script) = u.parse_spk();
+                        hex::encode(&script) != ring_token_p2sh_hex
+                            && !spent_tracker.is_spent(&u.outpoint_key())
+                    })
+                    .max_by_key(|u| u.utxo_entry.amount)
+                    .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
+
+                match execute_ring_fill(
+                    rpc, &leg_orders, ring_wallet_utxo.clone(),
+                    &ring_wallet_spk, ring_wallet_spk_version, config, spent_tracker,
+                ).await {
+                    Some(ring_result) => {
+                        info!(
+                            "[RING] SUCCESS: tx={} legs={} skim={}",
+                            &ring_result.tx_id[..ring_result.tx_id.len().min(16)],
+                            ring.len(),
+                            ring_result.matcher_surplus,
+                        );
+                        let mut ring_marked: Vec<String> = Vec::new();
+                        for e in ring {
+                            let k = e.outpoint_key();
+                            spent_tracker.mark_spent(&k);
+                            ring_marked.push(k);
+                        }
+                        if let Some(ref wu) = ring_wallet_utxo {
+                            let wk = format!("{}:{}", wu.0, wu.1);
+                            spent_tracker.mark_spent(&wk);
+                            ring_marked.push(wk);
+                        }
+                        if !ring_result.tx_id.is_empty() {
+                            spent_tracker.mark_submitted(&ring_result.tx_id, &ring_marked);
+                        }
+                    }
+                    None => {
+                        // execute_ring_fill already marked the legs
+                        // (transient/failed) before returning.
+                        warn!("[RING] Execution returned no result (see [RING-FILL] log above)");
+                    }
+                }
+            }
         } else {
             drop(swab);
         }
@@ -3517,11 +3973,16 @@ async fn run_scan_cycle(
         // Plan using the appropriate planner based on GroupKind
         let plan_result = match group.kind {
             matching::GroupKind::BuySweep => {
-                // 1 buy (in buys[0]) sweeps N sells. v17 buys use the
-                // dedicated per-sell-output IOC planner (plan_ioc_match's
-                // single merged BuyerTokens output doesn't match what the
-                // v17 contract's per-term OpAuthOutputIdx binding expects).
-                if buys[0].version == 17 {
+                // 1 buy (in buys[0]) sweeps N sells. v17/v18 buys use their
+                // dedicated per-sell-output IOC planners (plan_ioc_match's
+                // single merged BuyerTokens output doesn't match what those
+                // contracts' per-term OpAuthOutputIdx binding expects).
+                if buys[0].version == 18 {
+                    crate::matcher::batch::plan_ioc_match_v18(
+                        &sells, &buys[0], wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else if buys[0].version == 17 {
                     crate::matcher::batch::plan_ioc_match_v17(
                         &sells, &buys[0], wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
@@ -3534,16 +3995,32 @@ async fn run_scan_cycle(
                 }
             }
             matching::GroupKind::SellSweep => {
-                // 1 sell (in sells[0]) sweeps N buys
-                crate::matcher::batch::plan_sell_ioc_match(
-                    &sells[0], &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                )
+                // 1 sell (in sells[0]) sweeps N buys. v18 sells use the
+                // full-absorption parity planner (v18 sweeps are structurally
+                // full-fill-only on the sell side — auth-slot-0 conflict).
+                if sells[0].version == 18 {
+                    crate::matcher::batch::plan_sell_ioc_match_v18(
+                        &sells[0], &buys, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else {
+                    crate::matcher::batch::plan_sell_ioc_match(
+                        &sells[0], &buys, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                }
             }
             matching::GroupKind::PartialBuy => {
-                // 1:1 partial buy: buy IOC sweeps 1 sell (same v17 routing
-                // as BuySweep above -- plan_ioc_match_v17 handles N=1 fine).
-                if buys[0].version == 17 {
+                // 1:1 partial buy. v18 has a REAL partial path (Op2): the
+                // buy spends only part of its KAS and keeps a byte-exact
+                // self-SPK residual UTXO (item C). Pre-v18 buys emulate
+                // partials via their IOC selector.
+                if buys[0].version == 18 {
+                    crate::matcher::batch::plan_partial_match_v18(
+                        &sells, &buys[0], wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else if buys[0].version == 17 {
                     crate::matcher::batch::plan_ioc_match_v17(
                         &sells, &buys[0], wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
@@ -3556,11 +4033,21 @@ async fn run_scan_cycle(
                 }
             }
             matching::GroupKind::PartialSell => {
-                // 1:1 partial sell: sell IOC sweeps 1 buy
-                crate::matcher::batch::plan_sell_ioc_match(
-                    &sells[0], &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                )
+                // 1:1 partial sell: sell IOC sweeps 1 buy. A v18 partial sell
+                // cannot settle against a v18 buy in the same tx (auth-slot-0
+                // conflict) — plan_sell_ioc_match_v18 selects a fully-
+                // absorbing buy instead or reports V18SellResidualUnsupported.
+                if sells[0].version == 18 {
+                    crate::matcher::batch::plan_sell_ioc_match_v18(
+                        &sells[0], &buys, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else {
+                    crate::matcher::batch::plan_sell_ioc_match(
+                        &sells[0], &buys, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                }
             }
             matching::GroupKind::Batch
             | matching::GroupKind::GtcBuyMultiFill
@@ -3603,6 +4090,17 @@ async fn run_scan_cycle(
                 // Marking them failed here was the root cause of the P23
                 // Phase 3 starvation race (see phase3_race_investigation.md).
                 info!("[UNIFIED] OCO remainder not supported (skipping group, no cooldown): {}", e);
+                continue;
+            }
+            Err(ref e) if matches!(e,
+                crate::matcher::batch::BatchError::V18SellResidualUnsupported { .. }
+                | crate::matcher::batch::BatchError::V18CapInfeasible { .. }) => {
+                // Structural v18 pairing issues, not order faults: a v18
+                // partial sell can't compose with a v18 buy in one tx, and
+                // the surplus cap depends on WHICH counterparty is chosen.
+                // The orders may match against different counterparties, so
+                // skip without cooling anything down.
+                info!("[UNIFIED] v18 pairing infeasible (skipping group, no cooldown): {}", e);
                 continue;
             }
             Err(e) => {
@@ -8141,4 +8639,200 @@ mod tests {
         assert!(!ob.contains_outpoint("txA:0"), "A should be removed (added by block_1)");
     }
 
+    // ===================================================================
+    // v18 wiring: version mapping, bracket meta, planner routing, ring TX
+    // ===================================================================
+
+    fn v18_book_order(side: OrderSide, rs: Vec<u8>, value: u64) -> crate::matcher::order_book::BookOrder {
+        crate::matcher::order_book::BookOrder {
+            tx_id: "ab".repeat(32),
+            index: 0,
+            value,
+            token_cov_id: "cd".repeat(32),
+            price_num: 1,
+            price_den: 2,
+            min_fill: 1_000_000,
+            owner_hash: "ee".repeat(32),
+            spk_hash: "ff".repeat(32),
+            counterparty_spk: Some(hex::encode(vec![0xAA; 34])),
+            redeem_script_hex: hex::encode(&rs),
+            p2sh_script_hex: hex::encode(kob_core::build_p2sh(&rs).script()),
+            p2sh_version: 0,
+            side,
+            post_only: false,
+            expiry_daa: None,
+            is_freezable: false,
+            max_matcher_fee: 0,
+            ifd_order_b_rs_hex: None,
+            oco_path: None,
+            oco_partner_key: None,
+            discovered_daa: 0,
+        }
+    }
+
+    #[test]
+    fn book_order_to_batch_order_maps_v18_buy_to_version_18() {
+        let token = [0xCD; 32];
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &token, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 30, 0, 0,
+        ).unwrap();
+        assert_eq!(rs.len(), BUY_ORDER_V18_RS_EXPECTED_LEN);
+        let bo = v18_book_order(OrderSide::Buy, rs, 15_000_000);
+        let batch = book_order_to_batch_order(&bo, "TEST").expect("v18 buy must convert");
+        assert_eq!(batch.version, 18, "v18 buy RS must map to version 18 (planner dispatch key)");
+        assert!(batch.bracket_meta.is_none());
+    }
+
+    #[test]
+    fn book_order_to_batch_order_maps_v18_sell_and_oco_to_version_18() {
+        let sell_rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 30, 0, 0,
+        ).unwrap();
+        assert_eq!(sell_rs.len(), SELL_ORDER_V18_RS_EXPECTED_LEN);
+        let bo = v18_book_order(OrderSide::Sell, sell_rs, 30_000_000);
+        let batch = book_order_to_batch_order(&bo, "TEST").expect("v18 sell must convert");
+        assert_eq!(batch.version, 18);
+
+        let oco_rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+            2, 1, 1_000_000, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 30, 0, 0,
+        ).unwrap();
+        assert_eq!(oco_rs.len(), OCO_SELL_V18_RS_SIZE);
+        let mut bo = v18_book_order(OrderSide::Sell, oco_rs, 30_000_000);
+        bo.oco_path = Some(kob_core::OcoPath::StopLoss);
+        let batch = book_order_to_batch_order(&bo, "TEST").expect("v18 OCO must convert");
+        assert_eq!(batch.version, 18, "v18 OCO sells are sweep-eligible under the v18 planners");
+        assert_eq!(batch.oco_path, Some(kob_core::OcoPath::StopLoss));
+    }
+
+    #[test]
+    fn extract_bracket_meta_v18_arm_matches_v1_offsets() {
+        // Same state args through both builders -> identical BracketMeta
+        // (the 372B v18 bracket keeps the v1 224B state layout byte-exact).
+        let token = [0x11; 32];
+        let mut oco_spk = [0u8; 37];
+        oco_spk[0..2].copy_from_slice(&0u16.to_le_bytes());
+        oco_spk[2] = 0xaa;
+        let rcid = [0x22; 32];
+        let tsh = [0x33; 32];
+        let ohash = [0x44; 32];
+        let v1 = kob_core::contract::spot::bracket::build_bracket_redeem_script(
+            0, &token, 1, 2, &oco_spk, 5_000_000, 1_000_000, 700, &rcid, &tsh, &ohash,
+        ).unwrap();
+        let v18 = kob_core::contract::spot::bracket::build_bracket_v18_redeem_script(
+            0, &token, 1, 2, &oco_spk, 5_000_000, 1_000_000, 700, &rcid, &tsh, &ohash,
+        ).unwrap();
+        assert_eq!(v1.len(), BRACKET_RS_SIZE);
+        assert_eq!(v18.len(), BRACKET_V18_RS_SIZE);
+        let m1 = extract_bracket_meta(&v1).expect("v1 meta");
+        let m18 = extract_bracket_meta(&v18).expect("v18 meta");
+        assert_eq!(m1.receipt_cov_id, m18.receipt_cov_id);
+        assert_eq!(m1.min_receipt_val, m18.min_receipt_val);
+        assert_eq!(m1.oco_spk, m18.oco_spk);
+        assert_eq!(m1.oco_spk_version, m18.oco_spk_version);
+        assert_eq!(m1.oco_min_val, m18.oco_min_val);
+        assert_eq!(m1.entry_type, m18.entry_type);
+        assert_eq!(m18.min_receipt_val, 700);
+        assert_eq!(m18.oco_min_val, 5_000_000);
+    }
+
+    #[test]
+    fn v18_book_orders_route_through_v18_ioc_planner() {
+        // The BuySweep dispatch keys off `buys[0].version == 18` ->
+        // plan_ioc_match_v18. Prove the converted orders actually plan
+        // (i.e. the dispatch precondition set up by
+        // book_order_to_batch_order is sufficient for the v18 planner).
+        let token = [0xCD; 32];
+        let buy_rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &token, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 2000, 0, 0,
+        ).unwrap();
+        let sell_rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 30, 0, 0,
+        ).unwrap();
+        let buy = book_order_to_batch_order(
+            &v18_book_order(OrderSide::Buy, buy_rs, 16_000_000), "TEST",
+        ).unwrap();
+        let mut sell_bo = v18_book_order(OrderSide::Sell, sell_rs, 30_000_000);
+        sell_bo.tx_id = "12".repeat(32);
+        let sell = book_order_to_batch_order(&sell_bo, "TEST").unwrap();
+        assert_eq!(buy.version, 18);
+        assert_eq!(sell.version, 18);
+        let plan = crate::matcher::batch::plan_ioc_match_v18(
+            &[sell], &buy, Some(("77".repeat(32), 0, 10_000_000)),
+            &vec![0xBB; 34], 0, Some(30),
+        ).expect("v18 IOC plan from engine-converted orders");
+        assert_eq!(plan.sells.len(), 1);
+        assert!(plan.build_tx().is_ok(), "v18 sigscripts must build");
+    }
+
+    #[test]
+    fn build_ring_fill_tx_binds_deliveries_and_skims_to_giver_legs() {
+        // 2-cycle ring with a nonzero matcher skim: every token output
+        // (delivery AND skim) must carry the GIVER leg's covenant binding;
+        // covenant inputs are CSV(50); wallet is last; lock_time is 50.
+        let owner_spk = |seed: u8| -> Vec<u8> {
+            let mut s = vec![0x20u8];
+            s.extend_from_slice(&[seed; 32]);
+            s.push(0xac);
+            s
+        };
+        let make_leg = |id: u8, src: [u8; 32], tgt: [u8; 32], amount: u64, seed: u8| {
+            let spk = owner_spk(seed);
+            let spk_hash = kob_core::p2sh::compute_spk_hash(0, &spk);
+            // 1000 bps cap so the per-leg skim (amount/10000*bps) clears
+            // MIN_UTXO_VALUE and is emitted as its own token output.
+            let rs = kob_core::contract::spot::swap::build_swap_v18_redeem_script(
+                &src, &tgt, 1_000_000, &[0xBB; 32], &spk_hash, &[0xEE; 32], 1000,
+            ).unwrap();
+            crate::matcher::batch::RingLegOrder {
+                outpoint: (hex::encode([id; 32]), 0),
+                redeem_script: rs,
+                utxo_value: amount,
+                owner_spk: spk,
+                owner_spk_version: 0,
+            }
+        };
+        let tok_a = [0xA1; 32];
+        let tok_b = [0xB2; 32];
+        let legs = vec![
+            make_leg(0x01, tok_a, tok_b, 50_000_000, 0x71),
+            make_leg(0x02, tok_b, tok_a, 60_000_000, 0x72),
+        ];
+        let plan = crate::matcher::batch::plan_ring_match(
+            &legs, Some(("99".repeat(32), 1, 5_000_000)), &vec![0xCC; 34], 0,
+        ).expect("ring plan");
+        assert!(plan.matcher_surplus > 0, "cap-100bps legs must yield a skim");
+
+        let (sighash_tx, rpc_inputs, rpc_outputs) = build_ring_fill_tx(&plan).expect("ring tx");
+
+        // TX framing.
+        assert_eq!(sighash_tx.version, 1);
+        assert_eq!(sighash_tx.lock_time, 50);
+        assert_eq!(sighash_tx.inputs.len(), 3, "2 legs + wallet");
+        for i in 0..2 {
+            assert_eq!(sighash_tx.inputs[i].sequence, 50, "leg inputs are CSV(50)");
+            assert_eq!(sighash_tx.inputs[i].sig_op_count, 0);
+        }
+        assert_eq!(sighash_tx.inputs[2].sequence, 0, "wallet last, no CSV");
+        assert_eq!(sighash_tx.inputs[2].sig_op_count, 1);
+        assert_eq!(rpc_inputs.len(), 2, "wallet RPC input appended after signing");
+
+        // Every auth-mapped output carries the giver leg's token covenant.
+        let mut bound = 0;
+        for (i, out) in sighash_tx.outputs.iter().enumerate() {
+            match plan.output_auth_input.get(&i) {
+                Some(&auth) => {
+                    let cov = out.covenant.as_ref().expect("token output must be covenant-bound");
+                    assert_eq!(cov.authorizing_input, auth);
+                    let expected = hex::encode(plan.leg_source_tokens[auth as usize]);
+                    assert_eq!(rpc_outputs[i]["covenant"]["covenantId"].as_str().unwrap(), expected);
+                    bound += 1;
+                }
+                None => {
+                    assert!(out.covenant.is_none(), "change output must be plain KAS");
+                    assert!(rpc_outputs[i].get("covenant").is_none());
+                }
+            }
+        }
+        assert!(bound >= 3, "2 deliveries + at least 1 skim must be covenant-bound (got {})", bound);
+    }
 }

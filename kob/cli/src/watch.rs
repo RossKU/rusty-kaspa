@@ -170,9 +170,25 @@ pub fn detect_fill_from_sigscript(sigscript: &[u8]) -> Option<(String, u64, u64,
             return None;
         }
         Some(off)
+    } else if len == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN {
+        // V18 buy (unified spot). Body is generated programmatically.
+        let v18_body = kob_core::contract::spot::order::build_buy_v18_body();
+        let off = len - v18_body.len();
+        if last_push[off..] != v18_body[..] {
+            return None;
+        }
+        Some(off)
     } else if len == SELL_RS_SIZE {
         let off = len - kob_core::SELL_ORDER_BODY.len();
         if last_push[off..] != *kob_core::SELL_ORDER_BODY {
+            return None;
+        }
+        Some(off)
+    } else if len == kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN {
+        // V18 sell (canonical price attestation).
+        let v18_body = kob_core::contract::spot::order::build_sell_v18_body();
+        let off = len - v18_body.len();
+        if last_push[off..] != v18_body[..] {
             return None;
         }
         Some(off)
@@ -874,6 +890,44 @@ mod tests {
     fn detect_fill_no_match() {
         // Random sigscript that doesn't contain a v12 RS
         let ss = vec![0x03, 0xaa, 0xbb, 0xcc, 0x51, 0x02, 0x11, 0x22];
+        assert!(detect_fill_from_sigscript(&ss).is_none());
+    }
+
+    #[test]
+    fn detect_buy_fill_v18() {
+        let tcid = [0x42; 32];
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &tcid, 41, 152, 1_000_000, &[0u8; 32], &[0u8; 32], 30, 0, 0,
+        ).unwrap();
+        assert_eq!(rs.len(), kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN);
+        let ss = make_fill_sigscript(&rs, &[&[0x01], &[0x02], &[0x00], &[0x03]]);
+        let (token, pnum, pden, side) = detect_fill_from_sigscript(&ss).unwrap();
+        assert_eq!(token, hex::encode(tcid));
+        assert_eq!(pnum, 41);
+        assert_eq!(pden, 152);
+        assert_eq!(side, FillSide::Buy);
+    }
+
+    #[test]
+    fn detect_sell_fill_v18() {
+        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            7, 9, 1_000_000, &[0u8; 32], &[0u8; 32], 30, 0, 0,
+        ).unwrap();
+        assert_eq!(rs.len(), kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN);
+        let ss = make_fill_sigscript(&rs, &[&[0x00]]);
+        let (_, pnum, pden, side) = detect_fill_from_sigscript(&ss).unwrap();
+        assert_eq!(pnum, 7);
+        assert_eq!(pden, 9);
+        assert_eq!(side, FillSide::Sell);
+    }
+
+    #[test]
+    fn detect_fill_v18_fake_body_rejected() {
+        // Right v18 buy length, wrong body bytes: must be rejected.
+        let len = kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN;
+        let mut rs = vec![0xFFu8; len];
+        rs[0] = 0x20; // plausible state prefix
+        let ss = make_fill_sigscript(&rs, &[&[0x01]]);
         assert!(detect_fill_from_sigscript(&ss).is_none());
     }
 

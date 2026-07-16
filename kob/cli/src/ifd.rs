@@ -200,15 +200,17 @@ pub async fn deploy_ifd(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
-    // Step 1: Build Order B (sell) RS first — need its P2SH for Order A's bspkh
-    println!("Building IFD order pair...");
-    let order_b_rs = contract::build_sell_redeem_script(
+    // Step 1: Build Order B (sell) RS first — need its P2SH for Order A's bspkh.
+    // Both legs are v18 (V18_DESIGN.md "IFD / IFO — MANDATORY"): the done-leg
+    // sell is automatically sweep/batch-eligible under the v18 planners.
+    println!("Building IFD order pair (v18)...");
+    let order_b_rs = contract::spot::order::build_sell_v18_redeem_script(
         sell_price_num,
         sell_price_den,
         sell_min_fill,
         &owner_hash,
         &owner_spk_hash, // sell proceeds go back to owner's wallet
-        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         sell_expiry_daa,
     )?;
@@ -226,14 +228,14 @@ pub async fn deploy_ifd(
     println!("  Order A bspkh:    {}", hex::encode(&buyer_spk_hash));
 
     // Step 2: Build Order A (buy) RS with bspkh pointing to Order B
-    let order_a_rs = contract::build_buy_redeem_script(
+    let order_a_rs = contract::spot::order::build_buy_v18_redeem_script(
         &token_cov_id,
         buy_price_num,
         buy_price_den,
         buy_min_fill,
         &owner_hash,
         &buyer_spk_hash,
-        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         0, // GTC for entry order
     )?;
@@ -494,9 +496,20 @@ pub async fn deploy_ifo_trustless(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
-    // Step 1: Build Order B (OCO sell) RS -- need its P2SH for Order A's bspkh
-    println!("Building IFO trustless bracket order...");
-    let order_b_rs = contract::build_oco_sell_redeem_script(
+    // Step 1: Build Order B (v18 OCO sell) RS -- need its P2SH for Order A's
+    // bspkh. This is the v18 SOFT path: the entry is a plain v18 buy whose
+    // bspkh pins the OCO's P2SH, so the buy fill's token delivery (which
+    // carries the token CovenantBinding under the v18 planners) lands
+    // directly on the OCO address as a LIVE, sweep-eligible v18 OCO sell —
+    // no receipt gating and no engine-side trigger. (The receipt-gated HARD
+    // path is the separate `bracket` command / compute_bracket_scripts_v18.)
+    println!("Building IFO trustless order pair (v18 soft path)...");
+    let oco_bps = if max_matcher_fee <= 10_000 {
+        max_matcher_fee
+    } else {
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS
+    };
+    let order_b_rs = contract::spot::oco::build_oco_sell_v18_redeem_script(
         tp_price_num,
         tp_price_den,
         tp_min_fill,
@@ -505,7 +518,7 @@ pub async fn deploy_ifo_trustless(
         sl_min_fill,
         &owner_hash,
         &owner_spk_hash, // sell proceeds go back to owner's wallet
-        max_matcher_fee,
+        oco_bps,
         0, // cancel_pending
         expiry_daa,
     )?;
@@ -522,15 +535,15 @@ pub async fn deploy_ifo_trustless(
     println!("  Order B P2SH:         {}", hex::encode(&b_p2sh_spk.script()));
     println!("  Order A bspkh:        {}", hex::encode(&buyer_spk_hash));
 
-    // Step 2: Build Order A (buy) RS with bspkh pointing to OCO sell P2SH
-    let order_a_rs = contract::build_buy_redeem_script(
+    // Step 2: Build Order A (v18 buy) RS with bspkh pointing to OCO sell P2SH
+    let order_a_rs = contract::spot::order::build_buy_v18_redeem_script(
         &token_cov_id,
         buy_price_num,
         buy_price_den,
         buy_min_fill,
         &owner_hash,
         &buyer_spk_hash,
-        max_matcher_fee,
+        oco_bps,
         0, // cancel_pending
         0, // GTC for entry order
     )?;
@@ -823,14 +836,14 @@ pub async fn deploy_ifo(
     let mut buyer_spk_hash = [0u8; 32];
     buyer_spk_hash.copy_from_slice(&bspkh_bytes);
 
-    let rs = contract::build_buy_redeem_script(
+    let rs = contract::spot::order::build_buy_v18_redeem_script(
         &token_cov_id,
         buy_price_num,
         buy_price_den,
         buy_min_fill,
         &owner_hash,
         &buyer_spk_hash,
-        crate::deploy::DEFAULT_MAX_MATCHER_FEE,
+        crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         0, // GTC
     )?;

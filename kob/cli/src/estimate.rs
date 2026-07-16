@@ -67,6 +67,23 @@ const PUT_OPTION_RS_SIZE: u64 = 205;
 /// swap_order redeemScript: 174B state + 69B body = 243B.
 const SWAP_RS_SIZE: u64 = 243;
 
+// --- v18 (unified spot generation, V18_DESIGN.md) ---
+/// buy v18 redeemScript: 145B state + 1525B body = 1670B.
+#[allow(dead_code)] // Kept for fee estimation reference
+const BUY_V18_RS_SIZE: u64 = 1670;
+/// sell v18 redeemScript: 112B state + 365B body = 477B.
+#[allow(dead_code)] // Kept for fee estimation reference
+const SELL_V18_RS_SIZE: u64 = 477;
+/// oco_sell v18 redeemScript: 139B state + 220B body = 359B.
+#[allow(dead_code)] // Kept for fee estimation reference
+const OCO_V18_RS_SIZE: u64 = 359;
+/// swap v18 redeemScript: 183B state + 77B body = 260B.
+#[allow(dead_code)] // Kept for fee estimation reference
+const SWAP_V18_RS_SIZE: u64 = 260;
+/// bracket v18 redeemScript: 224B state + 148B body = 372B.
+#[allow(dead_code)] // Kept for fee estimation reference
+const BRACKET_V18_RS_SIZE: u64 = 372;
+
 /// swap_order cancel sigscript: pushData(sig 65B) + pushData(pk 32B) + Op0 + pushData(243B RS)
 ///   = 66 + 33 + 1 + 3 + 243 = 346.
 const SWAP_CANCEL_SS_SIZE: u64 = 346;
@@ -861,12 +878,12 @@ pub fn run(cmd: &EstimateCommand) {
 }
 
 fn validate_version(version: u8) {
-    if version != 6 && version != 8 && version != 9 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 {
-        error!("unsupported contract version {}. Use 14 (or legacy: 6, 8-13).", version);
+    if version != 6 && version != 8 && version != 9 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 && version != 16 && version != 17 && version != 18 {
+        error!("unsupported contract version {}. Use 18 (or legacy: 6, 8-14, 16, 17).", version);
         std::process::exit(1);
     }
-    if version != 14 {
-        eprintln!("WARNING: Only contract version 14 is supported. Got v{}.", version);
+    if version != 18 {
+        eprintln!("WARNING: New deployments are v18-only. Got v{} (estimation still shown).", version);
     }
 }
 
@@ -1431,5 +1448,37 @@ mod tests {
         ).unwrap();
         assert_eq!(BRACKET_RS_SIZE, rs.len() as u64,
             "BRACKET_RS_SIZE ({}) != actual ({})", BRACKET_RS_SIZE, rs.len());
+    }
+
+    // --- v18 size constants pinned against the real builders ---
+
+    #[test]
+    fn v18_rs_size_constants() {
+        let h32 = [0u8; 32];
+        let buy = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &h32, 1, 2, 1000, &h32, &h32, 30, 0, 0,
+        ).unwrap();
+        assert_eq!(BUY_V18_RS_SIZE, buy.len() as u64, "BUY_V18_RS_SIZE mismatch: {}", buy.len());
+
+        let sell = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            1, 2, 1000, &h32, &h32, 30, 0, 0,
+        ).unwrap();
+        assert_eq!(SELL_V18_RS_SIZE, sell.len() as u64, "SELL_V18_RS_SIZE mismatch: {}", sell.len());
+
+        let oco = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+            2, 1, 1000, 1, 1, 1000, &h32, &h32, 30, 0, 0,
+        ).unwrap();
+        assert_eq!(OCO_V18_RS_SIZE, oco.len() as u64, "OCO_V18_RS_SIZE mismatch: {}", oco.len());
+
+        let swap = kob_core::contract::spot::swap::build_swap_v18_redeem_script(
+            &[1u8; 32], &[2u8; 32], 1000, &h32, &h32, &h32, 30,
+        ).unwrap();
+        assert_eq!(SWAP_V18_RS_SIZE, swap.len() as u64, "SWAP_V18_RS_SIZE mismatch: {}", swap.len());
+
+        let oco_spk = [0u8; 37];
+        let bracket = kob_core::contract::spot::bracket::build_bracket_v18_redeem_script(
+            0, &h32, 1, 2, &oco_spk, 1000, 100, 1000, &h32, &h32, &h32,
+        ).unwrap();
+        assert_eq!(BRACKET_V18_RS_SIZE, bracket.len() as u64, "BRACKET_V18_RS_SIZE mismatch: {}", bracket.len());
     }
 }

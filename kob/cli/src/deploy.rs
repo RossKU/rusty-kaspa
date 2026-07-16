@@ -320,15 +320,13 @@ pub async fn deploy_buy(
     max_matcher_fee: u64,
     mmfee_bps: Option<u64>,
 ) -> anyhow::Result<String> {
-    // v14 buy has no on-chain surplus/matcher-fee cap (F6 removed) and lets a
-    // matcher keep the whole spread; v16 has the F6 cap but only reads a single
-    // merged output, so it cannot settle an N-sells:1-buy sweep in one tx
-    // (see NM_BUY_DESIGN.md). v17 is a strict superset of v16 (N=1 degenerates
-    // to identical 1:1 semantics, plus a tighter toi binding), so it is now the
-    // SOLE version new buy deploys may target. v14 and v16 remain fully
-    // parseable/cancellable/servicable for orders already resting on-chain.
-    if version != 17 {
-        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v17 (N:M sweep) may be deployed; v14 and v16 are retained only for managing pre-existing on-chain orders.", version);
+    // v18 (unified spot generation, V18_DESIGN.md) is the SOLE version new
+    // buy deploys may target: N:M GTC/IOC sweep + Op2 partial fill + OCO
+    // sweep-eligibility via the canonical price attestation. v14/v16/v17
+    // remain fully parseable/cancellable/servicable for orders already
+    // resting on-chain (deleted in Stage E).
+    if version != 18 {
+        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v18 (unified spot) may be deployed; v14/v16/v17 are retained only for managing pre-existing on-chain orders.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;
@@ -404,7 +402,20 @@ pub async fn deploy_buy(
     let owner_hash = blake2b_256(&pubkey);
     let buyer_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
-    let redeem_script = if version == 17 {
+    let redeem_script = if version == 18 {
+        let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
+        contract::spot::order::build_buy_v18_redeem_script(
+            &token_cov_id,
+            price_num,
+            price_den,
+            min_fill,
+            &owner_hash,
+            &buyer_spk_hash,
+            bps,
+            0, // cancel_pending = 0 (active order)
+            expiry_daa.unwrap_or(0),
+        )?
+    } else if version == 17 {
         let bps = mmfee_bps.unwrap_or(30); // default 0.3%
         contract::build_buy_v17_redeem_script(
             &token_cov_id,
@@ -461,8 +472,8 @@ pub async fn deploy_buy(
         amount,
         amount as f64 / 1e8
     );
-    if version == 16 || version == 17 {
-        let bps = mmfee_bps.unwrap_or(30);
+    if version == 16 || version == 17 || version == 18 {
+        let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
         println!("Max Matcher Fee: {} bps ({}%)", bps, bps as f64 / 100.0);
     } else {
         println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
@@ -708,7 +719,7 @@ pub async fn deploy_buy(
         token: Some(token_covenant_id.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
-        max_matcher_fee: if version == 16 { mmfee_bps.unwrap_or(30) } else { max_matcher_fee },
+        max_matcher_fee: if version >= 16 { mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS) } else { max_matcher_fee },
     };
     let mut cache = OrderCache::load(&cache_path);
     cache.orders.push(entry);
@@ -721,8 +732,11 @@ pub async fn deploy_buy(
     Ok(tx_id)
 }
 
-/// Default max_matcher_fee_bps for v16 buy orders (0.3%).
-pub const DEFAULT_MAX_MATCHER_FEE_BPS: u64 = 30;
+/// Default max_matcher_fee in basis points (0.3%) for v16/v17/v18 orders.
+/// Re-exported from `kob-domain` — the SINGLE shared constant across engine
+/// API, MM quoting and CLI deploys (v18 builders reject > 10000; deploy and
+/// any later RS reconstruction must agree on this value or the P2SH differs).
+pub use kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS;
 
 /// Deploy a sell order (lock tokens, request KAS at a given price).
 #[allow(clippy::too_many_arguments)]
@@ -740,11 +754,15 @@ pub async fn deploy_sell(
     post_only: bool,
     expiry_daa: Option<u64>,
     max_matcher_fee: u64,
+    mmfee_bps: Option<u64>,
     token_utxo_str: Option<&str>,
     fee_utxo_str: Option<&str>,
 ) -> anyhow::Result<String> {
-    if version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 is supported for deployment.", version);
+    // v18 (unified spot) is the SOLE version new sell deploys may target:
+    // canonical price attestation on all fill-family branches + Fix-3
+    // partial F4. v14 sells remain parseable/cancellable until Stage E.
+    if version != 18 {
+        anyhow::bail!("Unsupported contract version {} for NEW sell deployment. Only v18 (unified spot) may be deployed; v14 is retained only for managing pre-existing on-chain orders.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;
@@ -826,9 +844,10 @@ pub async fn deploy_sell(
     let owner_hash = blake2b_256(&pubkey);
     let seller_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
-    let redeem_script = contract::build_sell_redeem_script(
+    let sell_bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
+    let redeem_script = contract::spot::order::build_sell_v18_redeem_script(
         price_num, price_den, min_fill, &owner_hash, &seller_spk_hash,
-        max_matcher_fee,
+        sell_bps,
         0, // cancel_pending
         expiry_daa.unwrap_or(0),
     )?;
@@ -852,7 +871,8 @@ pub async fn deploy_sell(
         amount,
         amount as f64 / 1e8
     );
-    println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
+    println!("Max Matcher Fee: {} bps ({}%)", sell_bps, sell_bps as f64 / 100.0);
+    let _ = max_matcher_fee; // pre-v18 sompi cap: unused by v18 (BPS-uniform)
     println!("Owner:      {}", wallet.pubkey_hex());
     println!("Owner Hash: {}", hex::encode(owner_hash));
     println!("Seller SPK Hash: {}", hex::encode(seller_spk_hash));
@@ -1343,20 +1363,28 @@ pub async fn deploy_oco_sell(
     let owner_hash = blake2b_256(&pubkey);
     let seller_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
-    let redeem_script = kob_core::build_oco_sell_redeem_script(
+    // v18 OCO: both TP and SL branches are sweep-eligible (canonical price
+    // attestation). mmfee is BPS-uniform in v18 — the legacy sompi-scale
+    // value is clamped to the shared default when out of range.
+    let oco_bps = if max_matcher_fee <= 10_000 {
+        max_matcher_fee
+    } else {
+        DEFAULT_MAX_MATCHER_FEE_BPS
+    };
+    let redeem_script = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
         tp_price_num, tp_price_den, tp_min_fill,
         sl_price_num, sl_price_den, sl_min_fill,
         &owner_hash, &seller_spk_hash,
-        max_matcher_fee,
+        oco_bps,
         0, // cancel_pending
         expiry_daa.unwrap_or(0),
     )?;
-    assert_eq!(redeem_script.len(), kob_core::OCO_SELL_RS_SIZE);
+    assert_eq!(redeem_script.len(), kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE);
 
     let p2sh = build_p2sh(&redeem_script);
 
-    println!("Deploy OCO Sell Order (single-UTXO)");
-    println!("====================================");
+    println!("Deploy OCO Sell Order (single-UTXO, v18)");
+    println!("========================================");
     println!("Token:        {}", token_covenant_id);
     println!(
         "TP Price:     {}/{} ({:.6})",
@@ -1372,13 +1400,13 @@ pub async fn deploy_oco_sell(
         "Amount:       {} sompi ({:.8} KAS)",
         amount, amount as f64 / 1e8
     );
-    println!("Max Matcher Fee: {} sompi", max_matcher_fee);
+    println!("Max Matcher Fee: {} bps ({}%)", oco_bps, oco_bps as f64 / 100.0);
     println!("Owner:        {}", wallet.pubkey_hex());
     if let Some(daa) = expiry_daa {
         println!("Expiry DAA:   {}", daa);
     }
     println!();
-    println!("RedeemScript: {} bytes (OCO sell)", redeem_script.len());
+    println!("RedeemScript: {} bytes (v18 OCO sell)", redeem_script.len());
     println!("P2SH SPK:     {}", hex::encode(&p2sh.script()));
     println!();
 

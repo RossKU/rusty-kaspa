@@ -41,7 +41,7 @@ pub struct MmConfig {
     pub interval_secs: u64,
     /// Print orders without deploying.
     pub dry_run: bool,
-    /// Contract version (v14 only).
+    /// Contract version (v18 only — new quotes are always v18).
     pub version: u8,
     /// Min fill per order (sompi).
     pub min_fill: u64,
@@ -78,8 +78,8 @@ impl MmConfig {
         if self.interval_secs == 0 {
             anyhow::bail!("interval must be > 0");
         }
-        if self.version != 14 {
-            anyhow::bail!("version must be 14");
+        if self.version != 18 {
+            anyhow::bail!("version must be 18 (new quotes deploy as v18 only)");
         }
         if self.min_fill == 0 {
             anyhow::bail!("min_fill must be > 0");
@@ -1040,15 +1040,15 @@ async fn deploy_order(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_bytes);
 
-    if version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
+    if version != 18 {
+        anyhow::bail!("Unsupported contract version {}. New quotes deploy as v18 only.", version);
     }
     let redeem_script = match side {
-        "buy" => contract::build_buy_redeem_script(
+        "buy" => contract::spot::order::build_buy_v18_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
-            &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE, 0, 0,)?,
-        "sell" => contract::build_sell_redeem_script(
-            price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE, 0, 0,)?,
+            &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
+        "sell" => contract::spot::order::build_sell_v18_redeem_script(
+            price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         _ => anyhow::bail!("Unknown order side '{}'. Use 'buy' or 'sell'.", side),
     };
 
@@ -1184,16 +1184,17 @@ async fn cancel_order(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_bytes);
 
-    // Reconstruct the redeem script (v14 only)
-    if version != 14 {
-        anyhow::bail!("Unsupported contract version {}. Only v14 is supported.", version);
+    // Reconstruct the redeem script (v18 only — matches deploy_order above;
+    // the P2SH only resolves when the SAME builder + fee constant are used)
+    if version != 18 {
+        anyhow::bail!("Unsupported contract version {}. New quotes deploy as v18 only.", version);
     }
     let redeem_script = match side {
-        "buy" => contract::build_buy_redeem_script(
+        "buy" => contract::spot::order::build_buy_v18_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
-            &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE, 0, 0,)?,
-        "sell" => contract::build_sell_redeem_script(
-            price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE, 0, 0,)?,
+            &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
+        "sell" => contract::spot::order::build_sell_v18_redeem_script(
+            price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         _ => anyhow::bail!("Unknown order side '{}'. Use 'buy' or 'sell'.", side),
     };
 
@@ -1271,8 +1272,10 @@ async fn cancel_order(
     // Sign input 0 (order cancel path)
     let sighash_0 = compute_sighash(&tx, 0)?;
     let sig_0 = utils::schnorr_sign(&privkey, &sighash_0)?;
+    // v18 buy cancel: [pk][sig][Op0][RS] (v17/v18 convention);
+    // v18 sell cancel keeps the v14 [sig][pk][Op0][RS] shape.
     let cancel_sigscript = match side {
-        "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
+        "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
         _ => unreachable!(),
     };
@@ -1294,7 +1297,7 @@ async fn cancel_order(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = utils::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match side {
-            "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
+            "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
             _ => unreachable!(),
         };
@@ -1681,7 +1684,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1700,7 +1703,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1719,7 +1722,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1738,7 +1741,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1776,7 +1779,7 @@ mod tests {
             amount: 500_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1795,7 +1798,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1814,7 +1817,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 0,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1835,7 +1838,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1860,7 +1863,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -1882,7 +1885,7 @@ mod tests {
             amount: 50_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2199,7 +2202,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2218,7 +2221,7 @@ mod tests {
             amount: 0,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2237,7 +2240,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 0,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2256,7 +2259,7 @@ mod tests {
             amount: 1_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2276,7 +2279,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2286,7 +2289,7 @@ mod tests {
 
     #[test]
     fn config_validate_all_valid_versions() {
-        for v in [14] {
+        for v in [18] {
             let config = MmConfig {
                 token: "aa".repeat(32),
                 mid_price_num: 100,
@@ -2307,8 +2310,8 @@ mod tests {
 
     #[test]
     fn config_validate_version_boundaries() {
-        // Only version 14 is valid; all others should fail
-        for v in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 255] {
+        // Only version 18 is valid (new quotes are v18-only); all others fail
+        for v in [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 255] {
             let config = MmConfig {
                 token: "aa".repeat(32),
                 mid_price_num: 100,
@@ -2338,7 +2341,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2357,7 +2360,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: true,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2667,7 +2670,7 @@ mod tests {
             amount: 5_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2691,7 +2694,7 @@ mod tests {
             amount: 50_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 5_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2712,7 +2715,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2740,7 +2743,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -2967,7 +2970,7 @@ mod tests {
             amount: 1_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 100_000,
             requote_threshold_bps: 500,
             deploy_delay_secs: 0,
@@ -3034,7 +3037,7 @@ mod tests {
             amount: 10_000_000,
             interval_secs: 10,
             dry_run: false,
-            version: 14,
+            version: 18,
             min_fill: 1_000_000,
             requote_threshold_bps: 0,
             deploy_delay_secs: 0,

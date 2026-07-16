@@ -73,8 +73,8 @@ pub async fn run(
         Ok(tcid)
     };
 
-    if version != 14 && version != 16 && version != 17 {
-        anyhow::bail!("Unsupported contract version {}. Only v14, v16, and v17 are supported.", version);
+    if version != 14 && version != 16 && version != 17 && version != 18 {
+        anyhow::bail!("Unsupported contract version {}. Only v14, v16, v17, and v18 are supported.", version);
     }
     if version == 17 && side != "buy" {
         anyhow::bail!("v17 is a buy-only contract; sell orders are single-version.");
@@ -84,7 +84,9 @@ pub async fn run(
     let current_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            if version == 17 {
+            if version == 18 {
+                contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
+            } else if version == 17 {
                 contract::build_buy_v17_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
             } else if version == 16 {
                 contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
@@ -92,6 +94,7 @@ pub async fn run(
                 contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
             }
         }
+        "sell" if version == 18 => contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?,
         "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?,
         _ => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", side),
     };
@@ -100,7 +103,9 @@ pub async fn run(
     let target_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            if version == 17 {
+            if version == 18 {
+                contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
+            } else if version == 17 {
                 contract::build_buy_v17_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
             } else if version == 16 {
                 contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
@@ -108,6 +113,7 @@ pub async fn run(
                 contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
             }
         }
+        "sell" if version == 18 => contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?,
         "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?,
         _ => unreachable!(),
     };
@@ -279,6 +285,14 @@ pub async fn run(
             // stack depth 9, so pk/sig go BELOW the selector -- see order.rs).
             contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
         }
+        "buy" if version == 18 => {
+            // v18 buy cancel-mark: [pk][sig][Op3][RS] (v17/v18 convention).
+            contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
+        }
+        "sell" if version == 18 => {
+            // v18 sell cancel-mark: [sig][pk][Op3][RS].
+            contract::spot::order::build_sell_v18_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
+        }
         "buy" => {
             // buy cancel-mark: [Op1] [pushData(sig65)] [pushData(pk32)] [pushData(RS)]
             let mut ss = Vec::new();
@@ -309,7 +323,9 @@ pub async fn run(
     };
 
     println!("Cancel-Mark SigScript: {} bytes", cancel_mark_sigscript.len());
-    if side == "buy" && version == 17 {
+    if version == 18 {
+        println!("  (v18 cancel-mark uses Op3 selector; v17/v18 stack convention)");
+    } else if side == "buy" && version == 17 {
         println!("  (v17 buy cancel-mark uses Op3 selector; pk/sig below the selector)");
     } else if side == "buy" {
         println!("  (buy cancel-mark uses Op1 selector for MINIMALIF compliance)");
@@ -347,6 +363,12 @@ pub async fn run(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_mark_sigscript = match side {
+            "buy" if version == 18 => {
+                contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
+            }
+            "sell" if version == 18 => {
+                contract::spot::order::build_sell_v18_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
+            }
             "buy" if version == 17 => {
                 contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
             }

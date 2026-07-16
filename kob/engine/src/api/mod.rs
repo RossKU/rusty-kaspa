@@ -1452,8 +1452,11 @@ struct SubmitIfdRequest {
     owner_hash: String,
     /// Owner SPK hash (hex, 64 chars) — for B's bspkh/sspkh.
     owner_spk_hash: String,
-    /// Maximum matcher fee (sompi) embedded in B's RS.
+    /// Maximum matcher fee (sompi) — PRE-v18 wire field, kept for request
+    /// compatibility. v18 IFD builds B with the shared
+    /// `DEFAULT_MAX_MATCHER_FEE_BPS` (P2SH must match the trigger-time RS).
     #[serde(default = "default_max_matcher_fee")]
+    #[allow(dead_code)]
     max_matcher_fee: u64,
 }
 
@@ -1588,11 +1591,15 @@ async fn handle_submit_ifd(
         expiry_daa: req.order_b.expiry_daa,
     };
 
-    let (b_rs, b_p2sh_hex, b_spk_hash_hex) = match crate::matcher::ifd::compute_order_b_scripts(
+    // v18 done-leg: automatically sweep/batch-eligible under the v18
+    // planners. The fee is the shared BPS constant (v18 builders reject the
+    // legacy sompi-scale value); registration and trigger must agree on it
+    // or the precomputed P2SH won't match the deployed order.
+    let (b_rs, b_p2sh_hex, b_spk_hash_hex) = match crate::matcher::ifd::compute_order_b_scripts_v18(
         &b_params,
         &owner_hash,
         &owner_spk_hash,
-        req.max_matcher_fee,
+        crate::DEFAULT_MAX_MATCHER_FEE_BPS,
     ) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
@@ -1635,15 +1642,17 @@ async fn handle_submit_ifd(
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
     };
 
+    // Order A is deployed by the user as a v18 order (deploy paths are
+    // v18-only); this P2SH must match that deploy byte-exact.
     let a_rs = match req.order_a.side {
         crate::matcher::ifd::IfdSide::Buy => {
-            match kob_core::contract::build_buy_redeem_script(
+            match kob_core::contract::spot::order::build_buy_v18_redeem_script(
                 &a_token_bytes,
                 req.order_a.price_num,
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh_bytes, crate::DEFAULT_MAX_MATCHER_FEE,
+                &a_bspkh_bytes, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1651,12 +1660,12 @@ async fn handle_submit_ifd(
             }
         }
         crate::matcher::ifd::IfdSide::Sell => {
-            match kob_core::contract::build_sell_redeem_script(
+            match kob_core::contract::spot::order::build_sell_v18_redeem_script(
                 req.order_a.price_num,
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh_bytes, crate::DEFAULT_MAX_MATCHER_FEE,
+                &a_bspkh_bytes, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1751,13 +1760,14 @@ async fn handle_submit_ifo(
         sl_min_fill: req.sl_min_fill,
     };
 
-    // Compute OCO B script (single oco_sell with TP + SL paths)
-    let (oco_rs, oco_p2sh_hex) = match crate::matcher::ifd::compute_oco_b_scripts(
+    // Compute OCO B script (single v18 oco_sell with TP + SL paths — both
+    // branches sweep-eligible via the canonical attestation)
+    let (oco_rs, oco_p2sh_hex) = match crate::matcher::ifd::compute_oco_b_scripts_v18(
         &req.token,
         &oco_params,
         &owner_hash,
         &owner_spk_bytes,
-        req.amount,
+        crate::DEFAULT_MAX_MATCHER_FEE_BPS,
     ) {
         Ok(v) => v,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
@@ -1783,13 +1793,13 @@ async fn handle_submit_ifo(
 
     let a_rs = match req.order_a.side {
         crate::matcher::ifd::IfdSide::Buy => {
-            match kob_core::contract::build_buy_redeem_script(
+            match kob_core::contract::spot::order::build_buy_v18_redeem_script(
                 &a_token_bytes,
                 req.order_a.price_num,
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh, crate::DEFAULT_MAX_MATCHER_FEE,
+                &a_bspkh, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1797,12 +1807,12 @@ async fn handle_submit_ifo(
             }
         }
         crate::matcher::ifd::IfdSide::Sell => {
-            match kob_core::contract::build_sell_redeem_script(
+            match kob_core::contract::spot::order::build_sell_v18_redeem_script(
                 req.order_a.price_num,
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh, crate::DEFAULT_MAX_MATCHER_FEE,
+                &a_bspkh, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,

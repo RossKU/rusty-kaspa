@@ -2,11 +2,16 @@
 
 #![allow(clippy::too_many_arguments)]
 
-/// Default maximum matcher fee (in sompi) embedded in deploy redeemScripts.
-/// Must match `kob-cli`'s `DEFAULT_MAX_MATCHER_FEE` to avoid P2SH mismatch.
+/// Default maximum matcher fee (in sompi) embedded in PRE-v18 deploy
+/// redeemScripts. Must match `kob-cli`'s `DEFAULT_MAX_MATCHER_FEE` to avoid
+/// P2SH mismatch.
 ///
 /// Re-exported from `kob-domain` for backward compatibility.
 pub use kob_domain::DEFAULT_MAX_MATCHER_FEE;
+
+/// Default maximum matcher fee in BASIS POINTS — the shared constant for
+/// every v18 builder call site (v18 builders reject values > 10000).
+pub use kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS;
 
 pub mod config;
 pub mod chain;
@@ -597,7 +602,7 @@ fn build_mm_config(
         amount,
         interval_secs: interval_ms / 1000,
         dry_run: false,
-        version: 11,
+        version: 18,
         min_fill: mm_min_fill,
         requote_threshold_bps: 500,
         deploy_delay_secs: 2,

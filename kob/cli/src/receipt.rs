@@ -320,8 +320,31 @@ pub async fn receipt_create(
         funding.outpoint.transaction_id, funding.outpoint.index, funding.utxo_entry.amount
     );
 
-    // Build deploy TX (version 0, no covenant binding needed for receipt)
-    let mut tx = Transaction::new(0);
+    // Pre-compute the receipt's covenant id (version-1 covenant GENESIS).
+    //
+    // The v18 bracket fill gate checks `OpInputCovenantId(2) == receipt_cov_id`
+    // — a receipt deployed WITHOUT a covenant binding has no covenant id on
+    // its input and can never satisfy that check, so brackets could never
+    // fill against it. The receipt is therefore minted as a genesis covenant
+    // (same pattern as `token create`), and this covenant id is what must be
+    // passed to `bracket deploy --receipt-cov-id`.
+    let receipt_cov_id = kob_core::compute_covenant_id(
+        &funding.outpoint.transaction_id,
+        funding.outpoint.index,
+        &[kob_core::tx::AuthOutput {
+            index: 0,
+            value: amount,
+            spk_version: p2sh.version,
+            spk_script: p2sh.script().to_vec(),
+        }],
+    )?;
+    let receipt_cov_id_hex = hex::encode(receipt_cov_id);
+    println!("Receipt Covenant ID: {}", receipt_cov_id_hex);
+    println!("  (pass this as --receipt-cov-id when deploying a bracket)");
+    println!();
+
+    // Build deploy TX (version 1: covenant binding on the receipt output)
+    let mut tx = Transaction::new(1);
 
     let spk_bytes = funding.script_bytes();
     tx.inputs.push(TxInput {
@@ -334,8 +357,17 @@ pub async fn receipt_create(
         value: funding.utxo_entry.amount,
     });
 
-    // Output 0: receipt P2SH
-    tx.outputs.push(TxOutput::new(amount, p2sh.version, p2sh.script().to_vec(), None));
+    // Output 0: receipt P2SH (covenant genesis — authorizing input 0)
+    tx.outputs.push(TxOutput::new(
+        amount,
+        p2sh.version,
+        p2sh.script().to_vec(),
+        Some(kob_core::tx::CovenantBinding::new(
+            0,
+            kob_core::compat::parse_hash(&receipt_cov_id_hex)
+                .map_err(|e| anyhow::anyhow!("covenant id hash: {e:?}"))?,
+        )),
+    ));
 
     // Output 1: tentative change back to wallet
     let total_input = funding.utxo_entry.amount;
@@ -401,10 +433,11 @@ pub async fn receipt_create(
     let tx_id = rpc.submit_transaction(payload).await?;
 
     println!();
-    println!("SUCCESS! Receipt v3 deployed.");
+    println!("SUCCESS! Receipt deployed (version-1 covenant genesis).");
     println!("TXID:     {}", tx_id);
     println!("Receipt:  {}:0 ({} sompi)", tx_id, amount);
-    println!("RS:       {} bytes (119B v4)", receipt_rs.len());
+    println!("Cov ID:   {}", receipt_cov_id_hex);
+    println!("RS:       {} bytes (v4)", receipt_rs.len());
 
     Ok(())
 }

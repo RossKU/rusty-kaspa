@@ -100,16 +100,16 @@ pub async fn run(
             new_params.min_fill
         );
     }
-    // v17 is the sole creatable buy contract (mirrors deploy.rs's deploy_buy
-    // gate); v14/v16 remain valid only for reconstructing an EXISTING order
-    // via --old-version, not for this new deploy. Sell has just one version.
+    // v18 is the sole creatable contract generation (mirrors deploy.rs's
+    // deploy gates); v14/v16/v17 remain valid only for reconstructing an
+    // EXISTING order via --old-version, not for this new deploy.
     match new_params.side.as_str() {
-        "buy" if new_params.version != 17 => anyhow::bail!(
-            "Unsupported contract version {} for NEW buy deploy. Only v17 (N:M sweep) may be deployed; v14 and v16 are retained only for --old-version (managing an existing order).",
+        "buy" if new_params.version != 18 => anyhow::bail!(
+            "Unsupported contract version {} for NEW buy deploy. Only v18 (unified spot) may be deployed; v14/v16/v17 are retained only for --old-version (managing an existing order).",
             new_params.version
         ),
-        "sell" if new_params.version != 14 => anyhow::bail!(
-            "Unsupported contract version {} for NEW sell deploy. Only v14 is supported.",
+        "sell" if new_params.version != 18 => anyhow::bail!(
+            "Unsupported contract version {} for NEW sell deploy. Only v18 (unified spot) may be deployed.",
             new_params.version
         ),
         _ => {}
@@ -177,8 +177,8 @@ pub async fn run(
     };
     let old_token: Option<&str> = old_token_owned.as_deref();
 
-    if old_version != 14 && old_version != 16 && old_version != 17 {
-        anyhow::bail!("Unsupported old contract version {}. Only v14, v16, and v17 are supported.", old_version);
+    if old_version != 14 && old_version != 16 && old_version != 17 && old_version != 18 {
+        anyhow::bail!("Unsupported old contract version {}. Only v14, v16, v17, and v18 are supported.", old_version);
     }
 
     if needs_cache && cached.is_some() {
@@ -194,7 +194,11 @@ pub async fn run(
     let old_redeem_script = match old_side {
         "buy" => {
             let tcid = parse_old_token(old_token)?;
-            if old_version == 17 {
+            if old_version == 18 {
+                contract::spot::order::build_buy_v18_redeem_script(
+                    &tcid, old_price_num, old_price_den, old_min_fill,
+                    &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
+            } else if old_version == 17 {
                 contract::build_buy_v17_redeem_script(
                     &tcid, old_price_num, old_price_den, old_min_fill,
                     &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
@@ -207,6 +211,10 @@ pub async fn run(
                     &tcid, old_price_num, old_price_den, old_min_fill,
                     &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
             }
+        }
+        "sell" if old_version == 18 => {
+            contract::spot::order::build_sell_v18_redeem_script(
+                old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
         }
         "sell" => {
             contract::build_sell_redeem_script(
@@ -326,8 +334,10 @@ pub async fn run(
     let sighash_0 = compute_sighash(&cancel_tx, 0)?;
     let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
     let cancel_sigscript = match old_side {
+        "buy" if old_version == 18 => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
         "buy" if old_version == 17 => contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
         "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
+        // v18 sell cancel keeps the v14 [sig][pk][Op0][RS] shape.
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
         _ => unreachable!(),
     };
@@ -349,6 +359,7 @@ pub async fn run(
         let sighash_0 = compute_sighash(&cancel_tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match old_side {
+            "buy" if old_version == 18 => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
             "buy" if old_version == 17 => contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
             "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
@@ -437,6 +448,12 @@ pub async fn run(
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
     let new_redeem_script = match new_params.side.as_str() {
+        "buy" if new_params.version == 18 => contract::spot::order::build_buy_v18_redeem_script(
+            &token_cov_id, new_params.price_num, new_params.price_den,
+            new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+        "sell" if new_params.version == 18 => contract::spot::order::build_sell_v18_redeem_script(
+            new_params.price_num, new_params.price_den, new_params.min_fill,
+            &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         "buy" if new_params.version == 17 => contract::build_buy_v17_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
             new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,

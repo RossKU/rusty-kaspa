@@ -380,12 +380,12 @@ async fn execute_operation(
                 *price_den,
                 *min_fill,
                 *amount,
-                14, // v14 default for batch (match deploy CLI default)
+                18, // v18 (unified spot) — sole deploy target
                 fee,
                 false, // post_only not supported in batch mode
                 None,  // expiry_daa: None = GTC
-                deploy::DEFAULT_MAX_MATCHER_FEE,
-                None,  // mmfee_bps: None = v14
+                deploy::DEFAULT_MAX_MATCHER_FEE, // ignored for v18 (bps below)
+                Some(deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
             )
             .await?;
             // deploy_buy prints the TXID; we return None since we don't capture it
@@ -409,11 +409,12 @@ async fn execute_operation(
                 *price_den,
                 *min_fill,
                 *amount,
-                14, // v14 default for batch (match deploy CLI default)
+                18, // v18 (unified spot) — sole deploy target
                 fee,
                 false, // post_only not supported in batch mode
                 None,  // expiry_daa: None = GTC
-                deploy::DEFAULT_MAX_MATCHER_FEE,
+                deploy::DEFAULT_MAX_MATCHER_FEE, // ignored for v18 (bps below)
+                Some(deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
                 None,  // token_utxo: not supported in batch mode
                 None,  // fee_utxo: not supported in batch mode
             )
@@ -517,13 +518,13 @@ async fn execute_operation(
                 buyer_pubkey,
                 seller_pubkey,
                 None,
-                14, // v14 default for batch (match deploy CLI default)
+                18, // v18 (unified spot) — matches the batch deploy default
                 fee,
                 0, // buy_expiry (GTC)
                 0, // sell_expiry (GTC)
-                crate::deploy::DEFAULT_MAX_MATCHER_FEE, // v14 max_matcher_fee (sompi)
-                None, // mmfee_bps (v16-only; batch matches are v14)
-                None, // fee_bps (no bps cap; v14 has no on-chain F6)
+                crate::deploy::DEFAULT_MAX_MATCHER_FEE, // ignored for v18 (bps below)
+                Some(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
+                None, // fee_bps (defaults to mmfee_bps for v18 in matching::run)
                 None, // no tamper mode in batch
             )
             .await?;

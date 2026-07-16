@@ -10,6 +10,7 @@ pub use kob_core::contract::lending::parse::{ParsedLendingOrder, LendingOrderTyp
 pub use kob_core::contract::prediction::parse::{ParsedPredictionItem, PredictionItemType, parse_prediction_rs};
 pub use kob_core::{ParsedDcaOrder, parse_dca_order_rs, DCA_V2_RS_SIZE};
 pub use kob_core::{ParsedSwapOrder, parse_swap_order_rs, SWAP_RS_SIZE};
+pub use kob_core::contract::spot::swap::{ParsedSwapOrderV18, parse_swap_order_v18_rs, SWAP_V18_RS_SIZE};
 
 // Re-export spot RS size constants used by tests.
 pub use kob_core::contract::spot::parse::{BUY_RS_SIZE, SELL_RS_SIZE, BRACKET_RS_SIZE};
@@ -61,6 +62,8 @@ pub enum ScanResult {
     Dca(ParsedDcaOrder, u32, u64),
     /// Swap order detected (swap_order, 243B RS).
     Swap(ParsedSwapOrder, u32, u64),
+    /// v18 swap order detected (swap v18, 260B RS — ring-eligible legs).
+    SwapV18(ParsedSwapOrderV18, u32, u64),
 }
 
 /// Scanner for detecting KOB deploy transactions and spent orders.
@@ -179,7 +182,9 @@ impl BlockScanner {
     /// Returns `ParsedOcoSell` instead of `ParsedOrder`.
     fn scan_oco_sell(&self, tx: &TransactionData) -> Option<(ParsedOcoSell, u32, u64)> {
         let v2 = kob_core::contract::parse_order_payload(&tx.payload)?;
-        if v2.rs_data.len() != kob_core::OCO_SELL_RS_SIZE {
+        if v2.rs_data.len() != kob_core::OCO_SELL_RS_SIZE
+            && v2.rs_data.len() != kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE
+        {
             return None;
         }
         let rs_hash = kob_core::blake2b_256(&v2.rs_data);
@@ -354,12 +359,15 @@ impl BlockScanner {
                 }
                 zk
             },
-            // V16 and V17 buy orders store max_matcher_fee as BPS (basis points
-            // of trade value). Convert to absolute sompi so the matching engine
+            // V16/V17 buy orders and ALL v18 spot orders (buy AND sell — v18
+            // is BPS-uniform) store max_matcher_fee as BPS (basis points of
+            // trade value). Convert to absolute sompi so the matching engine
             // can use it uniformly: mmfee_sompi = value * bps / 10000.
-            // For v14 buys and all sells: use raw value (already in sompi).
+            // For v14 buys and v14 sells: use raw value (already in sompi).
             max_matcher_fee: if parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
                 || parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
+                || parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN
+                || parsed.redeem_script.len() == kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN
             {
                 value.saturating_mul(parsed._max_matcher_fee) / 10000
             } else {
@@ -427,7 +435,15 @@ impl BlockScanner {
                 post_only: false,
                 expiry_daa: parsed.expiry_daa,
                 is_freezable: false,
-                max_matcher_fee: parsed._max_matcher_fee,
+                // v18 OCO stores mmfee as BPS (uniform v18 semantics); the v1
+                // OCO stores absolute sompi. Same conversion as spot orders.
+                max_matcher_fee: if parsed.redeem_script.len()
+                    == kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE
+                {
+                    value.saturating_mul(parsed._max_matcher_fee) / 10000
+                } else {
+                    parsed._max_matcher_fee
+                },
                 ifd_order_b_rs_hex: None,
                 oco_path: Some(path),
                 oco_partner_key: Some(partner.to_string()),
@@ -548,6 +564,25 @@ impl BlockScanner {
                     if rs_hash == *p2sh_hash {
                         if let Some(parsed) = parse_swap_order_rs(&v2.rs_data) {
                             return Some(ScanResult::Swap(parsed, p2sh_idx, p2sh_out.value));
+                        }
+                    }
+                }
+            } else if v2.rs_data.len() == SWAP_V18_RS_SIZE {
+                // v18 swap (260B RS): ring-eligible leg (2-cycle/triangle).
+                let rs_hash = kob_core::blake2b_256(&v2.rs_data);
+                let p2sh_outputs: Vec<(u32, &TxOutputData, [u8; 32])> = tx
+                    .outputs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(idx, out)| {
+                        parse_p2sh_script(&out.script, out.script_version)
+                            .map(|hash| (idx as u32, out, hash))
+                    })
+                    .collect();
+                for &(p2sh_idx, p2sh_out, ref p2sh_hash) in &p2sh_outputs {
+                    if rs_hash == *p2sh_hash {
+                        if let Some(parsed) = parse_swap_order_v18_rs(&v2.rs_data) {
+                            return Some(ScanResult::SwapV18(parsed, p2sh_idx, p2sh_out.value));
                         }
                     }
                 }

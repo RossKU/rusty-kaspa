@@ -1439,6 +1439,97 @@ pub fn match_swap_routes(
     groups
 }
 
+/// Find v18 swap rings (item F): closed 2-cycles (token<->token) and
+/// 3-cycles (triangle) among v18 swap orders in the swap book.
+///
+/// Each returned ring is a leg list `[e_0 .. e_{n-1}]` where leg i's target
+/// token equals leg `(i+1) % n`'s source token, ready for
+/// `batch::plan_ring_match` (which re-validates every leg from its RS and
+/// performs the F2/F3/F4 feasibility checks — this function only does the
+/// cheap structural pass: v18 RS length, `owner_spk` present, closed cycle,
+/// distinct sources, greedy first-found claiming). Pre-v18 (243B) swap
+/// entries are ignored — they settle via the KAS-bridged
+/// `execute_swap_fill` route.
+pub fn find_v18_rings(
+    swap_book: &crate::swap_book::SwapBook,
+    spent_outpoints: Option<&std::collections::HashSet<String>>,
+) -> Vec<Vec<crate::swap_book::SwapEntry>> {
+    use kob_core::contract::spot::swap::SWAP_V18_RS_SIZE;
+    use std::collections::HashSet;
+
+    let empty_set = HashSet::new();
+    let spent = spent_outpoints.unwrap_or(&empty_set);
+
+    // Deterministic order: sort candidates by outpoint key.
+    let mut candidates: Vec<&crate::swap_book::SwapEntry> = swap_book
+        .all_entries()
+        .into_iter()
+        .filter(|e| {
+            hex::decode(&e.redeem_script_hex)
+                .map(|rs| rs.len() == SWAP_V18_RS_SIZE)
+                .unwrap_or(false)
+                && e.owner_spk.is_some()
+                && !spent.contains(&e.outpoint_key())
+        })
+        .collect();
+    candidates.sort_by_key(|e| e.outpoint_key());
+
+    let mut rings: Vec<Vec<crate::swap_book::SwapEntry>> = Vec::new();
+    let mut claimed: HashSet<String> = HashSet::new();
+
+    // 2-cycles first (cheapest settle), then triangles from the leftovers.
+    for i in 0..candidates.len() {
+        let a = candidates[i];
+        if claimed.contains(&a.outpoint_key()) {
+            continue;
+        }
+        if let Some(b) = candidates.iter().find(|b| {
+            !claimed.contains(&b.outpoint_key())
+                && b.outpoint_key() != a.outpoint_key()
+                && b.source_cov_id == a.target_cov_id
+                && b.target_cov_id == a.source_cov_id
+        }) {
+            claimed.insert(a.outpoint_key());
+            claimed.insert(b.outpoint_key());
+            rings.push(vec![a.clone(), (*b).clone()]);
+        }
+    }
+
+    for i in 0..candidates.len() {
+        let a = candidates[i];
+        if claimed.contains(&a.outpoint_key()) {
+            continue;
+        }
+        let found = candidates.iter().find_map(|b| {
+            if claimed.contains(&b.outpoint_key())
+                || b.outpoint_key() == a.outpoint_key()
+                || b.source_cov_id != a.target_cov_id
+                || b.target_cov_id == a.source_cov_id
+            {
+                return None;
+            }
+            candidates
+                .iter()
+                .find(|c| {
+                    !claimed.contains(&c.outpoint_key())
+                        && c.outpoint_key() != a.outpoint_key()
+                        && c.outpoint_key() != b.outpoint_key()
+                        && c.source_cov_id == b.target_cov_id
+                        && c.target_cov_id == a.source_cov_id
+                })
+                .map(|c| ((*b).clone(), (*c).clone()))
+        });
+        if let Some((b, c)) = found {
+            claimed.insert(a.outpoint_key());
+            claimed.insert(b.outpoint_key());
+            claimed.insert(c.outpoint_key());
+            rings.push(vec![a.clone(), b, c]);
+        }
+    }
+
+    rings
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3313,5 +3404,118 @@ mod tests {
             Err(other) => panic!("Expected OcoRemainderUnsupported, got {:?}", other),
             Ok(_) => panic!("Pre-fix: plan_batch_match accepted OCO with remainder. Fix required."),
         }
+    }
+
+    // ===============================================================
+    // v18 ring detection (find_v18_rings)
+    // ===============================================================
+
+    fn make_v18_swap_entry(
+        id_byte: u8,
+        source: [u8; 32],
+        target: [u8; 32],
+        amount: u64,
+    ) -> crate::swap_book::SwapEntry {
+        let owner_spk: Vec<u8> = {
+            let mut s = vec![0x20u8];
+            s.extend_from_slice(&[id_byte; 32]);
+            s.push(0xac);
+            s
+        };
+        let owner_spk_hash = kob_core::p2sh::compute_spk_hash(0, &owner_spk);
+        let rs = kob_core::contract::spot::swap::build_swap_v18_redeem_script(
+            &source, &target, 1_000_000, &[0xBB; 32], &owner_spk_hash, &[0xEE; 32], 100,
+        )
+        .unwrap();
+        let p2sh = kob_core::build_p2sh(&rs);
+        let mut spk_full = Vec::with_capacity(37);
+        spk_full.extend_from_slice(&0u16.to_le_bytes());
+        spk_full.extend_from_slice(&owner_spk);
+        crate::swap_book::SwapEntry {
+            tx_id: hex::encode([id_byte; 32]),
+            index: 0,
+            value: amount,
+            source_cov_id: hex::encode(source),
+            target_cov_id: hex::encode(target),
+            min_target_amount: 1_000_000,
+            owner_hash: hex::encode([0xBB; 32]),
+            owner_spk_hash: hex::encode(owner_spk_hash),
+            receipt_cov_id: hex::encode([0xEE; 32]),
+            redeem_script_hex: hex::encode(&rs),
+            p2sh_script_hex: hex::encode(p2sh.script()),
+            p2sh_version: p2sh.version,
+            discovered_daa: 0,
+            owner_spk: Some(hex::encode(&spk_full)),
+        }
+    }
+
+    const RING_TOKEN_A: [u8; 32] = [0xA1; 32];
+    const RING_TOKEN_B: [u8; 32] = [0xB2; 32];
+    const RING_TOKEN_C: [u8; 32] = [0xC3; 32];
+
+    #[test]
+    fn find_v18_rings_detects_2_cycle() {
+        let mut book = crate::swap_book::SwapBook::new();
+        book.add(make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
+        book.add(make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000));
+        let rings = find_v18_rings(&book, None);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].len(), 2);
+        // Closed cycle: leg i's target == leg (i+1)%n's source.
+        for i in 0..2 {
+            assert_eq!(rings[0][i].target_cov_id, rings[0][(i + 1) % 2].source_cov_id);
+        }
+    }
+
+    #[test]
+    fn find_v18_rings_detects_3_cycle_triangle() {
+        let mut book = crate::swap_book::SwapBook::new();
+        book.add(make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
+        book.add(make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_C, 60_000_000));
+        book.add(make_v18_swap_entry(0x03, RING_TOKEN_C, RING_TOKEN_A, 70_000_000));
+        let rings = find_v18_rings(&book, None);
+        assert_eq!(rings.len(), 1);
+        assert_eq!(rings[0].len(), 3);
+        for i in 0..3 {
+            assert_eq!(rings[0][i].target_cov_id, rings[0][(i + 1) % 3].source_cov_id);
+        }
+    }
+
+    #[test]
+    fn find_v18_rings_prefers_2_cycle_and_skips_spent() {
+        let mut book = crate::swap_book::SwapBook::new();
+        let e1 = make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000);
+        let e2 = make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
+        let key1 = e1.outpoint_key();
+        book.add(e1);
+        book.add(e2);
+        // Spending one leg kills the only ring.
+        let mut spent = std::collections::HashSet::new();
+        spent.insert(key1);
+        assert!(find_v18_rings(&book, Some(&spent)).is_empty());
+    }
+
+    #[test]
+    fn find_v18_rings_ignores_pre_v18_swaps_and_open_chains() {
+        let mut book = crate::swap_book::SwapBook::new();
+        // Open chain A->B, B->C (no C->A): no ring.
+        book.add(make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
+        book.add(make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_C, 60_000_000));
+        assert!(find_v18_rings(&book, None).is_empty());
+        // A pre-v18 (243B RS) B->A closer must NOT complete the ring.
+        let mut legacy = make_v18_swap_entry(0x03, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
+        legacy.redeem_script_hex = "00".repeat(243);
+        book.add(legacy);
+        assert!(find_v18_rings(&book, None).is_empty());
+    }
+
+    #[test]
+    fn find_v18_rings_requires_owner_spk() {
+        let mut book = crate::swap_book::SwapBook::new();
+        book.add(make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
+        let mut e2 = make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
+        e2.owner_spk = None; // fill would be unbuildable — defer
+        book.add(e2);
+        assert!(find_v18_rings(&book, None).is_empty());
     }
 }

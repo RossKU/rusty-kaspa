@@ -25,7 +25,7 @@ use crate::signing;
 use clap::Subcommand;
 use kob_core::contract;
 use kob_core::contract::build_order_payload;
-use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
+use kob_core::p2sh::{blake2b_256, build_p2sh};
 use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, Transaction, TxInput, TxOutput};
 use kob_core::types::{Network, Outpoint};
@@ -277,8 +277,11 @@ async fn deploy(
 
     // owner_hash = blake2b_256(pubkey)
     let owner_hash = blake2b_256(&pubkey);
-    // owner_spk_hash = blake2b_256(P2PK SPK) -- where target tokens are sent
-    let owner_spk_hash = compute_p2pk_spk_hash(&pubkey);
+    // owner_spk_hash = blake2b_256(token_unit P2SH SPK) -- where target tokens
+    // are sent. v18 delivery re-wrap: the received target tokens must land on
+    // the owner's token_unit P2SH (KCC20 Standard State Header), not the raw
+    // P2PK SPK, so the delivered UTXO is a spendable KCC20 token_unit.
+    let owner_spk_hash = contract::compute_token_unit_spk_hash(&pubkey);
 
     // Build RS — v18 swap (ring-eligible: token<->token 2-cycle / triangle
     // settles, per-leg F4 conservation cap in BPS; V18_DESIGN.md item F).
@@ -722,11 +725,15 @@ async fn cancel(
 
     let total_in = order_value + fee_utxo.utxo_entry.amount;
 
-    // Cancel TX layout:
+    // Cancel TX layout (D2 refund re-wrap):
     //   input[0]: Swap UTXO (sigOpCount=1, cancel sigscript)
     //   input[1]: fee UTXO (P2PK, signed)
-    //   output[0]: recovered funds to wallet
-    let mut tx = Transaction::new(0);
+    //   output[0]: source-token escrow back to the wallet's token_unit P2SH
+    //              (KCC20 token_unit: binding preserved, spendable by
+    //              `token transfer`) -- NOT merged into a bare P2PK output,
+    //              which would burn the binding into plain KAS.
+    //   output[1]: fee change to the wallet P2PK.
+    let mut tx = Transaction::new(1);
 
     // Input 0: Swap UTXO
     tx.inputs.push(TxInput {
@@ -751,19 +758,33 @@ async fn cancel(
         value: fee_utxo.utxo_entry.amount,
     });
 
-    // Output 0: all recovered funds to wallet (tentative, adjusted by converge_fee)
-    let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    let tentative_output = total_in.saturating_sub(cancel_est_fee);
+    // Output 0: source-token refund as a token_unit (fixed at order_value).
+    let token_unit_spk = contract::build_token_unit_p2sh_spk(&pubkey);
+    let refund_binding = kob_core::compat::covenant_binding_from_hex(
+        0,
+        &hex::encode(parsed.source_token_cov_id),
+    )
+    .map_err(|e| anyhow::anyhow!("invalid source token covenant id: {}", e))?;
     tx.outputs.push(TxOutput::new(
-        tentative_output,
+        order_value,
+        token_unit_spk.version,
+        token_unit_spk.script().to_vec(),
+        Some(refund_binding),
+    ));
+
+    // Output 1: fee change to wallet (tentative, adjusted by converge_fee)
+    let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
+    tx.outputs.push(TxOutput::new(
+        fee_utxo.utxo_entry.amount.saturating_sub(cancel_est_fee),
         fee_utxo.utxo_entry.script_public_key.version,
         wallet_spk,
         None,
     ));
 
-    // Phase 1: converge fee on output 0
-    let (phase1_fee, _) = converge_fee(&mut tx, total_in, 0, 0);
-    println!("Output Value: {} sompi", tx.outputs[0].value);
+    // Phase 1: converge fee on output 1 (the token refund is fixed)
+    let (phase1_fee, _) = converge_fee(&mut tx, total_in, 1, 0);
+    println!("Token refund: {} sompi -> token_unit P2SH {}", order_value, hex::encode(token_unit_spk.script()));
+    println!("Fee change:   {} sompi", tx.outputs[1].value);
     println!();
 
     // Sign input 0 (cancel sigscript)
@@ -786,9 +807,9 @@ async fn cancel(
     let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (cancel_ss_final, fee_ss_final) = if exact_fee != phase1_fee {
-        // Re-adjust output
-        let new_output = total_in.saturating_sub(exact_fee);
-        tx.outputs[0].value = new_output;
+        // Re-adjust the fee-change output (the token refund stays fixed)
+        let new_output = total_in.saturating_sub(order_value + exact_fee);
+        tx.outputs[1].value = new_output;
         // Re-sign
         let sighash_0b = compute_sighash(&tx, 0)?;
         let sig_0b = signing::schnorr_sign_secure(privkey, &sighash_0b)?;
@@ -821,7 +842,10 @@ async fn cancel(
     println!("SUCCESS! Swap order cancelled.");
     println!("TXID: {}", tx_id);
     println!();
-    println!("Recovered {} sompi to wallet.", tx.outputs[0].value);
+    println!(
+        "Refunded {} sompi of source tokens to the wallet's token_unit P2SH ({}:0) and {} sompi KAS change.",
+        order_value, tx_id, tx.outputs[1].value
+    );
 
     Ok(())
 }

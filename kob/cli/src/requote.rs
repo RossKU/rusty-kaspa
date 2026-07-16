@@ -81,7 +81,6 @@ pub async fn run(
     let pubkey = wallet.pubkey;
     let privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
-    let spk_hash = compute_p2pk_spk_hash(&pubkey);
 
     // --- Input validation for new order ---
     if new_params.price_num == 0 {
@@ -188,6 +187,35 @@ pub async fn run(
         );
         println!();
     }
+
+    // Delivery-SPK commitment for reconstructing the OLD order's RS. Prefer
+    // the exact hash the deploy recorded in the cache (byte-exact for both
+    // pre-D2 raw-P2PK orders and post-D2 token_unit orders); otherwise
+    // derive it: v18 buys commit the owner's token_unit P2SH hash (D2
+    // delivery re-wrap), everything else the raw P2PK hash.
+    let spk_hash: [u8; 32] = match cached
+        .as_ref()
+        .and_then(|c| hex::decode(&c.spk_hash).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    {
+        Some(h) => h,
+        None => {
+            if old_side == "buy" && old_version == 18 {
+                contract::compute_token_unit_spk_hash(&pubkey)
+            } else {
+                compute_p2pk_spk_hash(&pubkey)
+            }
+        }
+    };
+
+    // Delivery-SPK commitment for the NEW deploy leg: v18 buys commit the
+    // owner's token_unit P2SH hash (fills deliver spendable KCC20
+    // token_units); sells keep the raw P2PK hash (KAS proceeds).
+    let new_spk_hash: [u8; 32] = if new_params.side == "buy" && new_params.version == 18 {
+        contract::compute_token_unit_spk_hash(&pubkey)
+    } else {
+        compute_p2pk_spk_hash(&pubkey)
+    };
 
     // STEP 1: Build and submit cancel TX
 
@@ -450,22 +478,22 @@ pub async fn run(
     let new_redeem_script = match new_params.side.as_str() {
         "buy" if new_params.version == 18 => contract::spot::order::build_buy_v18_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+            new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         "sell" if new_params.version == 18 => contract::spot::order::build_sell_v18_redeem_script(
             new_params.price_num, new_params.price_den, new_params.min_fill,
-            &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+            &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         "buy" if new_params.version == 17 => contract::build_buy_v17_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+            new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         "buy" if new_params.version == 16 => contract::build_buy_v16_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+            new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         "buy" => contract::build_buy_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+            new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         "sell" => contract::build_sell_redeem_script(
             new_params.price_num, new_params.price_den, new_params.min_fill,
-            &owner_hash, &spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+            &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
         other => anyhow::bail!("Unknown new side '{}'. Use 'buy' or 'sell'.", other),
     };
 

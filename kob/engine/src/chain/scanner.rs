@@ -651,6 +651,13 @@ impl BlockScanner {
 /// Returns the first output whose hash matches `owner_spk_hash` as a hex string
 /// of the full SPK bytes (version LE u16 ++ script).
 ///
+/// D2 delivery re-wrap: v18 buys (and swaps) commit the owner's token_unit
+/// P2SH SPK hash instead of the raw P2PK hash. That SPK never appears as a
+/// deploy-TX output, but it is a pure function of the owner pubkey -- and the
+/// deploy TX's P2PK change output exposes that pubkey ([0x20][pk 32B][0xac]).
+/// So for every P2PK-shaped output we ALSO derive the token_unit P2SH SPK of
+/// its embedded pubkey and match that against `owner_spk_hash`.
+///
 /// Returns `None` if no matching output is found (e.g., the deployer's change
 /// address is on a different TX, or the deploy TX only has the P2SH output).
 pub fn extract_owner_spk(tx: &TransactionData, owner_spk_hash: &[u8; 32]) -> Option<String> {
@@ -670,6 +677,23 @@ pub fn extract_owner_spk(tx: &TransactionData, owner_spk_hash: &[u8; 32]) -> Opt
             spk_bytes.extend_from_slice(&out.script_version.to_le_bytes());
             spk_bytes.extend_from_slice(&out.script);
             return Some(hex::encode(&spk_bytes));
+        }
+        // Token_unit re-wrap recovery: derive the token_unit P2SH SPK of a
+        // P2PK output's embedded pubkey and match it against the commitment.
+        if out.script_version == 0
+            && out.script.len() == 34
+            && out.script[0] == 0x20
+            && out.script[33] == 0xac
+        {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&out.script[1..33]);
+            if kob_core::contract::compute_token_unit_spk_hash(&pk) == *owner_spk_hash {
+                let tu = kob_core::contract::build_token_unit_p2sh_spk(&pk);
+                let mut spk_bytes = Vec::with_capacity(2 + tu.script().len());
+                spk_bytes.extend_from_slice(&tu.version().to_le_bytes());
+                spk_bytes.extend_from_slice(tu.script());
+                return Some(hex::encode(&spk_bytes));
+            }
         }
     }
     None

@@ -149,9 +149,13 @@ struct DeployResult {
     buyer_spk_hash_hex: String,
     /// Hex-encoded Blake2b-256(seller SPK) embedded in the sell RS
     seller_spk_hash_hex: String,
-    /// Hex-encoded actual SPK bytes of the deployer wallet (buyer = seller in test mode).
-    /// Stored so the matcher can route match TX outputs to the correct counterparty.
-    counterparty_spk_hex: String,
+    /// Hex-encoded buyer delivery SPK (version 2B LE + script). D2 delivery
+    /// re-wrap: this is the wallet's token_unit P2SH SPK, matching the buy
+    /// RS's bspkh, so fills deliver spendable KCC20 token_units.
+    buyer_counterparty_spk_hex: String,
+    /// Hex-encoded seller KAS-proceeds SPK (version 2B LE + script): the
+    /// deployer wallet's raw P2PK SPK, matching the sell RS's sspkh.
+    seller_counterparty_spk_hex: String,
 }
 
 async fn deploy_test_pair(
@@ -255,9 +259,12 @@ async fn deploy_test_pair(
 
     let covenant_id_hex = token_cov_id.to_string();
 
-    // Compute SPK hashes (both sides are matcher's wallet in test mode)
-    let buyer_spk_hash = kob_core::compute_spk_hash(wallet_spk_version, &wallet_spk_script);
-    let seller_spk_hash = buyer_spk_hash;
+    // Compute SPK hashes (both sides are matcher's wallet in test mode).
+    // v18 delivery re-wrap: the buy's bspkh commits the wallet's token_unit
+    // P2SH SPK (fills deliver spendable KCC20 token_units); the sell's sspkh
+    // stays the raw wallet P2PK SPK (KAS proceeds).
+    let buyer_spk_hash = kob_core::contract::compute_token_unit_spk_hash(&pubkey);
+    let seller_spk_hash = kob_core::compute_spk_hash(wallet_spk_version, &wallet_spk_script);
 
     // Build order scripts
     let cov_id_bytes: [u8; 32] = match hex::decode(&covenant_id_hex) {
@@ -413,7 +420,19 @@ async fn deploy_test_pair(
             sell_value,
             buyer_spk_hash_hex: hex::encode(buyer_spk_hash),
             seller_spk_hash_hex: hex::encode(seller_spk_hash),
-            counterparty_spk_hex: wallet_spk_hex.clone(),
+            buyer_counterparty_spk_hex: {
+                let tu = kob_core::contract::build_token_unit_p2sh_spk(&pubkey);
+                let mut raw = Vec::with_capacity(2 + tu.script().len());
+                raw.extend_from_slice(&tu.version().to_le_bytes());
+                raw.extend_from_slice(tu.script());
+                hex::encode(raw)
+            },
+            seller_counterparty_spk_hex: {
+                let mut raw = Vec::with_capacity(2 + wallet_spk_script.len());
+                raw.extend_from_slice(&wallet_spk_version.to_le_bytes());
+                raw.extend_from_slice(&wallet_spk_script);
+                hex::encode(raw)
+            },
         });
     }
 
@@ -491,7 +510,7 @@ pub async fn run_deploy_test(
         &dr.deploy_tx_id, 0, dr.buy_value,
         &dr.covenant_id_hex, price_num, price_den, min_fill,
         &owner_hash_hex, &dr.buyer_spk_hash_hex,
-        Some(dr.counterparty_spk_hex.clone()),
+        Some(dr.buyer_counterparty_spk_hex.clone()),
         OrderSide::Buy,
         &dr.buy_rs_hex, &dr.buy_p2sh_hex, dr.buy_p2sh_ver,
     );
@@ -499,7 +518,7 @@ pub async fn run_deploy_test(
         &dr.deploy_tx_id, 1, dr.sell_value,
         &dr.covenant_id_hex, price_num, price_den, min_fill,
         &owner_hash_hex, &dr.seller_spk_hash_hex,
-        Some(dr.counterparty_spk_hex.clone()),
+        Some(dr.seller_counterparty_spk_hex.clone()),
         OrderSide::Sell,
         &dr.sell_rs_hex, &dr.sell_p2sh_hex, dr.sell_p2sh_ver,
     );

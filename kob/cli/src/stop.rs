@@ -403,7 +403,9 @@ async fn build_signed_buy_tx_json(
     let privkey = wallet.privkey();
 
     let owner_hash = blake2b_256(&pubkey);
-    let buyer_spk_hash = compute_p2pk_spk_hash(&pubkey);
+    // v18 delivery re-wrap: the triggered buy's bspkh commits the owner's
+    // token_unit P2SH SPK so its fill delivers a spendable KCC20 token_unit.
+    let buyer_spk_hash = contract::compute_token_unit_spk_hash(&pubkey);
 
     let token_cov_bytes = hex::decode(token)?;
     if token_cov_bytes.len() != 32 {

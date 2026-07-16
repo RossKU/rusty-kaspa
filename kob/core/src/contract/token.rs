@@ -317,6 +317,34 @@ pub fn build_token_unit_redeem_script(owner_pubkey: &[u8; 32]) -> Vec<u8> {
     rs
 }
 
+/// Build the owner's token_unit P2SH scriptPublicKey (version 0, 35-byte
+/// `aa 20 <blake2b(RS)> 87` script).
+///
+/// This is the canonical KCC20 delivery endpoint for `owner_pubkey`: a v18
+/// order that commits `compute_token_unit_spk_hash(owner_pubkey)` as its
+/// delivery SPK hash forces fills to land the tokens on exactly this SPK,
+/// making the delivered UTXO a spendable token_unit (Standard State Header
+/// + CovenantBinding) instead of a bare P2PK output.
+pub fn build_token_unit_p2sh_spk(
+    owner_pubkey: &[u8; 32],
+) -> kaspa_consensus_core::tx::ScriptPublicKey {
+    crate::p2sh::build_p2sh(&build_token_unit_redeem_script(owner_pubkey))
+}
+
+/// Blake2b SPK-hash (OpTxOutputSpk format: `version u16LE ++ script`) of the
+/// owner's token_unit P2SH SPK.
+///
+/// v18 token-delivery commitment: use this wherever a buy's `bspkh` (or a
+/// swap's `ospkh`, or a buy-entry bracket's `trade_spk_hash`) previously used
+/// `compute_p2pk_spk_hash(owner_pubkey)`. KAS-proceeds commitments (sell
+/// `sspkh`, OCO `sspkh`, sell-entry bracket `trade_spk_hash`) must KEEP the
+/// raw P2PK derivation -- wrapping KAS proceeds in a token_unit script would
+/// misrepresent plain KAS as token balance.
+pub fn compute_token_unit_spk_hash(owner_pubkey: &[u8; 32]) -> [u8; 32] {
+    let spk = build_token_unit_p2sh_spk(owner_pubkey);
+    crate::p2sh::compute_spk_hash(spk.version(), spk.script())
+}
+
 /// Decode the KCC20 Standard State Header from a token_unit redeemScript
 /// plus its UTXO's native value (the "Reader" side). `utxo_value` becomes
 /// the header's `amount` field (see module-level decision note). Returns

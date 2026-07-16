@@ -215,16 +215,24 @@ pub async fn deploy_bracket_v4(
     let privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
 
-    // Compute trade_spk_hash: blake2b of the wallet's P2PK scriptPublicKey.
-    // This is the SPK that must appear on the trade output (output[0] for sell,
-    // output[1] for buy), preventing a malicious matcher from redirecting funds.
-    // P2PK SPK = version(2B) + OP_DATA_32(1B) + pubkey(32B) + OP_CHECKSIG(1B) = 36B
-    let mut wallet_spk_for_hash = Vec::with_capacity(36);
-    wallet_spk_for_hash.extend_from_slice(&0u16.to_le_bytes()); // version 0
-    wallet_spk_for_hash.push(0x20); // push 32 bytes
-    wallet_spk_for_hash.extend_from_slice(&pubkey);
-    wallet_spk_for_hash.push(0xac); // OpCheckSig
-    let trade_spk_hash = blake2b_256(&wallet_spk_for_hash);
+    // Compute trade_spk_hash: the SPK that must appear on the trade output
+    // (output[0] for sell, output[1] for buy), preventing a malicious matcher
+    // from redirecting funds.
+    // - BUY entry: the trade output is a TOKEN delivery -> commit the owner's
+    //   token_unit P2SH SPK (KCC20 delivery re-wrap; the fill lands a
+    //   spendable token_unit, not a bare P2PK output).
+    // - SELL entry: the trade output is KAS proceeds -> keep the raw P2PK SPK.
+    let trade_spk_hash = if entry_type == 0 {
+        contract::compute_token_unit_spk_hash(&pubkey)
+    } else {
+        // P2PK SPK = version(2B) + OP_DATA_32(1B) + pubkey(32B) + OP_CHECKSIG(1B) = 36B
+        let mut wallet_spk_for_hash = Vec::with_capacity(36);
+        wallet_spk_for_hash.extend_from_slice(&0u16.to_le_bytes()); // version 0
+        wallet_spk_for_hash.push(0x20); // push 32 bytes
+        wallet_spk_for_hash.extend_from_slice(&pubkey);
+        wallet_spk_for_hash.push(0xac); // OpCheckSig
+        blake2b_256(&wallet_spk_for_hash)
+    };
 
     // Build v18 bracket redeemScript (372B: 224B state identical to v1 +
     // v18 body — receipt-gated fill with CSV(50) exposure delay; the OCO
@@ -1200,9 +1208,11 @@ pub async fn cancel_bracket_v4(
     println!("Connecting to {}...", node_url);
     let rpc = NodeClient::connect(node_url).await?;
 
-    // Resolve order value
-    let order_value = if let Some(v) = order_value_override {
-        v
+    // Resolve order value (and covenant binding: a SELL-entry bracket's
+    // escrow is tokens -- the refund must stay a token_unit, not be burned
+    // into plain KAS).
+    let (order_value, order_cov_id): (u64, Option<String>) = if let Some(v) = order_value_override {
+        (v, None)
     } else {
         let p2sh_addr = p2sh_to_address(&p2sh.script(), network.address_prefix());
         println!("P2SH Address:  {}", p2sh_addr);
@@ -1220,7 +1230,7 @@ pub async fn cancel_bracket_v4(
                     order_outpoint
                 )
             })?;
-        utxo.utxo_entry.amount
+        (utxo.utxo_entry.amount, utxo.utxo_entry.covenant_id.clone())
     };
     println!("Order Value:   {} sompi", order_value);
 
@@ -1244,8 +1254,9 @@ pub async fn cancel_bracket_v4(
 
     let total_in = order_value + fee_utxo.utxo_entry.amount;
 
-    // Build cancel TX (version 0)
-    let mut tx = Transaction::new(0);
+    // Build cancel TX (version 1 when the token escrow's binding is carried
+    // into a token_unit refund -- D2 refund re-wrap; version 0 otherwise)
+    let mut tx = Transaction::new(if order_cov_id.is_some() { 1 } else { 0 });
 
     // Input 0: bracket_order_v6 UTXO (sigOpCount = 1 for cancel path -- has CheckSigVerify)
     tx.inputs.push(TxInput {
@@ -1270,13 +1281,36 @@ pub async fn cancel_bracket_v4(
         value: fee_utxo.utxo_entry.amount,
     });
 
-    // Output 0: recovered funds to wallet (tentative, adjusted by converge_fee)
+    // Outputs. Token-escrow bracket (sell entry): output 0 = token_unit
+    // refund (fixed at order_value, binding preserved), output 1 = fee
+    // change. KAS-escrow bracket (buy entry): single output 0 to the wallet.
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
     let tentative_output = total_in.saturating_sub(est_fee_budget);
-    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    let fee_change_idx: usize = if let Some(ref cov_hex) = order_cov_id {
+        let token_unit_spk = contract::build_token_unit_p2sh_spk(&pubkey);
+        let binding = kob_core::compat::covenant_binding_from_hex(0, cov_hex)
+            .map_err(|e| anyhow::anyhow!("invalid covenant id on bracket UTXO: {}", e))?;
+        println!("Token refund:  {} sompi -> token_unit P2SH {}", order_value, hex::encode(token_unit_spk.script()));
+        tx.outputs.push(TxOutput::new(
+            order_value,
+            token_unit_spk.version,
+            token_unit_spk.script().to_vec(),
+            Some(binding),
+        ));
+        tx.outputs.push(TxOutput::new(
+            fee_utxo.utxo_entry.amount.saturating_sub(est_fee_budget),
+            fee_utxo.utxo_entry.script_public_key.version,
+            wallet_spk,
+            None,
+        ));
+        1
+    } else {
+        tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+        0
+    };
 
-    // Phase 1: converge fee on output[0]
-    let (est_fee, _) = converge_fee(&mut tx, total_in, 0, 0);
+    // Phase 1: converge fee on the fee-change slot
+    let (est_fee, _) = converge_fee(&mut tx, total_in, fee_change_idx, 0);
 
     // Sign input 0 (cancel path signature)
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -1305,8 +1339,17 @@ pub async fn cancel_bracket_v4(
     let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
-        let output_value = total_in.saturating_sub(exact_fee);
-        tx.outputs[0].value = output_value;
+        // Fixed outputs (the token refund, when present) keep their value;
+        // only the fee-change slot absorbs the fee delta.
+        let fixed_sum: u64 = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != fee_change_idx)
+            .map(|(_, o)| o.value)
+            .sum();
+        let output_value = total_in.saturating_sub(fixed_sum + exact_fee);
+        tx.outputs[fee_change_idx].value = output_value;
 
         // Re-sign with updated output value
         let sighash_0 = compute_sighash(&tx, 0)?;
@@ -1325,7 +1368,7 @@ pub async fn cancel_bracket_v4(
         (cancel_sigscript, fee_sigscript, est_fee)
     };
 
-    let output_value = tx.outputs[0].value;
+    let output_value = tx.outputs[fee_change_idx].value;
     println!("Output Value:  {} sompi", output_value);
     let cancel_exact_compute = calc_mass_with_sigscripts(&tx, &[cancel_sigscript.clone(), fee_sigscript.clone()]);
     println!("Compute mass:  {:>9} (exact, post-sign)", cancel_exact_compute);
@@ -1341,7 +1384,14 @@ pub async fn cancel_bracket_v4(
     println!("SUCCESS! Bracket order cancelled.");
     println!("TXID: {}", tx_id);
     println!();
-    println!("Recovered {} sompi to wallet.", output_value);
+    if order_cov_id.is_some() {
+        println!(
+            "Refunded {} sompi of tokens to the wallet's token_unit P2SH ({}:0) and {} sompi KAS change.",
+            order_value, tx_id, output_value
+        );
+    } else {
+        println!("Recovered {} sompi to wallet.", output_value);
+    }
 
     Ok(())
 }
@@ -1449,13 +1499,19 @@ pub async fn run(
     let mut receipt_cov_id = [0u8; 32];
     receipt_cov_id.copy_from_slice(&rcid_bytes);
 
-    // Compute trade_spk_hash from the owner's P2PK SPK (N5 fix)
-    let mut owner_spk = [0u8; 36];
-    owner_spk[0..2].copy_from_slice(&0u16.to_le_bytes()); // version 0
-    owner_spk[2] = 0x20; // push 32 bytes
-    owner_spk[3..35].copy_from_slice(&pubkey);
-    owner_spk[35] = 0xac; // OpCheckSig
-    let trade_spk_hash = blake2b_256(&owner_spk);
+    // Compute trade_spk_hash (N5 fix). BUY entry: the trade output is a TOKEN
+    // delivery -> commit the owner's token_unit P2SH SPK (KCC20 delivery
+    // re-wrap). SELL entry: KAS proceeds -> keep the raw P2PK SPK.
+    let trade_spk_hash = if entry_type == 0 {
+        contract::compute_token_unit_spk_hash(&pubkey)
+    } else {
+        let mut owner_spk = [0u8; 36];
+        owner_spk[0..2].copy_from_slice(&0u16.to_le_bytes()); // version 0
+        owner_spk[2] = 0x20; // push 32 bytes
+        owner_spk[3..35].copy_from_slice(&pubkey);
+        owner_spk[35] = 0xac; // OpCheckSig
+        blake2b_256(&owner_spk)
+    };
 
     // Build v18 bracket redeemScript (single v18 oco_sell at output[2])
     let redeem_script = contract::spot::bracket::build_bracket_v18_redeem_script(

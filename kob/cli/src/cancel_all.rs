@@ -81,17 +81,31 @@ pub fn build_cancel_tx(
     fee_utxo_value: u64,
     fee_utxo_spk_version: u16,
     fee_utxo_spk_bytes: &[u8],
+    refund_cov_id: Option<&str>,
 ) -> anyhow::Result<(Transaction, Vec<Vec<u8>>, u64)> {
 
     let redeem_script = build_redeem_script_for_order(order, pubkey)?;
     let p2sh = build_p2sh(&redeem_script);
+
+    // Sell-cancel refund re-wrap (D2): return the token escrow as a spendable
+    // KCC20 token_unit (token_unit P2SH SPK + CovenantBinding) instead of
+    // burning the binding into plain KAS. `refund_cov_id` is the covenant id
+    // observed on the live order UTXO (or the cached token id when the chain
+    // could not be queried); None falls back to the legacy plain-KAS refund.
+    let sell_refund_cov_id: Option<String> = if order.side == "sell" {
+        refund_cov_id
+            .filter(|t| hex::decode(t).map(|b| b.len() == 32).unwrap_or(false))
+            .map(str::to_string)
+    } else {
+        None
+    };
 
     let total_in = order_value + fee_utxo_value;
     // First pass: estimate fee to build a tentative TX.
     let est_fee = kob_core::mass::estimate_compute_mass(2, 1, 0);
     let tentative_output = total_in - est_fee;
 
-    let mut tx = Transaction::new(0);
+    let mut tx = Transaction::new(if sell_refund_cov_id.is_some() { 1 } else { 0 });
 
     // Input 0: order UTXO (P2SH)
     let parts: Vec<&str> = order.outpoint.split(':').collect();
@@ -119,8 +133,30 @@ pub fn build_cancel_tx(
         value: fee_utxo_value,
     });
 
-    // Output 0: recovered funds to wallet
-    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo_spk_version, fee_utxo_spk_bytes.to_vec(), None));
+    // Outputs. Token-refunding sell cancel: output 0 = token_unit refund
+    // (fixed at order_value, binding preserved), output 1 = fee change.
+    // Otherwise: single output 0 = all recovered funds to the wallet P2PK.
+    let fee_change_idx: usize = if let Some(ref cov_hex) = sell_refund_cov_id {
+        let token_unit_spk = contract::build_token_unit_p2sh_spk(pubkey);
+        let binding = kob_core::compat::covenant_binding_from_hex(0, cov_hex)
+            .map_err(|e| anyhow::anyhow!("invalid token covenant id '{}': {}", cov_hex, e))?;
+        tx.outputs.push(TxOutput::new(
+            order_value,
+            token_unit_spk.version,
+            token_unit_spk.script().to_vec(),
+            Some(binding),
+        ));
+        tx.outputs.push(TxOutput::new(
+            fee_utxo_value.saturating_sub(est_fee),
+            fee_utxo_spk_version,
+            fee_utxo_spk_bytes.to_vec(),
+            None,
+        ));
+        1
+    } else {
+        tx.outputs.push(TxOutput::new(tentative_output, fee_utxo_spk_version, fee_utxo_spk_bytes.to_vec(), None));
+        0
+    };
 
     // Phase 1: sign with estimated fee
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -149,9 +185,18 @@ pub fn build_cancel_tx(
     let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
 
     let (cancel_sigscript, fee_sigscript, output_value) = if exact_fee != est_fee {
-        // Re-adjust output and re-sign (handles both over- and under-estimate)
-        let output_value = total_in.saturating_sub(exact_fee);
-        tx.outputs[0].value = output_value;
+        // Re-adjust the fee-change slot and re-sign (handles both over- and
+        // under-estimate). Fixed outputs (the token refund, when present)
+        // keep their full value.
+        let fixed_sum: u64 = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != fee_change_idx)
+            .map(|(_, o)| o.value)
+            .sum();
+        let output_value = total_in.saturating_sub(fixed_sum + exact_fee);
+        tx.outputs[fee_change_idx].value = output_value;
 
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(privkey, &sighash_0)?;
@@ -173,8 +218,15 @@ pub fn build_cancel_tx(
 
         (cancel_sigscript, fee_sigscript, output_value)
     } else {
-        let output_value = total_in.saturating_sub(est_fee);
-        tx.outputs[0].value = output_value;
+        let fixed_sum: u64 = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != fee_change_idx)
+            .map(|(_, o)| o.value)
+            .sum();
+        let output_value = total_in.saturating_sub(fixed_sum + est_fee);
+        tx.outputs[fee_change_idx].value = output_value;
         (cancel_sigscript, fee_sigscript, output_value)
     };
 
@@ -354,14 +406,16 @@ pub async fn run(
             }
         };
 
-        // Try to verify UTXO on-chain; fall back to cached value on query failure
-        let order_value = match rpc.get_utxos_by_addresses(&[&p2sh_address]).await {
+        // Try to verify UTXO on-chain; fall back to cached value on query failure.
+        // Also capture the live covenant binding (drives the sell-refund
+        // token_unit re-wrap; a missing binding must NOT be re-bound).
+        let (order_value, refund_cov_id): (u64, Option<String>) = match rpc.get_utxos_by_addresses(&[&p2sh_address]).await {
             Ok(order_utxos) => {
                 let live_utxo = order_utxos.iter().find(|u| {
                     u.outpoint.transaction_id == order_txid && u.outpoint.index == order_index
                 });
                 match live_utxo {
-                    Some(u) => u.utxo_entry.amount,
+                    Some(u) => (u.utxo_entry.amount, u.utxo_entry.covenant_id.clone()),
                     None => {
                         println!("  SKIP: Order UTXO not found on-chain (already cancelled/filled?).");
                         results.push(CancelResult {
@@ -377,7 +431,7 @@ pub async fn run(
             }
             Err(e) => {
                 println!("  WARN: UTXO query failed ({}), using cached value {} sompi.", e, order.value);
-                order.value
+                (order.value, order.token.clone())
             }
         };
 
@@ -417,6 +471,7 @@ pub async fn run(
                 fee_utxo.utxo_entry.amount,
                 fee_utxo.utxo_entry.script_public_key.version,
                 &fee_spk_bytes,
+                refund_cov_id.as_deref(),
             );
             let (tx, sigscripts, recovered) = match built {
                 Ok(v) => v,
@@ -501,7 +556,23 @@ pub fn build_redeem_script_for_order(
     pubkey: &[u8; 32],
 ) -> anyhow::Result<Vec<u8>> {
     let owner_hash = blake2b_256(pubkey);
-    let spk_hash = compute_p2pk_spk_hash(pubkey);
+    // Delivery-SPK commitment: prefer the exact hash the deploy recorded in
+    // the cache entry (byte-exact for both pre-D2 raw-P2PK orders and post-D2
+    // token_unit orders). Otherwise derive it: v18 buys commit the owner's
+    // token_unit P2SH hash (D2 delivery re-wrap), everything else raw P2PK.
+    let spk_hash: [u8; 32] = match hex::decode(&order.spk_hash)
+        .ok()
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    {
+        Some(h) => h,
+        None => {
+            if order.side == "buy" && order.version == 18 {
+                contract::compute_token_unit_spk_hash(pubkey)
+            } else {
+                compute_p2pk_spk_hash(pubkey)
+            }
+        }
+    };
 
 
     if order.version != 14 && order.version != 16 && order.version != 17 && order.version != 18 {

@@ -400,7 +400,16 @@ pub async fn deploy_buy(
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
     let owner_hash = blake2b_256(&pubkey);
-    let buyer_spk_hash = compute_p2pk_spk_hash(&pubkey);
+    // v18 delivery re-wrap: fills must land tokens on the buyer's token_unit
+    // P2SH (KCC20 Standard State Header) rather than the raw P2PK SPK, so the
+    // delivered UTXO is readable by KCC20 tooling and spendable by
+    // `token transfer`. Pre-v18 generations keep the historical raw-P2PK
+    // commitment (live orders on chain still reconstruct byte-exactly).
+    let buyer_spk_hash = if version == 18 {
+        contract::compute_token_unit_spk_hash(&pubkey)
+    } else {
+        compute_p2pk_spk_hash(&pubkey)
+    };
 
     let redeem_script = if version == 18 {
         let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);

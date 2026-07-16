@@ -269,6 +269,10 @@ pub async fn run(
         bytes
             .try_into()
             .map_err(|_| anyhow::anyhow!("Invalid --buy-spk-hash: must be exactly 64 hex characters (32 bytes)"))?
+    } else if version == 18 {
+        // v18 delivery re-wrap: v18 buys commit the buyer's token_unit P2SH
+        // hash (fills deliver spendable KCC20 token_units).
+        contract::compute_token_unit_spk_hash(&buyer_pubkey)
     } else {
         compute_p2pk_spk_hash(&buyer_pubkey)
     };
@@ -288,6 +292,23 @@ pub async fn run(
     } else {
         compute_p2pk_spk_hash(&seller_pubkey)
     };
+
+    // Buyer delivery SPK: must blake2b-hash to the buy's committed bspkh or
+    // the covenant F2 check rejects the fill. Candidates: the raw P2PK SPK
+    // (pre-D2 orders) and the token_unit P2SH SPK (D2 delivery re-wrap).
+    let (buyer_spk, buyer_spk_version): (Vec<u8>, u16) =
+        if kob_core::compute_spk_hash(0, &buyer_spk) == buy_spk_hash {
+            (buyer_spk, 0)
+        } else if contract::compute_token_unit_spk_hash(&buyer_pubkey) == buy_spk_hash {
+            let tu = contract::build_token_unit_p2sh_spk(&buyer_pubkey);
+            (tu.script().to_vec(), tu.version)
+        } else {
+            anyhow::bail!(
+                "The buy order's committed delivery SPK hash matches neither the buyer's \
+                 P2PK SPK nor their token_unit P2SH SPK. Cannot construct the token \
+                 delivery output."
+            );
+        };
 
     // Reconstruct redeemScripts. v13/v14 share a layout (build_buy_redeem_script);
     // v16 is the F6-fix buy contract (mmfee_bps semantics, see V16_STATUS.md);
@@ -430,7 +451,7 @@ pub async fn run(
         redeem_script: buy_rs,
         utxo_value: buy_value,
         counterparty_spk: buyer_spk,
-        counterparty_spk_version: 0,
+        counterparty_spk_version: buyer_spk_version,
         min_fill: buy_min_fill,
         oco_path: None,
         bracket_meta: None,

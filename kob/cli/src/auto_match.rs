@@ -200,6 +200,35 @@ pub async fn submit_match(
     let wallet_spk = fee_utxo.script_bytes();
     let wallet_spk_version = fee_utxo.utxo_entry.script_public_key.version;
 
+    // Buyer delivery SPK: MUST blake2b-hash to the buy's committed bspkh or
+    // the covenant F2 check rejects the fill. Self-trade model: the buyer is
+    // this wallet, so try the wallet P2PK SPK (pre-D2 orders) first, then the
+    // wallet's token_unit P2SH SPK (D2 delivery re-wrap). The wallet pubkey
+    // is recovered from the P2PK fee-UTXO script ([0x20][pk 32B][0xac]).
+    let (buyer_spk, buyer_spk_version): (Vec<u8>, u16) =
+        if kob_core::compute_spk_hash(wallet_spk_version, &wallet_spk) == buy.spk_hash {
+            (wallet_spk.clone(), wallet_spk_version)
+        } else if wallet_spk.len() == 34 && wallet_spk[0] == 0x20 && wallet_spk[33] == 0xac {
+            let mut pk = [0u8; 32];
+            pk.copy_from_slice(&wallet_spk[1..33]);
+            if contract::compute_token_unit_spk_hash(&pk) == buy.spk_hash {
+                let tu = contract::build_token_unit_p2sh_spk(&pk);
+                (tu.script().to_vec(), tu.version)
+            } else {
+                anyhow::bail!(
+                    "Buy order {}:{} commits a delivery SPK hash matching neither the \
+                     wallet P2PK SPK nor its token_unit P2SH SPK.",
+                    buy.txid, buy.index
+                );
+            }
+        } else {
+            anyhow::bail!(
+                "Buy order {}:{} delivery SPK hash does not match the wallet SPK and \
+                 the fee UTXO is not P2PK; cannot derive the token delivery SPK.",
+                buy.txid, buy.index
+            );
+        };
+
     let buy_order = BatchOrder {
         outpoint: (buy.txid.clone(), buy.index),
         order_type: OrderType::Buy,
@@ -210,8 +239,8 @@ pub async fn submit_match(
         amount: buy.value,
         redeem_script: buy.redeem_script.clone(),
         utxo_value: buy.value,
-        counterparty_spk: wallet_spk.clone(),
-        counterparty_spk_version: wallet_spk_version,
+        counterparty_spk: buyer_spk,
+        counterparty_spk_version: buyer_spk_version,
         min_fill: buy.min_fill,
         oco_path: None,
         bracket_meta: None,

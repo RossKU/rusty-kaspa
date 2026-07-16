@@ -198,6 +198,10 @@ pub async fn run(
             hex::decode(&entry.spk_hash)?
                 .try_into()
                 .map_err(|_| anyhow::anyhow!("Invalid spk_hash in cache for {}", op_str))?
+        } else if entry.version == 18 {
+            // v18 delivery re-wrap: v18 buys commit the owner's token_unit
+            // P2SH hash (fills deliver spendable KCC20 token_units).
+            contract::compute_token_unit_spk_hash(&pubkey)
         } else {
             spk_hash
         };
@@ -251,11 +255,29 @@ pub async fn run(
             .map(|u| u.utxo_entry.amount)
             .ok_or_else(|| anyhow::anyhow!("Buy order {} not found on chain", op_str))?;
 
-        // Buyer SPK = buyer's address
-        let mut buyer_spk = Vec::with_capacity(34);
-        buyer_spk.push(0x20);
-        buyer_spk.extend_from_slice(&pubkey);
-        buyer_spk.push(0xac);
+        // Buyer delivery SPK: MUST hash (OpTxOutputSpk blake2b) to the buy's
+        // committed bspkh or the covenant F2 check rejects the fill. This is
+        // a self-match utility (the buyer is this wallet), so the candidates
+        // are the raw P2PK SPK (pre-D2 orders) and the token_unit P2SH SPK
+        // (D2 delivery re-wrap).
+        let mut p2pk_spk = Vec::with_capacity(34);
+        p2pk_spk.push(0x20);
+        p2pk_spk.extend_from_slice(&pubkey);
+        p2pk_spk.push(0xac);
+        let (buyer_spk, buyer_spk_version): (Vec<u8>, u16) =
+            if kob_core::compute_spk_hash(0, &p2pk_spk) == buy_spkh {
+                (p2pk_spk, 0)
+            } else if contract::compute_token_unit_spk_hash(&pubkey) == buy_spkh {
+                let tu = contract::build_token_unit_p2sh_spk(&pubkey);
+                (tu.script().to_vec(), tu.version)
+            } else {
+                anyhow::bail!(
+                    "Buy order {} commits a delivery SPK hash that matches neither this \
+                     wallet's P2PK SPK nor its token_unit P2SH SPK. Cannot construct the \
+                     token delivery output.",
+                    op_str
+                );
+            };
 
         println!("  buy  {}: value={} price={}/{}", op_str, value, entry.price_num, entry.price_den);
 
@@ -270,7 +292,7 @@ pub async fn run(
             redeem_script: rs,
             utxo_value: value,
             counterparty_spk: buyer_spk,
-            counterparty_spk_version: 0,
+            counterparty_spk_version: buyer_spk_version,
             min_fill: entry.min_fill,
             oco_path: None,
             bracket_meta: None,
@@ -668,9 +690,11 @@ pub async fn run_ring(
                 i, contract::spot::swap::SWAP_V18_RS_SIZE, rs.len()
             ))?;
 
-        // Owner SPK: explicit per-leg (2B version LE + script) or this
-        // wallet's P2PK. plan_ring_match re-verifies blake2b(spk) ==
-        // owner_spk_hash (F3) either way.
+        // Owner SPK: explicit per-leg (2B version LE + script), or derived
+        // for this wallet by matching the RS's committed owner_spk_hash --
+        // token_unit P2SH first (D2 delivery re-wrap), raw P2PK for pre-D2
+        // legs. plan_ring_match re-verifies blake2b(spk) == owner_spk_hash
+        // (F3) either way.
         let (owner_spk_version, owner_spk) = if parts.len() == 4 {
             let raw = hex::decode(parts[3])
                 .map_err(|e| anyhow::anyhow!("--leg[{}]: invalid owner SPK hex: {}", i, e))?;
@@ -678,6 +702,9 @@ pub async fn run_ring(
                 anyhow::bail!("--leg[{}]: owner SPK must be 2B version + script bytes", i);
             }
             (u16::from_le_bytes([raw[0], raw[1]]), raw[2..].to_vec())
+        } else if contract::compute_token_unit_spk_hash(&pubkey) == parsed.owner_spk_hash {
+            let tu = contract::build_token_unit_p2sh_spk(&pubkey);
+            (tu.version, tu.script().to_vec())
         } else {
             (0u16, wallet_p2pk.clone())
         };

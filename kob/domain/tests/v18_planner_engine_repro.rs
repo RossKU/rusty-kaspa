@@ -229,6 +229,55 @@ fn v18_gtc_planner_sweep_passes_real_engine() {
     assert!(failures.is_empty(), "v18 GTC planner tx must pass the real engine; failures: {failures:?}");
 }
 
+/// D2 delivery re-wrap: a v18 buy whose bspkh commits the buyer's token_unit
+/// P2SH SPK (the production deploy shape after D2) plans, delivers every
+/// BuyerTokens output on exactly that P2SH, and passes the real engine.
+#[test]
+fn v18_gtc_planner_token_unit_delivery_passes_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let sell_spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+
+    // Buyer delivery endpoint: token_unit P2SH (KCC20 Standard State Header).
+    let buy_spk_hash = kob_core::contract::compute_token_unit_spk_hash(&pubkey);
+    let token_unit_spk = kob_core::contract::build_token_unit_p2sh_spk(&pubkey);
+
+    let sells = vec![
+        make_sell_v18(0x10, 10_000_000, 99, 100, token, &owner_hash, &sell_spk_hash),
+        make_sell_v18(0x11, 20_000_000, 99, 100, token, &owner_hash, &sell_spk_hash),
+    ];
+    let mut buy = make_buy_v18(0x20, 30_000_000, 1, 1, 1_000_000, token, &owner_hash, &buy_spk_hash, 2000);
+    buy.counterparty_spk = token_unit_spk.script().to_vec();
+    buy.counterparty_spk_version = token_unit_spk.version();
+    let buys = vec![buy];
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+
+    let plan = plan_batch_match(&sells, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000))
+        .expect("v18 GTC sweep with token_unit delivery must plan");
+    assert_eq!(plan.sells.len(), 2);
+
+    // Every BuyerTokens output must land on the buyer's token_unit P2SH and
+    // hash to the committed bspkh.
+    let mut buyer_token_outputs = 0;
+    for o in &plan.outputs {
+        if o.purpose == OutputPurpose::BuyerTokens {
+            buyer_token_outputs += 1;
+            assert_eq!(o.script_public_key, token_unit_spk.script().to_vec(), "delivery SPK must be the token_unit P2SH");
+            assert_eq!(o.spk_version, token_unit_spk.version(), "delivery SPK version");
+            assert_eq!(
+                kob_core::p2sh::compute_spk_hash(o.spk_version, &o.script_public_key),
+                buy_spk_hash,
+                "delivery SPK must hash to the committed bspkh"
+            );
+        }
+    }
+    assert!(buyer_token_outputs >= 1, "plan must contain BuyerTokens outputs");
+
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "v18 token_unit delivery tx must pass the real engine; failures: {failures:?}");
+}
+
 /// v18 GTC sweep with an OCO-SL term (OCO sweep enablement, the historic
 /// blocker): the OCO input executes its SL branch at the attested SL price.
 #[test]

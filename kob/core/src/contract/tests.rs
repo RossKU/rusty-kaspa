@@ -132,6 +132,30 @@ mod tests {
     }
 
     #[test]
+    fn token_unit_p2sh_spk_and_hash_consistent() {
+        // D2 delivery re-wrap commitment: the SPK is the standard 35B P2SH
+        // over the owner's token_unit RS, and the hash is blake2b over the
+        // OpTxOutputSpk encoding (version u16LE ++ script).
+        let pk = [0xEE; 32];
+        let spk = build_token_unit_p2sh_spk(&pk);
+        assert_eq!(spk.version(), 0);
+        assert_eq!(spk.script().len(), 35);
+        assert_eq!(spk.script()[0], 0xaa, "OpBlake2b");
+        assert_eq!(spk.script()[1], 0x20, "push32");
+        assert_eq!(spk.script()[34], 0x87, "OpEqual");
+        let rs = build_token_unit_redeem_script(&pk);
+        assert_eq!(&spk.script()[2..34], &crate::p2sh::blake2b_256(&rs), "P2SH inner hash = blake2b(token_unit RS)");
+
+        let h = compute_token_unit_spk_hash(&pk);
+        assert_eq!(h, crate::p2sh::compute_spk_hash(spk.version(), spk.script()));
+        // The re-wrap MUST change the commitment vs the raw P2PK derivation.
+        assert_ne!(h, crate::p2sh::compute_p2pk_spk_hash(&pk));
+        // Pure function of the owner pubkey (discovery relies on this).
+        assert_eq!(h, compute_token_unit_spk_hash(&pk));
+        assert_ne!(h, compute_token_unit_spk_hash(&[0xEF; 32]));
+    }
+
+    #[test]
     fn kcc20_state_header_decode_roundtrip() {
         let pk = [0xCC; 32];
         let rs = build_token_unit_redeem_script(&pk);

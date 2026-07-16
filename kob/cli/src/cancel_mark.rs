@@ -58,7 +58,29 @@ pub async fn run(
     let pubkey = wallet.pubkey;
     let privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
-    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    // Delivery-SPK commitment for RS reconstruction. Prefer the exact hash
+    // recorded at deploy time in the orders cache (byte-exact for both pre-D2
+    // raw-P2PK orders and post-D2 token_unit orders); otherwise derive it:
+    // v18 buys commit the owner's token_unit P2SH hash (D2 delivery re-wrap),
+    // everything else the raw P2PK hash.
+    let cached_spk_hash: Option<[u8; 32]> = {
+        let cache_path = crate::cancel_all::orders_cache_path(wallet_path);
+        crate::cancel_all::load_orders_cache(&cache_path)
+            .ok()
+            .and_then(|orders| orders.into_iter().find(|o| o.outpoint == outpoint_str))
+            .and_then(|o| hex::decode(&o.spk_hash).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    };
+    let spk_hash: [u8; 32] = match cached_spk_hash {
+        Some(h) => h,
+        None => {
+            if side == "buy" && version == 18 {
+                contract::compute_token_unit_spk_hash(&pubkey)
+            } else {
+                compute_p2pk_spk_hash(&pubkey)
+            }
+        }
+    };
 
     // Helper: parse token covenant ID for buy orders
     let parse_tcid = |token_cov_id: Option<&str>| -> anyhow::Result<[u8; 32]> {
@@ -139,9 +161,12 @@ pub async fn run(
     println!("Connecting to {}...", node_url);
     let rpc = NodeClient::connect(node_url).await?;
 
-    // Determine the order UTXO value
-    let order_value = if let Some(v) = order_value_override {
-        v
+    // Determine the order UTXO value (and its covenant binding: a sell's
+    // token escrow must carry its binding over to the cpend=1 continuation,
+    // otherwise the eventual cancel-complete refund cannot re-wrap the
+    // escrow as a token_unit -- the tokens would be burned to plain KAS).
+    let (order_value, order_cov_id): (u64, Option<String>) = if let Some(v) = order_value_override {
+        (v, None)
     } else {
         let p2sh_address = cancel::p2sh_to_address(&current_p2sh.script(), network.address_prefix());
         println!("P2SH Address:   {}", p2sh_address);
@@ -153,7 +178,7 @@ pub async fn run(
                 u.outpoint.transaction_id == outpoint.transaction_id
                     && u.outpoint.index == outpoint.index
             })
-            .map(|u| u.utxo_entry.amount)
+            .map(|u| (u.utxo_entry.amount, u.utxo_entry.covenant_id.clone()))
             .ok_or_else(|| {
                 anyhow::anyhow!(
                     "Order UTXO {} not found at P2SH address. Use --order-value.",
@@ -208,10 +233,19 @@ pub async fn run(
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
     let wallet_spk_version = fee_utxo.utxo_entry.script_public_key.version;
 
+    // Carry the covenant binding onto the cpend=1 continuation output.
+    let mark_binding = match order_cov_id.as_deref() {
+        Some(cov_hex) => Some(
+            kob_core::compat::covenant_binding_from_hex(0, cov_hex)
+                .map_err(|e| anyhow::anyhow!("invalid covenant id on order UTXO: {}", e))?,
+        ),
+        None => None,
+    };
+
     // Build the cancel-mark transaction with tentative output values
     let total_in = order_value + fee_value;
     let tentative_change = fee_value.saturating_sub(est_fee);
-    let mut tx = Transaction::new(0);
+    let mut tx = Transaction::new(if mark_binding.is_some() { 1 } else { 0 });
 
     // Input 0: order UTXO (P2SH, cancel-mark sigscript, sigOpCount=1)
     tx.inputs.push(TxInput {
@@ -235,8 +269,9 @@ pub async fn run(
         value: fee_value,
     });
 
-    // Output 0: order with cpend=1 (new P2SH address) — value stays the same
-    tx.outputs.push(TxOutput::new(order_value, target_p2sh.version, target_p2sh.script().to_vec(), None));
+    // Output 0: order with cpend=1 (new P2SH address) — value stays the same,
+    // covenant binding (if any) carried over so the escrow stays a token.
+    tx.outputs.push(TxOutput::new(order_value, target_p2sh.version, target_p2sh.script().to_vec(), mark_binding));
 
     // Output 1: fee change (if above dust threshold)
     if tentative_change >= MIN_UTXO_VALUE {

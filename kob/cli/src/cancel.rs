@@ -64,7 +64,6 @@ pub async fn run(
     let pubkey = wallet.pubkey;
     let privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
-    let spk_hash = compute_p2pk_spk_hash(&pubkey);
 
     // Resolve missing parameters from the orders cache.
     //
@@ -158,6 +157,26 @@ pub async fn run(
         )
     });
 
+    // Delivery-SPK commitment for RS reconstruction. Prefer the exact hash the
+    // deploy recorded in the orders cache (byte-exact for both pre-D2 raw-P2PK
+    // orders and post-D2 token_unit orders); otherwise derive it: v18 buys
+    // commit the owner's token_unit P2SH hash (D2 delivery re-wrap), all other
+    // side/version combinations commit the raw P2PK hash.
+    let spk_hash: [u8; 32] = match cached
+        .as_ref()
+        .and_then(|c| hex::decode(&c.spk_hash).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    {
+        Some(h) => h,
+        None => {
+            if side == "buy" && version == 18 {
+                contract::compute_token_unit_spk_hash(&pubkey)
+            } else {
+                compute_p2pk_spk_hash(&pubkey)
+            }
+        }
+    };
+
     let redeem_script = match side {
         "buy" => {
             let tcid = parse_token_cov_id(token_cov_id_resolved.as_deref())?;
@@ -199,9 +218,10 @@ pub async fn run(
     println!("Connecting to {}...", node_url);
     let rpc = NodeClient::connect(node_url).await?;
 
-    // Determine the order UTXO value
-    let order_value = if let Some(v) = order_value_override {
-        v
+    // Determine the order UTXO value (and, for sells, its covenant binding --
+    // needed to re-wrap the refunded token escrow as a token_unit).
+    let (order_value, chain_cov_id): (u64, Option<String>) = if let Some(v) = order_value_override {
+        (v, None)
     } else {
         // Query the P2SH address for this order
         let p2sh_address = p2sh_to_address(&p2sh.script(), network.address_prefix());
@@ -220,7 +240,7 @@ pub async fn run(
                     outpoint, p2sh_address
                 )
             })?;
-        order_utxo.utxo_entry.amount
+        (order_utxo.utxo_entry.amount, order_utxo.utxo_entry.covenant_id.clone())
     };
 
     println!("Order Value:   {} sompi", order_value);
@@ -261,10 +281,36 @@ pub async fn run(
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
     );
 
+    // Sell-cancel refund re-wrap (D2): a sell order's escrow IS the token
+    // (covenant-bound sompi). Refund it as a spendable KCC20 token_unit owned
+    // by the wallet -- token_unit P2SH SPK + the token's CovenantBinding --
+    // instead of merging it into a bare P2PK output (which burns the binding
+    // and turns the tokens back into plain KAS). Requires the token covenant
+    // id (CLI --token > cache > the order UTXO's own binding).
+    let sell_refund_cov_id: Option<String> = if side == "sell" {
+        let resolved = if order_value_override.is_none() {
+            // The chain was queried: trust the UTXO's ACTUAL binding. If the
+            // binding is absent (e.g. burned by an older cancel-mark), a
+            // re-bound output would be consensus-invalid -- refund plain KAS.
+            chain_cov_id
+        } else {
+            // --order-value skipped the chain query: best effort CLI/cache.
+            token_cov_id_resolved.clone()
+        };
+        if resolved.is_none() {
+            println!("WARNING: no token covenant binding resolved for this sell order.");
+            println!("         Refunding sell escrow as plain KAS (no token_unit re-wrap).");
+            println!();
+        }
+        resolved
+    } else {
+        None
+    };
+
     // Build the cancel transaction with tentative output value
     let total_in = order_value + fee_utxo.utxo_entry.amount;
     let tentative_output = total_in - est_fee;
-    let mut tx = Transaction::new(0);
+    let mut tx = Transaction::new(if sell_refund_cov_id.is_some() { 1 } else { 0 });
 
     // Input 0: order UTXO (P2SH, cancel sigscript)
     tx.inputs.push(TxInput {
@@ -289,13 +335,38 @@ pub async fn run(
         value: fee_utxo.utxo_entry.amount,
     });
 
-    // Output 0: recovered funds to wallet
+    // Outputs. For a token-refunding sell cancel: output 0 = token_unit
+    // refund (fixed at order_value, binding preserved), output 1 = fee change
+    // to the wallet P2PK. Otherwise: single output 0 = all recovered funds to
+    // the wallet P2PK.
     let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk, None));
+    let fee_change_idx: usize = if let Some(ref cov_hex) = sell_refund_cov_id {
+        let token_unit_spk = contract::build_token_unit_p2sh_spk(&pubkey);
+        let binding = kob_core::compat::covenant_binding_from_hex(0, cov_hex)
+            .map_err(|e| anyhow::anyhow!("invalid token covenant id '{}': {}", cov_hex, e))?;
+        println!("Token refund:  {} sompi -> token_unit P2SH {}", order_value, hex::encode(token_unit_spk.script()));
+        tx.outputs.push(TxOutput::new(
+            order_value,
+            token_unit_spk.version,
+            token_unit_spk.script().to_vec(),
+            Some(binding),
+        ));
+        let fee_change = fee_utxo.utxo_entry.amount.saturating_sub(est_fee);
+        tx.outputs.push(TxOutput::new(
+            fee_change,
+            fee_utxo.utxo_entry.script_public_key.version,
+            wallet_spk.clone(),
+            None,
+        ));
+        1
+    } else {
+        tx.outputs.push(TxOutput::new(tentative_output, fee_utxo.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+        0
+    };
 
     // Phase 1: converge fee using estimated sigscript sizes
     let min_fee_override = if fee > 0 { fee } else { 0 };
-    let (est_fee, _) = converge_fee(&mut tx, total_in, 0, min_fee_override);
+    let (est_fee, _) = converge_fee(&mut tx, total_in, fee_change_idx, min_fee_override);
 
     // Sign input 0 (order cancel -- the cancel path signature covers the order input)
     let sighash_0 = compute_sighash(&tx, 0)?;
@@ -327,9 +398,17 @@ pub async fn run(
 
     // If exact fee exceeds estimated fee, re-adjust output and re-sign
     let (cancel_sigscript, fee_sigscript, actual_fee) = if exact_fee != est_fee {
-        let fixed_sum = 0u64; // no fixed outputs in cancel TX
+        // Fixed outputs = everything except the fee-change slot (the token
+        // refund output, when present, keeps its full order_value).
+        let fixed_sum: u64 = tx
+            .outputs
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != fee_change_idx)
+            .map(|(_, o)| o.value)
+            .sum();
         let output_value = total_in.saturating_sub(fixed_sum + exact_fee);
-        tx.outputs[0].value = output_value;
+        tx.outputs[fee_change_idx].value = output_value;
 
         // Re-sign with updated output value
         let sighash_0 = compute_sighash(&tx, 0)?;
@@ -354,7 +433,7 @@ pub async fn run(
         (cancel_sigscript, fee_sigscript, est_fee)
     };
 
-    let output_value = tx.outputs[0].value;
+    let output_value = tx.outputs[fee_change_idx].value;
 
     println!("Cancel SigScript: {} bytes", cancel_sigscript.len());
     if side == "buy"
@@ -418,7 +497,14 @@ pub async fn run(
     println!("SUCCESS! Cancel transaction submitted.");
     println!("TXID: {}", tx_id);
     println!();
-    println!("Recovered {} sompi to wallet.", output_value);
+    if sell_refund_cov_id.is_some() {
+        println!(
+            "Refunded {} sompi of tokens to the wallet's token_unit P2SH ({}:0) and {} sompi KAS change.",
+            order_value, tx_id, output_value
+        );
+    } else {
+        println!("Recovered {} sompi to wallet.", output_value);
+    }
 
     Ok(())
 }

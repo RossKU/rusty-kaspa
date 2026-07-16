@@ -991,13 +991,26 @@ pub async fn token_transfer(
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
     );
 
-    // Resolve recipient public key from address for the token_unit redeemScript.
-    // For now, we create a token_unit owned by the recipient's address.
-    // The recipient address is expected to be a P2PK address (kaspa:qr... / kaspatest:qr...).
-    // We extract the public key hash from the address and use it to construct
-    // a P2PK SPK for the recipient's token output.
-    let recipient_spk = kob_core::bech32::address_to_spk(to_address)
+    // Resolve the recipient public key from the address and build THEIR
+    // token_unit P2SH SPK (D2 receive-side fix): the transferred output must
+    // itself be a KCC20 token_unit owned by the recipient -- readable by
+    // KCC20 tooling and re-spendable via `token transfer` -- not a bare P2PK
+    // output with a binding (which this command's own discovery would never
+    // find, since it only scans the token_unit P2SH address).
+    let recipient_p2pk_spk = kob_core::bech32::address_to_spk(to_address)
         .map_err(|e| anyhow::anyhow!(e))?;
+    if recipient_p2pk_spk.len() != 34
+        || recipient_p2pk_spk[0] != 0x20
+        || recipient_p2pk_spk[33] != 0xac
+    {
+        anyhow::bail!(
+            "Recipient address does not decode to a schnorr P2PK SPK; cannot derive \
+             their token_unit P2SH. Use a kaspa:qr.../kaspatest:qr... address."
+        );
+    }
+    let mut recipient_pubkey = [0u8; 32];
+    recipient_pubkey.copy_from_slice(&recipient_p2pk_spk[1..33]);
+    let recipient_token_unit_spk = contract::build_token_unit_p2sh_spk(&recipient_pubkey);
 
     // Build TX version 1 (CovenantBinding for token continuation)
     let mut tx = Transaction::new(1);
@@ -1026,11 +1039,15 @@ pub async fn token_transfer(
         value: fee_utxo.utxo_entry.amount,
     });
 
-    // Output 0: token to recipient (P2PK with covenant binding)
-    // The recipient gets a simple P2PK output carrying the token covenant.
-    // For a more advanced flow, this would create a new token_unit P2SH.
-    // Here we use the simpler approach matching token_unit: owner_pk-based P2SH.
-    tx.outputs.push(TxOutput::new(amount, 0, recipient_spk, Some(CovenantBinding::new(0, kob_core::compat::parse_hash(&token_covenant_id.to_string()).unwrap()))));
+    // Output 0: token to recipient -- their token_unit P2SH with the token's
+    // covenant binding (a proper KCC20 token_unit, re-spendable by the
+    // recipient's own `token transfer`).
+    tx.outputs.push(TxOutput::new(
+        amount,
+        recipient_token_unit_spk.version,
+        recipient_token_unit_spk.script().to_vec(),
+        Some(CovenantBinding::new(0, kob_core::compat::parse_hash(&token_covenant_id.to_string()).unwrap())),
+    ));
 
     // Output 1: remainder token back to sender (if partial transfer)
     if has_remainder {
@@ -1685,12 +1702,22 @@ pub async fn run(
         }
     }
 
-    // Connect and fetch UTXOs
+    // Connect and fetch UTXOs.
+    //
+    // D2 receive-side fix: token_unit holdings do NOT live at the wallet's
+    // P2PK address -- they sit at the wallet's token_unit P2SH address (a
+    // pure function of the owner pubkey; v18 fills, swap deliveries, and
+    // sell-cancel refunds all land there). Query BOTH addresses.
+    let token_unit_spk = contract::build_token_unit_p2sh_spk(&wallet.pubkey);
+    let token_unit_addr = crate::cancel::p2sh_to_address(&token_unit_spk.script(), _network.address_prefix());
+    println!("Token P2SH: {}", token_unit_addr);
     info!(address = %wallet.address, "querying token balances");
     println!("Connecting to {}...", node_url);
     let rpc = NodeClient::connect(node_url).await?;
 
-    let utxos = rpc.get_utxos_by_addresses(&[wallet.address.as_str()]).await?;
+    let utxos = rpc
+        .get_utxos_by_addresses(&[wallet.address.as_str(), token_unit_addr.as_str()])
+        .await?;
 
     // Separate P2PK and P2SH UTXOs
     let p2pk_utxos: Vec<_> = utxos.iter().filter(|u| !u.is_p2sh()).collect();
@@ -1711,9 +1738,22 @@ pub async fn run(
         return Ok(());
     }
 
-    // Group P2SH UTXOs by script hash
+    // Group P2SH UTXOs.
+    //
+    // The token_unit P2SH address is SHARED by every token this wallet holds
+    // (its redeemScript is a pure function of the owner pubkey), so token
+    // holdings are keyed by the UTXO's covenant binding, not by script hash.
+    // Binding-less P2SH UTXOs (orders, or plain KAS parked at the token_unit
+    // address by a v18 buy expire refund) group by script hash as before.
+    let mut cov_groups: HashMap<String, (u64, usize)> = HashMap::new();
     let mut groups: HashMap<String, (u64, usize)> = HashMap::new();
     for u in &p2sh_utxos {
+        if let Some(cov) = &u.utxo_entry.covenant_id {
+            let entry = cov_groups.entry(cov.clone()).or_insert((0, 0));
+            entry.0 += u.utxo_entry.amount;
+            entry.1 += 1;
+            continue;
+        }
         let script = &u.utxo_entry.script_public_key.script;
         // Extract the 32-byte hash from the P2SH script: aa20<hash>87
         let hash_hex = if script.len() >= 68 && script.starts_with("aa20") && script.ends_with("87") {
@@ -1726,60 +1766,80 @@ pub async fn run(
         entry.1 += 1;
     }
 
-    // Display token balances
-    if !registry.is_empty() {
-        println!("Token Holdings:");
+    // Build lookup: covenant_id -> TokenEntry
+    let cov_to_token: HashMap<&str, &TokenEntry> = registry
+        .iter()
+        .map(|e| (e.covenant_id.as_str(), e))
+        .collect();
+
+    // Display token balances (covenant-bound UTXOs)
+    if !cov_groups.is_empty() {
+        println!("Token Holdings (covenant-bound):");
         println!(
-            "{:<10}  {:<20}  {:>14}  {:>5}  SCRIPT_HASH",
-            "TICKER", "COVENANT_ID", "AMOUNT", "UTXOs"
+            "{:<10}  {:>14}  {:>5}  COVENANT_ID",
+            "TICKER", "AMOUNT", "UTXOs"
         );
         println!("{}", "-".repeat(100));
-
-        let mut matched = 0;
-        for (hash, (total, count)) in &groups {
-            if let Some(token) = hash_to_token.get(hash) {
-                let display_amount = if token.decimals > 0 {
+        for (cov, (total, count)) in &cov_groups {
+            let (ticker, display_amount) = match cov_to_token.get(cov.as_str()) {
+                Some(token) if token.decimals > 0 => (
+                    token.ticker.as_str(),
                     format!(
                         "{:.prec$}",
                         *total as f64 / 10f64.powi(token.decimals as i32),
                         prec = token.decimals as usize
-                    )
-                } else {
-                    format!("{}", total)
-                };
+                    ),
+                ),
+                Some(token) => (token.ticker.as_str(), format!("{}", total)),
+                None => ("?", format!("{}", total)),
+            };
+            println!("{:<10}  {:>14}  {:>5}  {}", ticker, display_amount, count, cov);
+        }
+        println!();
+    }
+
+    // Display legacy script-hash-matched holdings (registry entries recorded
+    // by script hash; pre-binding flows)
+    if !registry.is_empty() {
+        let mut matched = 0;
+        for (hash, (total, count)) in &groups {
+            if let Some(token) = hash_to_token.get(hash) {
+                if matched == 0 {
+                    println!("Token Holdings (by script hash, no binding):");
+                }
                 println!(
                     "{:<10}  {:<20}  {:>14}  {:>5}  {}",
                     token.ticker,
                     truncate_id(&token.covenant_id, 20),
-                    display_amount,
+                    total,
                     count,
                     truncate_id(hash, 16),
                 );
                 matched += 1;
             }
         }
-
-        if matched == 0 {
-            println!("  (no registered tokens found in UTXOs)");
+        if matched > 0 {
+            println!();
         }
-        println!();
     }
 
-    // Show unregistered P2SH UTXOs
+    // Show unregistered binding-less P2SH UTXOs
     let unregistered: Vec<_> = groups
         .iter()
         .filter(|(hash, _)| !hash_to_token.contains_key(hash.as_str()))
         .collect();
 
     if !unregistered.is_empty() {
-        println!("Unregistered P2SH UTXOs (potential tokens or orders):");
+        let token_unit_hash = hex::encode(&token_unit_spk.script()[2..34]);
+        println!("Unregistered P2SH UTXOs without covenant binding (orders, or plain KAS):");
         println!(
             "{:<66}  {:>14}  {:>5}",
             "SCRIPT_HASH", "TOTAL (sompi)", "UTXOs"
         );
         println!("{}", "-".repeat(90));
         for (hash, (total, count)) in &unregistered {
-            println!("{:<66}  {:>14}  {:>5}", hash, total, count);
+            let note = if *hash == &token_unit_hash { "  <- KAS at token_unit address" } else { "" };
+            println!("{:<66}  {:>14}  {:>5}{}", hash, total, count, note);
         }
         println!();
         println!("Register tokens in '{}' to see tickers and proper formatting.", registry_path_str);

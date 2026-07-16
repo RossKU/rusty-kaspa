@@ -97,7 +97,13 @@ async fn main() -> anyhow::Result<()> {
                 .map(|s| s.parse::<u64>())
                 .collect::<Result<_, _>>()?;
             let owner_hash = blake2b_256(&wallet.pubkey);
-            let spkh = compute_p2pk_spk_hash(&wallet.pubkey);
+            // D2 delivery re-wrap: v18 buys commit the token_unit P2SH hash.
+            // KOB_E2E_LEGACY_P2PK_SPKH=1 reconstructs pre-D2 orders instead.
+            let spkh = if env::var("KOB_E2E_LEGACY_P2PK_SPKH").ok().as_deref() == Some("1") {
+                compute_p2pk_spk_hash(&wallet.pubkey)
+            } else {
+                kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey)
+            };
             let rs = order::build_buy_v18_redeem_script(
                 &tcid, p[0], p[1], p[2], &owner_hash, &spkh, p[3], p[4] as u8, p[5],
             )?;
@@ -284,11 +290,14 @@ async fn main() -> anyhow::Result<()> {
                 p2sh.script().to_vec(),
                 if no_cov { None } else { Some(CovenantBinding::new(0, token_hash)) },
             ));
-            // [2] taker token delivery (auth slot 1 of input 0)
+            // [2] taker token delivery (auth slot 1 of input 0) -- D2: the
+            // taker's tokens land on their token_unit P2SH (spendable KCC20
+            // token_unit), not a bare P2PK output.
+            let taker_tu = kob_core::contract::build_token_unit_p2sh_spk(&wallet.pubkey);
             tx.outputs.push(TxOutput::new(
                 fta,
-                0,
-                wallet_spk.clone(),
+                taker_tu.version(),
+                taker_tu.script().to_vec(),
                 if no_cov { None } else { Some(CovenantBinding::new(0, token_hash)) },
             ));
             // [3] wallet change (KAS leg is paid out of the fee input)
@@ -368,6 +377,31 @@ async fn main() -> anyhow::Result<()> {
             wallet_spk.extend_from_slice(&wallet.pubkey);
             wallet_spk.push(0xac);
 
+            // The expire branch forces blake2b(out[0].spk) == the spkh
+            // committed in state (bspkh at rs[94..126] for buys, sspkh at
+            // rs[61..93] for sells). Post-D2 v18 buys commit the token_unit
+            // P2SH hash, pre-D2 orders the raw P2PK -- pick whichever
+            // candidate matches, or fail loudly.
+            let committed_spkh: [u8; 32] = {
+                let range = if side == "buy" { 94..126 } else { 61..93 };
+                let mut h = [0u8; 32];
+                h.copy_from_slice(&rs[range]);
+                h
+            };
+            let (refund_spk_version, refund_spk): (u16, Vec<u8>) =
+                if kob_core::compute_spk_hash(0, &wallet_spk) == committed_spkh {
+                    (0, wallet_spk.clone())
+                } else if kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey)
+                    == committed_spkh
+                {
+                    let tu = kob_core::contract::build_token_unit_p2sh_spk(&wallet.pubkey);
+                    (tu.version(), tu.script().to_vec())
+                } else {
+                    anyhow::bail!(
+                        "committed refund spkh matches neither the wallet P2PK nor its token_unit P2SH"
+                    );
+                };
+
             // Full-refund covenant binding: a sell refund carries the token
             // covenant (conservation check `OpCovOutCount >= 1`); buy is KAS.
             let refund_cov = if side == "sell" {
@@ -401,9 +435,9 @@ async fn main() -> anyhow::Result<()> {
                 script_bytes: fee_utxo.script_bytes(),
                 value: fee_utxo.utxo_entry.amount,
             });
-            // [0] full refund
+            // [0] full refund (SPK forced by the committed spkh)
             tx.outputs
-                .push(TxOutput::new(order_value, 0, wallet_spk.clone(), refund_cov));
+                .push(TxOutput::new(order_value, refund_spk_version, refund_spk, refund_cov));
             // [1] change
             let est_fee = 60_000u64;
             tx.outputs.push(TxOutput::new(

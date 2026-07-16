@@ -1,5 +1,53 @@
 # KOB Live testnet-10 E2E — post-hardening full run
 
+## v18 delivery re-wrap (KCC20 token_units) — Stage D2 live run (2026-07-16)
+
+Fix: v18 fills previously delivered tokens to the buyer's **raw P2PK SPK**
+(bspkh = blake2b(P2PK)) — carrying the CovenantBinding but no KCC20 Standard
+State Header, unreadable by KCC20 tooling and unspendable by KOB's own
+`token transfer`. D2 re-wraps every v18 token-delivery endpoint at the
+**deploy-parameter level** (no covenant change): buy `bspkh`, swap `ospkh`,
+and buy-entry bracket `trade_spk_hash` now commit the owner's **token_unit
+P2SH SPK hash** (`compute_token_unit_spk_hash`), so fills land spendable
+KCC20 token_units. KAS-proceeds commitments (sell/OCO `sspkh`, sell-entry
+bracket) stay raw P2PK. Refund endpoints re-wrapped too: sell/swap/bracket
+cancels return the token escrow as a token_unit (binding preserved) instead
+of burning it to plain KAS; cancel-mark carries the binding onto the cpend=1
+continuation. Receive side: `token balance` now queries the token_unit P2SH
+address (holdings keyed by covenant binding) and `token transfer` wraps the
+recipient into THEIR token_unit P2SH. Reconstruction paths (cancel /
+cancel-all / cancel-mark / requote / match-batch / auto-match / mm requote)
+resolve the committed spkh cache-first, so pre-D2 orders stay cancellable;
+the engine scanner's `extract_owner_spk` additionally derives the token_unit
+P2SH of any P2PK deploy-output pubkey to recover the delivery-SPK preimage.
+
+Live proof (node `ws://65.108.107.30:18210`, REST `api-tn10.kaspa.org`, all
+`is_accepted:true`): sell `5a53089e…:0` + buy `ef41ccdd…:0` (bspkh
+`fe271675…` = token_unit hash) matched via `match-batch` —
+**fill `7ee7edceeb1616383ee1bf35cd34c5ecf0a033dca9a45f7f66e78b498eafe15a`**
+(blue 507915963), out[1] = 30M at the token_unit P2SH
+(`aa2052faa4c1…87`, blake2b == committed bspkh) with COV(ai=0, V18A
+`eab5c99a…a4b4`). Spendability proven:
+**`token transfer` `064b389334825e5e6b6a4ee93f0330561f4777978cf604b418a5c33a640b92f8`**
+(blue 507916661) spends `7ee7edce…:1`; its out[0] is again a bound
+token_unit (recipient re-wrap live too). Refund path also live-verified:
+sell `55401be9…:0` cancelled → `b9dea2209dbdbe1543aeb041cf2bbab29e93caf1850ad3cdcea6935f395d2013`
+(blue 507917355), out[0] = 30M token_unit refund with binding.
+
+Known residual endpoints (documented, not regressions): the v18 buy EXPIRE
+branch forces the KAS refund onto bspkh — post-D2 that parks plain KAS at
+the token_unit address (binding-less; `token balance` flags it, owner-sig
+spendable); the v18 sell/OCO EXPIRE branch still refunds tokens to the raw
+P2PK sspkh (sspkh doubles as the KAS-proceeds seat — covenant-level, out of
+D2's no-covenant-change scope; use cancel instead of expire for sells). The
+DCA covenant generation keeps its own raw-P2PK delivery (separate contract,
+out of D2 scope). Regression: 2427 tests / 21 suites green across
+kob-core/domain/engine/cli, incl. a new planner+engine repro
+(`v18_gtc_planner_token_unit_delivery_passes_real_engine`) asserting every
+BuyerTokens output lands on the token_unit P2SH and hashes to bspkh.
+
+---
+
 ## v18 full spot unification — Stage D live run (2026-07-16)
 
 Full 13-form matrix on fresh v18 binaries (HEAD cc18931 + this run's CLI-glue

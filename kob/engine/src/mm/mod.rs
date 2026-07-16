@@ -1044,9 +1044,14 @@ async fn deploy_order(
         anyhow::bail!("Unsupported contract version {}. New quotes deploy as v18 only.", version);
     }
     let redeem_script = match side {
+        // v18 delivery re-wrap: the buy's bspkh commits the owner's
+        // token_unit P2SH SPK so fills deliver spendable KCC20 token_units.
+        // The sell's sspkh stays raw P2PK (KAS proceeds). Must stay in
+        // lockstep with cancel_order's reconstruction below.
         "buy" => contract::spot::order::build_buy_v18_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
-            &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
+            &owner_hash, &contract::compute_token_unit_spk_hash(&pubkey),
+            crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         "sell" => contract::spot::order::build_sell_v18_redeem_script(
             price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         _ => anyhow::bail!("Unknown order side '{}'. Use 'buy' or 'sell'.", side),
@@ -1190,9 +1195,13 @@ async fn cancel_order(
         anyhow::bail!("Unsupported contract version {}. New quotes deploy as v18 only.", version);
     }
     let redeem_script = match side {
+        // Buy bspkh = token_unit P2SH hash (v18 delivery re-wrap) -- byte-
+        // exact match with deploy_order's builder args or the P2SH will not
+        // resolve and the cancel scan finds nothing.
         "buy" => contract::spot::order::build_buy_v18_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
-            &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
+            &owner_hash, &contract::compute_token_unit_spk_hash(&pubkey),
+            crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         "sell" => contract::spot::order::build_sell_v18_redeem_script(
             price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         _ => anyhow::bail!("Unknown order side '{}'. Use 'buy' or 'sell'.", side),

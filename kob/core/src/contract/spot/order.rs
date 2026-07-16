@@ -1324,3 +1324,504 @@ pub fn build_buy_v16_partial_fill_sigscript(
     ss.extend_from_slice(&push_data(redeem_script));
     ss
 }
+
+// ============================================================================
+// V17 BUY CONTRACT — N:M-capable sweep (N sells : 1 buy in one tx)
+// ============================================================================
+//
+// v16 delivered the buyer's tokens to ONE merged output[toi] and priced the
+// surplus cap against it. The sell contract's per-input F4 (Fix 3) requires each
+// sell's tokens to land in an output that ONLY that sell authorizes, so an
+// N-sell match needs N separate token outputs — mutually incompatible with the
+// single-output read. v17 SUMS N per-sell token outputs, each re-derived from
+// and bound to its own sell input, and caps the buyer's surplus against the sum
+// (see kob/NM_BUY_DESIGN.md).
+//
+// Both buyer protections are carried:
+//   - aggregate limit-price floor: sum(tokens_i) >= kas_in/buy_pden*buy_pnum
+//     (relaxed to `mfill` on the IOC selector, mirroring v16).
+//   - aggregate surplus cap: (kas_in - sum(fair_kas_i)) <= kas_in/10000*mmfee_bps
+//     where fair_kas_i = tokens_i priced at sell_i's own committed price.
+//
+// Per summation term i, given the sigscript-supplied sell input index tii_i:
+//   1. toi_i = OpAuthOutputIdx(tii_i, 0)  — the delivered output is DERIVED from
+//      the sell input, never a free sigscript parameter, so no decoy/unauthorized
+//      output can be substituted (CovenantsContext guarantees toi_i carries the
+//      same covenant id as input tii_i).
+//   2. OpInputCovenantId(tii_i) == tcid   — tii_i is really a sell of THIS token.
+//   3. blake2b(OpTxOutputSpk(toi_i)) == bspkh — tokens go to the buyer.
+//   4. sell_pnum/pden read off tii_i's sigscript at the fixed-offset convention
+//      (build_sell_fill_sigscript_fixed_offset, unchanged): [7..15)/[16..24).
+// Plus strict-increasing tii across active slots (anti double-count), O(N).
+//
+// State layout: UNCHANGED (145B) — identical to v14/v15/v16. mmfee_bps is BPS.
+// Dispatch: explicit selector (like the sell contract), NOT length-based — the
+// fill sigscript carries a variable number of tii pushes. Selector sits at
+// depth 9 (9 state items) in every sigscript form.
+
+/// Maximum sells swept into one buy fill (compile-time slot count).
+///
+/// Justification (tx mass budget): each swept sell adds ~478B of input (its
+/// fixed-offset fill sigscript is ~433B: `[0x01,koi][Op1][pushData(RS 427B)]`)
+/// + 2 outputs (seller KAS + buyer tokens). An N=8 sweep tx is ~6KB serialized
+/// + ~6K output-spk mass ≈ 12,000 compute grams — ~12% of the pre-Toccata
+/// `MAXIMUM_STANDARD_TRANSACTION_MASS` (100,000), leaving generous headroom for
+/// fee/change/mass-estimation slack. (Post-Toccata the standard cap is relaxed
+/// and only block-fit bounds apply, so 8 is conservative either way;
+/// script-size/op-count limits are 1e6, nowhere near binding.) 8 balances
+/// realistic same-token sweep depth against the per-fill cost every buy — even
+/// a 1:1 fill — pays to carry the MAX_N-slot body. A crossing book with more
+/// than MAX_N same-token sells against one buy is settled MAX_N-at-a-time across
+/// sequential txs by the matcher (each a valid v17 fill consuming <=8 sells);
+/// this full-sweep path fully fills one buy from <=MAX_N sells.
+pub const BUY_ORDER_V17_MAX_N: usize = 8;
+
+// v17 opcode bytes (named for readability of the programmatic builder).
+mod v17op {
+    pub const OP0: u8 = 0x00;
+    pub const OP1: u8 = 0x51;
+    pub const DUP: u8 = 0x76;
+    pub const DROP: u8 = 0x75;
+    pub const TWO_DROP: u8 = 0x6d;
+    pub const SWAP: u8 = 0x7c;
+    pub const PICK: u8 = 0x79;
+    pub const ROLL: u8 = 0x7a;
+    pub const IF: u8 = 0x63;
+    pub const NOTIF: u8 = 0x64;
+    pub const ELSE: u8 = 0x67;
+    pub const ENDIF: u8 = 0x68;
+    pub const VERIFY: u8 = 0x69;
+    pub const EQUAL: u8 = 0x87;
+    pub const LT: u8 = 0x9f;
+    pub const NUMEQUAL: u8 = 0x9c;
+    pub const ADD: u8 = 0x93;
+    pub const SUB: u8 = 0x94;
+    pub const MUL: u8 = 0x95;
+    pub const DIV: u8 = 0x96;
+    pub const GT: u8 = 0xa0;
+    pub const LTE: u8 = 0xa1;
+    pub const GTE: u8 = 0xa2;
+    pub const BLAKE2B: u8 = 0xaa;
+    pub const CHECKSIGVERIFY: u8 = 0xad;
+    pub const CLTV: u8 = 0xb0;
+    pub const CSV: u8 = 0xb1;
+    pub const TXLOCKTIME: u8 = 0xb5;
+    pub const TXINPUTINDEX: u8 = 0xb9;
+    pub const TXINPUTSIGSUBSTR: u8 = 0xbc;
+    pub const TXINPUTAMOUNT: u8 = 0xbe;
+    pub const TXOUTPUTAMOUNT: u8 = 0xc2;
+    pub const TXOUTPUTSPK: u8 = 0xc3;
+    pub const AUTHOUTPUTIDX: u8 = 0xcc;
+    pub const INPUTCOVENANTID: u8 = 0xcf;
+}
+
+// Emit `OpPick(depth)`.
+fn e_pick(b: &mut Vec<u8>, depth: usize) {
+    push_index(b, depth as u16);
+    b.push(v17op::PICK);
+}
+// Emit `OpRoll(depth)`.
+fn e_roll(b: &mut Vec<u8>, depth: usize) {
+    push_index(b, depth as u16);
+    b.push(v17op::ROLL);
+}
+// Emit a numeric literal push.
+fn e_num(b: &mut Vec<u8>, n: u16) {
+    push_index(b, n);
+}
+
+/// Build the v17 buy body (deterministic given `BUY_ORDER_V17_MAX_N`).
+///
+/// Stack after the RS state prefix pushes (depth 0 = top):
+///   expiry(0), cpend(1), mmfee_bps(2), bspkh(3), ohash(4), mfill(5),
+///   pden(6), pnum(7), tcid(8), <sigscript items at depth 9+>
+/// with the selector at depth 9 in every sigscript form.
+pub fn build_buy_v17_body() -> Vec<u8> {
+    use v17op::*;
+    const MAX_N: usize = BUY_ORDER_V17_MAX_N;
+    let mut b: Vec<u8> = Vec::with_capacity(1024);
+
+    // ===== DISPATCH: bring selector (depth 9) to top, branch on its value =====
+    e_num(&mut b, 9);
+    b.push(ROLL);
+
+    // selector == 4 -> EXPIRE
+    b.push(DUP);
+    e_num(&mut b, 4);
+    b.push(NUMEQUAL);
+    b.push(IF);
+    {
+        b.push(DROP);
+        // stack: expiry(0), cpend(1), mmfee(2), bspkh(3), ohash(4), mfill(5),
+        //        pden(6), pnum(7), tcid(8)
+        b.push(DUP);
+        b.push(VERIFY); // expiry != 0 (GTC guard)
+        b.push(CLTV); // consumes expiry; requires expiry <= tx.lockTime
+        // cpend(0), mmfee(1), bspkh(2), ohash(3), mfill(4), pden(5), pnum(6), tcid(7)
+        b.push(OP0);
+        b.push(TXOUTPUTSPK);
+        b.push(BLAKE2B);
+        e_pick(&mut b, 3); // bspkh (depth 2 + 1 for the hash)
+        b.push(EQUAL);
+        b.push(VERIFY); // output[0] pays the buyer
+        b.push(OP0);
+        b.push(TXOUTPUTAMOUNT);
+        b.push(TXINPUTINDEX);
+        b.push(TXINPUTAMOUNT);
+        b.push(GTE);
+        b.push(VERIFY); // output[0].value >= input.value (full refund)
+        for _ in 0..4 {
+            b.push(TWO_DROP);
+        }
+    }
+    b.push(ELSE);
+    {
+        b.push(DUP);
+        e_num(&mut b, 0);
+        b.push(NUMEQUAL);
+        b.push(IF); // selector == 0 -> CANCEL
+        {
+            b.push(DROP);
+            emit_cancel_body(&mut b);
+        }
+        b.push(ELSE);
+        {
+            b.push(DUP);
+            e_num(&mut b, 3);
+            b.push(NUMEQUAL);
+            b.push(IF); // selector == 3 -> CANCEL-MARK
+            {
+                b.push(DROP);
+                emit_cancel_body(&mut b);
+            }
+            b.push(ELSE);
+            {
+                // selector is 1 (fill) or 5 (IOC fill); selector on top.
+                emit_fill_body(&mut b, MAX_N);
+            }
+            b.push(ENDIF);
+        }
+        b.push(ENDIF);
+    }
+    b.push(ENDIF);
+
+    b.push(OP1);
+    b
+}
+
+/// CANCEL / CANCEL-MARK owner-signature spend.
+/// Entry (selector dropped): expiry(0), cpend(1), mmfee(2), bspkh(3), ohash(4),
+///   mfill(5), pden(6), pnum(7), tcid(8), sig(9), pk(10)
+fn emit_cancel_body(b: &mut Vec<u8>) {
+    use v17op::*;
+    e_pick(b, 10);
+    b.push(BLAKE2B); // blake2b(pk)
+    e_pick(b, 5); // ohash (depth 4 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    e_roll(b, 9); // sig -> top
+    e_roll(b, 10); // pk -> top
+    b.push(CHECKSIGVERIFY);
+    // 9 items: expiry..tcid
+    for _ in 0..4 {
+        b.push(TWO_DROP);
+    }
+    b.push(DROP);
+}
+
+/// FILL (selector 1) / IOC FILL (selector 5): the N:M sweep.
+/// Entry (selector on top): selector(0), expiry(1), cpend(2), mmfee_bps(3),
+///   bspkh(4), ohash(5), mfill(6), pden(7), pnum(8), tcid(9), N(10),
+///   tii_MAX_N(11), tii_k(11 + MAX_N - k), tii_1(10 + MAX_N)
+fn emit_fill_body(b: &mut Vec<u8>, max_n: usize) {
+    use v17op::*;
+
+    // A) ioc_flag = (selector == 5), replacing selector at depth 0.
+    e_num(b, 5);
+    b.push(NUMEQUAL);
+    // B0: ioc_flag(0), expiry(1), cpend(2), mmfee(3), bspkh(4), ohash(5),
+    //     mfill(6), pden(7), pnum(8), tcid(9), N(10), tii_MAX_N(11),
+    //     tii_k(11 + max_n - k)
+
+    // B) F5: cpend == 0.
+    e_pick(b, 2);
+    b.push(OP0);
+    b.push(NUMEQUAL);
+    b.push(VERIFY);
+
+    // C) time gate on expiry (copy; leaves stack unchanged).
+    e_pick(b, 1);
+    b.push(DUP);
+    b.push(OP0);
+    b.push(NUMEQUAL);
+    b.push(NOTIF);
+    b.push(DUP);
+    b.push(TXLOCKTIME);
+    b.push(GT);
+    b.push(VERIFY);
+    b.push(ENDIF);
+    b.push(DROP);
+
+    // D) exposure delay (OP_CSV 50 DAA).
+    e_num(b, 50);
+    b.push(CSV);
+
+    // Distinctness: tii_k < tii_{k+1} for active adjacent pairs.
+    for k in 1..max_n {
+        e_num(b, (k + 1) as u16); // guard: (k+1) <= N
+        e_pick(b, 11); // N (depth 10 + 1)
+        b.push(LTE);
+        b.push(IF);
+        {
+            let d = 11 + max_n - k; // tii_k depth at B0
+            e_pick(b, d); // tii_k
+            e_pick(b, d); // tii_{k+1} (was d-1, +1 after the tii_k push)
+            b.push(LT);
+            b.push(VERIFY);
+        }
+        b.push(ENDIF);
+    }
+
+    // E) floor_value = ioc_flag ? mfill : expected, consuming ioc_flag.
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT); // kas_in(0), ioc_flag(1)
+    e_pick(b, 8); // pden (depth 7 + 1)
+    b.push(DIV);
+    e_pick(b, 9); // pnum (depth 8 + 1)
+    b.push(MUL); // expected(0), ioc_flag(1)
+    b.push(DUP);
+    e_pick(b, 8); // mfill (B0 depth 6 -> +2 after expected/dup)
+    b.push(GTE);
+    b.push(VERIFY); // expected >= mfill
+    b.push(SWAP); // ioc_flag(0), expected(1)
+    b.push(IF);
+    {
+        b.push(DROP); // drop expected
+        e_pick(b, 5); // mfill as floor
+    }
+    b.push(ENDIF);
+    // B1: floor_value(0), expiry(1), ... tcid(9), N(10), tii_MAX_N(11), ...
+
+    // F) token_sum = 0.
+    b.push(OP0);
+    // B2: token_sum(0), floor_value(1), expiry(2), cpend(3), mmfee(4),
+    //     bspkh(5), ohash(6), mfill(7), pden(8), pnum(9), tcid(10), N(11),
+    //     tii_MAX_N(12), tii_k(12 + max_n - k)
+
+    // G) PASS 1: sum delivered tokens + per-term binding checks.
+    for k in 1..=max_n {
+        e_num(b, k as u16); // guard: k <= N
+        e_pick(b, 12); // N (depth 11 + 1)
+        b.push(LTE);
+        b.push(IF);
+        {
+            let tii = 12 + max_n - k; // tii_k depth at B2
+            e_pick(b, tii);
+            b.push(OP0);
+            b.push(AUTHOUTPUTIDX); // toi = auth_outputs[tii][0]
+            e_pick(b, tii + 1); // tii_k (+1 for toi)
+            b.push(INPUTCOVENANTID);
+            e_pick(b, 12); // tcid (depth 10, +2 for toi+covid)
+            b.push(EQUAL);
+            b.push(VERIFY);
+            b.push(DUP);
+            b.push(TXOUTPUTSPK);
+            b.push(BLAKE2B);
+            e_pick(b, 7); // bspkh (depth 5, +2 for toi+hash)
+            b.push(EQUAL);
+            b.push(VERIFY);
+            b.push(TXOUTPUTAMOUNT); // tokens_i (consumes toi)
+            b.push(ADD); // token_sum += tokens_i
+        }
+        b.push(ENDIF);
+    }
+
+    // H) aggregate limit-price floor: token_sum >= floor_value.
+    b.push(SWAP); // floor_value(0), token_sum(1)
+    b.push(GTE); // pops [token_sum, floor_value] -> token_sum >= floor_value
+    b.push(VERIFY);
+    // B3: expiry(0), cpend(1), mmfee(2), bspkh(3), ohash(4), mfill(5),
+    //     pden(6), pnum(7), tcid(8), N(9), tii_MAX_N(10), tii_k(10 + max_n - k)
+
+    // I) fair_sum = 0.
+    b.push(OP0);
+    // B4: fair_sum(0), expiry(1), cpend(2), mmfee(3), bspkh(4), ohash(5),
+    //     mfill(6), pden(7), pnum(8), tcid(9), N(10), tii_MAX_N(11),
+    //     tii_k(11 + max_n - k)
+
+    // PASS 2: sum fair_kas at each sell's own committed price.
+    for k in 1..=max_n {
+        e_num(b, k as u16);
+        e_pick(b, 11); // N (depth 10 + 1)
+        b.push(LTE);
+        b.push(IF);
+        {
+            let tii = 11 + max_n - k; // tii_k depth at B4
+            e_pick(b, tii);
+            b.push(OP0);
+            b.push(AUTHOUTPUTIDX); // toi
+            b.push(TXOUTPUTAMOUNT); // tokens_i
+            e_pick(b, tii + 1); // tii_k (+1 for tokens)
+            e_num(b, 7);
+            e_num(b, 15);
+            b.push(TXINPUTSIGSUBSTR); // sell_pnum
+            e_pick(b, tii + 2); // tii_k (+2 for tokens + pnum)
+            e_num(b, 16);
+            e_num(b, 24);
+            b.push(TXINPUTSIGSUBSTR); // sell_pden
+            // fair_kas = tokens / sell_pden * sell_pnum, consuming temps.
+            // stack: fair_sum, tokens, sell_pnum, sell_pden(top)
+            e_num(b, 2);
+            b.push(ROLL); // tokens -> top
+            b.push(SWAP); // sell_pden on top, tokens below
+            b.push(DIV); // tokens / sell_pden
+            b.push(SWAP); // sell_pnum on top
+            b.push(MUL); // -> fair_kas
+            b.push(ADD); // fair_sum += fair_kas
+        }
+        b.push(ENDIF);
+    }
+
+    // J) aggregate surplus cap.
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT); // kas_in(0), fair_sum(1)
+    b.push(DUP);
+    e_num(b, 2);
+    b.push(ROLL); // fair_sum -> top: fair_sum(0), kas_in(1), kas_in(2)
+    b.push(SUB); // surplus = kas_in - fair_sum: surplus(0), kas_in(1)
+    b.push(SWAP); // kas_in(0), surplus(1)
+    e_num(b, 10000);
+    b.push(DIV); // kas_in/10000(0), surplus(1)
+    e_pick(b, 4); // mmfee_bps (depth 2, +2 for surplus + kas_in/10000)
+    b.push(MUL); // max_surplus(0), surplus(1)
+    b.push(LTE); // pops [surplus, max_surplus] -> surplus <= max_surplus
+    b.push(VERIFY);
+    // leftover: 9 state + N + max_n tii
+    let leftover = 10 + max_n;
+    for _ in 0..(leftover / 2) {
+        b.push(TWO_DROP);
+    }
+    if leftover % 2 == 1 {
+        b.push(DROP);
+    }
+}
+
+/// Expected v17 buy body length (deterministic for `BUY_ORDER_V17_MAX_N`=8).
+/// Asserted against `build_buy_v17_body()` in tests + the `bytecode_stable` pin.
+pub const BUY_ORDER_V17_BODY_EXPECTED_LEN: usize = 693;
+
+/// Expected v17 buy redeemScript length (145B state + body).
+pub const BUY_ORDER_V17_RS_EXPECTED_LEN: usize = 145 + BUY_ORDER_V17_BODY_EXPECTED_LEN;
+
+/// Build the v17 buy_order redeemScript (145B state + v17 body).
+///
+/// State layout identical to v14/v15/v16 (145B). `max_matcher_fee_bps` is BPS.
+pub fn build_buy_v17_redeem_script(
+    token_covenant_id: &[u8; 32],
+    price_num: u64,
+    price_den: u64,
+    min_fill: u64,
+    owner_hash: &[u8; 32],
+    buyer_spk_hash: &[u8; 32],
+    max_matcher_fee_bps: u64,
+    cancel_pending: u8,
+    expiry_daa: u64,
+) -> crate::Result<Vec<u8>> {
+    if price_num == 0 {
+        return Err(crate::KobError::Contract("price_num must be > 0".into()));
+    }
+    if price_den == 0 {
+        return Err(crate::KobError::Contract("price_den must be > 0".into()));
+    }
+    if min_fill == 0 {
+        return Err(crate::KobError::Contract("min_fill must be > 0".into()));
+    }
+    if cancel_pending > 1 {
+        return Err(crate::KobError::Contract("cancel_pending must be 0 or 1".into()));
+    }
+    if max_matcher_fee_bps > 10000 {
+        return Err(crate::KobError::Contract("max_matcher_fee_bps must be <= 10000".into()));
+    }
+    let g = gcd(price_num, price_den);
+    let price_num = if g > 0 { price_num / g } else { price_num };
+    let price_den = if g > 0 { price_den / g } else { price_den };
+    let body = build_buy_v17_body();
+    let mut rs = Vec::with_capacity(145 + body.len());
+    rs.push(0x20);
+    rs.extend_from_slice(token_covenant_id);
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(price_num));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(price_den));
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(min_fill));
+    rs.push(0x20);
+    rs.extend_from_slice(owner_hash);
+    rs.push(0x20);
+    rs.extend_from_slice(buyer_spk_hash);
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(max_matcher_fee_bps));
+    if cancel_pending == 0 {
+        rs.push(0x00);
+    } else {
+        rs.push(0x51);
+    }
+    rs.push(0x08);
+    rs.extend_from_slice(&u64_le(expiry_daa));
+    rs.extend_from_slice(&body);
+    Ok(rs)
+}
+
+/// Build a v17 buy fill sigscript for an N-sell sweep.
+///
+/// Layout: `[tii_1]...[tii_MAX_N][N][selector][pushData(RS)]` — always MAX_N tii
+/// pushes (unused slots padded with 0, never read since guarded by k<=N), then
+/// the sell count N, then the selector (Op1 fill / Op5 IOC).
+///
+/// `sell_input_indices` are the tx-input indices of the swept sells, strictly
+/// increasing. `1 <= len <= MAX_N`.
+pub fn build_buy_v17_fill_sigscript(
+    sell_input_indices: &[u16],
+    ioc: bool,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    assert!(!sell_input_indices.is_empty(), "at least one sell required");
+    assert!(
+        sell_input_indices.len() <= BUY_ORDER_V17_MAX_N,
+        "at most MAX_N sells per sweep"
+    );
+    let n = sell_input_indices.len();
+    let mut ss = Vec::with_capacity(BUY_ORDER_V17_MAX_N + 4 + redeem_script.len() + 3);
+    for i in 0..BUY_ORDER_V17_MAX_N {
+        let v = if i < n { sell_input_indices[i] } else { 0 };
+        push_index(&mut ss, v);
+    }
+    push_index(&mut ss, n as u16);
+    ss.push(if ioc { 0x55 } else { 0x51 });
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build a v17 buy expire sigscript: `[Op4][pushData(RS)]`.
+pub fn build_buy_v17_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
+    let mut ss = Vec::with_capacity(1 + redeem_script.len() + 3);
+    ss.push(0x54); // Op4
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build a v17 buy cancel/cancel-mark sigscript: `[pk][sig][selector][pushData(RS)]`.
+/// selector = Op0 (cancel) or Op3 (cancel-mark).
+pub fn build_buy_v17_cancel_sigscript(
+    pubkey: &[u8; 32],
+    signature: &[u8],
+    mark: bool,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    let mut ss = Vec::with_capacity(2 + 32 + signature.len() + redeem_script.len() + 6);
+    ss.extend_from_slice(&push_data(pubkey));
+    ss.extend_from_slice(&push_data(signature));
+    ss.push(if mark { 0x53 } else { 0x00 }); // Op3 / Op0
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}

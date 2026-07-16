@@ -1720,21 +1720,55 @@ pub fn plan_sell_ioc_match(
         .map(|(j, b)| ((*b).clone(), 1 + j))
         .collect();
 
-    // Build outputs
+    // Build outputs.
+    //
+    // Output layout (partial IOC-sell, i.e. token_change present):
+    //   [0] SellerKas           (KAS to the seller's wallet; non-covenant)
+    //   [1] SellRemainder       (unsold tokens re-locked under the sell order's
+    //                            OWN P2SH -- the residual self-continuation)
+    //   [2..] BuyerTokens       (tokens delivered to each buyer)
+    //
+    // The residual MUST be the sell input's 0th AUTHORIZED covenant output:
+    // the deployed sell IOC F4 reads `OpTxInputIndex Op0 OpAuthOutputIdx` and
+    // requires that output's SPK == the sell input's own SPK (the order P2SH,
+    // a self-continuation) with value >= token_in - fta. BuyerTokens are ALSO
+    // covenant continuations authorized by the (single) sell input, so the
+    // residual has to sit at a LOWER output index than any BuyerTokens.
+    // SellerKas at [0] is non-covenant (not in the sell input's auth list), so
+    // putting the residual at [1] makes it the sell input's auth-index 0 while
+    // keeping koi=0. Previously this output used the seller's *wallet* SPK and
+    // sat AFTER the BuyerTokens, so auth[0] resolved to a BuyerTokens output
+    // and the F4 self-continuation check failed closed (SECURITY_FIXES Fix 1
+    // residual). The residual's covenant binding (authorizing_input = 0 = the
+    // sell input, covenant_id = the token) is attached by the CLI/engine
+    // caller (match_batch.rs / matching.rs SellRemainder arm).
     let mut outputs: Vec<PlannedOutput> = Vec::new();
 
-    // Seller KAS output (aggregated from all filled buys)
-    // Output[0] = seller's KAS
-    if total_seller_kas >= MIN_UTXO_VALUE {
+    // Output[0] = seller's KAS (aggregated from all filled buys).
+    // total_seller_kas is the sum of the filled buys' UTXO values (each
+    // >= MIN_UTXO_VALUE), so it is always emitted here and koi = 0 holds.
+    outputs.push(PlannedOutput {
+        value: total_seller_kas,
+        script_public_key: sell.counterparty_spk.clone(),
+        spk_version: sell.counterparty_spk_version,
+        purpose: OutputPurpose::SellerKas,
+    });
+
+    // Output[1] = residual self-continuation (unsold tokens -> sell order P2SH).
+    let token_change = sell_tokens.saturating_sub(total_tokens_sold);
+    let has_residual = token_change >= MIN_UTXO_VALUE;
+    if has_residual {
+        let sell_p2sh = kob_core::p2sh::build_p2sh(&sell.redeem_script);
         outputs.push(PlannedOutput {
-            value: total_seller_kas,
-            script_public_key: sell.counterparty_spk.clone(),
-            spk_version: sell.counterparty_spk_version,
-            purpose: OutputPurpose::SellerKas,
+            value: token_change,
+            script_public_key: sell_p2sh.script().to_vec(),
+            spk_version: sell_p2sh.version(),
+            purpose: OutputPurpose::SellRemainder,
         });
     }
 
-    // Buyer token outputs (each buyer gets their tokens)
+    // Output[buyer_base + j] = buyer token outputs (each buyer gets their tokens).
+    let buyer_base = if has_residual { 2 } else { 1 };
     for buy in &filled_buys {
         let buy_tokens_128 = buy.utxo_value as u128 * buy.price_num as u128
             / buy.price_den as u128;
@@ -1744,17 +1778,6 @@ pub fn plan_sell_ioc_match(
             script_public_key: buy.counterparty_spk.clone(),
             spk_version: buy.counterparty_spk_version,
             purpose: OutputPurpose::BuyerTokens,
-        });
-    }
-
-    // Seller token change (unfilled tokens returned to seller)
-    let token_change = sell_tokens.saturating_sub(total_tokens_sold);
-    if token_change >= MIN_UTXO_VALUE {
-        outputs.push(PlannedOutput {
-            value: token_change,
-            script_public_key: sell.counterparty_spk.clone(),
-            spk_version: sell.counterparty_spk_version,
-            purpose: OutputPurpose::SellRemainder,
         });
     }
 
@@ -1784,9 +1807,11 @@ pub fn plan_sell_ioc_match(
     // Apply bps cap
     let (capped_matcher_kas, buyer_refund_from_bps) = apply_bps_cap(matcher_kas, total_seller_kas, fee_bps);
 
-    // Refund BPS cap excess to buyers pro-rata by KAS input
+    // Refund BPS cap excess to buyers pro-rata by KAS input. BuyerTokens
+    // start at `buyer_base` (2 when a residual self-continuation occupies
+    // output[1], else 1), so dust-folding must target that offset.
     if buyer_refund_from_bps > 0 {
-        distribute_buyer_refund(&mut outputs, buyer_refund_from_bps, &filled_buys, total_buy_value, 1, None);
+        distribute_buyer_refund(&mut outputs, buyer_refund_from_bps, &filled_buys, total_buy_value, buyer_base, None);
     }
 
     // Matcher fee output: a dust surplus is dropped to the miner fee (added to
@@ -1795,10 +1820,21 @@ pub fn plan_sell_ioc_match(
     let (matcher_surplus, dropped_to_fee) = emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
     total_fee += dropped_to_fee;
 
-    // Buy-to-sell mapping (all buys map to the single sell at index 0)
+    // Explicit output-index maps (the residual, when present, shifts the
+    // BuyerTokens outputs and the token covenant-output ordering):
+    //   koi (seller KAS)  = output 0
+    //   toi (buyer j)     = buyer_base + j
+    //   coi (buyer j)     = (has_residual ? 1 : 0) + j  -- the residual is
+    //                       token covenant-output 0 when present.
+    // Buy-to-sell mapping keys are the BuyerTokens OUTPUT indices, all
+    // authorized by the single sell input (0).
+    let sell_output_idx = vec![0usize];
+    let buy_output_idx: Vec<usize> = (0..m).map(|j| buyer_base + j).collect();
+    let coi_base: u16 = if has_residual { 1 } else { 0 };
+    let buy_coi: Vec<u16> = (0..m).map(|j| coi_base + j as u16).collect();
     let mut buy_seller_map: HashMap<usize, usize> = HashMap::new();
     for j in 0..m {
-        buy_seller_map.insert(1 + j, 0);
+        buy_seller_map.insert(buyer_base + j, 0);
     }
 
     // sell_fill_amounts: the sell is the sweeper, so we track how much of its
@@ -1820,9 +1856,9 @@ pub fn plan_sell_ioc_match(
         ioc_mode: Some(IocSide::Sell),
         sell_fill_amounts,
         buy_partial_fills: HashMap::new(),
-        sell_output_idx: Vec::new(),
-        buy_output_idx: Vec::new(),
-        buy_coi: Vec::new(),
+        sell_output_idx,
+        buy_output_idx,
+        buy_coi,
         bracket_receipt: None,
         bracket_oco_output: None,
     })
@@ -3003,6 +3039,48 @@ mod tests {
             .filter(|o| matches!(o.purpose, OutputPurpose::SellRemainder))
             .collect();
         assert_eq!(token_change[0].value, 7_000_000, "10M - 3M = 7M tokens remaining");
+    }
+
+    #[test]
+    fn test_sell_ioc_residual_is_self_continuation_at_auth0() {
+        // Partial IOC-sell (SECURITY_FIXES Fix 1 residual wiring): the unsold
+        // tokens must return via a self-continuation output that is the sell
+        // input's 0th AUTHORIZED covenant output.
+        let sell = make_sell(0x01, 10_000_000, 1, 1, TOKEN_A);
+        let buy1 = make_buy(0x10, 3_000_000, 1, 1, TOKEN_A);
+        let wallet = ("wallet".to_string(), 0, 5_000_000u64);
+
+        let plan = plan_sell_ioc_match(&sell, &[buy1], Some(wallet), &matcher_spk(), 0, None).unwrap();
+
+        // Layout: SellerKas[0] (non-covenant), residual[1], BuyerTokens[2].
+        assert_eq!(plan.outputs[0].purpose, OutputPurpose::SellerKas);
+        assert_eq!(plan.outputs[1].purpose, OutputPurpose::SellRemainder);
+        assert_eq!(plan.outputs[2].purpose, OutputPurpose::BuyerTokens);
+
+        // Residual SPK == the sell order's OWN P2SH (self-continuation), NOT the
+        // seller's wallet SPK (the pre-fix bug), and value == token_in - fta.
+        let sell_p2sh = kob_core::p2sh::build_p2sh(&sell.redeem_script);
+        assert_eq!(plan.outputs[1].script_public_key, sell_p2sh.script().to_vec());
+        assert_eq!(plan.outputs[1].spk_version, sell_p2sh.version());
+        assert_ne!(plan.outputs[1].script_public_key, sell.counterparty_spk);
+        assert_eq!(plan.outputs[1].value, 7_000_000);
+
+        // Index maps: koi=0, buyer toi=2, buyer coi=1 (residual is covOut 0);
+        // buy_seller_map keys are BuyerTokens OUTPUT indices -> sell input 0.
+        assert_eq!(plan.sell_output_idx, vec![0]);
+        assert_eq!(plan.buy_output_idx, vec![2]);
+        assert_eq!(plan.buy_coi, vec![1]);
+        assert_eq!(plan.buy_seller_map.get(&2), Some(&0));
+
+        // No-residual (exact fill): layout unchanged -- BuyerTokens at [1], coi 0.
+        let sell2 = make_sell(0x02, 3_000_000, 1, 1, TOKEN_A);
+        let buy2 = make_buy(0x20, 3_000_000, 1, 1, TOKEN_A);
+        let plan2 = plan_sell_ioc_match(
+            &sell2, &[buy2], Some(("w".into(), 0, 5_000_000)), &matcher_spk(), 0, None,
+        ).unwrap();
+        assert!(plan2.outputs.iter().all(|o| o.purpose != OutputPurpose::SellRemainder));
+        assert_eq!(plan2.buy_output_idx, vec![1]);
+        assert_eq!(plan2.buy_coi, vec![0]);
     }
 
     #[test]

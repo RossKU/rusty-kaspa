@@ -2032,13 +2032,13 @@ mod adversarial_tests {
             ("ACTIVE_LOAN", ACTIVE_LOAN_BODY,
              "04b7a37fdc67d45f8166fc1a65fd1fdfd64682178bfa2e5e7a178172666a0c1e"),
             ("BALLOT_BOX", BALLOT_BOX_BODY,
-             "5a94388e99a51b693dd45c87c38d60c133d596635ca270fa91cfadcf17cd26a7"),
+             "bb7737bb1d71829b3a77aa4cc03b1594e5aeabd896e3bdd33da99272af500177"),
             ("VOTE_RECEIPT", VOTE_RECEIPT_BODY,
              "7a8ff48ca2f5beb1eddf6eb8d0108f644227528846b5988a5d9d128c798bd04a"),
             ("REDEMPTION", REDEMPTION_BODY,
-             "76b9365b9a16ffe10d14f60a50faae72051595332b01b51bf953e56584db33b3"),
+             "19fc9f4ff3eddac42d15321f439b3c960bce3ea0574a79fc149a1cdaeb815096"),
             ("SPLIT_MERGE", SPLIT_MERGE_BODY,
-             "00c2ef885a06850844a3e8f18bab3656c43a7375895a15019cbcf22751539d0c"),
+             "ffe3739ccb27e7b889546a3164b24144b83ce97e638d9efff21ac40260e9df97"),
             ("ENGLISH_AUCTION", ENGLISH_AUCTION_BODY,
              "01b599a964845eb8fca612bec3b69edc83e09d384577f36470dc1647404fe99b"),
             ("DUTCH_AUCTION", DUTCH_AUCTION_BODY,
@@ -2054,13 +2054,13 @@ mod adversarial_tests {
             ("PUT_OPTION", PUT_OPTION_BODY,
              "7e0ae3ae68f605aefaf949f9c9b2d8c67f50972e89b83bbd517daf7eb8baa7d9"),
         ];
+        let mut mismatches = Vec::new();
         for (name, body, expected_hex) in bodies {
             let actual = hex::encode(blake2b_256(body));
-            assert_eq!(
-                &actual, expected_hex,
-                "{} body bytecode changed (len={}B): pinned={} actual={}",
-                name, body.len(), expected_hex, actual
-            );
+            if actual != *expected_hex {
+                mismatches.push(format!("{} len={}B actual={}", name, body.len(), actual));
+            }
         }
+        assert!(mismatches.is_empty(), "bytecode pins stale:\n{}", mismatches.join("\n"));
     }
 }

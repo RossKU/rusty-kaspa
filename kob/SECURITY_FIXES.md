@@ -131,11 +131,35 @@ never share one output.
   `bytecode_stable` pin.
 - **Tests**: `sell_ioc_residual_drain_rejected` (short residual, and residual
   not bound to this input, both FAIL) + `sell_ioc_honest_residual_passes`.
-- **Residual (honest)**: the covenant is now safe-closed on-chain, but the
-  batch/CLI match builders do not yet EMIT the residual self-continuation output
-  for IOC-sell, so honest partial IOC-sell fills fail closed (no drain) until
-  that builder wiring lands. Follow-on: make the match builders create the
-  residual as the sell's 0th authorized output.
+- **Residual (honest) — WIRED (release-backlog pass)**: the dedicated sell-IOC
+  planner `kob_domain::spot::batch::plan_sell_ioc_match` (the CLI's `--ioc`
+  `N buys + 1 sell` path) now EMITS the residual self-continuation correctly:
+  the unsold `token_in - fta` tokens go to the sell order's OWN P2SH (not the
+  seller's wallet SPK, the pre-fix bug), covenant-bound to the sell input
+  (`authorizing_input = 0`), and positioned as the sell input's 0th AUTHORIZED
+  covenant output. Because the BuyerTokens are also continuations authorized by
+  the (single) sell input, the residual must sit at a lower output index than
+  any BuyerTokens for `OpTxInputIndex Op0 OpAuthOutputIdx` to resolve to it;
+  `SellerKas` at output[0] is non-covenant, so the layout is `[0]=SellerKas,
+  [1]=residual, [2..]=BuyerTokens` (koi=0 preserved, buyer toi/coi shifted).
+  The CLI `match_batch.rs` already attaches the SellRemainder covenant binding.
+  Verified: domain unit test
+  `spot::batch::tests::test_sell_ioc_residual_is_self_continuation_at_auth0`
+  (planner output structure) + covenant-engine harness
+  `sell_ioc_builder_layout_residual_at_auth0_passes` in
+  `kob/core/tests/toccata_fill_repro.rs` (the exact builder layout, incl. a
+  BuyerTokens covenant output, PASSES the real `kaspa-txscript` engine, and the
+  negative case — residual placed behind the buyer output — FAILS as auth[0]
+  misresolves).
+- **Residual limitation (honest, deferred)**: the general multi-order batch
+  planner `plan_batch_match` still emits its (multi-sell) IOC residual with the
+  seller wallet SPK and merges remainders by SPK, which is incompatible with the
+  per-input self-continuation binding, so a partially-filled sell inside a
+  SYMMETRIC multi-order batch still fails closed on-chain (no drain, no fund
+  risk). The supported route for partial IOC-sell is the dedicated
+  `plan_sell_ioc_match` (`--ioc`) path above; wiring per-sell residuals with the
+  correct auth[0] ordering into `plan_batch_match` (which the auto-match engine
+  uses, primarily for full fills) is a follow-on.
 
 ### Fix 8 — x402 additive borrow: aggregate-inputs drain  [Phase 1b]
 - **File**: `kob/x402/src/reservation.rs` (+ harness

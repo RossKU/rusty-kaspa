@@ -444,6 +444,76 @@ fn sell_ioc_honest_residual_passes() {
     assert!(r.is_ok(), "honest IOC partial with the residual returned must pass; got {r:?}");
 }
 
+/// Run the IOC-sell script against the EXACT output layout the honest match
+/// builder (`kob_domain::batch::plan_sell_ioc_match`) now emits:
+///   output[0] = seller KAS  (koi=0, non-covenant)
+///   output[1] = residual self-continuation to the sell P2SH (covenant, auth=0)
+///   output[2] = buyer tokens (covenant, auth=0)
+/// The buyer-tokens output is ALSO a covenant continuation authorized by the
+/// (single) sell input, so this proves the F4 `OpTxInputIndex Op0
+/// OpAuthOutputIdx` resolves to the residual (output[1], the lowest-indexed
+/// authorized output) and NOT the buyer output at output[2] -- the exact
+/// ordering constraint the builder wiring has to honour. `residual_first`
+/// swaps outputs[1] and [2] to show that if the buyer output preceded the
+/// residual, auth[0] would land on the buyer output and the self-continuation
+/// SPK check would fail.
+fn run_sell_ioc_builder_layout(residual_first: bool) -> Result<(), String> {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+
+    let token_in = 30_000_000u64;
+    let fta = 20_000_000u64; // partial: residual = token_in - fta = 10M
+    let sell_rs = build_sell_redeem_script(1, 1, 8_000_000, &owner_hash, &spk_hash, 10_000_000, 0, 0).unwrap();
+    let sell_p2sh = build_p2sh(&sell_rs);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    // koi = 0 (seller KAS at output[0]), matching the builder.
+    let sell_ss = build_sell_ioc_fill_sigscript(0, fta, &sell_rs);
+    let buyer_spk = p2pk_spk(&arr32("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"));
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), sell_ss, 50, 0),       // sell (token 30M)
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1), // fee placeholder (not executed)
+    ];
+    let residual_p2sh = ScriptPublicKey::new(sell_p2sh.version(), sell_p2sh.script().into());
+    // Both residual and buyer are covenant continuations authorized by input 0.
+    let residual_out = TransactionOutput::with_covenant(10_000_000, residual_p2sh, Some(CovenantBinding::new(0, token_cov_id)));
+    let buyer_out = TransactionOutput::with_covenant(fta, buyer_spk, Some(CovenantBinding::new(0, token_cov_id)));
+    let (out1, out2) = if residual_first { (residual_out, buyer_out) } else { (buyer_out, residual_out) };
+    let outputs = vec![
+        TransactionOutput::with_covenant(fta, wallet_spk.clone(), None), // [0] seller KAS 20M (koi=0)
+        out1,                                                            // [1]
+        out2,                                                            // [2]
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+    let entries = vec![
+        UtxoEntry { amount: token_in, script_public_key: sell_p2sh, block_daa_score: 0, is_coinbase: false, covenant_id: Some(token_cov_id) },
+        UtxoEntry { amount: 260_000_000, script_public_key: wallet_spk, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+    ];
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).expect("CovenantsContext::from_tx");
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let reused = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+    let (input, entry) = populated.populated_input(0);
+    let mut vm = TxScriptEngine::from_transaction_input(&populated, input, 0, entry, ctx, flags);
+    vm.execute().map_err(|e| format!("{e:?}"))
+}
+
+/// The honest match-builder layout (residual at output[1], before buyer tokens)
+/// passes the real engine; swapping the residual behind the buyer output makes
+/// auth[0] resolve to the buyer output and the self-continuation check fail.
+#[test]
+fn sell_ioc_builder_layout_residual_at_auth0_passes() {
+    let ok = run_sell_ioc_builder_layout(true);
+    assert!(ok.is_ok(), "builder layout (residual is the sell input's auth[0]) must pass; got {ok:?}");
+    let bad = run_sell_ioc_builder_layout(false);
+    assert!(bad.is_err(), "if a buyer output precedes the residual, auth[0] misresolves and the sell script must fail");
+}
+
 /// Run a listing PATH 6 (settle english auction) script with the seller paid
 /// `seller_out_value` at output[1], against an accrued listing UTXO worth
 /// `accrued`. Returns the raw execute() result of the listing covenant input.

@@ -1,5 +1,84 @@
 # KOB Live testnet-10 E2E — post-hardening full run
 
+## v17 N:M live verification
+
+**RESULT: the v17 N-sells:1-buy sweep settled autonomously on-chain in ONE
+tx — the live proof the harness could not give. testnet-10 accepted it.**
+
+- **Settle TXID: `6794639c6cff0e6967bb0ca3dceb6d0cee7885aa72a48d43f6e5f667d7c2f8a5`**
+  (`is_accepted: true`, accepting-block blue_score 507333120, confirmed via
+  `api-tn10.kaspa.org/transactions/<txid>`, independent of the wRPC node).
+- **Genuine multi-sell sweep, verified on-chain** (5 inputs, 4 outputs):
+  - IN[0] `add68feb…:0`, IN[1] `9a0e1c1f…:0`, IN[2] `2be82d7e…:0` — **3 distinct
+    v14 sells** (30M token_units each @ 99/100), all consumed in one tx.
+  - IN[3] `1ec3ab83…:0` — the **v17 buy** (90M KAS @ 1/1, mmfee 2000bps, GTC
+    full-fill min_fill=90M). IN[4] `e459a8d5…:2` — wallet fee UTXO.
+  - OUT[0] 89,100,000 sompi = SellerKas (3 × 29.7M merged to the one seller SPK).
+  - OUT[1..3] 30,000,000 each = **one BuyerTokens output per sell, each covenant-
+    bound to its OWN sell input** (`COV(ai=0)`, `COV(ai=1)`, `COV(ai=2)` in the
+    daemon's TX debug dump). This is the exact shape the merged v14/v16 path
+    cannot express: the sell-side per-input F4 needs N separate token outputs,
+    and the v17 buy's F6 SUMS them. Node acceptance proves all 3 per-input sell
+    F4 checks passed simultaneously with the v17 buy's aggregate check.
+  - **F6 aggregate surplus cap held**: buyer paid 90M KAS, aggregate fair value
+    89.1M, matcher surplus 900,000 ≤ cap 18,000,000 (=90M/10000×2000bps). The
+    surplus was dropped to the miner fee (no matcher-fee output emitted).
+  - **Aggregate limit-price floor held**: Σtokens 90,000,000 ≥ kas_in/buy_price
+    = 90M/(1/1) = 90,000,000 (satisfied exactly at the floor).
+
+- **Autonomous, LISTEN-mode discovery (bulk-getBlocks avoided)**: the daemon was
+  started FRESH FROM THE CURRENT TIP — the persisted scan cursor
+  (`orderbook.json.scan.json`) was deleted before launch, so `[H1] No cursor;
+  initial last_seen_hash = <sink>` then `startup catchup: tip … (spot+0, perp+0)`
+  = zero historical catch-up, no bulk `getBlocks`. The crossing book (1 v17 buy
+  + 3 sells, all resting on-chain) was in the persisted order book; the daemon
+  loaded it, found the crossing on its first scan cycle, and settled — no manual
+  `match` call. Group classified `GtcBuyMultiFill sells=3 buys=1`, routed to the
+  isolated `plan_batch_match_v17`, `[BATCH] SUCCESS!`, then it pruned all 4
+  orders (book → 0 bids/0 asks) after seeing its own tx consume them.
+
+- **Two product-code bugs found + fixed to get here** (both in the v17 wiring,
+  surfaced only by this live run; the harness could not because it hand-builds
+  the sell sigscripts):
+  1. `BatchPlan::validate()` (`kob/domain/src/spot/batch.rs`) still hard-rejected
+     `buy.version == 17` ("is v17, unsupported (v14/v16 only)") as a post-hoc
+     sanity check, even though `plan_batch_match` itself already routed v17
+     correctly — so a correctly-planned sweep was killed at the last gate.
+     Added v17 to the allowed set (mirrors the planner's own check).
+  2. **The load-bearing one**: `build_tx`'s `has_v16_buy` gate
+     (`kob/domain/src/spot/batch.rs`) decided whether the swept sells use the
+     fixed-offset sell fill sigscript (`build_sell_fill_sigscript_fixed_offset`,
+     2-byte koi push) vs the regular 1-byte-OpN koi push. v17 — exactly like v16
+     — reads each sell's pnum/pden via `OpTxInputScriptSigSubstr` at fixed
+     offsets `[7..15)`/`[16..24)`, which only line up when the sell RS push
+     starts at a fixed byte (the 2-byte koi). The gate only recognized v16, so a
+     v17 sweep left the sells on the 1-byte push, shifting the RS one byte and
+     making v17's price read decode garbage → the node rejected the tx with
+     `script ran, but verification failed` (the identical txid `6794639c…`, since
+     Kaspa txids exclude sigscripts — only the sigscripts differed between the
+     rejected and accepted submits). Renamed the gate `has_fixed_offset_buy` and
+     included the v17 RS length. This matches the proven harness, which uses
+     `build_sell_fill_sigscript_fixed_offset` for its v17 sells
+     (`kob/core/tests/v17_nm_buy.rs`).
+
+  Both binaries rebuilt after each fix; the final settle above ran on the
+  offset-fix binary. Sell sigscript length went 432B → 433B (the extra byte is
+  the fixed-offset koi push), the on-chain confirmation that the fix took.
+
+- **v17's core spot capability is now LIVE-PROVEN on testnet-10.** The
+  N-sells→1-buy sweep — unsettleable under v14/v16 (mutually-exclusive sell-F4
+  vs buy-F6 output requirements, per `NM_BUY_DESIGN.md §1`) — settles in a
+  single real on-chain tx under v17, discovered and built autonomously by the
+  continuous daemon.
+
+- **Token/orders for the record** (testnet-10, wallet
+  `kaspatest:qz6qc3j…cfy7qrwa6v8lf`): token
+  `e503795c370e0aa9acac0ceedd589cb8db52e8e12692504316a8492643939d79` (V17E2E,
+  genesis `b6ca7b5d…`). v17 cancel path also live-exercised en route (the
+  wrong-priced first buy, cancel TXID `d09972357e09e1cd…`, and a min_fill-too-low
+  buy, cancel TXID `62d1c4db33104a6e…`) — confirms v17 orders stay cancellable
+  after the version-gate change (Task A).
+
 ## Final summary
 
 Every flow/command actually attempted live against testnet-10 in this pass,
@@ -591,9 +670,9 @@ run where the node serves the catch-up:
 | 1:1 full `Batch` | `plan_batch_match` | **LIVE-SETTLED** (`6cf08c27`, `a801a585`, `e459a8d5`) |
 | N:N same-token in ONE TX (`Batch`, >=2 sells) | `plan_batch_match` (per-pair fix) | **BUG root-caused; fix DESIGNED, not committed** (breaks 5 partial-sell/merge unit tests; unverifiable on this node — see Bug section) |
 | `PartialBuy` / `PartialSell` (1:1 partial) | `compute_partial_fill_match` -> `plan_ioc_match` | not driven live this pass; CLI partial-fill separately live-proven earlier (`86ef6b42...`). Seed: 1 small sell + 1 larger buy (or vice-versa) crossing, in one cycle |
-| `BuySweep` (N sells : 1 buy) | `plan_ioc_match` | **CONTRACT-LIMITED** (sell-F4 needs per-sell outputs vs buy-F6 needs one aggregated output; token conservation forbids both) — currently rejects on-chain |
+| `BuySweep` (N sells : 1 buy, IOC) | `plan_ioc_match` | **CONTRACT-LIMITED for v14/v16 IOC** (sell-F4 needs per-sell outputs vs buy-F6 needs one aggregated output; token conservation forbids both). The GTC full-fill sibling (`GtcBuyMultiFill`, below) is now LIVE-SETTLED under v17; the v17 IOC BuySweep path (`plan_ioc_match` for v17) is wired but not yet live-driven this pass. |
 | `SellSweep` (1 sell : N buys) | `plan_sell_ioc_match` | not driven live; needs an IOC sell + >=2 buys discovered in one cycle |
-| `GtcBuyMultiFill` / `GtcSellMultiFill` (N:1 same token) | `plan_batch_match` | same contract limitation as BuySweep (one aggregated buyer/seller output cannot be authorized by N inputs) |
+| `GtcBuyMultiFill` (N sells : 1 v17 buy, same token) | `plan_batch_match` -> `plan_batch_match_v17` | **LIVE-SETTLED under v17** (`6794639c…`, 3 sells → 1 v17 buy in one tx; see "v17 N:M live verification" at the top). The old contract limitation was a v14/v16 property; v17's per-sell BuyerTokens + summed F6 lifts it. `GtcSellMultiFill` (1 sell : N buys) is the still-open mirror. |
 | `CrossSwap` / cross-pair 2-hop / triangular ("triangle") | `match_swap_routes` -> `execute_swap_fill` (submit at executor.rs:1538) | cross-pair routing was ENABLED (`--cross-pair`) but no `swap` covenant + bridge counterparties were deployed to route; needs 2 tokens + a `swap deploy` + a buy-source in pair A + a sell-target in pair B |
 
 ### Non-spot instrument auto-fill capability matrix (engine wiring audit)

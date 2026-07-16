@@ -43,6 +43,7 @@ use kob_core::contract::spot::oco::{
 };
 use kob_core::contract::spot::order::{
     BUY_ORDER_V16_RS_EXPECTED_LEN,
+    BUY_ORDER_V17_RS_EXPECTED_LEN,
     build_buy_fill_sigscript,
     build_buy_ioc_fill_sigscript,
     build_buy_v16_fill_sigscript,
@@ -397,13 +398,19 @@ impl BatchPlan {
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
 
-        // V16 detection: if any buy in the batch uses the v16 contract (it
-        // reads the counterparty sell's pnum/pden via
-        // OpTxInputScriptSigSubstr at fixed sigscript offsets), all sells
-        // must use the fixed-offset sigscript format (fixed 2-byte koi push)
-        // so those offsets land where F6 expects them (see order.rs).
-        let has_v16_buy = self.buys.iter().any(|(b, _)| {
+        // Fixed-offset detection: if any buy in the batch reads the
+        // counterparty sell's pnum/pden via OpTxInputScriptSigSubstr at fixed
+        // sigscript offsets [7..15)/[16..24), all sells must use the
+        // fixed-offset sigscript format (fixed 2-byte koi push) so those
+        // offsets land where the buy expects them (see order.rs). BOTH v16
+        // (F6 cross-input surplus) AND v17 (per-sell fair_kas summation) use
+        // this exact convention, so a v17 buy needs it too -- omitting v17
+        // here left the swept sells on the 1-byte-OpN koi push, shifting the
+        // RS (and thus pnum/pden) one byte and making v17's price read decode
+        // garbage -> "script ran, but verification failed" on-chain.
+        let has_fixed_offset_buy = self.buys.iter().any(|(b, _)| {
             b.redeem_script.len() == BUY_ORDER_V16_RS_EXPECTED_LEN
+                || b.redeem_script.len() == BUY_ORDER_V17_RS_EXPECTED_LEN
         });
 
         // === Build sell inputs ===
@@ -428,7 +435,7 @@ impl BatchPlan {
                     // OCO sell with remainder: use IOC fill (Op5 + fta) instead
                     // of TP/SL full-fill path to avoid F4 value check failure.
                     let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
-                    if has_v16_buy {
+                    if has_fixed_offset_buy {
                         build_sell_ioc_fill_sigscript_fixed_offset(koi as u16, fta, &sell.redeem_script)
                     } else {
                         build_sell_ioc_fill_sigscript(koi as u16, fta, &sell.redeem_script)
@@ -447,12 +454,12 @@ impl BatchPlan {
             } else if (self.ioc_mode == Some(IocSide::Sell) || has_remainder) && !self.sell_fill_amounts.is_empty() {
                 // Sell IOC or sell with remainder: use fta-based sigscript
                 let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
-                if has_v16_buy {
+                if has_fixed_offset_buy {
                     build_sell_ioc_fill_sigscript_fixed_offset(koi as u16, fta, &sell.redeem_script)
                 } else {
                     build_sell_ioc_fill_sigscript(koi as u16, fta, &sell.redeem_script)
                 }
-            } else if has_v16_buy {
+            } else if has_fixed_offset_buy {
                 build_sell_fill_sigscript_fixed_offset(koi as u16, &sell.redeem_script)
             } else {
                 build_sell_fill_sigscript(koi as u16, &sell.redeem_script)
@@ -645,7 +652,12 @@ impl BatchPlan {
 
     /// Validate the plan: all contracts satisfied, fees covered, amounts balanced.
     pub fn validate(&self) -> Result<(), BatchError> {
-        // Check: order versions (v14 for buys/sells, v16 for buy (F6-fix) or bracket entry)
+        // Check: order versions (v14 for buys/sells, v16 (F6-fix) or v17 (N:M
+        // sweep) for buy, or bracket entry). This mirrors plan_batch_match's
+        // own version check -- kept here too as a post-hoc sanity check on
+        // the built plan, so it must stay in sync with that check (it was
+        // missed when v17 landed, silently rejecting an otherwise-correctly
+        // planned v17 sweep at this late stage).
         for (sell, _) in &self.sells {
             if sell.version != 14 {
                 return Err(BatchError::UnsupportedVersion {
@@ -655,7 +667,7 @@ impl BatchPlan {
             }
         }
         for (buy, _) in &self.buys {
-            if buy.version != 14 && buy.version != 16 {
+            if buy.version != 14 && buy.version != 16 && buy.version != 17 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                     version: buy.version,

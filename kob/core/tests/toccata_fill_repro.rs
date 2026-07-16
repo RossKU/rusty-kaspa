@@ -21,6 +21,10 @@ use kaspa_txscript::covenants::CovenantsContext;
 use kaspa_txscript::engine_context::EngineCtx;
 use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
+use kob_core::contract::spot::oco::{
+    build_oco_sell_redeem_script, build_oco_sell_tp_fill_sigscript,
+    build_oco_sell_tp_fill_sigscript_fixed_offset,
+};
 use kob_core::contract::spot::order::{
     build_buy_v16_fill_sigscript, build_buy_v16_ioc_fill_sigscript, build_buy_v16_redeem_script,
     build_sell_fill_sigscript, build_sell_fill_sigscript_fixed_offset,
@@ -583,5 +587,95 @@ fn listing_settle_full_payment_passes() {
     assert!(
         res.is_ok(),
         "listing PATH6 must ACCEPT a settle that pays the seller the full accrued bid; got {res:?}"
+    );
+}
+
+/// MED #4: an OCO sell (TP path) paired with a v16 buy in one tx, using the
+/// FIXED-OFFSET TP fill sigscript. Reuses `run_full_fill_match`'s generic tx
+/// shape (it doesn't care that `sell_rs` is an OCO redeemScript rather than a
+/// plain sell one). Both the OCO sell's own script (input[0]) and the v16
+/// buy's fixed-offset price read (input[1]) must pass.
+#[test]
+fn oco_sell_tp_fixed_offset_plus_v16_buy_fill_passes() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let buy_rs = build_buy_v16_redeem_script(&token, 1, 1, 8_000_000, &owner_hash, &spk_hash, 2000, 0, 0).unwrap();
+    let oco_rs = build_oco_sell_redeem_script(
+        499, 500, 8_000_000, // TP: same price/min_fill as the plain-sell parity test
+        499, 500, 8_000_000, // SL: unused by the TP path, just needs to be valid
+        &owner_hash, &spk_hash, 10_000_000, 0, 0,
+    ).unwrap();
+    let sell_ss = build_oco_sell_tp_fill_sigscript_fixed_offset(0, &oco_rs);
+    let buy_ss = build_buy_v16_fill_sigscript(1, 0, 0, &buy_rs); // [toi=1, tii=0, coi=0, Op1]
+    run_full_fill_match("oco-tp-fixed-offset/v16-buy-fill", sell_ss, buy_ss, &buy_rs, &oco_rs);
+}
+
+/// Execute ONLY the v16 buy covenant script (input[1]) of an OCO-sell + v16-buy
+/// match tx, given an arbitrary OCO sell sigscript. Same tx shape as
+/// `oco_sell_tp_fixed_offset_plus_v16_buy_fill_passes`, but returns the buy
+/// script's raw result instead of asserting, so a caller can prove the
+/// NON-fixed-offset OCO sigscript breaks the buy's price read.
+fn oco_buy_v16_result(sell_ss: Vec<u8>, buy_rs: &[u8], sell_rs: &[u8]) -> Result<(), String> {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let sell_p2sh = build_p2sh(sell_rs);
+    let buy_p2sh = build_p2sh(buy_rs);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let buy_ss = build_buy_v16_fill_sigscript(1, 0, 0, buy_rs);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), sell_ss, 50, 0),
+        TransactionInput::new(op(0x20, 0), buy_ss, 50, 0),
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1), // wallet placeholder (not executed)
+    ];
+    let outputs = vec![
+        TransactionOutput::with_covenant(29_940_000, wallet_spk.clone(), None), // SellerKas
+        TransactionOutput::with_covenant(30_000_000, wallet_spk.clone(), Some(CovenantBinding::new(0, token_cov_id))), // BuyerTokens
+        TransactionOutput::with_covenant(200_000_000, wallet_spk.clone(), None), // BuyerChange
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 50, Default::default(), 0, vec![]);
+    let entries = vec![
+        UtxoEntry { amount: 30_000_000, script_public_key: sell_p2sh, block_daa_score: 0, is_coinbase: false, covenant_id: Some(token_cov_id) },
+        UtxoEntry { amount: 30_000_000, script_public_key: buy_p2sh, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+        UtxoEntry { amount: 260_000_000, script_public_key: wallet_spk, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+    ];
+
+    let populated = PopulatedTransaction::new(&tx, entries);
+    let cov_ctx = CovenantsContext::from_tx(&populated).expect("CovenantsContext::from_tx");
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    let reused = SigHashReusedValuesUnsync::new();
+    let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+    let (input, entry) = populated.populated_input(1);
+    let mut vm = TxScriptEngine::from_transaction_input(&populated, input, 1, entry, ctx, flags);
+    vm.execute().map_err(|e| format!("{e:?}"))
+}
+
+/// MED #4 regression: the NON-fixed-offset OCO TP fill sigscript (1-byte OpN
+/// koi push) shifts the RS by one byte when paired with a v16 buy in the same
+/// tx, so the buy's `OpTxInputScriptSigSubstr` price read decodes garbage and
+/// the buy script MUST fail. This is the exact byte-shift bug MED #4 fixes by
+/// switching to the fixed-offset variant (proven passing above).
+#[test]
+fn oco_sell_tp_non_fixed_offset_plus_v16_buy_fill_fails() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let buy_rs = build_buy_v16_redeem_script(&token, 1, 1, 8_000_000, &owner_hash, &spk_hash, 2000, 0, 0).unwrap();
+    let oco_rs = build_oco_sell_redeem_script(
+        499, 500, 8_000_000,
+        499, 500, 8_000_000,
+        &owner_hash, &spk_hash, 10_000_000, 0, 0,
+    ).unwrap();
+    let sell_ss = build_oco_sell_tp_fill_sigscript(0, &oco_rs); // NOT fixed-offset
+    let res = oco_buy_v16_result(sell_ss, &buy_rs, &oco_rs);
+    assert!(
+        res.is_err(),
+        "v16 buy paired with a NON-fixed-offset OCO sell sigscript must fail \
+         (byte-shifted price read); got Ok -- MED #4 regression"
     );
 }

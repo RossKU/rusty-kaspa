@@ -48,6 +48,7 @@ pub use contract::{
     OCO_SELL_BODY, OCO_SELL_RS_SIZE, OCO_SELL_STATE_SIZE, OcoPath,
     build_oco_sell_redeem_script,
     build_oco_sell_tp_fill_sigscript, build_oco_sell_sl_fill_sigscript,
+    build_oco_sell_tp_fill_sigscript_fixed_offset, build_oco_sell_sl_fill_sigscript_fixed_offset,
     build_oco_sell_cancel_sigscript, build_oco_sell_expire_sigscript,
     // DCA
     DCA_V2_RS_SIZE, DCA_V2_STATE_SIZE, DCA_V2_BODY_SIZE,

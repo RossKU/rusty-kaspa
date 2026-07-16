@@ -39,7 +39,9 @@ use std::collections::{HashMap, HashSet};
 use kob_core::MIN_UTXO_VALUE;
 use kob_core::contract::spot::oco::{
     build_oco_sell_sl_fill_sigscript,
+    build_oco_sell_sl_fill_sigscript_fixed_offset,
     build_oco_sell_tp_fill_sigscript,
+    build_oco_sell_tp_fill_sigscript_fixed_offset,
 };
 use kob_core::contract::spot::order::{
     BUY_ORDER_V16_RS_EXPECTED_LEN,
@@ -467,12 +469,22 @@ impl BatchPlan {
                         build_sell_ioc_fill_sigscript(koi as u16, fta, &sell.redeem_script)
                     }
                 } else {
-                    // OCO sell fully filled: use TP (Op1) or SL (Op2) path selector
-                    match oco_path {
-                        kob_core::OcoPath::TakeProfit => {
+                    // OCO sell fully filled: use TP (Op1) or SL (Op2) path
+                    // selector. MED #4: gate on has_fixed_offset_buy, same as
+                    // the sibling sell branches -- a v16/v17 buy in this tx
+                    // reads this sell's pnum/pden at fixed sigscript offsets,
+                    // which only line up with the 2-byte koi push.
+                    match (oco_path, has_fixed_offset_buy) {
+                        (kob_core::OcoPath::TakeProfit, true) => {
+                            build_oco_sell_tp_fill_sigscript_fixed_offset(koi as u16, &sell.redeem_script)
+                        }
+                        (kob_core::OcoPath::TakeProfit, false) => {
                             build_oco_sell_tp_fill_sigscript(koi as u16, &sell.redeem_script)
                         }
-                        kob_core::OcoPath::StopLoss => {
+                        (kob_core::OcoPath::StopLoss, true) => {
+                            build_oco_sell_sl_fill_sigscript_fixed_offset(koi as u16, &sell.redeem_script)
+                        }
+                        (kob_core::OcoPath::StopLoss, false) => {
                             build_oco_sell_sl_fill_sigscript(koi as u16, &sell.redeem_script)
                         }
                     }
@@ -2398,6 +2410,17 @@ mod tests {
         let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 100_000_000u64));
         let r = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000));
         assert!(r.is_ok(), "solo OCO sell must still plan fine: {:?}", r.err());
+
+        // MED #4: build_tx must pick the FIXED-OFFSET OCO TP builder (2-byte
+        // koi push), matching the sibling sell branches, because the v17 buy
+        // in this tx reads pnum/pden at fixed sigscript offsets.
+        let plan = r.unwrap();
+        let tx = plan.build_tx().expect("build_tx");
+        let expected = kob_core::build_oco_sell_tp_fill_sigscript_fixed_offset(0, &plan.sells[0].0.redeem_script);
+        assert_eq!(
+            tx.inputs[0].sigscript, expected,
+            "OCO sell paired with a v17 buy must use the fixed-offset TP fill sigscript"
+        );
     }
 
     /// HIGH DoS #3: more sells than BUY_ORDER_V17_MAX_N must reject gracefully

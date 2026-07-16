@@ -287,6 +287,48 @@ pub fn build_oco_sell_sl_fill_sigscript(
     ss
 }
 
+/// Build OCO sell TP fill sigscript with the fixed-offset convention.
+///
+/// Layout: `[0x01, koi_val] [Op1] [pushData(RS)]`
+///
+/// Mirrors `build_sell_fill_sigscript_fixed_offset` (`spot/order.rs`): always
+/// uses a 2-byte koi push (even for indices 0-16) so a v16/v17 buy sharing
+/// this tx can read this sell's pnum/pden at the fixed sigscript offsets
+/// `[7..15)`/`[16..24)` via `OpTxInputScriptSigSubstr`. Without this, an OCO
+/// sell paired with a v16/v17 buy uses the 1-byte OpN koi push instead,
+/// shifting the RS one byte and making the buy's price read decode garbage.
+pub fn build_oco_sell_tp_fill_sigscript_fixed_offset(
+    kas_output_idx: u16,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    assert!(kas_output_idx <= 255, "koi must fit in 1 byte for fixed-offset convention");
+    let mut ss = Vec::with_capacity(4 + redeem_script.len() + 3);
+    ss.push(0x01); // push 1 byte
+    ss.push(kas_output_idx as u8);
+    ss.push(0x51); // Op1 (selector = TP fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build OCO sell SL fill sigscript with the fixed-offset convention.
+///
+/// Layout: `[0x01, koi_val] [Op2] [pushData(RS)]`
+///
+/// See `build_oco_sell_tp_fill_sigscript_fixed_offset` for why this variant
+/// exists.
+pub fn build_oco_sell_sl_fill_sigscript_fixed_offset(
+    kas_output_idx: u16,
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    assert!(kas_output_idx <= 255, "koi must fit in 1 byte for fixed-offset convention");
+    let mut ss = Vec::with_capacity(4 + redeem_script.len() + 3);
+    ss.push(0x01); // push 1 byte
+    ss.push(kas_output_idx as u8);
+    ss.push(0x52); // Op2 (selector = SL fill)
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
 /// Build OCO sell cancel sigscript.
 ///
 /// Layout: `[pushData(sig+type 65B)] [pushData(pubkey 32B)] [Op0] [pushData(RS)]`

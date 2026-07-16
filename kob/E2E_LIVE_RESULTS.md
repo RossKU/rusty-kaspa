@@ -1,5 +1,97 @@
 # KOB Live testnet-10 E2E — post-hardening full run
 
+## v18 full spot unification — Stage D live run (2026-07-16)
+
+Full 13-form matrix on fresh v18 binaries (HEAD cc18931 + this run's CLI-glue
+fixes). Node `ws://65.108.107.30:18210`, REST verification via
+`api-tn10.kaspa.org` (every TXID below re-checked `is_accepted:true`,
+independent of the wRPC node). Wallet `kaspatest:qz6qc3j…cfy7qrwa6v8lf`
+(start 216.59 KAS free / 89 UTXOs; end ~5.3 KAS free — the rest sits in
+self-trade token round-trips/resting orders, net spend = miner fees only).
+Three fresh tokens: **V18A** `eab5c99a…a4b4` (genesis `f4e01942…`),
+**V18B** `d5fb0009…2c45` (genesis `3cbe6e7e…`), **V18C** `31679217…c07e`
+(genesis `37b16f78…`), 23 chained mints. Engine-driven forms ran LISTEN-mode
+daemons fresh from the tip (scan cursor deleted, `[H1] No cursor`); the rest
+were CLI-driven (`match-batch --ioc/--partial`, `match-ring`) plus a new E2E
+glue bin `kob-e2e-util` (oco-spk / sell-partial / expire / oco-cancel /
+*-rs helpers) for the paths the CLI has no subcommand for yet.
+
+| # | Form | Path | Result | TXID |
+|---|---|---|---|---|
+| 1 | mint 3 fresh tokens A/B/C | `token create` + chained `token mint` | **PASS** | `f4e01942…`, `3cbe6e7e…`, `37b16f78…` + 23 mints |
+| 2 | deploy v18 buy/sell/OCO/swap/bracket + receipt genesis | CLI deploys (all v18 RS) | **PASS** | buys `04495ad2…`/`c0a519b2…`, sells `38975397…` et al., OCO `3b87a680…`/`631409e4…`, swaps `852a5504…`/`0c10f03b…`/`ed9c88c6…`/`6bbab79f…`/`ac2e1b1d…`, bracket `fc50b663…`, receipt `986d73f4…` |
+| 3 | GTC N:M sweep (1 v18 buy × 3 v18 sells) | engine `GtcBuyMultiFill` → `plan_batch_match_v18` | **SETTLED** (blue 507744211) — 5-in/4-out, 3 per-sell BuyerTokens COV(ai=0/1/2) + merged 89.1M SellerKas | **`a951f2abd71354ad6e941cc9068c3c7adad1f3fd582f10ba83310a575dce3a75`** |
+| 4 | IOC N:M sweep (1 v18 buy × 3 v18 sells) | `kob-cli match-batch --ioc` → `plan_ioc_match_v18` | **SETTLED** (blue 507748168) — matcher fee at the 2000bps cap, buyer change returned | **`793e84ff6fad4ba44e0b417b443c371786ce01deff38ef5b6ef1668401a4d7c3`** |
+| 5 | buy partial Op2, two chained events + final fill | `match-batch --partial` ×2 → `plan_partial_match_v18`, final `--ioc` | **SETTLED ×3** — 90M buy: ev1 spends 30M (residual 60M @ `4b7767d7…:2`), ev2 spends 30M (residual 30M @ `81a6d1b1…:2`), final IOC consumes the residual fully; residual SPK byte-exact, no covenant | **`4b7767d7…`**, **`81a6d1b1…`**, **`a264d66f…`** |
+| 6 | sell partial (v18 Fix-3 F4, direct spend) | `kob-e2e-util sell-partial` — wallet is the KAS payer (no planner composes v18 sell partial with a v18 buy, by design) | **SETTLED ×2 chained** — 300M sell: fta 100M (residual 200M @ `99dbe088…:1`), then fta 50M on the residual (150M @ `02a1592a…:1`); shape: in[0] sell (seq 50) + in[1] wallet; out[0] seller KAS (koi=0, sspkh), out[1] residual self-SPK COV(ai=0) at auth slot 0, out[2] delivery COV(ai=0), out[3] change; residual later cancelled (`9b70b1ae…`) proving it rests as a live v18 sell | **`99dbe088…`**, **`02a1592a…`** |
+| 7a | OCO swept in a 2-sell batch, TP branch | engine `GtcBuyMultiFill sells=2` (OCO TP 99/100 + plain 99/100, buy 59.4M @1/1) | **SETTLED** (blue 507757077) — OCO input attests the TP pair (canonical [3..11)/[12..20) layout) | **`95f241de65edbeddbe4b4e02eea3fd45e05aeadf7d09423aa39a7548e0c5a7db`** |
+| 7b | OCO swept in a 2-sell batch, SL branch | engine `GtcBuyMultiFill sells=2` (OCO SL 1/2 + plain 1/2, buy 30M @3/4) | **SETTLED** (blue 507764333) — OCO input attests the SL pair; the pre-v18 OCO-SL sweep blocker is gone live | **`c512fcdbbfc4352fde7fa41d7550253c5bee2dc7ecf54536c27cc474d26f9625`** |
+| 8 | cancel-mark → fill rejected → cancel (v18 two-phase) | `cancel-mark` (sell, v18) → direct fill attempt → `cancel --cpend 1` | **PASS** — mark `795366c8…` (cpend=1 UTXO); fill attempt `f9a360ca…` refused by the node with `script ran, but verification failed` (F5 cpend); covenant-bound variant separately refused at the covenants layer (mark de-tokenizes, see notes); cancel `516d15a1…` recovered the funds | mark **`795366c8…`**, cancel **`516d15a1…`** |
+| 9 | expire path (near expiry_daa → wait → claim) | v18 buy Op4 via `kob-e2e-util expire` (permissionless, CLTV, FULL refund + wallet fee input) | **CLAIMED ×2** — `54470692…` (first probe) and `650eafd6…` (order live ~80s; early claim correctly refused pre-expiry, claimed after DAA passed) | **`54470692…`**, **`650eafd6…`** |
+| 10 | 2-cycle ring A↔B | `kob-cli match-ring` → `plan_ring_match` (2 legs) | **SETTLED** (blue 507793686) — token↔token direct, all-or-nothing, per-leg slot-0 delivery COV | **`fcffaaaf58f067f4a09a8643ba2b0ee8dcde23bb550cee9d0b8101c74abd3799`** |
+| 11 | 3-cycle triangle A→B→C→A | `kob-cli match-ring` (3 legs) | **SETTLED** (blue 507794242) — 3 swap legs + fee input, 3×30M deliveries, **no KAS in any order leg** | **`ac5fab548ca1cf2c6a2a517657680e8668b2febe7cb914d32537cd221f415598`** |
+| 12 | IFD soft path (register → entry fill → done-leg live) | `deploy ifd` (v18 buy entry, done-leg RS in payload) → engine fill | **SETTLED** (blue 507798479) — entry `0847a1ed…` filled autonomously; delivery out[1] landed ON the done-leg sell P2SH (`aa204a9fb8…`) and the engine immediately discovered it as a live v18 sell @2/1 (`252e953b…:1`) | **`252e953b997d60cb0d0946f3a8bc4099314e5b947636a78d9749515f43176252`** |
+| 13 | bracket v18 fill (receipt input[2], CSV(50), OCO spawn) | `receipt create` → `kob-e2e-util oco-spk` → `bracket deploy`/`fill --token-utxo` → `kob-e2e-util oco-cancel` | **SETTLED** (blue 507802941) — in[2] = receipt `986d73f4…:0` (cov `924ab6c5…`), in[3] matcher token unit; out[1] 30M delivery COV, out[2] 30M OCO spawn at the exact `oco_spk`, out[3] token change; spawned OCO then cancelled (`76891f4c…`, owner path) | deploy **`fc50b663…`**, fill **`9a993dc11548406fce5698c901f7751267360eccf8b37582f8ecc0ff9e0ad9da`**, OCO cancel **`76891f4c…`** |
+
+**Verdict: the full v18 spot matrix is LIVE-CONFIRMED on testnet-10 — all 13
+forms have `is_accepted:true` TXIDs (32 verified via REST). No contract
+defect found**; the OCO-SL sweep, buy Op2 partial chain, sell Fix-3 partial,
+token↔token rings (incl. the 3-cycle triangle), IFD done-leg spawn, and the
+receipt-gated bracket→OCO spawn — all previously impossible or unproven —
+settled on-chain.
+
+**One near-miss that was NOT a defect**: the first SL-sweep buy used
+`--min-fill 30000000` (its full KAS) at price 3/4 and the node kept rejecting
+the settle. Offline repro against the real `kaspa-txscript` engine isolated
+it to Section E of `emit_fill_body_v18`: `expected = kas_in/pden*pnum >= mfill`
+— **the v18 buy `min_fill` is a floor on TOKENS, not KAS** (22.5M expected
+tokens < 30M mfill can never fill; at 1/1 prices KAS==tokens masked this).
+Pinned in `kob/core/tests/v18_mfill_pin.rs` (reject + 4 passing price/floor
+combos).
+
+**Glue fixes landed during the run** (product code, non-covenant):
+1. `deploy.rs`: v18 **sell** deploys cached the raw sompi `max_matcher_fee`
+   (10000000) instead of the BPS baked into the RS → `match-batch` rebuilt a
+   different RS ("max_matcher_fee_bps must be <= 10000"). Cache now stores
+   BPS for v18, mirroring the buy path.
+2. `match_batch.rs`: `KOB_FEE_FLOOR` env override — the node's
+   byte-proportional transient-mass floor can exceed the compute-mass fee on
+   covenant-heavy shapes; the bump is absorbed by matcher-side outputs
+   (WalletChange→MatcherFee), never seller/buyer.
+3. `bracket.rs` v18 fill: receipt UTXO now resolved via
+   `get_utxos_by_addresses` on the P2SH of `--receipt-rs` — this node does
+   not serve `getTransaction` (30s timeout), and the new path doubles as an
+   unspent check.
+4. New `kob/cli/src/bin/kob_e2e_util.rs` (E2E glue bin): `oco-spk` (compute
+   v18 OCO RS/SPK for `bracket deploy --oco-spk`), `sell-partial` (direct
+   v18 sell Op2 settle), `expire` (v18 Op4 with the full-refund + fee-input
+   shape), `oco-cancel`, and `buy-rs`/`sell-rs`/`receipt-rs` helpers.
+
+**Operational notes for Stage E / future runs**:
+- v18 buy deploys carry a ~1.7KB RS payload → the CLI's mass fee is below the
+  node's transient floor; `--fee-rate 450000` (or better: fee model unification)
+  is required. BUT a forced fee can produce an exact-spend deploy with **no
+  P2PK change output**, and the scanner then cannot extract `counterparty_spk`
+  → `[INDEXER] skipped unmatchable order`. Consolidate first, then deploy.
+- The engine's auto-expire builder (1-in/1-out, fee subtracted from the
+  refund) predates v18: the v18 expire branch demands a FULL refund
+  (`out[0] >= input`), so engine-side auto-expiry of v18 orders would be
+  rejected on-chain. Needs the 2-input shape (order + fee) at Stage E.
+- Fresh-cursor LISTEN engines defer buy orders on tokens whose covenant has
+  not yet been seen in scanned blocks (`Marking covenant … invalid (not seen
+  on-chain, TTL=300s)`). Deploy a covenant-carrying tx (e.g. the sell) BEFORE
+  the buy, or wait out the TTL (hit once on the first IFD entry `0ec3c3cd…`,
+  which now rests unfilled; the redeploy settled cleanly).
+- `cancel-mark` intentionally strips the token covenant from the marked sell
+  UTXO (tokens unlock-to-KAS at mark): a fill attempt with covenant-bound
+  outputs dies at the covenants layer, a plain attempt dies at F5 — both
+  captured live.
+- OCO deploys print `Order at output …` (not `Order deployed at output …`) —
+  parse accordingly.
+
+---
+
+
 ## v17 full spot coverage — composition-hardening live run (2026-07-16)
 
 LISTEN-mode daemon, FRESH FROM THE CURRENT TIP (persisted scan cursor absent

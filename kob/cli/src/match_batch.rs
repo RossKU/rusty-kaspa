@@ -19,7 +19,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, CovenantBinding, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletContext;
-use kob_engine::matcher::batch::{BatchOrder, OrderType};
+use kob_engine::matcher::batch::{BatchOrder, OrderType, OutputPurpose};
 use std::path::Path;
 use tracing::info;
 
@@ -456,15 +456,50 @@ pub async fn run(
     }
 
     // ---- Phase 2: Exact mass with real sigscripts ----
-    let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
+    let (mut exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
     println!();
     println!("Phase 2 Convergence:");
     println!("  Exact compute mass: {} sompi", exact_fee);
     println!("  Fee delta:          {} sompi (recovered)", delta);
 
-    if delta > 0 {
+    // Optional fee floor override (sompi): the node's transient-mass floor
+    // (byte-proportional) can exceed the compute-mass fee on covenant-heavy
+    // shapes; KOB_FEE_FLOOR lets the operator force a higher exact fee.
+    let mut fee_bumped = false;
+    if let Ok(v) = std::env::var("KOB_FEE_FLOOR") {
+        if let Ok(floor) = v.parse::<u64>() {
+            if floor > exact_fee {
+                println!("  Fee floor override: {} sompi (KOB_FEE_FLOOR)", floor);
+                exact_fee = floor;
+                fee_bumped = true;
+            }
+        }
+    }
+
+    if delta > 0 || fee_bumped {
         // Re-adjust outputs
         plan.apply_exact_fee(exact_fee);
+
+        // Fee floor bump: apply_exact_fee only recovers a Phase-1 surplus; a
+        // floor ABOVE the converged fee must come out of the matcher-side
+        // outputs (WalletChange first, then MatcherFee) — never seller/buyer.
+        if fee_bumped {
+            let mut need = exact_fee.saturating_sub(plan.total_fee);
+            if need > 0 {
+                for purpose in [OutputPurpose::WalletChange, OutputPurpose::MatcherFee] {
+                    if need == 0 { break; }
+                    if let Some(o) = plan.outputs.iter_mut().find(|o| o.purpose == purpose) {
+                        let take = need.min(o.value.saturating_sub(1_000_000));
+                        o.value -= take;
+                        need -= take;
+                    }
+                }
+                if need > 0 {
+                    anyhow::bail!("KOB_FEE_FLOOR: no matcher-side output can absorb the fee bump ({} sompi short)", need);
+                }
+                plan.total_fee = exact_fee;
+            }
+        }
 
         // Rebuild tx outputs from adjusted plan
         tx.outputs.clear();

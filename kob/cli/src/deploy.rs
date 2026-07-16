@@ -1315,7 +1315,9 @@ pub async fn deploy_sell(
         token: token_covenant_id.map(|s| s.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
-        max_matcher_fee,
+        // v18 caches store BPS (the value baked into the deployed RS), same
+        // as the buy path above; pre-v18 keeps the legacy sompi cap.
+        max_matcher_fee: if version >= 18 { sell_bps } else { max_matcher_fee },
     };
     let mut cache = OrderCache::load(&cache_path);
     cache.orders.push(entry);

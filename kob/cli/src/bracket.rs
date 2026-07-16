@@ -890,39 +890,33 @@ async fn fill_bracket_v18(
     };
     println!("Order Value:    {} sompi", order_value);
 
-    // Resolve receipt UTXO details via getTransaction (SPK needed for sighash).
+    // Resolve receipt UTXO details via the receipt P2SH address (derived from
+    // --receipt-rs). This avoids `getTransaction`, which some public nodes do
+    // not serve, and doubles as an unspent-ness check.
     let (receipt_value, receipt_spk_version, receipt_spk_script) = {
-        let resp = rpc.call(
-            "getTransaction",
-            serde_json::json!({
-                "transactionId": receipt_outpoint.transaction_id,
-                "includeVerboseData": true,
-            }),
-        ).await.map_err(|e| anyhow::anyhow!(
-            "Failed to query receipt TX {}: {}. Ensure the TX is confirmed.",
-            receipt_outpoint.transaction_id, e
-        ))?;
-        let outs = resp.get("transaction")
-            .and_then(|t| t.get("outputs"))
-            .and_then(|o| o.as_array())
-            .ok_or_else(|| anyhow::anyhow!("Cannot read receipt transaction outputs from the node."))?;
-        let idx = receipt_outpoint.index as usize;
-        let out = outs.get(idx)
-            .ok_or_else(|| anyhow::anyhow!("Receipt output index {} out of range ({} outputs).", idx, outs.len()))?;
-        let value = if let Some(rv) = receipt_value_override {
-            rv
-        } else {
-            out.get("value").and_then(|v| v.as_u64())
-                .ok_or_else(|| anyhow::anyhow!("Cannot read receipt output value from the node."))?
-        };
-        let spk = out.get("scriptPublicKey")
-            .ok_or_else(|| anyhow::anyhow!("Receipt output is missing script data."))?;
-        let ver = spk.get("version").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-        let script = hex::decode(
-            spk.get("script").and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Receipt output is missing the script field."))?
-        )?;
-        (value, ver, script)
+        let receipt_rs_probe = hex::decode(receipt_rs_hex)?;
+        if receipt_rs_probe.is_empty() {
+            anyhow::bail!("--receipt-rs cannot be empty.");
+        }
+        let rp2sh = build_p2sh(&receipt_rs_probe);
+        let raddr = crate::cancel::kaspa_address_encode(
+            network.address_prefix(), 8, &rp2sh.script()[2..34],
+        );
+        let rutxos = rpc.get_utxos_by_addresses(&[&raddr]).await?;
+        let ru = rutxos
+            .iter()
+            .find(|u| u.outpoint.transaction_id == receipt_outpoint.transaction_id
+                && u.outpoint.index == receipt_outpoint.index)
+            .ok_or_else(|| anyhow::anyhow!(
+                "Receipt UTXO {} not found at the P2SH of --receipt-rs (spent, unconfirmed, or wrong RS).",
+                receipt_outpoint
+            ))?;
+        let value = receipt_value_override.unwrap_or(ru.utxo_entry.amount);
+        (
+            value,
+            ru.utxo_entry.script_public_key.version,
+            hex::decode(&ru.utxo_entry.script_public_key.script)?,
+        )
     };
     println!("Receipt Value:  {} sompi", receipt_value);
 

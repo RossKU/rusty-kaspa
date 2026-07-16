@@ -1,9 +1,31 @@
 {
   "network": "testnet-10",
   "node": "ws://65.108.107.30:18210",
-  "ticker": "V17E2E",
-  "token_covenant_id": "e503795c370e0aa9acac0ceedd589cb8db52e8e12692504316a8492643939d79",
-  "token_genesis_txid": "b6ca7b5d00ba4f951002740277711f8bf72d102511925b997efd4ea0616a494d",
-  "mint_authority_outpoint": "7177c1a50914224176ca2850694a0013a0a9465da296fcc65fe30dbd5412e880:0",
-  "note": "Reusable v17 E2E token (replaces the old V16E2E fixture -- its mint authority was spent). Do NOT re-deploy the token genesis on every run. Mint fresh token_units from mint_authority_outpoint (cheap); after each mint, update mint_authority_outpoint to the new continuation ':0'. Only deploy a fresh genesis (kob-cli token create) if this file is missing or mint_authority_outpoint is spent. token_units are minted per-run because a cancelled sell unlocks its tokens back to KAS (KOB model), so they are not long-lived UTXOs to persist."
+  "tokens": [
+    {
+      "ticker": "V18A",
+      "token_covenant_id": "eab5c99a1f23b29629f5e5e6808ea386cae522d8b9d122a3f1378b189bb5a4b4",
+      "token_genesis_txid": "f4e01942a37eb792ca71b520f1e69b22e85883bebcd96d4db908c64d8e15541f",
+      "mint_authority_outpoint": "c714d9ed012c6dae38d3694100e671da8634fdc3bb941d404ff2ccd039a6806b:0"
+    },
+    {
+      "ticker": "V18B",
+      "token_covenant_id": "d5fb0009ce6c56a0f5fc7c2cca6bc339acf42c4564110b1dbce82ba58f862c45",
+      "token_genesis_txid": "3cbe6e7e06bb0d63ed0ff902cda7d47e0ad57b60cb07783de4e1ff08994c7885",
+      "mint_authority_outpoint": "53f88adf05bdb60a60f250454d16656e371fb86b35faa68af9e01ef270ab30c2:0"
+    },
+    {
+      "ticker": "V18C",
+      "token_covenant_id": "316792177c7dbf2f47d75b34696c373194855197f86776881248da1b6433c07e",
+      "token_genesis_txid": "37b16f788351c1ace6e2d0398fced2207005afd872ade63e2d6b10e0cc859a6b",
+      "mint_authority_outpoint": "2c2e16dfef755d451226a311b6aa74d050feb83c571b19eb3903395ccb1b5760:0"
+    }
+  ],
+  "legacy_v17_token": {
+    "ticker": "V17E2E",
+    "token_covenant_id": "e503795c370e0aa9acac0ceedd589cb8db52e8e12692504316a8492643939d79",
+    "token_genesis_txid": "b6ca7b5d00ba4f951002740277711f8bf72d102511925b997efd4ea0616a494d",
+    "mint_authority_outpoint": "7177c1a50914224176ca2850694a0013a0a9465da296fcc65fe30dbd5412e880:0"
+  },
+  "note": "Reusable v18 E2E tokens (Stage D run, 2026-07-16; the v17 fixture is kept under legacy_v17_token). Do NOT re-deploy token geneses on every run. Mint fresh token_units from each mint_authority_outpoint (cheap); after each mint, update that token's mint_authority_outpoint to the new continuation ':0'. Only deploy a fresh genesis (kob-cli token create) if this file is missing or the authority is spent. token_units are minted per-run because a cancelled sell unlocks its tokens back to KAS (KOB model), so they are not long-lived UTXOs to persist."
 }

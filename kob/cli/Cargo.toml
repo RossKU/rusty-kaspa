@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "kob-miner"
 path = "src/bin/kob_miner.rs"
 
+[[bin]]
+name = "kob-e2e-util"
+path = "src/bin/kob_e2e_util.rs"
+
 [dependencies]
 kob-core = { path = "../core" }
 kob-domain = { path = "../domain" }

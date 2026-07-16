@@ -400,7 +400,7 @@ pub fn build_liquidation_tx(
         .ok_or_else(|| LendingTxError::Overflow("total payout".to_string()))?;
 
     // Estimate fee from compute mass: 1 input, up to 3 outputs, no payload.
-    let est_fee = estimate_compute_mass(1, 3, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 3, 0));
     let total_with_fee = total_payout
         .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("total + fee".to_string()))?;
@@ -494,7 +494,7 @@ pub fn build_default_claim_tx(
 
     let loan_value = loan.collateral;
     // Estimate fee from compute mass: 1 input (1 sig), 1 output, no payload.
-    let est_fee = estimate_compute_mass(1, 1, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0));
     let payout = loan_value.saturating_sub(est_fee);
     if payout < MIN_UTXO_VALUE {
         return Err(LendingTxError::OutputBelowMinimum {
@@ -611,7 +611,7 @@ pub fn build_repay_tx(
     // Required: lender_amount + fee (borrower gets remainder)
     // Estimate fee from compute mass: 1-2 inputs, up to 2 outputs, no payload.
     let num_inputs = if params.funding_tx_id.is_some() { 2 } else { 1 };
-    let est_fee = estimate_compute_mass(num_inputs, 2, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(num_inputs, 2, 0));
     let required = lender_amount
         .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("lender_amount + fee".to_string()))?;
@@ -761,7 +761,7 @@ pub fn build_partial_repay_tx(
 
     let loan_value = loan.collateral;
     // Estimate fee from compute mass: 1 input, 2 outputs (continuation + lender), no payload.
-    let est_fee = estimate_compute_mass(1, 2, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 2, 0));
     let required = params
         .repay_amount
         .checked_add(est_fee)
@@ -879,7 +879,7 @@ pub fn build_topup_tx(
         .ok_or_else(|| LendingTxError::Overflow("collateral + additional".to_string()))?;
 
     // Estimate fee from compute mass: 2 inputs, 1 output (continuation), no payload.
-    let est_fee = estimate_compute_mass(2, 1, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(2, 1, 0));
     let required = new_value
         .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("new_value + fee".to_string()))?;
@@ -1015,7 +1015,7 @@ pub fn build_extend_tx(
 
     let loan_value = loan.collateral;
     // Estimate fee from compute mass: 1 input (2 sigs), up to 2 outputs, no payload.
-    let est_fee = estimate_compute_mass(1, 2, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 2, 0));
     let required = params
         .interest_payment
         .checked_add(est_fee)
@@ -1159,7 +1159,7 @@ pub fn build_rebalance_tx(
 
     let loan_value = loan.collateral;
     // Estimate fee from compute mass: 2 inputs, up to 2 outputs, no payload.
-    let est_fee = estimate_compute_mass(2, 2, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(2, 2, 0));
     let required = params
         .interest_payment
         .checked_add(est_fee)
@@ -1283,7 +1283,7 @@ pub fn build_partial_liquidation_tx(
         .checked_add(params.liquidator_payout)
         .ok_or_else(|| LendingTxError::Overflow("lender + liquidator payout".to_string()))?;
     // Estimate fee from compute mass: 1 input, up to 3 outputs, no payload.
-    let est_fee = estimate_compute_mass(1, 3, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 3, 0));
     let required = total_payout
         .checked_add(est_fee)
         .ok_or_else(|| LendingTxError::Overflow("payout + fee".to_string()))?;
@@ -1412,7 +1412,7 @@ pub fn build_loan_transfer_tx(
 
     let loan_value = loan.collateral;
     // Estimate fee from compute mass: 1 input (1 sig), 1 output, no payload.
-    let est_fee = estimate_compute_mass(1, 1, 0);
+    let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0));
     let payout = loan_value.saturating_sub(est_fee);
     if payout < MIN_UTXO_VALUE {
         return Err(LendingTxError::OutputBelowMinimum {
@@ -1764,7 +1764,7 @@ mod tests {
         let blueprint = build_default_claim_tx(&params).unwrap();
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 1);
-        let est_fee = estimate_compute_mass(1, 1, 0);
+        let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0));
         assert_eq!(blueprint.outputs[0].value, 20_000_000 - est_fee);
         // lock_time = expiry + grace = 32M + 1M = 33M
         assert_eq!(blueprint.lock_time, 33_000_000);
@@ -1873,7 +1873,7 @@ mod tests {
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 2); // continuation + lender
         // Continuation: 20M - 5M - est_fee
-        let est_fee = estimate_compute_mass(1, 2, 0);
+        let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 2, 0));
         assert_eq!(blueprint.outputs[0].value, 15_000_000 - est_fee);
         assert_eq!(blueprint.outputs[1].value, 5_000_000);
     }
@@ -1923,7 +1923,7 @@ mod tests {
             additional_collateral: 5_000_000,
             funding_tx_id: "funding_tx".to_string(),
             funding_index: 0,
-            funding_value: 5_100_000, // enough for additional + mass-based fee
+            funding_value: 5_400_000, // additional (5M) + min-relay-scaled fee
             funding_sig_script: vec![0x00],
         };
 
@@ -1971,7 +1971,7 @@ mod tests {
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 2); // continuation + interest
         // Continuation: 20M - 3M - est_fee
-        let est_fee = estimate_compute_mass(1, 2, 0);
+        let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 2, 0));
         assert_eq!(blueprint.outputs[0].value, 17_000_000 - est_fee);
         assert_eq!(blueprint.outputs[1].value, 3_000_000);
         assert_eq!(blueprint.sig_op_counts, vec![2]); // 2-of-2
@@ -2057,7 +2057,7 @@ mod tests {
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 3); // continuation + lender + liquidator
         // Continuation: 20M - 5M - 3M - est_fee
-        let est_fee = estimate_compute_mass(1, 3, 0);
+        let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 3, 0));
         assert_eq!(blueprint.outputs[0].value, 12_000_000 - est_fee);
     }
 
@@ -2094,7 +2094,7 @@ mod tests {
         let blueprint = build_loan_transfer_tx(&params).unwrap();
         assert_eq!(blueprint.inputs.len(), 1);
         assert_eq!(blueprint.outputs.len(), 1); // continuation with new lender
-        let est_fee = estimate_compute_mass(1, 1, 0);
+        let est_fee = kob_core::mass::min_relay_fee(estimate_compute_mass(1, 1, 0));
         assert_eq!(blueprint.outputs[0].value, 20_000_000 - est_fee);
         assert_eq!(blueprint.sig_op_counts, vec![1]);
     }

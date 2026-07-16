@@ -363,7 +363,7 @@ pub fn build_cooperative_close_tx(
         .ok_or_else(|| PerpTxError::Overflow("long_payout + short_payout".to_string()))?;
 
     // Cooperative close: 1 position input, 2-3 outputs
-    let coop_miner_fee = kob_core::mass::estimate_compute_mass(1, 3, 0);
+    let coop_miner_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0));
     let total_with_fee = total_payout
         .checked_add(coop_miner_fee)
         .ok_or_else(|| PerpTxError::Overflow("total_payout + fee".to_string()))?;
@@ -481,7 +481,7 @@ pub fn build_unilateral_close_tx(
         .ok_or_else(|| PerpTxError::Overflow("long_payout + short_payout".to_string()))?;
 
     // Forced/maturity close: 1 input, 2-3 outputs
-    let close_miner_fee = kob_core::mass::estimate_compute_mass(1, 3, 0);
+    let close_miner_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0));
     let total_with_fee = total_payout
         .checked_add(close_miner_fee)
         .ok_or_else(|| PerpTxError::Overflow("total_payout + fee".to_string()))?;
@@ -597,7 +597,7 @@ pub fn build_liquidation_tx(
 
     let deductions = keeper_fee
         .checked_add(close_fee)
-        .and_then(|v| v.checked_add(kob_core::mass::estimate_compute_mass(1, 3, 0)))
+        .and_then(|v| v.checked_add(kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0))))
         .ok_or_else(|| PerpTxError::Overflow("keeper_fee + close_fee + fee".to_string()))?;
 
     let solvent_payout = position_value
@@ -714,7 +714,7 @@ pub fn build_maturity_settle_tx(
         .ok_or_else(|| PerpTxError::Overflow("long_payout + short_payout".to_string()))?;
 
     // Forced/maturity close: 1 input, 2-3 outputs
-    let close_miner_fee = kob_core::mass::estimate_compute_mass(1, 3, 0);
+    let close_miner_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0));
     let total_with_fee = total_payout
         .checked_add(close_miner_fee)
         .ok_or_else(|| PerpTxError::Overflow("total_payout + fee".to_string()))?;
@@ -836,7 +836,7 @@ pub fn build_add_margin_tx(
         .ok_or_else(|| PerpTxError::Overflow("position + funding".to_string()))?;
 
     // Margin add: 2 inputs (position + funding), 1-2 outputs
-    let margin_miner_fee = kob_core::mass::estimate_compute_mass(2, 2, 0);
+    let margin_miner_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(2, 2, 0));
     let required = new_position_value
         .checked_add(margin_miner_fee)
         .ok_or_else(|| PerpTxError::Overflow("new_value + fee".to_string()))?;
@@ -1285,11 +1285,15 @@ mod tests {
     #[test]
     fn cooperative_close_basic() {
         let position = make_position();
+        // Fee is now min-relay-scaled; short absorbs it so long+short+fee == margin(10M).
+        let fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0));
+        let long_payout = 6_000_000u64;
+        let short_payout = 10_000_000 - long_payout - fee;
 
         let params = CooperativeCloseParams {
             position,
-            long_payout: 6_000_000,
-            short_payout: 3_990_000, // total=9_990_000 + 10k fee = 10M
+            long_payout,
+            short_payout,
             sig_long: [0xaa; 64],
             pk_long: [1; 32],
             sig_short: [0xbb; 64],
@@ -1306,8 +1310,8 @@ mod tests {
 
         // 2 outputs: long + short
         assert_eq!(blueprint.outputs.len(), 2);
-        assert_eq!(blueprint.outputs[0].value, 6_000_000);
-        assert_eq!(blueprint.outputs[1].value, 3_990_000);
+        assert_eq!(blueprint.outputs[0].value, long_payout);
+        assert_eq!(blueprint.outputs[1].value, short_payout);
 
         assert!(!blueprint.inputs[0].sig_script.is_empty());
         assert_eq!(blueprint.sig_op_counts, vec![1]); // v7 cancel: 1 sig (owner only)
@@ -1337,9 +1341,11 @@ mod tests {
     fn cooperative_close_one_party_zero() {
         let position = make_position();
 
+        let fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0));
+        let long_payout = 10_000_000 - fee; // margin - min-relay fee
         let params = CooperativeCloseParams {
             position,
-            long_payout: 9_990_000, // 10M - 10k fee
+            long_payout,
             short_payout: 0,
             sig_long: [0xaa; 64],
             pk_long: [1; 32],
@@ -1351,7 +1357,7 @@ mod tests {
 
         let blueprint = build_cooperative_close_tx(&params).unwrap();
         assert_eq!(blueprint.outputs.len(), 1);
-        assert_eq!(blueprint.outputs[0].value, 9_990_000);
+        assert_eq!(blueprint.outputs[0].value, long_payout);
     }
 
     #[test]
@@ -1361,7 +1367,9 @@ mod tests {
         let params = CooperativeCloseParams {
             position,
             long_payout: 1000, // Below MIN_UTXO_VALUE
-            short_payout: 9_989_000,
+            // Small enough that total_payout + min-relay fee stays under the 10M
+            // margin, so the below-minimum check is reached (not InsufficientFunds).
+            short_payout: 5_000_000,
             sig_long: [0xaa; 64],
             pk_long: [1; 32],
             sig_short: [0xbb; 64],
@@ -1379,6 +1387,11 @@ mod tests {
     #[test]
     fn unilateral_close_basic() {
         let position = make_position();
+        // InsufficientFunds check counts long+short+min-relay fee (not close_fee);
+        // short absorbs the scaled fee so long+short+fee == margin(10M).
+        let fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0));
+        let long_payout = 6_000_000u64;
+        let short_payout = 10_000_000 - long_payout - fee;
 
         let params = UnilateralCloseParams {
             position,
@@ -1387,8 +1400,8 @@ mod tests {
             price_tx_id: "price_tx".to_string(),
             price_index: 0,
             price_sig_script: vec![0x51],
-            long_payout: 6_000_000,
-            short_payout: 3_990_000,
+            long_payout,
+            short_payout,
             long_spk: [vec![0x20], vec![0x11; 32]].concat(),
             short_spk: [vec![0x20], vec![0x22; 32]].concat(),
             close_fee_script: [vec![0x20], vec![0xcc; 32]].concat(),
@@ -1401,8 +1414,8 @@ mod tests {
         assert_eq!(blueprint.inputs[1].prev_tx_id, "price_tx");
         // 3 outputs: long payout + short payout + close_fee (10_000)
         assert_eq!(blueprint.outputs.len(), 3);
-        assert_eq!(blueprint.outputs[0].value, 6_000_000);
-        assert_eq!(blueprint.outputs[1].value, 3_990_000);
+        assert_eq!(blueprint.outputs[0].value, long_payout);
+        assert_eq!(blueprint.outputs[1].value, short_payout);
         assert_eq!(blueprint.outputs[2].value, 10_000); // close_fee
         assert_eq!(blueprint.sig_op_counts, vec![1, 1]);
     }
@@ -1444,7 +1457,7 @@ mod tests {
         assert_eq!(blueprint.outputs.len(), 2);
 
         // Solvent payout = 10M - 3M keeper - 10k close_fee - miner_fee
-        let miner_fee = kob_core::mass::estimate_compute_mass(1, 3, 0);
+        let miner_fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0));
         assert_eq!(blueprint.outputs[0].value, 10_000_000 - 3_000_000 - 10_000 - miner_fee);
         // Keeper fee = 3M
         assert_eq!(blueprint.outputs[1].value, 3_000_000);
@@ -1512,14 +1525,17 @@ mod tests {
     #[test]
     fn maturity_settle_basic() {
         let position = make_position();
+        let fee = kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(1, 3, 0));
+        let long_payout = 6_000_000u64;
+        let short_payout = 10_000_000 - long_payout - fee;
 
         let params = MaturitySettleParams {
             position: position.clone(),
             price_tx_id: "price_tx".to_string(),
             price_index: 0,
             price_sig_script: vec![0x51],
-            long_payout: 6_000_000,
-            short_payout: 3_990_000,
+            long_payout,
+            short_payout,
             long_spk: [vec![0x20], vec![0x11; 32]].concat(),
             short_spk: [vec![0x20], vec![0x22; 32]].concat(),
             close_fee_script: [vec![0x20], vec![0xcc; 32]].concat(),
@@ -1530,8 +1546,8 @@ mod tests {
         assert_eq!(blueprint.inputs.len(), 2);
         // 3 outputs: long payout + short payout + close_fee (10_000)
         assert_eq!(blueprint.outputs.len(), 3);
-        assert_eq!(blueprint.outputs[0].value, 6_000_000);
-        assert_eq!(blueprint.outputs[1].value, 3_990_000);
+        assert_eq!(blueprint.outputs[0].value, long_payout);
+        assert_eq!(blueprint.outputs[1].value, short_payout);
         assert_eq!(blueprint.outputs[2].value, 10_000); // close_fee
         // lock_time must be >= maturity_daa
         assert_eq!(blueprint.lock_time, position.maturity_daa);

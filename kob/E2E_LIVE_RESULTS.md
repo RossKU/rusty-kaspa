@@ -464,3 +464,163 @@ feature, not a bugfix, and beyond this pass's scope. This ALSO means the
 `ballot_box.rs` VOTE PATH CLTV fix above could not be live-tested through
 the current CLI (there is no working path to a live vote transaction to
 test it with). Noted honestly rather than silently left broken.
+
+## Auto-matcher comprehensive run (continuous daemon, autonomous discovery + settle)
+
+Node `ws://65.108.107.30:18210` (testnet-10). Wallet
+`kaspatest:qz6qc3j...cfy7qrwa6v8lf` (`/tmp/kob_e2e/wallet.json`). Binaries
+`/root/kob-rust-target4/release/{kob-cli,kob-engine}`. Daemon launched
+DAEMON-FIRST and detached (`setsid nohup kob-engine --mode continuous
+--interval 800 --allow-self-trade --cross-pair --fee-bps 30 --api-port 8080
+... &`), confirmed scanning (ready banner + block cursor advancing), THEN
+orders deployed so their deploy TXs land in blocks it scans forward. Funding
+via `kob-miner` (PoW.checkWork native miner; 60/60 blocks accepted this run).
+
+### Autonomous auto-match settle TXIDs (daemon-produced, confirmed on-chain)
+
+All confirmed via the tn10 REST API (`api-tn10.kaspa.org/transactions/<txid>`),
+independent of the wRPC node:
+
+| # | TXID | Form | Book | Surplus (F6) | Binary |
+|---|---|---|---|---|---|
+| 1 | `6cf08c27dbdd8dcdd3760f239891ef08e6c77d62a9a7212cf8f3d853d75909f7` | 1:1 `Batch` | sell 800M@499/500 + v16 buy 800M@1/1 | 0 (mmfee floor) | pre-fix |
+| 2 | `a801a585b01c9d5eb8acc3e38dcba2d2e7bdd954ab6d7b72c03b68a0cee76a1f` | 1:1 `Batch` | sell 200M@495/500 + v16 buy 200M@1/1 | 2,000,000 ≤ 40M cap ✓ | per-pair fix |
+| 3 | `e459a8d5edcb8f0914ef444ab955284ac499fe970c3402f1295c124c25269d7b` | 1:1 `Batch` | sell 200M@497/500 + v16 buy 200M@1/1 | 1,200,000 ≤ cap ✓ | per-pair fix |
+
+TXID 2 verified 3-in/3-out on-chain: out0 198,000,000 (seller KAS = 200M @
+495/500), out1 200,000,000 (buyer tokens, covenant-bound), out2 change; F6
+surplus 2M well under the 2000bps (40M) cap. TXIDs 2+3 came from a single
+2-sell:2-buy crossing book that the daemon discovered across separate scan
+cycles and autonomously settled as two sequential 1:1 `Batch` matches —
+i.e. autonomous multi-order settlement, several orders matched + settled by
+the daemon with no manual `match` call.
+
+### Bug found + root-caused (real product-code bug; fix DESIGNED, not committed — see below)
+
+**Multi-sell same-token single-TX batch: covenant-authorization reject.**
+When the daemon discovered a crossing book with **2+ sells of the same
+token** and swept them against a buy, it planned + built the settlement TX
+and the node rejected it:
+`covenants error: 0 is not a valid covenant output index for input 1 with 0
+authorized outputs` (rejected, never landed: `97964d89c29cd64d...`,
+`7090e23b3f31f611...`).
+
+Root cause: `plan_batch_match` / `plan_ioc_match`
+(`kob/domain/src/spot/batch.rs`) **merged** all buyer-token outputs of a
+token into ONE output whose covenant `authorizing_input` was, via
+`token_input_map`, always the **first** sell. But the deployed v14 sell
+contract's F4 token-conservation check is **per-input** —
+`OpTxInputIndex Op0 OpAuthOutputIdx` (see `SELL_ORDER_BODY` in
+`kob/core/src/contract/spot/order.rs` and `auth_output_index` in
+`crypto/txscript/src/covenants.rs`). Every covenant output can declare only
+one `authorizing_input`, so the 2nd+ sells had **zero** authorized outputs
+and the node rejected. This is why the pre-existing auto-matcher had only
+ever settled **1:1** groups (a single sell authorizes the single buyer
+output).
+
+**Fix DESIGN** (prototyped in `kob/domain/src/spot/batch.rs` `plan_batch_match`
++ `kob/engine/src/chain/executor.rs` `execute_batch_match`, then **reverted —
+NOT committed**, see "Why the fix is not committed" below): when a token has
+>=2 fully-filled sells, emit **one buyer-token output per buy** (no cross-buy
+merge) and bind each output to a **distinct** sell (new
+`BatchPlan.buyer_token_auth_input`, distributed least-used). The executor
+reads `buyer_token_auth_input` for the per-output authorizing input in BOTH
+the initial and the Phase-2 fee-convergence covenant-binding builds; an empty
+vec preserves the legacy single-authorizer binding for 1:1 / cross-token /
+single-sell groups.
+
+**Deeper finding (documented contract limitation, not fixable in the
+builder): `BuySweep` / `GtcBuyMultiFill` — N sells : 1 buy, same token — is
+fundamentally unsettleable.** Splitting per sell (needed for the sell F4)
+was tried first and moved the reject from the covenant error to
+`script ran, but verification failed`: the **v16 buy's F6 surplus cap**
+(`BUY_ORDER_V16_BODY`, `order.rs`) reads `output[toi]` as the **total**
+tokens delivered to the buyer to compute `fair_kas`; with tokens split into
+one output per sell, F6 sees only one sell's worth (e.g. 200M of 600M),
+computes a bogus 500M "surplus" and rejects. The sell side wants N separate
+covenant outputs; the buy side wants ONE aggregated output — and token
+conservation (total token output == total token input) forbids satisfying
+both at once. The per-sell fix therefore keeps the **merged single output
+for `plan_ioc_match`/BuySweep** (correct for exactly 1 sell) and confines
+the multi-sell per-pair binding to `plan_batch_match`. The only settleable
+same-token N:M-in-one-TX form is **N sells : N buys paired 1:1**.
+
+**Why the fix is NOT committed (honest):** the prototype compiled clean and
+the shared `plan_batch_match` 1:1 path kept settling live (TXIDs 2+3 were
+produced by the prototype binary, using that unchanged 1:1 path), BUT:
+(1) `cargo test -p kob-domain spot::batch` went **41 passed / 5 failed** —
+the prototype breaks `test_simple_same_pair_batch`, `test_large_batch`,
+`test_20x20_large_batch`, `test_large_coi_succeeds`,
+`test_bps_cap_prorata_multi_buyer`. Those failures are two kinds mixed
+together: some are *partial-sell* multi-sell scenarios (buyer wants fewer
+tokens than a sell holds) where the legacy merge is actually **correct**
+on-chain (each partial sell authorizes its OWN residual/`SellRemainder`
+output via the Op5 F4 path, so the per-input auth is satisfied without
+per-buy binding) and the per-sell branch wrongly rejects them; others are
+genuine *full-fill* multi-sell tests whose assertions encode the very merge
+that fails on-chain and would need rewriting to the corrected structure.
+A correct fix must therefore scope the per-sell binding to **full-fill only**
+and **fall back to the legacy merge for partial-sell**, then update the
+full-fill test assertions. (2) The full-fill N:N success path could not be
+**live-verified** on this node (see below), and committing an unverifiable,
+test-breaking change to covenant-critical code is the wrong call. The bug +
+root cause + fix design are captured here for a proper implementation.
+
+**Why the N:N-in-one-TX success path is not live-settled here (honest):**
+the daemon matches greedily every 0.8s, so a balanced book deployed
+order-by-order settles as **sequential 1:1s** (exactly what TXIDs 2+3 show
+from a 2:2 book). Forming a single >=2-sell group requires **batched
+discovery** — all orders discovered in ONE scan cycle — which in kob-engine
+only happens during a forward-scan **catch-up**. This testnet node
+deterministically **hangs at 0% CPU** on the daemon's bulk `getBlocks` for
+large gaps (observed 4x: 1057 / 1358 / 1320 / 1357-block catch-ups all
+stalled with no progress), so the batched-discovery trick (kill daemon ->
+deploy the full book while down -> restart -> catch-up discovers all at
+once) never completed. Small near-tip catch-ups DO work (that is how the
+daemon discovered + settled TXIDs 2+3). The blocker is node catch-up
+throughput, not the fix. Six such orders remain OPEN on-chain for a future
+run where the node serves the catch-up:
+`3815bd03...`, `6ae839da...`, `02d33920...` (sells) +
+`baee5fa3...`, `dc256ba9...`, `0c4f607a...` (buys), plus a 2-sell:2-buy set
+`b03a9fc5...`,`038ac10a...`,`d013a0cc...`,`a44208f4...`.
+
+### Matcher-internal-form coverage (from batch.rs / matching.rs / executor.rs)
+
+| Internal form (`GroupKind` / path) | Planner | Status this run |
+|---|---|---|
+| 1:1 full `Batch` | `plan_batch_match` | **LIVE-SETTLED** (`6cf08c27`, `a801a585`, `e459a8d5`) |
+| N:N same-token in ONE TX (`Batch`, >=2 sells) | `plan_batch_match` (per-pair fix) | **BUG root-caused; fix DESIGNED, not committed** (breaks 5 partial-sell/merge unit tests; unverifiable on this node — see Bug section) |
+| `PartialBuy` / `PartialSell` (1:1 partial) | `compute_partial_fill_match` -> `plan_ioc_match` | not driven live this pass; CLI partial-fill separately live-proven earlier (`86ef6b42...`). Seed: 1 small sell + 1 larger buy (or vice-versa) crossing, in one cycle |
+| `BuySweep` (N sells : 1 buy) | `plan_ioc_match` | **CONTRACT-LIMITED** (sell-F4 needs per-sell outputs vs buy-F6 needs one aggregated output; token conservation forbids both) — currently rejects on-chain |
+| `SellSweep` (1 sell : N buys) | `plan_sell_ioc_match` | not driven live; needs an IOC sell + >=2 buys discovered in one cycle |
+| `GtcBuyMultiFill` / `GtcSellMultiFill` (N:1 same token) | `plan_batch_match` | same contract limitation as BuySweep (one aggregated buyer/seller output cannot be authorized by N inputs) |
+| `CrossSwap` / cross-pair 2-hop / triangular ("triangle") | `match_swap_routes` -> `execute_swap_fill` (submit at executor.rs:1538) | cross-pair routing was ENABLED (`--cross-pair`) but no `swap` covenant + bridge counterparties were deployed to route; needs 2 tokens + a `swap deploy` + a buy-source in pair A + a sell-target in pair B |
+
+### Non-spot instrument auto-fill capability matrix (engine wiring audit)
+
+Does the continuous daemon autonomously BUILD + SUBMIT a settlement/fill TX
+(vs deploy-only / manual CLI)? Evidence from `kob/engine/src/chain/executor.rs`
+unless noted.
+
+| Instrument | Auto-fill wired into daemon? | Trigger | Evidence |
+|---|---|---|---|
+| **Spot** (buy/sell; batch/sweep/partial/IOC) | **YES (auto)** | crossing orders in a token book | Phase 1 `execute_batch_match` -> `[BATCH] SUCCESS!` (1163); LIVE this run |
+| **Swap** (cross-token) | **YES (auto)** | swap covenant + buy-source (pair A) + sell-target (pair B), KAS-bridged | Phase 3 `execute_swap_fill` submit (1538) -> `[SWAP-FILL] SUCCESS!` |
+| **Perp** (long/short) | **YES (auto)** | a crossing long + short perp deploy pair | Phase 4 `perp_executor::build_open_position_tx` + submit (3839) -> `[PERP] SUCCESS! Open-position TXID` |
+| **Lending** (offer/request) | **YES (auto)** | a loan offer matched to a borrow request | Phase 5 `lending_executor::build_lending_match_tx` + submit (4102) -> `[LENDING] SUCCESS! Match TXID` |
+| **DCA** | **YES (auto)** | period window reached (`next_execution_daa`) AND limit price crosses; permissionless | DCA block submit (4747) -> `[DCA] FILL SUCCESS` |
+| **Stop / Stop-limit / Stop-market** | **YES (auto-broadcast)** | trigger price hit; Matcher broadcasts the pre-signed TX it holds | `submit_transaction` + `mark_triggered(id, Some(tx_id))` (~5400). Requires `stop deploy-sell --matcher-url` (Matcher-held, off-chain, not an on-chain covenant) |
+| **Trailing stop** | **YES (auto-broadcast)** | price reverses by the trail distance | same broadcast loop as stop (~5400); Matcher-held |
+| **IFD (If-Done)** | **YES (auto)** | entry order fills -> exit auto-deployed via the fill TX's IFD payload | `ifd.trigger(rule_id, tx_id)` after a batch fill (3462); trustless IFD via embedded payload |
+| **Prediction market** | **NO (track-only)** | Phase 6 only LOGS "SETTLEABLE" / "creator can reclaim after expiry" | Phase 6 (~4214-4282) has **no** `submit_transaction`; `settle`/`expire`/`vote`/`redeem` are manual CLI (and `vote` is a fee==0 miner-inclusion-only TX by contract design, see above) |
+| **Options** (call/put) | **NO (deploy-only)** | — | **zero** engine references; no `option_executor`; exercise/expire/cancel are manual CLI only |
+| **Insurance (CDS)** | **NO (deploy-only)** | — | **zero** engine references; claim/release/timeout/mutual-cancel are manual CLI only |
+| **Bracket / OCO-sell** | partial (folds into spot) | bracket entry / OCO-sell fill folds into a spot batch group (RS-size / `oco_path` detection) | executor.rs 422-503; fill not driven live this pass |
+
+Summary: `lending_executor` / `perp_executor` / `prediction_executor` are the
+three `kob_domain` executor modules re-exported by the engine
+(`kob/engine/src/matcher/mod.rs` 22/25/28). Perp, lending, DCA, spot, swap
+all have a real auto-fill submit path in the continuous daemon; stop /
+trailing-stop / IFD auto-broadcast on trigger; **prediction is settlement
+track-only (no auto-submit); options and insurance are deploy-only with no
+engine-side execution at all.**

@@ -31,7 +31,7 @@ use crate::matcher::perp_tracker::PositionTracker;
 use crate::matcher::prediction_book::PredictionBook;
 use crate::matcher::prediction_tracker::MarketTracker;
 use crate::matcher::stop_book::StopOrderBook;
-use crate::matcher::trades::{Side, TradeLog};
+use crate::matcher::trades::{PendingTrades, Side, TradeLog};
 
 /// Generate a random 64-char hex cancel secret using OS CSPRNG.
 fn generate_cancel_secret() -> String {
@@ -59,6 +59,9 @@ pub struct SharedState {
     pub trailing_stop_book: Arc<Mutex<TrailingStopBook>>,
     /// Optional SQLite history store for persistent trade/candle data.
     pub history: Option<Arc<crate::matcher::history::HistoryStore>>,
+    /// Trades staged at submission time, awaiting confirmation before being
+    /// written to `history`'s durable trade ledger (H3-TRADES).
+    pub pending_trades: PendingTrades,
     /// Shared IFD/IFO order book (used by executor + REST API).
     pub ifd_book: Arc<Mutex<IfdBook>>,
 
@@ -119,6 +122,7 @@ impl SharedState {
             stop_book,
             trailing_stop_book,
             history: None,
+            pending_trades: PendingTrades::new(),
             ifd_book,
             perp_book: None,
             perp_tracker: None,
@@ -172,6 +176,7 @@ impl SharedState {
             stop_book,
             trailing_stop_book,
             history: None,
+            pending_trades: PendingTrades::new(),
             ifd_book,
             perp_book: None,
             perp_tracker: None,

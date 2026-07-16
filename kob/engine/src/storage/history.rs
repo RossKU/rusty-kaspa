@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use tracing::info;
 
 use crate::reporting::candle::{Candle, Interval};
+use crate::reporting::trades::{RoutingInfo, Side, Trade};
 use crate::config::HistoryConfig;
 
 /// SQLite history store — M1 candles only.
@@ -35,6 +36,33 @@ CREATE TABLE IF NOT EXISTS candles_1m (
     PRIMARY KEY (pair_id, open_time)
 );
 CREATE INDEX IF NOT EXISTS idx_candles_1m_time ON candles_1m(pair_id, open_time);
+
+-- H3-TRADES: durable, query-indexed trade ledger. Rows are written only at
+-- CONFIRMATION time (the trade's settlement txid observed in a scanned
+-- block, via PendingTrades::take_confirmed), never at submission time --
+-- see executor.rs's block-scan loop. `block_hash` records which confirmed
+-- block a row was committed under, so a later reorg can retract exactly
+-- those rows (retract_trades_by_block). This is the data source
+-- /api/v1/trades (deep history) and /api/v1/gecko/historical_trades need;
+-- the in-memory TradeLog stays the low-latency hot path for recent/WS data.
+CREATE TABLE IF NOT EXISTS trades (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    txid         TEXT    NOT NULL,
+    pair_id      TEXT    NOT NULL,
+    price_num    INTEGER NOT NULL,
+    price_den    INTEGER NOT NULL,
+    quantity     INTEGER NOT NULL,
+    side         TEXT    NOT NULL,
+    daa_score    INTEGER NOT NULL,
+    timestamp    INTEGER NOT NULL,
+    block_hash   TEXT    NOT NULL,
+    routing_json TEXT,
+    confirmed_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_trades_pair_time ON trades(pair_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_trades_pair_daa ON trades(pair_id, daa_score);
+CREATE INDEX IF NOT EXISTS idx_trades_txid ON trades(txid);
+CREATE INDEX IF NOT EXISTS idx_trades_block_hash ON trades(block_hash);
 ";
 
 impl HistoryStore {
@@ -357,6 +385,165 @@ impl HistoryStore {
         }
         Ok(deleted)
     }
+
+    // Durable trade ledger (H3-TRADES)
+
+    /// Persist a CONFIRMED trade, tagged with the block it was confirmed
+    /// under. Returns the new row id.
+    ///
+    /// Callers must only call this once a trade's txid has actually been
+    /// observed in a scanned block (see `PendingTrades::take_confirmed` in
+    /// `reporting::trades`) -- never at submission time.
+    pub fn insert_confirmed_trade(
+        &self,
+        trade: &Trade,
+        block_hash: &str,
+    ) -> Result<i64, rusqlite::Error> {
+        let side_str = match trade.side {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        };
+        let routing_json = trade
+            .routing
+            .as_ref()
+            .map(|r| serde_json::to_string(r).unwrap_or_default());
+        let confirmed_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute(
+            "INSERT INTO trades (txid, pair_id, price_num, price_den, quantity, side, daa_score, timestamp, block_hash, routing_json, confirmed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                trade.txid,
+                trade.pair_id,
+                trade.price_num as i64,
+                trade.price_den as i64,
+                trade.quantity as i64,
+                side_str,
+                trade.daa_score as i64,
+                trade.timestamp as i64,
+                block_hash,
+                routing_json,
+                confirmed_at as i64,
+            ],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// Retract (delete) every durably-persisted trade recorded under
+    /// `block_hash`. Called when a chain reorg removes that block, so a
+    /// trade whose confirming block no longer exists on-chain doesn't stay
+    /// in the ledger. Returns the number of rows deleted (0 if none, e.g.
+    /// the reorged block never had a confirmed trade).
+    pub fn retract_trades_by_block(&self, block_hash: &str) -> Result<usize, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.execute("DELETE FROM trades WHERE block_hash = ?1", params![block_hash])
+    }
+
+    fn row_to_trade(row: &rusqlite::Row) -> rusqlite::Result<Trade> {
+        let side_str: String = row.get(5)?;
+        let side = if side_str == "sell" { Side::Sell } else { Side::Buy };
+        let routing_json: Option<String> = row.get(9)?;
+        let routing: Option<RoutingInfo> = routing_json
+            .as_deref()
+            .and_then(|s| serde_json::from_str(s).ok());
+        Ok(Trade {
+            txid: row.get(0)?,
+            pair_id: row.get(1)?,
+            price_num: row.get::<_, i64>(2)? as u64,
+            price_den: row.get::<_, i64>(3)? as u64,
+            quantity: row.get::<_, i64>(4)? as u64,
+            side,
+            daa_score: row.get::<_, i64>(6)? as u64,
+            timestamp: row.get::<_, i64>(7)? as u64,
+            routing,
+        })
+    }
+
+    const TRADE_SELECT_COLS: &'static str =
+        "txid, pair_id, price_num, price_den, quantity, side, daa_score, timestamp, block_hash, routing_json";
+
+    /// Most recent `limit` durably-confirmed trades for a pair, newest first.
+    pub fn recent_trades(&self, pair_id: &str, limit: usize) -> Result<Vec<Trade>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let sql = format!(
+            "SELECT {} FROM trades WHERE pair_id = ?1 ORDER BY id DESC LIMIT ?2",
+            Self::TRADE_SELECT_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![pair_id, limit as i64], |row| Self::row_to_trade(row))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Durably-confirmed trades for a pair with `daa_score >= daa_score`, oldest first.
+    pub fn trades_since(&self, pair_id: &str, daa_score: u64) -> Result<Vec<Trade>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let sql = format!(
+            "SELECT {} FROM trades WHERE pair_id = ?1 AND daa_score >= ?2 ORDER BY id ASC",
+            Self::TRADE_SELECT_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(params![pair_id, daa_score as i64], |row| Self::row_to_trade(row))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Durably-confirmed trades for a pair in `[start_time, end_time]`
+    /// (inclusive, either bound optional), newest first, capped at `limit`.
+    /// Mirrors `TradeLog::range`'s contract for the durable store.
+    pub fn trades_range(
+        &self,
+        pair_id: &str,
+        start_time: Option<u64>,
+        end_time: Option<u64>,
+        limit: usize,
+    ) -> Result<Vec<Trade>, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let sql = format!(
+            "SELECT {} FROM trades WHERE pair_id = ?1
+             AND (?2 IS NULL OR timestamp >= ?2)
+             AND (?3 IS NULL OR timestamp <= ?3)
+             ORDER BY id DESC LIMIT ?4",
+            Self::TRADE_SELECT_COLS
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let rows = stmt
+            .query_map(
+                params![
+                    pair_id,
+                    start_time.map(|v| v as i64),
+                    end_time.map(|v| v as i64),
+                    limit as i64
+                ],
+                |row| Self::row_to_trade(row),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Total durably-confirmed trade count for a pair.
+    pub fn trade_count(&self, pair_id: &str) -> Result<u64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row(
+            "SELECT COUNT(*) FROM trades WHERE pair_id = ?1",
+            params![pair_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|c| c as u64)
+    }
+
+    /// Total durably-confirmed trade count across all pairs.
+    pub fn total_trade_count(&self) -> Result<u64, rusqlite::Error> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        conn.query_row("SELECT COUNT(*) FROM trades", [], |row| row.get::<_, i64>(0))
+            .map(|c| c as u64)
+    }
 }
 
 #[cfg(test)]
@@ -595,5 +782,162 @@ mod tests {
         assert_eq!(candles.len(), 2);
         assert_eq!(candles[0].open_time, 60);
         assert_eq!(candles[1].open_time, 120);
+    }
+
+    // Durable trade ledger (H3-TRADES)
+
+    fn make_trade(txid: &str, pair: &str, price_num: u64, daa: u64) -> Trade {
+        Trade {
+            txid: txid.to_string(),
+            pair_id: pair.to_string(),
+            price_num,
+            price_den: 1,
+            quantity: 100,
+            side: Side::Buy,
+            daa_score: daa,
+            timestamp: daa,
+            routing: None,
+        }
+    }
+
+    #[test]
+    fn test_insert_and_recent_trades() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        store.insert_confirmed_trade(&make_trade("tx1", "T/KAS", 10, 100), "blockA").unwrap();
+        store.insert_confirmed_trade(&make_trade("tx2", "T/KAS", 20, 200), "blockA").unwrap();
+
+        let recent = store.recent_trades("T/KAS", 10).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].txid, "tx2", "newest first");
+        assert_eq!(recent[1].txid, "tx1");
+        assert_eq!(store.trade_count("T/KAS").unwrap(), 2);
+        assert_eq!(store.total_trade_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_trade_persistence_survives_reopen() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("test_trade_persist_{}.sqlite", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut cfg = test_config();
+        cfg.db_path = path.to_string_lossy().to_string();
+
+        {
+            let store = HistoryStore::open(&cfg).unwrap();
+            store.insert_confirmed_trade(&make_trade("tx1", "T/KAS", 10, 100), "blockA").unwrap();
+        }
+
+        {
+            // Reopen — durable trade must still be there.
+            let store = HistoryStore::open(&cfg).unwrap();
+            let recent = store.recent_trades("T/KAS", 10).unwrap();
+            assert_eq!(recent.len(), 1, "confirmed trade must survive a process restart");
+            assert_eq!(recent[0].txid, "tx1");
+        }
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+
+    #[test]
+    fn test_retract_trades_by_block_removes_only_that_block() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        store.insert_confirmed_trade(&make_trade("tx1", "T/KAS", 10, 100), "blockA").unwrap();
+        store.insert_confirmed_trade(&make_trade("tx2", "T/KAS", 20, 200), "blockB").unwrap();
+        store.insert_confirmed_trade(&make_trade("tx3", "T/KAS", 30, 300), "blockA").unwrap();
+        assert_eq!(store.trade_count("T/KAS").unwrap(), 3);
+
+        // Reorg retracts blockA: tx1 and tx3 (both under blockA) must be
+        // deleted; tx2 (blockB) must survive untouched.
+        let retracted = store.retract_trades_by_block("blockA").unwrap();
+        assert_eq!(retracted, 2, "both blockA trades must be retracted");
+
+        let remaining = store.recent_trades("T/KAS", 10).unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].txid, "tx2", "blockB's trade must survive the blockA reorg-retract");
+        assert_eq!(store.trade_count("T/KAS").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_retract_trades_by_block_no_match_is_noop() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        store.insert_confirmed_trade(&make_trade("tx1", "T/KAS", 10, 100), "blockA").unwrap();
+
+        let retracted = store.retract_trades_by_block("nonexistent_block").unwrap();
+        assert_eq!(retracted, 0);
+        assert_eq!(store.trade_count("T/KAS").unwrap(), 1, "unrelated block retraction must not touch other rows");
+    }
+
+    #[test]
+    fn test_trades_since_daa_filter() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        store.insert_confirmed_trade(&make_trade("tx1", "T/KAS", 10, 100), "b1").unwrap();
+        store.insert_confirmed_trade(&make_trade("tx2", "T/KAS", 20, 200), "b2").unwrap();
+        store.insert_confirmed_trade(&make_trade("tx3", "T/KAS", 30, 300), "b3").unwrap();
+
+        let since_200 = store.trades_since("T/KAS", 200).unwrap();
+        assert_eq!(since_200.len(), 2, "oldest-first, daa_score >= 200");
+        assert_eq!(since_200[0].txid, "tx2");
+        assert_eq!(since_200[1].txid, "tx3");
+    }
+
+    #[test]
+    fn test_trades_range_time_bounds() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        store.insert_confirmed_trade(&make_trade("tx1", "T/KAS", 10, 100), "b1").unwrap();
+        store.insert_confirmed_trade(&make_trade("tx2", "T/KAS", 20, 200), "b2").unwrap();
+        store.insert_confirmed_trade(&make_trade("tx3", "T/KAS", 30, 300), "b3").unwrap();
+
+        let result = store.trades_range("T/KAS", Some(200), Some(300), 10).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].txid, "tx3", "newest first");
+        assert_eq!(result[1].txid, "tx2");
+
+        let no_bounds = store.trades_range("T/KAS", None, None, 10).unwrap();
+        assert_eq!(no_bounds.len(), 3);
+    }
+
+    #[test]
+    fn test_trades_isolated_per_pair() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        store.insert_confirmed_trade(&make_trade("tx1", "A/KAS", 10, 100), "b1").unwrap();
+        store.insert_confirmed_trade(&make_trade("tx2", "B/KAS", 20, 200), "b1").unwrap();
+
+        assert_eq!(store.trade_count("A/KAS").unwrap(), 1);
+        assert_eq!(store.trade_count("B/KAS").unwrap(), 1);
+        assert_eq!(store.total_trade_count().unwrap(), 2);
+    }
+
+    #[test]
+    fn test_trade_routing_info_roundtrip() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        let mut trade = make_trade("tx_cp", "cross:A->B", 1, 100);
+        trade.routing = Some(RoutingInfo {
+            sell_pair: "A/KAS".to_string(),
+            buy_pair: "B/KAS".to_string(),
+            intermediate_token: "KAS".to_string(),
+            kas_through: 5_000_000,
+            sell_price_num: 1,
+            sell_price_den: 2,
+            buy_price_num: 1,
+            buy_price_den: 3,
+            surplus: 2_000_000,
+        });
+        store.insert_confirmed_trade(&trade, "blockA").unwrap();
+
+        let recent = store.recent_trades("cross:A->B", 10).unwrap();
+        assert_eq!(recent.len(), 1);
+        let routing = recent[0].routing.as_ref().expect("routing must survive SQLite roundtrip");
+        assert_eq!(routing.sell_pair, "A/KAS");
+        assert_eq!(routing.kas_through, 5_000_000);
+    }
+
+    #[test]
+    fn test_trade_without_routing_deserializes_none() {
+        let store = HistoryStore::open_memory(&test_config()).unwrap();
+        store.insert_confirmed_trade(&make_trade("tx1", "T/KAS", 10, 100), "b1").unwrap();
+        let recent = store.recent_trades("T/KAS", 10).unwrap();
+        assert!(recent[0].routing.is_none());
     }
 }

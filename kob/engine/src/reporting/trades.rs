@@ -428,6 +428,104 @@ impl TradeLog {
     }
 }
 
+// Pending trades: submission-time staging for confirmation-time durable persistence
+
+/// Default horizon after which a staged trade whose txid never confirmed is
+/// dropped (mempool eviction / the TX was replaced or never mined).
+pub const DEFAULT_PENDING_TRADE_MAX_AGE_SECS: u64 = 600;
+
+/// Trades staged at TX-submission time, awaiting confirmation before being
+/// written to the durable, query-indexed trade store.
+///
+/// `record_trade` (submission time) still pushes to the in-memory `TradeLog`
+/// + candle aggregator immediately (unchanged low-latency hot path for
+/// recent-data/WS), but ALSO stages a copy here. The block-scan loop
+/// promotes staged trades to the durable store only once their txid is
+/// actually observed in a confirmed block (`take_confirmed`); entries whose
+/// txid never confirms are simply dropped (`expire_older_than`) and are
+/// never written -- this is what makes the durable ledger "confirmation
+/// time, not submission time", with reorg/mempool-eviction safety by
+/// construction (nothing durable exists until real confirmation).
+pub struct PendingTrades {
+    /// txid -> (staged_at, trades staged under that txid).
+    by_txid: HashMap<String, (std::time::Instant, Vec<Trade>)>,
+}
+
+impl Default for PendingTrades {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PendingTrades {
+    pub fn new() -> Self {
+        PendingTrades { by_txid: HashMap::new() }
+    }
+
+    /// Stage a trade under its txid, awaiting confirmation.
+    pub fn stage(&mut self, trade: Trade) {
+        self.by_txid
+            .entry(trade.txid.clone())
+            .or_insert_with(|| (std::time::Instant::now(), Vec::new()))
+            .1
+            .push(trade);
+    }
+
+    /// Remove and return every staged trade whose txid appears in
+    /// `confirmed_txids` (the txid set of a just-processed confirmed block).
+    /// Called from the block-scan loop; the caller is responsible for
+    /// writing the returned trades to the durable store.
+    pub fn take_confirmed(
+        &mut self,
+        confirmed_txids: &std::collections::HashSet<String>,
+    ) -> Vec<Trade> {
+        let mut out = Vec::new();
+        let mut done: Vec<String> = Vec::new();
+        for (txid, (_, trades)) in self.by_txid.iter_mut() {
+            if confirmed_txids.contains(txid) {
+                out.append(trades);
+                done.push(txid.clone());
+            }
+        }
+        for txid in done {
+            self.by_txid.remove(&txid);
+        }
+        out
+    }
+
+    /// Drop (never persist) staged trades older than `max_age_secs` whose
+    /// txid never confirmed -- the mempool-eviction / replaced-TX case.
+    /// Returns the dropped trades for logging/metrics only; callers must
+    /// NOT write them to the durable store (that's the point: they never
+    /// confirmed).
+    pub fn expire_older_than(&mut self, max_age_secs: u64) -> Vec<Trade> {
+        let mut dropped = Vec::new();
+        let mut expired: Vec<String> = Vec::new();
+        for (txid, (staged_at, _)) in self.by_txid.iter() {
+            if staged_at.elapsed().as_secs() >= max_age_secs {
+                expired.push(txid.clone());
+            }
+        }
+        for txid in expired {
+            if let Some((_, trades)) = self.by_txid.remove(&txid) {
+                dropped.extend(trades);
+            }
+        }
+        dropped
+    }
+
+    /// Total number of staged (not yet confirmed or expired) trades.
+    #[allow(dead_code)] // Used in tests
+    pub fn len(&self) -> usize {
+        self.by_txid.values().map(|(_, v)| v.len()).sum()
+    }
+
+    #[allow(dead_code)] // Used in tests
+    pub fn is_empty(&self) -> bool {
+        self.by_txid.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1100,5 +1198,97 @@ mod tests {
 
         let result = log.range("pairA", None, None, 100);
         assert_eq!(result.len(), 2);
+    }
+
+    // PendingTrades: submission-time staging for confirmation-time persistence
+
+    #[test]
+    fn pending_trades_new_is_empty() {
+        let p = PendingTrades::new();
+        assert!(p.is_empty());
+        assert_eq!(p.len(), 0);
+    }
+
+    #[test]
+    fn pending_trades_stage_then_take_confirmed() {
+        let mut p = PendingTrades::new();
+        p.stage(make_trade("tx1", "pairA", 10, 100));
+        p.stage(make_trade("tx2", "pairA", 20, 101));
+        assert_eq!(p.len(), 2);
+
+        let mut confirmed_txids = std::collections::HashSet::new();
+        confirmed_txids.insert("tx1".to_string());
+
+        let confirmed = p.take_confirmed(&confirmed_txids);
+        assert_eq!(confirmed.len(), 1, "only tx1's staged trade should be confirmed");
+        assert_eq!(confirmed[0].txid, "tx1");
+        assert_eq!(p.len(), 1, "tx2 remains staged (not yet confirmed)");
+    }
+
+    #[test]
+    fn pending_trades_take_confirmed_multiple_legs_same_txid() {
+        // v17 N:M sweeps emit multiple trade records sharing one txid --
+        // confirmation must promote ALL of them together.
+        let mut p = PendingTrades::new();
+        p.stage(make_trade("sweep_tx", "pairA", 1, 100));
+        p.stage(make_trade("sweep_tx", "pairA", 2, 100));
+        p.stage(make_trade("sweep_tx", "pairA", 3, 100));
+
+        let mut confirmed_txids = std::collections::HashSet::new();
+        confirmed_txids.insert("sweep_tx".to_string());
+        let confirmed = p.take_confirmed(&confirmed_txids);
+        assert_eq!(confirmed.len(), 3, "all legs sharing the txid must confirm together");
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn pending_trades_take_confirmed_no_match_returns_empty_and_keeps_staged() {
+        let mut p = PendingTrades::new();
+        p.stage(make_trade("tx1", "pairA", 10, 100));
+
+        let confirmed_txids = std::collections::HashSet::new(); // no txids confirmed
+        let confirmed = p.take_confirmed(&confirmed_txids);
+        assert!(confirmed.is_empty());
+        assert_eq!(p.len(), 1, "unconfirmed trade must remain staged");
+    }
+
+    #[test]
+    fn pending_trades_take_confirmed_is_idempotent() {
+        let mut p = PendingTrades::new();
+        p.stage(make_trade("tx1", "pairA", 10, 100));
+
+        let mut confirmed_txids = std::collections::HashSet::new();
+        confirmed_txids.insert("tx1".to_string());
+
+        let first = p.take_confirmed(&confirmed_txids);
+        assert_eq!(first.len(), 1);
+
+        // A second call with the same confirmed set must find nothing --
+        // the trade was already drained, proving no double-confirmation.
+        let second = p.take_confirmed(&confirmed_txids);
+        assert!(second.is_empty(), "already-confirmed trade must not be returned twice");
+    }
+
+    #[test]
+    fn pending_trades_expire_older_than_drops_stale_unconfirmed() {
+        let mut p = PendingTrades::new();
+        p.stage(make_trade("tx_stale", "pairA", 10, 100));
+        assert_eq!(p.len(), 1);
+
+        // max_age_secs=0: anything staged (even microseconds ago) is stale.
+        let dropped = p.expire_older_than(0);
+        assert_eq!(dropped.len(), 1, "stale unconfirmed trade must be dropped (mempool eviction)");
+        assert!(p.is_empty());
+    }
+
+    #[test]
+    fn pending_trades_expire_older_than_keeps_fresh_entries() {
+        let mut p = PendingTrades::new();
+        p.stage(make_trade("tx_fresh", "pairA", 10, 100));
+
+        // A large horizon must NOT expire a just-staged trade.
+        let dropped = p.expire_older_than(3600);
+        assert!(dropped.is_empty());
+        assert_eq!(p.len(), 1, "fresh staged trade must survive a generous horizon");
     }
 }

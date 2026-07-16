@@ -2806,8 +2806,16 @@ async fn record_trade(
 
     let mut state = shared_state.write().await;
 
-    // Push to trade log (ring buffer + optional JSONL file)
+    // Push to trade log (ring buffer + optional JSONL file) -- unchanged
+    // low-latency hot path for recent-data/WS, preserved as-is.
     state.trade_log.push(trade.clone());
+
+    // H3-TRADES: stage for the DURABLE, query-indexed ledger. This trade is
+    // NOT written to `history`'s trades table yet -- only once its txid is
+    // observed in a confirmed block (see `confirm_pending_trades`, called
+    // from the block-scan loop) does it become durable. If the TX never
+    // confirms (mempool eviction), it is dropped, never persisted.
+    state.pending_trades.stage(trade.clone());
 
     // Update candle aggregator for all intervals
     state.candles.on_trade(&trade);
@@ -2845,6 +2853,71 @@ async fn record_trade(
                 c: format!("{}/{}", c.close.0, c.close.1),
                 v: c.volume.to_string(),
             });
+        }
+    }
+}
+
+/// Default horizon after which a staged (never-confirmed) trade is dropped.
+/// Mirrors `SPENT_PRUNE_AGE_SECS`'s mempool-dwell reasoning: a self-submitted
+/// TX that hasn't confirmed within this window is treated as evicted.
+const PENDING_TRADE_MAX_AGE_SECS: u64 = crate::matcher::trades::DEFAULT_PENDING_TRADE_MAX_AGE_SECS;
+
+/// H3-TRADES confirmation hook: promote every staged trade whose txid
+/// appears in `confirmed_txids` (a just-processed confirmed block's TX set)
+/// to the durable trade ledger, tagged with `block_hash` so a later reorg
+/// can retract exactly these rows.
+///
+/// Called once per confirmed block from the block-scan loop, right where
+/// `ReorgTracker::record_block` is also invoked (same block, same txid set).
+async fn confirm_pending_trades(
+    shared_state: &AppState,
+    confirmed_txids: &HashSet<String>,
+    block_hash: &str,
+) {
+    if confirmed_txids.is_empty() {
+        return;
+    }
+    let confirmed = {
+        let mut state = shared_state.write().await;
+        state.pending_trades.take_confirmed(confirmed_txids)
+    };
+    if confirmed.is_empty() {
+        return;
+    }
+    let state = shared_state.read().await;
+    if let Some(ref history) = state.history {
+        for trade in &confirmed {
+            if let Err(e) = history.insert_confirmed_trade(trade, block_hash) {
+                warn!(
+                    "[TRADES] Failed to persist confirmed trade {} ({}): {}",
+                    &trade.txid[..trade.txid.len().min(16)], trade.pair_id, e,
+                );
+            }
+        }
+        info!(
+            "[TRADES] Confirmed {} trade(s) into the durable ledger (block {}...)",
+            confirmed.len(), &block_hash[..block_hash.len().min(16)],
+        );
+    }
+}
+
+/// H3-TRADES reorg hook: retract every durably-persisted trade recorded
+/// under a block that a chain reorg just removed. Called alongside
+/// `ReorgTracker::handle_removed_blocks` for the same `removed_hashes`.
+async fn retract_reorged_trades(shared_state: &AppState, removed_block_hashes: &[String]) {
+    let state = shared_state.read().await;
+    let Some(ref history) = state.history else { return };
+    for block_hash in removed_block_hashes {
+        match history.retract_trades_by_block(block_hash) {
+            Ok(n) if n > 0 => warn!(
+                "[REORG] Retracted {} durable trade(s) recorded under reorged block {}...",
+                n, &block_hash[..block_hash.len().min(16)],
+            ),
+            Ok(_) => {}
+            Err(e) => warn!(
+                "[REORG] Failed to retract trades for reorged block {}: {}",
+                &block_hash[..block_hash.len().min(16)], e,
+            ),
         }
     }
 }
@@ -5151,6 +5224,24 @@ pub async fn run_continuous_with_ws(
         }
         spent_tracker.expire_failed();
 
+        // H3-TRADES: drop staged trades whose txid never confirmed within
+        // PENDING_TRADE_MAX_AGE_SECS (mempool eviction / replaced TX). These
+        // are simply forgotten -- never written to the durable ledger,
+        // which is exactly the point (nothing durable exists for a trade
+        // that never confirmed).
+        if let Some(ref state) = shared_state {
+            let dropped = {
+                let mut s = state.write().await;
+                s.pending_trades.expire_older_than(PENDING_TRADE_MAX_AGE_SECS)
+            };
+            if !dropped.is_empty() {
+                warn!(
+                    "[TRADES] {} staged trade(s) dropped (never confirmed within {}s -- mempool eviction)",
+                    dropped.len(), PENDING_TRADE_MAX_AGE_SECS,
+                );
+            }
+        }
+
         // Phase 0: Process block notifications (event-driven).
         // Drain all pending notifications and process them.
         //
@@ -5312,6 +5403,12 @@ pub async fn run_continuous_with_ws(
                     &mut spent_tracker,
                 );
 
+                // H3-TRADES: retract any durably-persisted trades that were
+                // recorded under a block this reorg just removed.
+                if let Some(ref state) = shared_state {
+                    retract_reorged_trades(state, &reorg_removed_hashes).await;
+                }
+
                 if restored > 0 || removed > 0 {
                     warn!(
                         "[REORG] Rollback complete: {} order(s) restored, {} order(s) removed, \
@@ -5374,6 +5471,13 @@ pub async fn run_continuous_with_ws(
                         // and the TX confirming — regardless of mempool dwell
                         // time (root-fix for P23 run24).
                         spent_tracker.remove_spent_for_txids(&rc.txids);
+
+                        // H3-TRADES: this block just confirmed -- promote any
+                        // staged trades whose txid it contains to the durable
+                        // ledger before rc.txids is moved into record_block.
+                        if let Some(ref state) = shared_state {
+                            confirm_pending_trades(state, &rc.txids, bh).await;
+                        }
 
                         if !rc.orders_added.is_empty() || !rc.orders_spent.is_empty() {
                             reorg_tracker.record_block(
@@ -6928,6 +7032,139 @@ mod tests {
             Side::Buy,
             None,
         ).await;
+    }
+
+    // H3-TRADES: confirmation-time durable persistence + reorg-retract
+
+    fn h3_test_shared_state_with_history() -> (AppState, Arc<crate::matcher::history::HistoryStore>) {
+        use crate::matcher::api::SharedState;
+        use crate::matcher::order_book::OrderBook;
+        use crate::matcher::stop_book::StopOrderBook;
+        use crate::matcher::trailing_stop::TrailingStopBook;
+        use crate::matcher::history::HistoryStore;
+
+        let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
+        let ob = Arc::new(Mutex::new(OrderBook::new()));
+        let sb = Arc::new(Mutex::new(StopOrderBook::new()));
+        let tb = Arc::new(Mutex::new(TrailingStopBook::new()));
+        let mut state_core = SharedState::new(ws_tx, ob, sb, tb);
+        let history = Arc::new(
+            HistoryStore::open_memory(&crate::config::HistoryConfig::default()).unwrap(),
+        );
+        state_core.history = Some(history.clone());
+        let shared: AppState = Arc::new(tokio::sync::RwLock::new(state_core));
+        (shared, history)
+    }
+
+    fn h3_pair_id(token_cov_id: &str) -> String {
+        format!("{}/KAS", &token_cov_id[..token_cov_id.len().min(16)])
+    }
+
+    /// Submission-time `record_trade` must NOT write to the durable ledger:
+    /// only `confirm_pending_trades` (confirmation time) does.
+    #[tokio::test]
+    async fn record_trade_does_not_persist_durably_before_confirmation() {
+        let (shared, history) = h3_test_shared_state_with_history();
+        let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a1";
+
+        record_trade(Some(&shared), "confirm_tx_1", token, 100, 1, 50_000, Side::Buy, None).await;
+
+        assert_eq!(
+            history.trade_count(&h3_pair_id(token)).unwrap(), 0,
+            "trade must not be durable before its txid is observed in a confirmed block"
+        );
+        let s = shared.read().await;
+        assert_eq!(s.pending_trades.len(), 1, "trade must be staged, awaiting confirmation");
+    }
+
+    /// Confirmation: once the trade's txid appears in a scanned block,
+    /// `confirm_pending_trades` must persist it durably and drain it from
+    /// the pending stage.
+    #[tokio::test]
+    async fn confirm_pending_trades_persists_to_durable_history() {
+        let (shared, history) = h3_test_shared_state_with_history();
+        let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a2";
+
+        record_trade(Some(&shared), "confirm_tx_2", token, 100, 1, 50_000, Side::Buy, None).await;
+
+        let mut confirmed_txids = HashSet::new();
+        confirmed_txids.insert("confirm_tx_2".to_string());
+        confirm_pending_trades(&shared, &confirmed_txids, "block_abc").await;
+
+        let recent = history.recent_trades(&h3_pair_id(token), 10).unwrap();
+        assert_eq!(recent.len(), 1, "trade must be durable after confirmation");
+        assert_eq!(recent[0].txid, "confirm_tx_2");
+
+        let s = shared.read().await;
+        assert!(s.pending_trades.is_empty(), "confirmed trade must be drained from the pending stage");
+    }
+
+    /// A trade whose txid does NOT appear in the confirmed set must remain
+    /// staged and must not be written durably (proves the confirm hook is
+    /// txid-selective, not a blanket flush).
+    #[tokio::test]
+    async fn confirm_pending_trades_ignores_unrelated_txids() {
+        let (shared, history) = h3_test_shared_state_with_history();
+        let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a3";
+
+        record_trade(Some(&shared), "confirm_tx_3", token, 100, 1, 50_000, Side::Buy, None).await;
+
+        let mut confirmed_txids = HashSet::new();
+        confirmed_txids.insert("some_other_txid".to_string());
+        confirm_pending_trades(&shared, &confirmed_txids, "block_xyz").await;
+
+        assert_eq!(history.trade_count(&h3_pair_id(token)).unwrap(), 0, "unrelated confirmation must not persist this trade");
+        let s = shared.read().await;
+        assert_eq!(s.pending_trades.len(), 1, "trade must remain staged");
+    }
+
+    /// Reorg-retract: a durably-confirmed trade whose block gets reorged out
+    /// must be deleted from the ledger.
+    #[tokio::test]
+    async fn retract_reorged_trades_deletes_durable_rows_for_removed_block() {
+        let (shared, history) = h3_test_shared_state_with_history();
+        let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a4";
+
+        record_trade(Some(&shared), "confirm_tx_4", token, 100, 1, 50_000, Side::Buy, None).await;
+        let mut confirmed_txids = HashSet::new();
+        confirmed_txids.insert("confirm_tx_4".to_string());
+        confirm_pending_trades(&shared, &confirmed_txids, "block_to_be_reorged").await;
+
+        assert_eq!(history.trade_count(&h3_pair_id(token)).unwrap(), 1, "sanity: trade is durable pre-reorg");
+
+        retract_reorged_trades(&shared, &["block_to_be_reorged".to_string()]).await;
+
+        assert_eq!(
+            history.trade_count(&h3_pair_id(token)).unwrap(), 0,
+            "trade confirmed under a reorged-out block must be retracted"
+        );
+    }
+
+    /// Reorg-retract must be surgical: retracting one block's hash must not
+    /// touch trades confirmed under a different (still-valid) block.
+    #[tokio::test]
+    async fn retract_reorged_trades_does_not_affect_other_blocks() {
+        let (shared, history) = h3_test_shared_state_with_history();
+        let token = "confirm_token_cov_id_64char_pad_0000000000000000000000000000a5";
+
+        record_trade(Some(&shared), "confirm_tx_5a", token, 100, 1, 50_000, Side::Buy, None).await;
+        record_trade(Some(&shared), "confirm_tx_5b", token, 200, 1, 60_000, Side::Sell, None).await;
+
+        let mut confirmed_a = HashSet::new();
+        confirmed_a.insert("confirm_tx_5a".to_string());
+        confirm_pending_trades(&shared, &confirmed_a, "block_A").await;
+
+        let mut confirmed_b = HashSet::new();
+        confirmed_b.insert("confirm_tx_5b".to_string());
+        confirm_pending_trades(&shared, &confirmed_b, "block_B").await;
+
+        assert_eq!(history.trade_count(&h3_pair_id(token)).unwrap(), 2, "sanity: both durable pre-reorg");
+
+        retract_reorged_trades(&shared, &["block_A".to_string()]).await;
+
+        let remaining = history.recent_trades(&h3_pair_id(token), 10).unwrap();
+        assert_eq!(remaining.len(), 1, "only block_A's trade should be retracted");
+        assert_eq!(remaining[0].txid, "confirm_tx_5b", "block_B's trade must survive");
     }
 
     // IFD Integration Tests

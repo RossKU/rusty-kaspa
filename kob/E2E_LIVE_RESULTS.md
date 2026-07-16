@@ -1,5 +1,62 @@
 # KOB Live testnet-10 E2E — post-hardening full run
 
+## v17 full spot coverage — composition-hardening live run (2026-07-16)
+
+LISTEN-mode daemon, FRESH FROM THE CURRENT TIP (persisted scan cursor absent
+→ `[H1] No cursor; initial last_seen_hash = 87a5b989…` → zero historical
+catch-up, no bulk `getBlocks`). Daemon-first + orders deployed AFTER the
+scanning banner, so each deploy landed in a block the daemon scanned forward
+(small near-tip scans only). Fresh binaries built from the composition-hardening
+commits. Node `ws://65.108.107.30:18210`, wallet `kaspatest:qz6qc3j…cfy7qrwa6v8lf`,
+token `cfe91413dfbf9250e2bcc6940b3c26c2dbe231e29188f6f7538b2ad21f67f6cd` (V17HARD).
+
+| # | Case | Path exercised | Result | TXID |
+|---|---|---|---|---|
+| a | honest v17 N:M GTC sweep (3 sells : 1 v17 buy, `min_fill = full`) | `GtcBuyMultiFill` → **`plan_batch_match_v17`** | **SETTLED** (`is_accepted:true`, blue_score 507428908) — regression of `6794639c…` | **`1c25c0dd8bd18ffdce05f7e5d7a8d7796a39bbf759ccd28776e161a2165a902b`** |
+| b | honest v17 N:M IOC sweep (3 sells : 1 v17 buy, `min_fill < full` ⇒ IOC-eligible) | `BuySweep` → **`plan_ioc_match_v17`** (newly-wired) | **SETTLED** (`is_accepted:true`, blue_score 507421873) | **`40f87a828f72489d504a4bd9a59c99f418395745f3144890384a397a12c6938e`** |
+| c | OCO-sell NOT swept into a multi-sell composition | `find_sweep_groups` OCO exclusion | **HOLDS** — see below | (matching-layer; deploy TXIDs below) |
+| d | N>8 rejects gracefully (no panic) | `find_sweep_groups` MAX_N cap + `plan_batch_match_v17` `V17TooManySells` | **harness-authoritative** — see below | (unit-proven; daemon structurally capped) |
+
+Both N:M settles verified on-chain via the tn10 REST API (independent of the
+wRPC node): each is **5 inputs (3 sells + 1 v17 buy + 1 fee UTXO)** with
+**one per-sell BuyerTokens output covenant-bound to its OWN sell input**
+(daemon TX debug: `COV(ai=0)`, `COV(ai=1)`, `COV(ai=2)`), plus the merged
+SellerKas output (89,100,000 = 3 × 29.7M) — the exact v17 per-sell shape that
+v14/v16 cannot express. (a) and (b) produce the SAME on-chain shape; they
+differ only in the matcher-internal routing (`plan_batch_match_v17` vs
+`plan_ioc_match_v17`), so the run exercises BOTH newly-relevant v17 planners.
+
+**(c) OCO exclusion — LIVE-PROVEN at the matching layer.** Deployed a plain
+sell (`b1a058c7…`, 30M @ 99/100), an OCO sell (`e00973988b…`, 30M, TP 99/100 /
+SL 9/10), and a v17 buy (`37557c0a…`, 60M KAS @ 1/1) that could afford BOTH
+sells. The daemon discovered all three (the OCO recognized as `Discovered OCO
+sell … TP=99/100 SL=9/10`, tagged `oco_path`); the book showed **1 bid / 3
+asks** (plain + OCO-TP + OCO-SL virtual orders). Yet every matching cycle
+formed **`Group kind=Batch sells=1 buys=1`** — only the PLAIN sell, never a
+2-sell sweep including the OCO — proving the `find_sweep_groups` OCO exclusion
+holds live: an OCO sell is never composed into a multi-sell sweep even when a
+buy could afford it. (The plain-sell settle itself was intermittently blocked
+by transient node `getUtxos`/`getDaaScore` RPC timeouts — the same node
+flakiness that delayed the (a)/(b) settles by several retry cycles — but the
+exclusion is established by the group shape, independent of that settle.)
+
+**(d) N>8 graceful reject — harness-authoritative + structural.** The panic
+path (`build_buy_v17_fill_sigscript`'s `assert!(len <= MAX_N)`) is unreachable
+in the daemon: `find_sweep_groups` caps a v17-anchor sweep at `BUY_ORDER_V17_MAX_N`
+(8) before any planner is called (`test_v17_buy_sweep_capped_at_max_n` /
+`test_v17_ioc_sweep_capped_at_max_n`), and `plan_batch_match_v17` independently
+returns `BatchError::V17TooManySells` for `N>8`
+(`test_v17_too_many_sells_rejects_not_panics`) — never a panic. A 9th crossing
+sell is simply left for a follow-on group. Not separately driven live this pass
+(would require 9 minted token UTXOs + 9 deploys under the flaky node); the
+covenant/planner guards are the authoritative verification, as agreed.
+
+**Verdict: v17 full spot coverage is LIVE-CONFIRMED** for both N:M sweep paths
+(GTC + IOC) and the OCO-exclusion safety boundary; the two documented
+limitations (N>8, and C/D/F below) are guarded and unit-proven.
+
+---
+
 ## v17 N:M live verification
 
 **RESULT: the v17 N-sells:1-buy sweep settled autonomously on-chain in ONE

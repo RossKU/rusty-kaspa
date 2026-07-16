@@ -541,6 +541,70 @@ pub fn compute_oco_b_scripts_v18(
     Ok((rs, hex::encode(p2sh.script())))
 }
 
+/// Build the v18 HARD-path IFO scripts: the done-leg v18 OCO sell and the
+/// v18 bracket entry whose embedded `oco_spk` pins that OCO's P2SH.
+///
+/// The bracket is the on-chain-enforced (receipt-gated) IFD/IFO form: the
+/// entry fill itself must spawn the done-leg output (`output[2].spk ==
+/// oco_spk`, token-bound for a buy entry), so no engine-side trigger is
+/// involved. `entry_type` 0 = buy entry (KAS bracket, OCO done-leg holds the
+/// bought tokens), 1 = sell entry (token bracket; for a sell entry pass a
+/// custom `oco_spk` instead — the OCO built here sells tokens and is only
+/// meaningful after a buy).
+///
+/// `max_matcher_fee_bps` applies to the done-leg OCO only (the bracket
+/// carries no fee field — the matcher's compensation is the entry spread).
+///
+/// Returns (bracket_rs, bracket_p2sh_hex, oco_rs, oco_p2sh_hex).
+pub fn compute_bracket_scripts_v18(
+    token: &str,
+    entry_type: u64,
+    entry_price_num: u64,
+    entry_price_den: u64,
+    min_fill: u64,
+    oco_min_value: u64,
+    min_receipt_value: u64,
+    receipt_cov_id: &[u8; 32],
+    trade_spk_hash: &[u8; 32],
+    oco: &IfoOcoParams,
+    owner_hash: &[u8; 32],
+    owner_spk: &[u8; 36],
+    max_matcher_fee_bps: u64,
+) -> Result<(Vec<u8>, String, Vec<u8>, String), String> {
+    let token_bytes = parse_hex_32(token)?;
+
+    // Done-leg: v18 OCO sell (sweep-eligible on both branches).
+    let (oco_rs, oco_p2sh_hex) =
+        compute_oco_b_scripts_v18(token, oco, owner_hash, owner_spk, max_matcher_fee_bps)?;
+    let oco_p2sh = kob_core::p2sh::build_p2sh(&oco_rs);
+    let mut oco_spk = [0u8; 37];
+    oco_spk[0..2].copy_from_slice(&oco_p2sh.version.to_le_bytes());
+    oco_spk[2..37].copy_from_slice(oco_p2sh.script());
+
+    let bracket_rs = kob_core::contract::spot::bracket::build_bracket_v18_redeem_script(
+        entry_type,
+        &token_bytes,
+        entry_price_num,
+        entry_price_den,
+        &oco_spk,
+        oco_min_value,
+        min_fill,
+        min_receipt_value,
+        receipt_cov_id,
+        trade_spk_hash,
+        owner_hash,
+    )
+    .map_err(|e| e.to_string())?;
+    let bracket_p2sh = kob_core::p2sh::build_p2sh(&bracket_rs);
+
+    Ok((
+        bracket_rs,
+        hex::encode(bracket_p2sh.script()),
+        oco_rs,
+        oco_p2sh_hex,
+    ))
+}
+
 fn parse_hex_32(hex_str: &str) -> Result<[u8; 32], String> {
     let bytes = hex::decode(hex_str).map_err(|e| format!("invalid hex: {}", e))?;
     if bytes.len() != 32 {
@@ -1081,6 +1145,65 @@ mod tests {
             "IFO done-leg must be a v18 OCO sell RS (sweep-eligible on both branches)"
         );
         assert_eq!(p2sh.len(), 70);
+    }
+
+    #[test]
+    fn compute_bracket_scripts_v18_pins_v18_oco_p2sh() {
+        use kob_core::contract::spot::bracket::BRACKET_V18_RS_SIZE;
+        use kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE;
+        let owner_hash = [0xbb; 32];
+        let trade_spk_hash = [0xcc; 32];
+        let receipt_cov_id = [0xee; 32];
+        let mut owner_spk = [0u8; 36];
+        owner_spk[2] = 0x20;
+        owner_spk[3..35].copy_from_slice(&[0xdd; 32]);
+        owner_spk[35] = 0xac;
+        let oco = IfoOcoParams {
+            tp_side: IfdSide::Sell,
+            tp_price_num: 150,
+            tp_price_den: 1,
+            tp_min_fill: 100_000,
+            sl_side: IfdSide::Sell,
+            sl_price_num: 80,
+            sl_price_den: 1,
+            sl_min_fill: 100_000,
+        };
+
+        let (bracket_rs, bracket_p2sh_hex, oco_rs, oco_p2sh_hex) = compute_bracket_scripts_v18(
+            &"aa".repeat(32),
+            0, // buy entry
+            1,
+            100,
+            100_000,
+            1_000_000,
+            5_000_000,
+            &receipt_cov_id,
+            &trade_spk_hash,
+            &oco,
+            &owner_hash,
+            &owner_spk,
+            30,
+        )
+        .unwrap();
+
+        assert_eq!(bracket_rs.len(), BRACKET_V18_RS_SIZE, "bracket must be v18");
+        assert_eq!(oco_rs.len(), OCO_SELL_V18_RS_SIZE, "done-leg must be a v18 OCO");
+        assert_eq!(bracket_p2sh_hex.len(), 70);
+        assert_eq!(oco_p2sh_hex.len(), 70);
+
+        // The bracket state's embedded oco_spk (bytes 61..98, after the 0x25
+        // push prefix at 60) must be exactly the v18 OCO's P2SH SPK
+        // (version u16LE + 35B script).
+        let oco_p2sh = kob_core::p2sh::build_p2sh(&oco_rs);
+        let mut expected_spk = Vec::with_capacity(37);
+        expected_spk.extend_from_slice(&oco_p2sh.version.to_le_bytes());
+        expected_spk.extend_from_slice(oco_p2sh.script());
+        assert_eq!(&bracket_rs[61..98], &expected_spk[..], "oco_spk must pin the v18 OCO P2SH");
+
+        // And the bracket must parse as a v18 bracket buy.
+        let parsed = kob_core::contract::spot::parse::parse_redeem_script(&bracket_rs)
+            .expect("v18 bracket must parse");
+        assert_eq!(parsed.version, 18);
     }
 
     #[test]

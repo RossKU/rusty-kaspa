@@ -1421,6 +1421,8 @@ pub(crate) mod v17op {
     pub const CHECKSIG: u8 = 0xac;
     pub const COVOUTCOUNT: u8 = 0xd2;
     pub const OUTPUTCOVENANTID: u8 = 0xd5;
+    // Added for the v18 bracket (entry-type dispatch on an 8-byte state push).
+    pub const BIN2NUM: u8 = 0xce;
 }
 
 // Emit `OpPick(depth)`.

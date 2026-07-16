@@ -1,6 +1,7 @@
 //! Parse spot order redeemScripts to extract on-chain state.
 
 use crate::types::OrderSide;
+use crate::contract::spot::bracket::BRACKET_V18_RS_SIZE;
 use crate::contract::spot::oco::{
     OCO_SELL_STATE_SIZE, OCO_SELL_RS_SIZE, OCO_SELL_V18_RS_SIZE, OcoPath,
 };
@@ -154,6 +155,20 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
                 && rs[BRACKET_STATE_SIZE + 2] == 0x02
             {
                 return parse_bracket_state(rs);
+            }
+            None
+        }
+        BRACKET_V18_RS_SIZE => {
+            // Bracket v18: SAME 224B state layout as v1 (oco_spk pins a v18
+            // OCO P2SH), selector-dispatch body starting with Op11 OpRoll
+            // (0x5b 0x7a — same signature bytes as the OCO sell body, which
+            // is unambiguous because the RS lengths differ; pinned by the
+            // v18_rs_lengths_no_collision test).
+            if rs[BRACKET_STATE_SIZE] == 0x5b && rs[BRACKET_STATE_SIZE + 1] == 0x7a {
+                return parse_bracket_state(rs).map(|mut o| {
+                    o.version = 18;
+                    o
+                });
             }
             None
         }
@@ -775,5 +790,59 @@ mod tests {
     fn bracket_wrong_size_returns_none() {
         assert!(parse_redeem_script(&vec![0x51; 364]).is_none());
         assert!(parse_redeem_script(&vec![0x51; 366]).is_none());
+    }
+
+    #[test]
+    fn roundtrip_bracket_v18_buy_and_sell() {
+        use crate::contract::spot::bracket::build_bracket_v18_redeem_script;
+        let tcid = [0xAA; 32];
+        let ohash = [0xBB; 32];
+        let tspkh = [0xCC; 32];
+        let oco_spk = [0xDD; 37];
+        let rcid = [0xEE; 32];
+        for (etype, side) in [(0u64, OrderSide::Buy), (1u64, OrderSide::Sell)] {
+            let rs = build_bracket_v18_redeem_script(
+                etype, &tcid, 3, 2, &oco_spk, 500_000, 1_000_000, 100, &rcid, &tspkh, &ohash,
+            )
+            .unwrap();
+            assert_eq!(rs.len(), BRACKET_V18_RS_SIZE);
+            let parsed = parse_redeem_script(&rs).expect("should parse v18 bracket");
+            assert_eq!(parsed.order_type, side);
+            assert_eq!(parsed.version, 18, "v18 bracket must report version 18");
+            assert_eq!(
+                parsed.token_cov_id,
+                if side == OrderSide::Buy { tcid } else { [0u8; 32] }
+            );
+            assert_eq!(parsed.price_num, 3);
+            assert_eq!(parsed.price_den, 2);
+            assert_eq!(parsed.min_fill, 1_000_000);
+            assert_eq!(parsed.owner_hash, ohash);
+            assert_eq!(parsed.spk_hash, tspkh);
+        }
+    }
+
+    #[test]
+    fn bracket_v18_wrong_signature_returns_none() {
+        // Right length, wrong body signature bytes.
+        use crate::contract::spot::bracket::build_bracket_v18_redeem_script;
+        let t32 = [0x11; 32];
+        let mut rs = build_bracket_v18_redeem_script(
+            0, &t32, 1, 1, &[0x22; 37], 1, 1, 1, &t32, &t32, &t32,
+        )
+        .unwrap();
+        rs[BRACKET_STATE_SIZE] = 0xb9; // v1-style preamble instead of Op11 OpRoll
+        rs[BRACKET_STATE_SIZE + 1] = 0xc9;
+        assert!(parse_redeem_script(&rs).is_none());
+    }
+
+    #[test]
+    fn bracket_v18_rejects_invalid_builder_args() {
+        use crate::contract::spot::bracket::build_bracket_v18_redeem_script;
+        let t32 = [0x11; 32];
+        let spk = [0x22; 37];
+        assert!(build_bracket_v18_redeem_script(2, &t32, 1, 1, &spk, 1, 1, 1, &t32, &t32, &t32).is_err());
+        assert!(build_bracket_v18_redeem_script(0, &t32, 0, 1, &spk, 1, 1, 1, &t32, &t32, &t32).is_err());
+        assert!(build_bracket_v18_redeem_script(0, &t32, 1, 0, &spk, 1, 1, 1, &t32, &t32, &t32).is_err());
+        assert!(build_bracket_v18_redeem_script(0, &t32, 1, 1, &spk, 1, 0, 1, &t32, &t32, &t32).is_err());
     }
 }

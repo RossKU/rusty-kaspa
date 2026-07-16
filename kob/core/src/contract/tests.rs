@@ -2087,10 +2087,12 @@ mod adversarial_tests {
         };
         use crate::contract::spot::oco::{build_oco_sell_v18_body, OCO_SELL_V18_BODY_EXPECTED_LEN};
         use crate::contract::spot::swap::{build_swap_v18_body, SWAP_V18_BODY_EXPECTED_LEN};
+        use crate::contract::spot::bracket::{build_bracket_v18_body, BRACKET_V18_BODY_EXPECTED_LEN};
         assert_eq!(build_buy_v18_body().len(), BUY_ORDER_V18_BODY_EXPECTED_LEN, "buy v18 body");
         assert_eq!(build_sell_v18_body().len(), SELL_ORDER_V18_BODY_EXPECTED_LEN, "sell v18 body");
         assert_eq!(build_oco_sell_v18_body().len(), OCO_SELL_V18_BODY_EXPECTED_LEN, "OCO v18 body");
         assert_eq!(build_swap_v18_body().len(), SWAP_V18_BODY_EXPECTED_LEN, "swap v18 body");
+        assert_eq!(build_bracket_v18_body().len(), BRACKET_V18_BODY_EXPECTED_LEN, "bracket v18 body");
     }
 
     /// Every v18 RS length must be distinct from every other dispatch length
@@ -2105,13 +2107,16 @@ mod adversarial_tests {
             SELL_ORDER_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
         };
         use crate::contract::spot::parse::BRACKET_RS_SIZE;
+        use crate::contract::spot::bracket::BRACKET_V18_RS_SIZE;
         use crate::contract::spot::oco::{OCO_SELL_RS_SIZE, OCO_SELL_V18_RS_SIZE};
         use crate::contract::spot::swap::{SWAP_RS_SIZE, SWAP_V18_RS_SIZE};
+        use crate::contract::spot::dca::DCA_V2_RS_SIZE;
         let v18 = [
             BUY_ORDER_V18_RS_EXPECTED_LEN,
             SELL_ORDER_V18_RS_EXPECTED_LEN,
             OCO_SELL_V18_RS_SIZE,
             SWAP_V18_RS_SIZE,
+            BRACKET_V18_RS_SIZE,
         ];
         let existing = [
             BUY_ORDER_RS_EXPECTED_LEN,
@@ -2121,6 +2126,7 @@ mod adversarial_tests {
             BRACKET_RS_SIZE,
             OCO_SELL_RS_SIZE,
             SWAP_RS_SIZE,
+            DCA_V2_RS_SIZE,
         ];
         for (i, a) in v18.iter().enumerate() {
             for b in existing.iter() {
@@ -2150,6 +2156,8 @@ mod adversarial_tests {
              "c2cd219b2c12832e6b1a057e9ad1c5bc96bf0afc82b15b1b7cb85ec9f3f382f5"),
             ("SWAP_ORDER_V18", build_swap_v18_body(),
              "47552d56319a3b8a523ae4d467192db1496347ff4243f1eae5b31e36729eb0b3"),
+            ("BRACKET_V18", crate::contract::spot::bracket::build_bracket_v18_body(),
+             "169cdae3e31dcb11ea3f958611222dc0d59136f5c8b1d03d08ec5de7df5f1c3f"),
         ];
         let mut mismatches = Vec::new();
         for (name, body, expected_hex) in pins {

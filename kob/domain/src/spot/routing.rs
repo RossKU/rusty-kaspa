@@ -88,19 +88,34 @@ pub fn find_cross_pair_routes_with_stp(
 ) -> Vec<CrossPairRoute> {
     let mut routes = Vec::new();
 
-    // Collect all active sells (asks) across all pairs
+    // Collect candidate sells (asks) / buys (bids) across all pairs.
+    //
+    // H2-TOB: read the denormalized top-of-book cache (best few resting
+    // levels per pair, see `order_book::TOP_OF_BOOK_DEPTH`) instead of every
+    // resting order in every pair. Cross-pair routing is a Forex-USD-hub
+    // style "N hub quotes" problem -- the profitable route through a pair
+    // always prefers that pair's best available price, so restricting the
+    // candidate set to the cached top levels turns the O(orders-in-pair)
+    // collection (and the O(sells x buys) cross product below) into
+    // O(pairs x TOP_OF_BOOK_DEPTH), without changing which routes are found
+    // in practice (the cache holds the prices that would win anyway).
     let mut all_sells: Vec<(&str, &BookOrder)> = Vec::new();
-    // Collect all active buys (bids) across all pairs
     let mut all_buys: Vec<(&str, &BookOrder)> = Vec::new();
 
     for (token_cov_id, pair_book) in &order_book.pair_books {
-        for order in pair_book.asks.values() {
-            if !order_book.matched_outpoints.contains_key(&order.outpoint_key()) {
+        for tq in pair_book.top_asks() {
+            if order_book.matched_outpoints.contains_key(&tq.outpoint_key) {
+                continue;
+            }
+            if let Some(order) = pair_book.get_ask(&tq.outpoint_key) {
                 all_sells.push((token_cov_id.as_str(), order));
             }
         }
-        for order in pair_book.bids.values() {
-            if !order_book.matched_outpoints.contains_key(&order.outpoint_key()) {
+        for tq in pair_book.top_bids() {
+            if order_book.matched_outpoints.contains_key(&tq.outpoint_key) {
+                continue;
+            }
+            if let Some(order) = pair_book.get_bid(&tq.outpoint_key) {
                 all_buys.push((token_cov_id.as_str(), order));
             }
         }
@@ -1137,5 +1152,58 @@ mod tests {
 
         let routes = find_cross_pair_routes_with_stp(&ob, 10, true);
         assert!(routes.is_empty(), "surplus too small for fee");
+    }
+
+    // H2-TOB: top-of-book cache correctness (routing must read the cache,
+    // and its results must match what a full-book walk would find).
+
+    /// With more resting sells/buys per pair than `TOP_OF_BOOK_DEPTH`, the
+    /// best (highest-surplus) cross-pair route must still be found -- and
+    /// must match a manual full-book walk -- proving `find_cross_pair_routes_with_stp`
+    /// reading the top-of-book cache doesn't silently drop the profitable
+    /// route just because the book is deeper than the cache.
+    #[test]
+    fn cross_pair_route_correct_with_book_deeper_than_cache() {
+        use crate::order_book::TOP_OF_BOOK_DEPTH;
+
+        let mut ob = OrderBook::new();
+        let n = TOP_OF_BOOK_DEPTH + 3;
+
+        // Token A: n sells, inserted worst-price-first; the LAST-inserted
+        // (i = n-1) is the cheapest (price_num=3, lowest sell_kas_output),
+        // proving the cache tracks true price order, not insertion order.
+        for i in 0..n {
+            let price_num = (n - i) as u64 + 2; // n+2 (worst) down to 3 (best)
+            ob.add_sell_order(make_sell_unique(&format!("sa{}", i), 1, 10_000_000, price_num, 10, TOKEN_A));
+        }
+
+        // Token B: n buys, inserted worst-first; the LAST-inserted (i=n-1)
+        // provides the most KAS (best for the buyer's counterpart route).
+        for i in 0..n {
+            let value = 20_000_000 + i as u64 * 1_000_000;
+            ob.add_buy_order(make_buy_unique(&format!("bb{}", i), 0, value, 1, 2, TOKEN_B));
+        }
+
+        assert!(ob.pair_books[TOKEN_A].asks.len() > TOP_OF_BOOK_DEPTH, "sanity: book deeper than cache");
+        assert!(ob.pair_books[TOKEN_B].bids.len() > TOP_OF_BOOK_DEPTH, "sanity: book deeper than cache");
+
+        let routes = find_cross_pair_routes_with_stp(&ob, 100, true);
+        assert!(!routes.is_empty(), "must find a route even though books are deeper than the top-of-book cache");
+
+        // Reference: walk the FULL book directly (bypassing the cache) to
+        // compute the ground-truth best possible surplus.
+        let best_sell_kas = ob.pair_books[TOKEN_A]
+            .asks
+            .values()
+            .map(|o| o.value * o.price_num / o.price_den)
+            .min()
+            .unwrap();
+        let best_buy_kas = ob.pair_books[TOKEN_B].bids.values().map(|o| o.value).max().unwrap();
+        let expected_surplus = best_buy_kas - best_sell_kas;
+
+        assert_eq!(
+            routes[0].surplus, expected_surplus,
+            "cache-based routing must find the same best route as a full-book walk"
+        );
     }
 }

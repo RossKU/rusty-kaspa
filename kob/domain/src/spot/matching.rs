@@ -1,7 +1,7 @@
 //! Crossing pair detection and match output computation.
 
 use kob_core::MIN_UTXO_VALUE;
-use crate::order_book::{BookOrder, OrderBook};
+use crate::order_book::{BookOrder, OrderBook, PairBook};
 
 /// OP_CSV maturity window: orders must age at least this many DAA scores
 /// before they can be spent. Matches the lockTime embedded in deploy TXs.
@@ -1174,6 +1174,66 @@ pub struct CrossSwapGroup {
 /// * `swap_book` — The swap order tracker.
 /// * `spent_outpoints` — Outpoints consumed by prior phases or under cooldown.
 /// * `used_outpoints` — Outpoints consumed by same-token matching in this cycle.
+/// Find an available bid for hub cross-rate routing.
+///
+/// H2-TOB: tries the denormalized top-of-book cache first (best few resting
+/// bids, see `order_book::TOP_OF_BOOK_DEPTH`) -- O(TOP_OF_BOOK_DEPTH) instead
+/// of O(orders-in-pair). If every cached candidate is spent/used/claimed
+/// (cache exhausted), falls back to a full scan of the pair's resting bids
+/// so correctness never depends on how deep the cache is: a route is never
+/// missed just because it wasn't among the top few cached levels.
+fn find_available_bid<'a>(
+    order_book: &'a OrderBook,
+    pair_book: &'a PairBook,
+    spent: &std::collections::HashSet<String>,
+    used_outpoints: &std::collections::HashSet<String>,
+    claimed: &std::collections::HashSet<String>,
+) -> Option<&'a BookOrder> {
+    let is_available = |key: &str| {
+        !spent.contains(key)
+            && !used_outpoints.contains(key)
+            && !claimed.contains(key)
+            && !order_book.matched_outpoints.contains_key(key)
+    };
+    for tq in pair_book.top_bids() {
+        if tq.price_num > 0 && tq.price_den > 0 && is_available(&tq.outpoint_key) {
+            if let Some(order) = pair_book.get_bid(&tq.outpoint_key) {
+                return Some(order);
+            }
+        }
+    }
+    pair_book.bids.values().find(|bid| {
+        bid.price_num > 0 && bid.price_den > 0 && is_available(&bid.outpoint_key())
+    })
+}
+
+/// Find an available ask for hub cross-rate routing. Mirror of
+/// `find_available_bid` for the sell side.
+fn find_available_ask<'a>(
+    order_book: &'a OrderBook,
+    pair_book: &'a PairBook,
+    spent: &std::collections::HashSet<String>,
+    used_outpoints: &std::collections::HashSet<String>,
+    claimed: &std::collections::HashSet<String>,
+) -> Option<&'a BookOrder> {
+    let is_available = |key: &str| {
+        !spent.contains(key)
+            && !used_outpoints.contains(key)
+            && !claimed.contains(key)
+            && !order_book.matched_outpoints.contains_key(key)
+    };
+    for tq in pair_book.top_asks() {
+        if tq.price_num > 0 && tq.price_den > 0 && is_available(&tq.outpoint_key) {
+            if let Some(order) = pair_book.get_ask(&tq.outpoint_key) {
+                return Some(order);
+            }
+        }
+    }
+    pair_book.asks.values().find(|ask| {
+        ask.price_num > 0 && ask.price_den > 0 && is_available(&ask.outpoint_key())
+    })
+}
+
 pub fn match_swap_routes(
     order_book: &OrderBook,
     swap_book: &crate::swap_book::SwapBook,
@@ -1214,15 +1274,7 @@ pub fn match_swap_routes(
             None => continue, // No book for source token.
         };
 
-        let buy_source = source_book.bids.values().find(|bid| {
-            let key = bid.outpoint_key();
-            !spent.contains(&key)
-                && !used_outpoints.contains(&key)
-                && !claimed.contains(&key)
-                && !order_book.matched_outpoints.contains_key(&key)
-                && bid.price_num > 0
-                && bid.price_den > 0
-        });
+        let buy_source = find_available_bid(order_book, source_book, spent, used_outpoints, &claimed);
 
         let buy_source = match buy_source {
             Some(b) => b,
@@ -1254,15 +1306,7 @@ pub fn match_swap_routes(
             None => continue, // No book for target token.
         };
 
-        let sell_target = target_book.asks.values().find(|ask| {
-            let key = ask.outpoint_key();
-            !spent.contains(&key)
-                && !used_outpoints.contains(&key)
-                && !claimed.contains(&key)
-                && !order_book.matched_outpoints.contains_key(&key)
-                && ask.price_num > 0
-                && ask.price_den > 0
-        });
+        let sell_target = find_available_ask(order_book, target_book, spent, used_outpoints, &claimed);
 
         let sell_target = match sell_target {
             Some(a) => a,
@@ -2744,6 +2788,64 @@ mod tests {
         assert!(
             groups_with_cooldown.is_empty(),
             "Phase 3 must return empty when the only buy_source candidate is in cooldown (reproduces Bug B symptom)",
+        );
+    }
+
+    /// H2-TOB: when every candidate in the top-of-book cache is excluded
+    /// (here, via `used_outpoints`), `match_swap_routes` must fall back to a
+    /// full scan of the pair's resting bids rather than returning empty --
+    /// proving the cache is a fast-path optimization, not a correctness cap.
+    #[test]
+    fn match_swap_routes_falls_back_beyond_cache_depth() {
+        use crate::order_book::TOP_OF_BOOK_DEPTH;
+
+        let token_a = "aa".repeat(32);
+        let token_b = "bb".repeat(32);
+        let mut ob = OrderBook::new();
+
+        // TOKEN_A: more buys than TOP_OF_BOOK_DEPTH, all with the same
+        // locked KAS value (10M) but distinct, descending prices so the
+        // insertion order i=0..TOP_OF_BOOK_DEPTH-1 is exactly the set the
+        // top-of-book cache holds (highest price first).
+        let n = TOP_OF_BOOK_DEPTH + 2;
+        let mut used_outpoints: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut beyond_cache_txids: Vec<String> = Vec::new();
+        for i in 0..n {
+            let price_num = (n - i) as u64; // i=0 => highest price (best, cached)
+            let tx_id = format!("{:064x}", i);
+            let buy = make_buy_with_owner(&tx_id, 0, 10_000_000, price_num, 100, &token_a, &"aa".repeat(32));
+            let key = buy.outpoint_key();
+            ob.add_buy_order(buy);
+            if i < TOP_OF_BOOK_DEPTH {
+                // One of the cached top levels: exclude it via used_outpoints
+                // so the cache alone yields nothing.
+                used_outpoints.insert(key);
+            } else {
+                beyond_cache_txids.push(tx_id);
+            }
+        }
+
+        // Sanity: the cache holds exactly the excluded (used) levels.
+        {
+            let pair_book = &ob.pair_books[&token_a];
+            assert_eq!(pair_book.top_bids().len(), TOP_OF_BOOK_DEPTH);
+            for tq in pair_book.top_bids() {
+                assert!(used_outpoints.contains(&tq.outpoint_key), "cache must hold exactly the excluded top levels");
+            }
+        }
+
+        // TOKEN_B: a single sell well within reach.
+        let sell_b = make_sell_with_owner(&"3d".repeat(32), 0, 16_000_000, 1, 5, &token_b, &"bb".repeat(32));
+        ob.add_sell_order(sell_b);
+
+        let mut swap = crate::swap_book::SwapBook::new();
+        swap.add(make_swap_entry(&"9c".repeat(32), 0, &token_a, &token_b, 100_000_000, 1_000_000));
+
+        let groups = match_swap_routes(&ob, &swap, None, &used_outpoints);
+        assert_eq!(groups.len(), 1, "must find a route via the full-scan fallback");
+        assert!(
+            beyond_cache_txids.contains(&groups[0].buy_source.tx_id),
+            "the route's buy_source must be one of the levels beyond the cache (proves fallback ran, not just the cache)"
         );
     }
 

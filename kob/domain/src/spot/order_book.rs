@@ -290,6 +290,40 @@ impl BookOrder {
 
 pub use kob_core::types::OrderSide;
 
+/// Number of price levels retained in the denormalized top-of-book cache,
+/// per side, per pair.
+///
+/// Hub cross-rate routing (Forex-USD-hub style: every pair quotes through
+/// KAS) only ever needs the best few resting prices per pair to find or
+/// quote a route -- not the full resting book, which can hold up to
+/// `MAX_ORDERS_PER_PAIR` orders. Reading `top_bids()`/`top_asks()` turns an
+/// O(orders-in-pair) walk into an O(1) read of at most this many entries.
+pub const TOP_OF_BOOK_DEPTH: usize = 8;
+
+/// A single denormalized top-of-book price level.
+///
+/// Carries just enough to route/quote without a second BTreeMap lookup;
+/// callers that need the full `BookOrder` (e.g. to build a settlement TX)
+/// resolve `outpoint_key` via `PairBook::get_bid`/`get_ask`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TopQuote {
+    pub price_num: u64,
+    pub price_den: u64,
+    pub value: u64,
+    pub outpoint_key: String,
+}
+
+impl From<&BookOrder> for TopQuote {
+    fn from(order: &BookOrder) -> Self {
+        TopQuote {
+            price_num: order.price_num,
+            price_den: order.price_den,
+            value: order.value,
+            outpoint_key: order.outpoint_key(),
+        }
+    }
+}
+
 /// Per-pair order book (one token_covenant_id)
 #[derive(Default)]
 pub struct PairBook {
@@ -298,6 +332,15 @@ pub struct PairBook {
     /// Reverse lookup: outpoint_key -> BidKey or AskKey identifier
     bid_outpoints: HashMap<String, BidKey>,
     ask_outpoints: HashMap<String, AskKey>,
+    /// Denormalized top-of-book cache: the best (up to `TOP_OF_BOOK_DEPTH`)
+    /// bid/ask levels, refreshed on every insert/remove (`refresh_top_bids`/
+    /// `refresh_top_asks`). `bids`/`asks` are already price-ordered
+    /// BTreeMaps, so the refresh is a cheap `O(log n + TOP_OF_BOOK_DEPTH)`
+    /// prefix read -- the cache exists so callers that need "N hub quotes"
+    /// (routing.rs, match_swap_routes) don't re-walk every resting order in
+    /// every pair on every routing pass.
+    top_bids: Vec<TopQuote>,
+    top_asks: Vec<TopQuote>,
 }
 
 impl PairBook {
@@ -316,6 +359,7 @@ impl PairBook {
         self.bid_outpoints
             .insert(order.outpoint_key(), key.clone());
         self.bids.insert(key, order);
+        self.refresh_top_bids();
     }
 
     pub fn add_ask(&mut self, order: BookOrder) {
@@ -329,11 +373,14 @@ impl PairBook {
         self.ask_outpoints
             .insert(order.outpoint_key(), key.clone());
         self.asks.insert(key, order);
+        self.refresh_top_asks();
     }
 
     pub fn remove_bid(&mut self, outpoint_key: &str) -> Option<BookOrder> {
         if let Some(key) = self.bid_outpoints.remove(outpoint_key) {
-            self.bids.remove(&key)
+            let removed = self.bids.remove(&key);
+            self.refresh_top_bids();
+            removed
         } else {
             None
         }
@@ -341,10 +388,54 @@ impl PairBook {
 
     pub fn remove_ask(&mut self, outpoint_key: &str) -> Option<BookOrder> {
         if let Some(key) = self.ask_outpoints.remove(outpoint_key) {
-            self.asks.remove(&key)
+            let removed = self.asks.remove(&key);
+            self.refresh_top_asks();
+            removed
         } else {
             None
         }
+    }
+
+    fn refresh_top_bids(&mut self) {
+        self.top_bids = self.bids.values().take(TOP_OF_BOOK_DEPTH).map(TopQuote::from).collect();
+    }
+
+    fn refresh_top_asks(&mut self) {
+        self.top_asks = self.asks.values().take(TOP_OF_BOOK_DEPTH).map(TopQuote::from).collect();
+    }
+
+    /// Denormalized top-of-book bid levels, best price first, up to
+    /// `TOP_OF_BOOK_DEPTH` entries.
+    pub fn top_bids(&self) -> &[TopQuote] {
+        &self.top_bids
+    }
+
+    /// Denormalized top-of-book ask levels, best price first, up to
+    /// `TOP_OF_BOOK_DEPTH` entries.
+    pub fn top_asks(&self) -> &[TopQuote] {
+        &self.top_asks
+    }
+
+    /// Best (highest) resting bid, if any.
+    pub fn best_bid(&self) -> Option<&TopQuote> {
+        self.top_bids.first()
+    }
+
+    /// Best (lowest) resting ask, if any.
+    pub fn best_ask(&self) -> Option<&TopQuote> {
+        self.top_asks.first()
+    }
+
+    /// Resolve a bid's full `BookOrder` by outpoint key (O(1)).
+    pub fn get_bid(&self, outpoint_key: &str) -> Option<&BookOrder> {
+        let key = self.bid_outpoints.get(outpoint_key)?;
+        self.bids.get(key)
+    }
+
+    /// Resolve an ask's full `BookOrder` by outpoint key (O(1)).
+    pub fn get_ask(&self, outpoint_key: &str) -> Option<&BookOrder> {
+        let key = self.ask_outpoints.get(outpoint_key)?;
+        self.asks.get(key)
     }
 
     /// Check if a buy order at the given price would cross the best ask.
@@ -1714,5 +1805,103 @@ mod tests {
 
         let removed = ob.remove_expired(100);
         assert_eq!(removed.len(), 0, "Order not yet expired should not be removed");
+    }
+
+    // Top-of-book cache tests (denormalized best-bid/best-ask + top-K)
+
+    /// Best bid/ask reflect price priority immediately after insert, with no
+    /// separate refresh call needed (maintained incrementally on add).
+    #[test]
+    fn top_of_book_best_bid_ask_track_price_priority() {
+        let mut book = PairBook::new();
+        assert!(book.best_bid().is_none());
+        assert!(book.best_ask().is_none());
+
+        book.add_bid(make_buy_at("a".repeat(64).as_str(), &"ab".repeat(32), 1, 2, false)); // 0.5
+        book.add_bid(make_buy_at("b".repeat(64).as_str(), &"ab".repeat(32), 3, 4, false)); // 0.75 (better bid)
+        assert_eq!(book.best_bid().unwrap().price_num, 3, "higher bid price should be best");
+        assert_eq!(book.best_bid().unwrap().price_den, 4);
+
+        book.add_ask(make_sell_at("c".repeat(64).as_str(), &"ab".repeat(32), 9, 10, false)); // 0.9
+        book.add_ask(make_sell_at("d".repeat(64).as_str(), &"ab".repeat(32), 4, 5, false)); // 0.8 (better ask)
+        assert_eq!(book.best_ask().unwrap().price_num, 4, "lower ask price should be best");
+        assert_eq!(book.best_ask().unwrap().price_den, 5);
+    }
+
+    /// Removing the current best bid/ask promotes the next-best level.
+    #[test]
+    fn top_of_book_removal_promotes_next_level() {
+        let mut book = PairBook::new();
+        let best_key = "a".repeat(64);
+        let second_key = "b".repeat(64);
+        book.add_bid(make_buy_at(&best_key, &"ab".repeat(32), 3, 4, false)); // 0.75 best
+        book.add_bid(make_buy_at(&second_key, &"ab".repeat(32), 1, 2, false)); // 0.5
+
+        assert_eq!(book.best_bid().unwrap().outpoint_key, format!("{}:0", best_key));
+
+        book.remove_bid(&format!("{}:0", best_key));
+        assert_eq!(
+            book.best_bid().unwrap().outpoint_key,
+            format!("{}:0", second_key),
+            "removing the best bid must promote the next-best level"
+        );
+
+        book.remove_bid(&format!("{}:0", second_key));
+        assert!(book.best_bid().is_none(), "removing the last bid must clear best_bid");
+    }
+
+    /// The cache retains at most TOP_OF_BOOK_DEPTH levels even when more
+    /// orders exist in the pair.
+    #[test]
+    fn top_of_book_depth_is_capped() {
+        let mut book = PairBook::new();
+        let tcid = "ab".repeat(32);
+        let total = TOP_OF_BOOK_DEPTH + 5;
+        for i in 0..total {
+            // Distinct, monotonically improving-for-bids prices: higher i => higher price.
+            book.add_bid(make_buy_at(&format!("{:064x}", i), &tcid, (i + 1) as u64, 1, false));
+        }
+        assert_eq!(book.bids.len(), total, "all orders should be in the full book");
+        assert_eq!(book.top_bids().len(), TOP_OF_BOOK_DEPTH, "cache must be capped at TOP_OF_BOOK_DEPTH");
+        // Best bid must be the highest price (i = total - 1 => price total).
+        assert_eq!(book.best_bid().unwrap().price_num, total as u64);
+        // Cache must be sorted best-first.
+        for w in book.top_bids().windows(2) {
+            assert!(w[0].price_num >= w[1].price_num, "top_bids must be sorted best (highest) first");
+        }
+    }
+
+    /// get_bid/get_ask resolve the full BookOrder for a cached outpoint key.
+    #[test]
+    fn top_of_book_get_bid_ask_resolve_full_order() {
+        let mut book = PairBook::new();
+        let tcid = "ab".repeat(32);
+        book.add_ask(make_sell_at("c".repeat(64).as_str(), &tcid, 1, 2, false));
+
+        let tq = book.best_ask().expect("ask must be present").clone();
+        let full = book.get_ask(&tq.outpoint_key).expect("must resolve full order from cache key");
+        assert_eq!(full.tx_id, "c".repeat(64));
+        assert_eq!(full.price_num, 1);
+        assert_eq!(full.price_den, 2);
+
+        assert!(book.get_bid(&tq.outpoint_key).is_none(), "ask key must not resolve as a bid");
+    }
+
+    /// OrderBook-level insertion (add_buy_order/add_sell_order) maintains the
+    /// per-pair top-of-book cache the same way direct PairBook calls do.
+    #[test]
+    fn top_of_book_maintained_through_order_book_api() {
+        let mut ob = OrderBook::new();
+        let tcid = "ab".repeat(32);
+        ob.add_buy_order(make_buy_at("a".repeat(64).as_str(), &tcid, 1, 2, false));
+        ob.add_buy_order(make_buy_at("b".repeat(64).as_str(), &tcid, 3, 4, false));
+
+        let book = ob.pair_books.get(&tcid).unwrap();
+        assert_eq!(book.best_bid().unwrap().price_num, 3, "best bid via OrderBook::add_buy_order");
+
+        let key = format!("{}:0", "b".repeat(64));
+        ob.remove_order(&key);
+        let book = ob.pair_books.get(&tcid).unwrap();
+        assert_eq!(book.best_bid().unwrap().price_num, 1, "removal via OrderBook::remove_order must refresh cache");
     }
 }

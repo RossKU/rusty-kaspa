@@ -263,14 +263,25 @@ pub async fn run(
         //   N buys + 1 sell  → sell sweeps buys (plan_sell_ioc_match)
         if buys.len() == 1 && sells.len() >= 1 {
             println!("IOC direction: buy sweeps {} sells", sells.len());
-            kob_engine::matcher::batch::plan_ioc_match(
-                &sells,
-                &buys[0],
-                Some(wallet_utxo_info.clone()),
-                &matcher_spk,
-                0,
-                fee_bps,
-            )?
+            if buys[0].version == 17 {
+                kob_engine::matcher::batch::plan_ioc_match_v17(
+                    &sells,
+                    &buys[0],
+                    Some(wallet_utxo_info.clone()),
+                    &matcher_spk,
+                    0,
+                    fee_bps,
+                )?
+            } else {
+                kob_engine::matcher::batch::plan_ioc_match(
+                    &sells,
+                    &buys[0],
+                    Some(wallet_utxo_info.clone()),
+                    &matcher_spk,
+                    0,
+                    fee_bps,
+                )?
+            }
         } else if sells.len() == 1 && buys.len() >= 1 {
             println!("IOC direction: sell sweeps {} buys", buys.len());
             kob_engine::matcher::batch::plan_sell_ioc_match(

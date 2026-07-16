@@ -1914,6 +1914,223 @@ pub fn plan_ioc_match(
     })
 }
 
+/// v17 IOC N:M sweep planner: 1 v17 buy (IOC selector) sweeps up to
+/// `BUY_ORDER_V17_MAX_N` sells of the same token, immediately-or-cancel.
+///
+/// Mirrors `plan_batch_match_v17`'s per-sell BuyerTokens output mechanism
+/// (each output bound to its own sell input via `output_auth_input`, exactly
+/// the shape the v17 contract's per-term `OpAuthOutputIdx` binding expects),
+/// combined with `plan_ioc_match`'s greedy affordability sweep (full-fill
+/// sells only, stop when the buy's remaining KAS can't afford the next
+/// sell) and buyer-change output for any leftover KAS.
+///
+/// IOC floor: the v17 contract relaxes its aggregate limit-price floor from
+/// the full expected-token amount to the buy's own `min_fill` when the IOC
+/// selector (Op5) is used -- mirrored here by checking `total_tokens >=
+/// buy.min_fill` instead of the GTC full amount.
+///
+/// The contract's aggregate surplus cap (`kas_in - fair_sum <= cap`) reads
+/// the buy's FULL `kas_in` unconditionally, exactly like v16's existing F6
+/// (see `order.rs`) -- so, like the pre-existing `plan_ioc_match`, a large
+/// buyer-change amount is only obtainable within `mmfee_bps`; this mirrors
+/// that already-shipped design, not a new risk. The v17 covenant bytecode
+/// itself is unchanged and already adversarially proven (`v17_nm_buy.rs`
+/// `m15_ioc_within_cap_passes` / `m15b_ioc_underdelivery_theft_rejected`);
+/// this planner only has to compose the HONEST tx shape those tests assume.
+pub fn plan_ioc_match_v17(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    if sells.is_empty() {
+        return Err(BatchError::NoSellOrders);
+    }
+    if buy.order_type != OrderType::Buy {
+        return Err(BatchError::NoBuyOrders);
+    }
+    if buy.version != 17 {
+        return Err(BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        });
+    }
+
+    // Greedy affordability sweep: full-fill sells only, capped at MAX_N.
+    // RELEASE-BLOCKER #1 (defense-in-depth): an OCO sell must never enter a
+    // multi-sell v17 composition even here, in case a caller bypasses the
+    // find_sweep_groups/plan_batch_match gates.
+    let buy_kas = buy.utxo_value;
+    let mut kas_remaining = buy_kas;
+    let mut filled: Vec<&BatchOrder> = Vec::new();
+    for sell in sells {
+        if filled.len() >= BUY_ORDER_V17_MAX_N {
+            break;
+        }
+        if sell.oco_path.is_some() {
+            continue;
+        }
+        if sell.token_cov_id != buy.token_cov_id {
+            continue;
+        }
+        if sell.price_den == 0 {
+            continue;
+        }
+        let sell_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+        if sell_kas_128 > u64::MAX as u128 {
+            continue;
+        }
+        let sell_kas = sell_kas_128 as u64;
+        if sell_kas < MIN_UTXO_VALUE || sell_kas < sell.min_fill {
+            continue;
+        }
+        if kas_remaining >= sell_kas {
+            filled.push(sell);
+            kas_remaining -= sell_kas;
+        } else {
+            break;
+        }
+    }
+
+    if filled.is_empty() {
+        return Err(BatchError::MinFillViolation {
+            index: 0,
+            fill_kas: 0,
+            min_fill: buy.min_fill,
+        });
+    }
+
+    let n = filled.len();
+    let total_tokens: u64 = filled.iter().map(|s| s.amount).sum();
+
+    // IOC floor: aggregate delivered tokens must meet the buy's OWN min_fill
+    // (relaxed from the full expected-amount GTC floor), mirroring the
+    // contract's ioc_flag ? mfill : expected relaxation.
+    if total_tokens < buy.min_fill {
+        return Err(BatchError::MinFillViolation {
+            index: n,
+            fill_kas: total_tokens,
+            min_fill: buy.min_fill,
+        });
+    }
+
+    let token_input_map = build_token_input_map(
+        &filled.iter().map(|s| s.token_cov_id).collect::<Vec<_>>(),
+    );
+    let plan_sells: Vec<(BatchOrder, usize)> =
+        filled.iter().enumerate().map(|(i, s)| ((*s).clone(), i)).collect();
+    let plan_buys: Vec<(BatchOrder, usize)> = vec![(buy.clone(), n)];
+
+    let mut outputs: Vec<PlannedOutput> = Vec::new();
+
+    // SellerKas per sell, merged by (spk, version).
+    let mut total_seller_kas: u64 = 0;
+    let mut seller_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
+    for sell in &filled {
+        let sell_kas = (sell.amount as u128 * sell.price_num as u128
+            / sell.price_den as u128) as u64;
+        total_seller_kas += sell_kas;
+        let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
+        if let Some(&existing) = seller_group_idx.get(&key) {
+            outputs[existing].value += sell_kas;
+        } else {
+            let new_idx = outputs.len();
+            outputs.push(PlannedOutput {
+                value: sell_kas,
+                script_public_key: sell.counterparty_spk.clone(),
+                spk_version: sell.counterparty_spk_version,
+                purpose: OutputPurpose::SellerKas,
+            });
+            seller_group_idx.insert(key, new_idx);
+        }
+    }
+
+    // BuyerTokens per sell (NOT merged) -- each authorized by its own sell
+    // input, exactly like the GTC v17 planner.
+    let mut output_auth_input: std::collections::HashMap<usize, u16> = std::collections::HashMap::new();
+    for (i, sell) in filled.iter().enumerate() {
+        let out_idx = outputs.len();
+        outputs.push(PlannedOutput {
+            value: sell.amount,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerTokens,
+        });
+        output_auth_input.insert(out_idx, i as u16);
+    }
+
+    let total_sell_value: u64 = filled.iter().map(|s| s.utxo_value).sum();
+    let total_buy_kas = buy.utxo_value;
+    let wallet_value = wallet_utxo.as_ref().map_or(0, |w| w.2);
+    let total_kas_in = total_sell_value + total_buy_kas + wallet_value;
+    let total_planned_out = total_seller_kas + total_tokens;
+
+    let num_inputs = 1 + n + if wallet_utxo.is_some() { 1 } else { 0 };
+    let num_outputs = outputs.len() + 2; // + buyer change + matcher fee
+    let mut total_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
+    );
+    if total_kas_in < total_planned_out + total_fee {
+        return Err(BatchError::InsufficientFee {
+            needed: total_planned_out + total_fee,
+            available: total_kas_in,
+        });
+    }
+    let raw_surplus = total_kas_in - total_planned_out - total_fee;
+
+    // matcher_kas excludes kas_remaining (unspent buy KAS, returned to the
+    // buyer as change) from the matcher's take, same split as plan_ioc_match.
+    let matcher_kas = raw_surplus.saturating_sub(kas_remaining);
+    let (capped_matcher_kas, buyer_refund_from_bps) = apply_bps_cap(matcher_kas, total_seller_kas, fee_bps);
+
+    let total_buyer_change = kas_remaining + buyer_refund_from_bps;
+    if total_buyer_change >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: total_buyer_change,
+            script_public_key: buy.counterparty_spk.clone(),
+            spk_version: buy.counterparty_spk_version,
+            purpose: OutputPurpose::BuyerChange,
+        });
+    } else if total_buyer_change > 0 {
+        // Dust: fold into the first BuyerTokens output.
+        if let Some(tok_out) = outputs.iter_mut().find(|o| o.purpose == OutputPurpose::BuyerTokens) {
+            tok_out.value += total_buyer_change;
+        }
+    }
+
+    let (matcher_surplus, dropped_to_fee) =
+        emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
+    total_fee += dropped_to_fee;
+    total_fee += raw_surplus.saturating_sub(matcher_surplus + dropped_to_fee + kas_remaining + buyer_refund_from_bps);
+
+    let sell_indices: Vec<u16> = (0..n as u16).collect();
+
+    Ok(BatchPlan {
+        sells: plan_sells,
+        buys: plan_buys,
+        wallet_input: wallet_utxo,
+        outputs,
+        total_fee,
+        matcher_surplus,
+        token_input_map,
+        buy_seller_map: HashMap::new(),
+        fee_bps,
+        total_seller_kas,
+        ioc_mode: Some(IocSide::Buy),
+        sell_fill_amounts: Vec::new(),
+        buy_partial_fills: HashMap::new(),
+        sell_output_idx: Vec::new(),
+        buy_output_idx: Vec::new(),
+        buy_coi: Vec::new(),
+        bracket_receipt: None,
+        bracket_oco_output: None,
+        buy_sweep_sells: vec![sell_indices],
+        output_auth_input,
+    })
+}
+
 /// IOC (Immediate-Or-Cancel) batch match: one sell sweeps multiple buys.
 ///
 /// Buys are consumed in order (caller should pre-sort by price, best first).
@@ -2455,6 +2672,79 @@ mod tests {
         let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 100_000_000u64));
         let r = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000));
         assert!(r.is_ok(), "N == MAX_N must plan fine: {:?}", r.err());
+    }
+
+    /// HIGH #2: v17 IOC N:M sweep -- honest case. 3 sells cross, buy can only
+    /// afford 2, so IOC stops there (unlike GTC, no min-total-tokens floor
+    /// beyond the buy's own min_fill) and returns change for the unspent KAS.
+    #[test]
+    fn test_v17_ioc_sweep_with_change() {
+        let token = [0x4a; 32];
+        let sell1 = make_sell(0x10, 3_000_000, 1, 1, token);
+        let sell2 = make_sell(0x11, 3_000_000, 1, 1, token);
+        let sell3 = make_sell(0x12, 5_000_000, 1, 1, token); // too expensive to also afford
+        let buy = make_buy_v17(0x20, 7_000_000, 1, 1, token, 2000);
+        let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 5_000_000u64));
+
+        let plan = plan_ioc_match_v17(&[sell1, sell2, sell3], &buy, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("v17 IOC sweep must plan");
+
+        assert_eq!(plan.sells.len(), 2, "only the 2 affordable sells should be filled");
+        let bt: Vec<&PlannedOutput> = plan.outputs.iter()
+            .filter(|o| o.purpose == OutputPurpose::BuyerTokens)
+            .collect();
+        assert_eq!(bt.len(), 2, "one per-sell BuyerTokens output (not merged)");
+        let auths: std::collections::HashSet<u16> = plan.output_auth_input.values().copied().collect();
+        assert_eq!(auths.len(), 2, "each BuyerTokens output bound to a distinct sell input");
+        assert_eq!(plan.buy_sweep_sells, vec![vec![0u16, 1u16]]);
+
+        // Some form of leftover accounting exists (change or matcher surplus).
+        let buyer_change_exists = plan.outputs.iter().any(|o| o.purpose == OutputPurpose::BuyerChange);
+        assert!(buyer_change_exists || plan.matcher_surplus > 0, "leftover KAS must go somewhere");
+    }
+
+    /// A v17 IOC sweep whose total delivered tokens fall below the buy's own
+    /// min_fill must be rejected (the IOC floor, mirroring the contract's
+    /// ioc_flag ? mfill : expected relaxation).
+    #[test]
+    fn test_v17_ioc_sweep_below_min_fill_rejected() {
+        let token = [0x4b; 32];
+        let sell1 = make_sell(0x10, 3_000_000, 1, 1, token);
+        let mut buy = make_buy_v17(0x20, 3_000_000, 1, 1, token, 2000);
+        buy.min_fill = 50_000_000; // far above what a single 3M sell can deliver
+        let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 5_000_000u64));
+
+        let r = plan_ioc_match_v17(&[sell1], &buy, wallet, &matcher_spk(), 0, Some(2000));
+        assert!(matches!(r, Err(BatchError::MinFillViolation { .. })), "below-min_fill IOC sweep must reject, got {:?}", r);
+    }
+
+    /// A non-v17 buy passed to plan_ioc_match_v17 must be rejected explicitly
+    /// (this planner is v17-only; v14/v16 IOC sweeps keep using plan_ioc_match).
+    #[test]
+    fn test_v17_ioc_rejects_non_v17_buy() {
+        let token = [0x4c; 32];
+        let sell1 = make_sell(0x10, 3_000_000, 1, 1, token);
+        let buy = make_buy(0x20, 3_000_000, 1, 1, token); // version 14
+        let r = plan_ioc_match_v17(&[sell1], &buy, None, &matcher_spk(), 0, Some(2000));
+        assert!(matches!(r, Err(BatchError::UnsupportedVersion { .. })), "non-v17 buy must reject, got {:?}", r);
+    }
+
+    /// HIGH DoS #3 (IOC variant): more crossing sells than MAX_N must cap the
+    /// sweep at MAX_N, not attempt to include them all.
+    #[test]
+    fn test_v17_ioc_sweep_capped_at_max_n() {
+        let token = [0x4d; 32];
+        let n_max = kob_core::contract::spot::order::BUY_ORDER_V17_MAX_N;
+        let sells: Vec<BatchOrder> = (0..(n_max as u8 + 2))
+            .map(|i| make_sell(0x50 + i, 5_000_000, 1, 1, token))
+            .collect();
+        // Buy affords far more than n_max sells' worth of KAS.
+        let buy = make_buy_v17(0x20, 100_000_000, 1, 1, token, 2000);
+        let wallet = Some((hex::encode(&[0x99u8; 32]), 0u32, 5_000_000u64));
+
+        let plan = plan_ioc_match_v17(&sells, &buy, wallet, &matcher_spk(), 0, Some(2000))
+            .expect("must plan (capped, not error)");
+        assert_eq!(plan.sells.len(), n_max, "sweep must cap at MAX_N even though more sells crossed and were affordable");
     }
 
     // Test 1: Simple same-pair batch (2 sells + 2 buys of same token)

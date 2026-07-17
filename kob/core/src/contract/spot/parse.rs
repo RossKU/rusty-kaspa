@@ -9,6 +9,12 @@ use crate::contract::spot::order::{
     BUY_ORDER_RS_EXPECTED_LEN, BUY_ORDER_STATE_SIZE,
     SELL_ORDER_RS_EXPECTED_LEN, SELL_ORDER_STATE_SIZE,
 };
+use crate::contract::spot::decay::{
+    DECAY_BUY_RS_EXPECTED_LEN, DECAY_BUY_STATE_SIZE,
+    DECAY_SELL_RS_EXPECTED_LEN, DECAY_SELL_STATE_SIZE,
+};
+use crate::contract::spot::ratchet::{RATCHET_OCO_RS_EXPECTED_LEN, RATCHET_OCO_STATE_SIZE};
+use crate::contract::spot::twap::{TWAP_SELL_RS_EXPECTED_LEN, TWAP_SELL_STATE_SIZE};
 
 /// OpZkPrecompile opcode byte (0xa6).
 pub const OP_ZK_PRECOMPILE: u8 = 0xa6;
@@ -126,8 +132,225 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
             }
             None
         }
+        TWAP_SELL_RS_EXPECTED_LEN => {
+            // twap_sell: `[0x08 twin][0x08 mpw]` + the v18 sell 145B state,
+            // body dispatch signature Op11 OpRoll = 0x5b 0x7a. Book view =
+            // an ordinary sell (the state price IS the executing price);
+            // the rate-limit fields are exposed by
+            // `parse_twap_sell_redeem_script`.
+            parse_twap_sell_redeem_script(rs).map(|p| p.order)
+        }
+        DECAY_SELL_RS_EXPECTED_LEN => {
+            // decay_sell: `[0x08 dslope][0x08 t0][0x08 t_end]` + the v18
+            // sell 145B state, body dispatch signature Op12 OpRoll =
+            // 0x5c 0x7a. Book view carries the START price (pnum at t0);
+            // `effective_price(now)` surfacing is a Stage-B/C concern via
+            // `parse_decay_sell_redeem_script` + `decay_effective_pnum`.
+            parse_decay_sell_redeem_script(rs).map(|p| p.order)
+        }
+        DECAY_BUY_RS_EXPECTED_LEN => {
+            // decay_buy: same three fields + the v18 buy 178B state, body
+            // dispatch signature Op13 OpRoll = 0x5d 0x7a.
+            parse_decay_buy_redeem_script(rs).map(|p| p.order)
+        }
         _ => None,
     }
+}
+
+// ============================================================================
+// Time-contracts family (kob/TIME_CONTRACTS_DESIGN.md) — field structs +
+// dedicated parsers. RS-length dispatch, v18 house model; `version` reports
+// the spot generation (18).
+// ============================================================================
+
+/// Parsed twap_sell: rate-limit fields + the embedded sell order view.
+#[derive(Debug, Clone)]
+pub struct ParsedTwapSell {
+    /// DAA window: consecutive fill-family events on one lineage are >= twin
+    /// real DAA apart (consensus CSV clock).
+    pub twin: u64,
+    /// Max tokens moved per event (FILL: token_in; IOC/PARTIAL: fta).
+    pub mpw: u64,
+    /// The embedded v18-shaped sell order view (state price, seats, expiry).
+    pub order: ParsedOrder,
+}
+
+/// Parsed decay order (sell or buy — see `order.order_type`).
+#[derive(Debug, Clone)]
+pub struct ParsedDecayOrder {
+    /// Schedule slope: pnum_eff = pnum - dslope*(clamp(L) - t0).
+    pub dslope: u64,
+    /// Schedule start (DAA score).
+    pub t0: u64,
+    /// Schedule end (DAA score, < LOCK_TIME_THRESHOLD).
+    pub t_end: u64,
+    /// The embedded v18-shaped order view; `price_num` is the START price
+    /// numerator (raw, non-gcd-normalized).
+    pub order: ParsedOrder,
+}
+
+/// Parsed ratchet_oco: ratchet fields + the embedded OCO view.
+#[derive(Debug, Clone)]
+pub struct ParsedRatchetOco {
+    /// SL numerator increment per ratchet (additive on the same pden_sl).
+    pub rstep: u64,
+    /// Required print premium over the POST-ratchet stop (trailing distance).
+    pub rgap: u64,
+    /// Ratchet rate-limit window (CSV DAA).
+    pub rwin: u64,
+    /// Minimum sibling settle volume (G2).
+    pub mrv: u64,
+    /// The embedded OCO view (CURRENT pnum_sl — deploy value + k*rstep on a
+    /// k-th continuation; raw, non-gcd-normalized pairs).
+    pub oco: ParsedOcoSell,
+}
+
+/// Parse a twap_sell redeemScript (163B state + body).
+pub fn parse_twap_sell_redeem_script(rs: &[u8]) -> Option<ParsedTwapSell> {
+    if rs.len() != TWAP_SELL_RS_EXPECTED_LEN {
+        return None;
+    }
+    // Body dispatch signature: Op11 OpRoll.
+    if rs[TWAP_SELL_STATE_SIZE] != 0x5b || rs[TWAP_SELL_STATE_SIZE + 1] != 0x7a {
+        return None;
+    }
+    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x20 {
+        return None;
+    }
+    let twin = u64::from_le_bytes(rs[1..9].try_into().ok()?);
+    let mpw = u64::from_le_bytes(rs[10..18].try_into().ok()?);
+    if twin < 50 || mpw == 0 {
+        return None;
+    }
+    let mut seat = [0u8; 32];
+    seat.copy_from_slice(&rs[19..51]);
+    let mut o = parse_sell_state_at(rs, 51)?;
+    o.version = crate::contract::spot::SPOT_GENERATION as u8;
+    o.owner_seat_hash = Some(seat);
+    Some(ParsedTwapSell { twin, mpw, order: o })
+}
+
+/// Shared decay-field header parse: `[0x08 dslope][0x08 t0][0x08 t_end]`
+/// `[0x20 seat]` at RS offset 0; returns (dslope, t0, t_end, seat).
+fn parse_decay_header(rs: &[u8]) -> Option<(u64, u64, u64, [u8; 32])> {
+    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x08 || rs[27] != 0x20 {
+        return None;
+    }
+    let dslope = u64::from_le_bytes(rs[1..9].try_into().ok()?);
+    let t0 = u64::from_le_bytes(rs[10..18].try_into().ok()?);
+    let t_end = u64::from_le_bytes(rs[19..27].try_into().ok()?);
+    if dslope == 0 || t0 >= t_end {
+        return None;
+    }
+    let mut seat = [0u8; 32];
+    seat.copy_from_slice(&rs[28..60]);
+    Some((dslope, t0, t_end, seat))
+}
+
+/// Parse a decay_sell redeemScript (172B state + body).
+pub fn parse_decay_sell_redeem_script(rs: &[u8]) -> Option<ParsedDecayOrder> {
+    if rs.len() != DECAY_SELL_RS_EXPECTED_LEN {
+        return None;
+    }
+    // Body dispatch signature: Op12 OpRoll.
+    if rs[DECAY_SELL_STATE_SIZE] != 0x5c || rs[DECAY_SELL_STATE_SIZE + 1] != 0x7a {
+        return None;
+    }
+    let (dslope, t0, t_end, seat) = parse_decay_header(rs)?;
+    let mut o = parse_sell_state_at(rs, 60)?;
+    o.version = crate::contract::spot::SPOT_GENERATION as u8;
+    o.owner_seat_hash = Some(seat);
+    Some(ParsedDecayOrder { dslope, t0, t_end, order: o })
+}
+
+/// Parse a decay_buy redeemScript (205B state + body).
+pub fn parse_decay_buy_redeem_script(rs: &[u8]) -> Option<ParsedDecayOrder> {
+    if rs.len() != DECAY_BUY_RS_EXPECTED_LEN {
+        return None;
+    }
+    // Body dispatch signature: Op13 OpRoll.
+    if rs[DECAY_BUY_STATE_SIZE] != 0x5d || rs[DECAY_BUY_STATE_SIZE + 1] != 0x7a {
+        return None;
+    }
+    let (dslope, t0, t_end, seat) = parse_decay_header(rs)?;
+    let mut o = parse_buy_state_at(rs, 60)?;
+    o.version = crate::contract::spot::SPOT_GENERATION as u8;
+    o.owner_seat_hash = Some(seat);
+    Some(ParsedDecayOrder { dslope, t0, t_end, order: o })
+}
+
+/// Parse a ratchet_oco redeemScript (208B state + body).
+///
+/// State layout: `[0x08 rstep][0x08 rgap][0x08 rwin][0x08 mrv]` at [0..36),
+/// then the v18 OCO 172B layout at offset 36 (`[0x20 otspkh]` + the 139B
+/// core; pnum_sl VALUE at [97..105)).
+pub fn parse_ratchet_oco_redeem_script(rs: &[u8]) -> Option<ParsedRatchetOco> {
+    if rs.len() != RATCHET_OCO_RS_EXPECTED_LEN {
+        return None;
+    }
+    // Body dispatch signature: Op16 OpRoll.
+    if rs[RATCHET_OCO_STATE_SIZE] != 0x60 || rs[RATCHET_OCO_STATE_SIZE + 1] != 0x7a {
+        return None;
+    }
+    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x08 || rs[27] != 0x08 || rs[36] != 0x20 {
+        return None;
+    }
+    let rstep = u64::from_le_bytes(rs[1..9].try_into().ok()?);
+    let rgap = u64::from_le_bytes(rs[10..18].try_into().ok()?);
+    let rwin = u64::from_le_bytes(rs[19..27].try_into().ok()?);
+    let mrv = u64::from_le_bytes(rs[28..36].try_into().ok()?);
+    if rstep == 0 || rwin < 50 || mrv == 0 {
+        return None;
+    }
+    let mut seat = [0u8; 32];
+    seat.copy_from_slice(&rs[37..69]);
+    // v18 OCO core 139B layout at offset 69.
+    let s = &rs[69..69 + OCO_SELL_CORE_STATE_SIZE];
+    if s[0] != 0x08 || s[9] != 0x08 || s[18] != 0x08 { return None; }
+    if s[27] != 0x08 || s[36] != 0x08 || s[45] != 0x08 { return None; }
+    if s[54] != 0x20 || s[87] != 0x20 { return None; }
+    if s[120] != 0x08 { return None; }
+    if s[130] != 0x08 { return None; }
+    let pnum_tp = u64::from_le_bytes(s[1..9].try_into().ok()?);
+    let pden_tp = u64::from_le_bytes(s[10..18].try_into().ok()?);
+    let mfill_tp = u64::from_le_bytes(s[19..27].try_into().ok()?);
+    let pnum_sl = u64::from_le_bytes(s[28..36].try_into().ok()?);
+    let pden_sl = u64::from_le_bytes(s[37..45].try_into().ok()?);
+    let mfill_sl = u64::from_le_bytes(s[46..54].try_into().ok()?);
+    let mut ohash = [0u8; 32];
+    ohash.copy_from_slice(&s[55..87]);
+    let mut sspkh = [0u8; 32];
+    sspkh.copy_from_slice(&s[88..120]);
+    let mmfee = u64::from_le_bytes(s[121..129].try_into().ok()?);
+    let cpend = match s[129] {
+        0x00 => 0,
+        0x51 => 1,
+        _ => return None,
+    };
+    let expiry_daa_raw = u64::from_le_bytes(s[131..139].try_into().ok()?);
+    if pnum_tp == 0 || pden_tp == 0 || mfill_tp == 0 { return None; }
+    if pnum_sl == 0 || pden_sl == 0 || mfill_sl == 0 { return None; }
+    Some(ParsedRatchetOco {
+        rstep,
+        rgap,
+        rwin,
+        mrv,
+        oco: ParsedOcoSell {
+            price_num_tp: pnum_tp,
+            price_den_tp: pden_tp,
+            min_fill_tp: mfill_tp,
+            price_num_sl: pnum_sl,
+            price_den_sl: pden_sl,
+            min_fill_sl: mfill_sl,
+            owner_hash: ohash,
+            spk_hash: sspkh,
+            _max_matcher_fee: mmfee,
+            cpend,
+            expiry_daa: if expiry_daa_raw > 0 { Some(expiry_daa_raw) } else { None },
+            redeem_script: rs.to_vec(),
+            owner_seat_hash: Some(seat),
+        },
+    })
 }
 
 /// Try to parse a v18 OCO sell redeemScript (the core 139B layout preceded

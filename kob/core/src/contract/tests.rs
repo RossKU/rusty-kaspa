@@ -1444,8 +1444,13 @@ mod adversarial_tests {
     }
 
     /// Every dispatch RS length in the crate must be distinct — the RS
-    /// length is the version tag throughout parse/scan/match. Post-E2 set:
-    /// the five v18 spot lengths + the DCA covenant (374B).
+    /// length is the version tag throughout parse/scan/match. Stage-A
+    /// (TIME_CONTRACTS_DESIGN §5) extends the pin over EVERY
+    /// `*_RS_SIZE`/`*_RS_EXPECTED_LEN` const in kob-core: the five v18 spot
+    /// lengths + DCA + the four time contracts + lending/perp/x402.
+    /// Collision policy at freeze: append one OpNop to the YOUNGER body —
+    /// never reshuffle state (not needed: realized lengths are all distinct;
+    /// the flagged decay_sell/ratchet_oco danger zone resolved to 622 vs 733).
     #[test]
     fn rs_lengths_no_collision() {
         use crate::contract::spot::order::{
@@ -1455,21 +1460,49 @@ mod adversarial_tests {
         use crate::contract::spot::oco::OCO_SELL_RS_SIZE;
         use crate::contract::spot::swap::SWAP_RS_SIZE;
         use crate::contract::spot::dca::DCA_V2_RS_SIZE;
+        use crate::contract::spot::decay::{DECAY_BUY_RS_EXPECTED_LEN, DECAY_SELL_RS_EXPECTED_LEN};
+        use crate::contract::spot::ratchet::RATCHET_OCO_RS_EXPECTED_LEN;
+        use crate::contract::spot::twap::TWAP_SELL_RS_EXPECTED_LEN;
+        use crate::contract::lending::{BORROW_REQUEST_RS_SIZE, LOAN_OFFER_RS_SIZE};
+        use crate::contract::perp::PERP_DEPLOY_V1_RS_SIZE;
+        use crate::contract::x402_borrow::X402_BORROW_RS_SIZE;
         let all = [
-            BUY_ORDER_RS_EXPECTED_LEN,
-            SELL_ORDER_RS_EXPECTED_LEN,
-            OCO_SELL_RS_SIZE,
-            SWAP_RS_SIZE,
-            BRACKET_RS_SIZE,
-            DCA_V2_RS_SIZE,
+            ("buy", BUY_ORDER_RS_EXPECTED_LEN),
+            ("sell", SELL_ORDER_RS_EXPECTED_LEN),
+            ("oco", OCO_SELL_RS_SIZE),
+            ("swap", SWAP_RS_SIZE),
+            ("bracket", BRACKET_RS_SIZE),
+            ("dca", DCA_V2_RS_SIZE),
+            ("twap_sell", TWAP_SELL_RS_EXPECTED_LEN),
+            ("decay_sell", DECAY_SELL_RS_EXPECTED_LEN),
+            ("decay_buy", DECAY_BUY_RS_EXPECTED_LEN),
+            ("ratchet_oco", RATCHET_OCO_RS_EXPECTED_LEN),
+            ("loan_offer", LOAN_OFFER_RS_SIZE),
+            ("borrow_request", BORROW_REQUEST_RS_SIZE),
+            ("perp_deploy", PERP_DEPLOY_V1_RS_SIZE),
+            ("x402_borrow", X402_BORROW_RS_SIZE),
         ];
-        for (i, a) in all.iter().enumerate() {
-            for (j, b) in all.iter().enumerate() {
-                if i != j {
-                    assert_ne!(a, b, "two dispatch RS lengths collide: {a}");
-                }
+        for (i, (na, a)) in all.iter().enumerate() {
+            for (nb, b) in all.iter().skip(i + 1) {
+                assert_ne!(a, b, "dispatch RS lengths collide: {na} == {nb} ({a})");
             }
         }
+    }
+
+    /// Time-contracts body lengths are deterministic; pin them like the v18
+    /// bodies so the RS-length version tags can never silently drift.
+    #[test]
+    fn time_contract_body_lengths_pinned() {
+        use crate::contract::spot::decay::{
+            build_decay_buy_body, build_decay_sell_body,
+            DECAY_BUY_BODY_EXPECTED_LEN, DECAY_SELL_BODY_EXPECTED_LEN,
+        };
+        use crate::contract::spot::ratchet::{build_ratchet_oco_body, RATCHET_OCO_BODY_EXPECTED_LEN};
+        use crate::contract::spot::twap::{build_twap_sell_body, TWAP_SELL_BODY_EXPECTED_LEN};
+        assert_eq!(build_twap_sell_body().len(), TWAP_SELL_BODY_EXPECTED_LEN, "twap_sell body");
+        assert_eq!(build_decay_sell_body().len(), DECAY_SELL_BODY_EXPECTED_LEN, "decay_sell body");
+        assert_eq!(build_decay_buy_body().len(), DECAY_BUY_BODY_EXPECTED_LEN, "decay_buy body");
+        assert_eq!(build_ratchet_oco_body().len(), RATCHET_OCO_BODY_EXPECTED_LEN, "ratchet_oco body");
     }
 
     /// v18 bodies are generated programmatically; pin their hashes like v17.

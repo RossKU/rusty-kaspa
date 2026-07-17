@@ -16,6 +16,13 @@ pub mod dca;
 pub mod swap;
 pub mod token_pair;
 
+// Time-contracts family (kob/TIME_CONTRACTS_DESIGN.md): ADDITIVE sibling
+// contracts beside the frozen v18 generation — own builders, own RS-length
+// parse arms, no generation bump, v18 bytecode untouched (zero-diff pin).
+pub mod decay;
+pub mod ratchet;
+pub mod twap;
+
 /// EXPERIMENTAL — batch-limit measurement variants (kob/BATCH_LIMITS.md).
 /// Not shipping bytecode: nothing in the deploy/parse/settle paths uses this
 /// module. Deliberately NOT re-exported via `pub use` below.
@@ -29,3 +36,6 @@ pub use bracket::*;
 pub use dca::*;
 pub use swap::*;
 pub use token_pair::*;
+pub use decay::*;
+pub use ratchet::*;
+pub use twap::*;

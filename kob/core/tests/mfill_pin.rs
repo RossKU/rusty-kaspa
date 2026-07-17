@@ -1,6 +1,6 @@
 //! Pin: the v18 buy `min_fill` is a floor on TOKENS, not KAS.
 //!
-//! Section E of `emit_fill_body_v18` verifies `expected >= mfill` where
+//! Section E of `emit_fill_body` verifies `expected >= mfill` where
 //! `expected = kas_in / pden * pnum` (tokens at the buy limit). A GTC buy
 //! whose min_fill exceeds its own full expected-token count can never fill
 //! (first hit live on testnet-10, 2026-07-16: a 30M-KAS buy at 3/4 with
@@ -21,11 +21,11 @@ use kaspa_txscript::engine_context::EngineCtx;
 use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_core::contract::spot::oco::{
-    build_oco_sell_v18_redeem_script, build_oco_sell_v18_sl_fill_sigscript,
+    build_oco_sell_redeem_script, build_oco_sell_sl_fill_sigscript,
 };
 use kob_core::contract::spot::order::{
-    build_buy_v18_fill_sigscript, build_buy_v18_redeem_script, build_sell_v18_fill_sigscript,
-    build_sell_v18_redeem_script,
+    build_buy_fill_sigscript, build_buy_redeem_script, build_sell_fill_sigscript,
+    build_sell_redeem_script,
 };
 use kob_core::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 
@@ -99,14 +99,14 @@ fn run_case(buy_pn: u64, buy_pd: u64, buy_mfill: u64, buy_bps: u64, expect_buy_o
     let wallet_spk = p2pk_spk(&pubkey);
     let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
 
-    let oco_rs = build_oco_sell_v18_redeem_script(
+    let oco_rs = build_oco_sell_redeem_script(
         2, 1, 10_000_000, 1, 2, 10_000_000, &owner_hash, &spk_hash,
         &spk_hash, 30, 0, 0,
     )
     .unwrap();
     let plain_rs =
-        build_sell_v18_redeem_script(1, 2, 10_000_000, &owner_hash, &spk_hash, &spk_hash, 30, 0, 0).unwrap();
-    let buy_rs = build_buy_v18_redeem_script(
+        build_sell_redeem_script(1, 2, 10_000_000, &owner_hash, &spk_hash, &spk_hash, 30, 0, 0).unwrap();
+    let buy_rs = build_buy_redeem_script(
         &arr32(TOKEN_HEX),
         buy_pn,
         buy_pd,
@@ -120,9 +120,9 @@ fn run_case(buy_pn: u64, buy_pd: u64, buy_mfill: u64, buy_bps: u64, expect_buy_o
     )
     .unwrap();
 
-    let oco_ss = build_oco_sell_v18_sl_fill_sigscript(0, 1, 2, &oco_rs);
-    let plain_ss = build_sell_v18_fill_sigscript(0, 1, 2, &plain_rs);
-    let buy_ss = build_buy_v18_fill_sigscript(&[0, 1], false, &buy_rs);
+    let oco_ss = build_oco_sell_sl_fill_sigscript(0, 1, 2, &oco_rs);
+    let plain_ss = build_sell_fill_sigscript(0, 1, 2, &plain_rs);
+    let buy_ss = build_buy_fill_sigscript(&[0, 1], false, &buy_rs);
 
     let inputs = vec![
         TransactionInput::new(op(0x10, 0), oco_ss, 50, 0),

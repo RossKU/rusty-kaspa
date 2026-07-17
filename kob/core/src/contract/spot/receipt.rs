@@ -28,26 +28,6 @@ pub const RECEIPT_BODY: &[u8] = &[
     0x51,                         // Op1
 ];
 
-/// Build buy_order cancel sigscript:
-/// [Op0] [pushData(sig+sighash_type 65B)] [pushData(pubkey 32B)] [pushData(RS)]
-pub fn build_buy_cancel_sigscript(
-    signature: &[u8; 64],
-    pubkey: &[u8; 32],
-    redeem_script: &[u8],
-) -> Vec<u8> {
-    // sig + sighash type byte (0x01 = SIGHASH_ALL)
-    let mut sig_with_type = Vec::with_capacity(65);
-    sig_with_type.extend_from_slice(signature);
-    sig_with_type.push(0x01);
-
-    let mut ss = Vec::with_capacity(102 + redeem_script.len() + 3);
-    ss.push(0x00); // Op0 (selector = cancel)
-    ss.extend_from_slice(&push_data(&sig_with_type));
-    ss.extend_from_slice(&push_data(pubkey));
-    ss.extend_from_slice(&push_data(redeem_script));
-    ss
-}
-
 /// Build sell_order cancel sigscript:
 /// [pushData(sig+sighash_type 65B)] [pushData(pubkey 32B)] [Op0] [pushData(RS)]
 ///

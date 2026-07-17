@@ -2,7 +2,7 @@ use crate::primitives::{push_data, u64_le};
 use crate::contract::helpers::push_index;
 
 /// Swap v1 state size (174B); the v18 state appends `[0x08][mmfee_bps 8B]`.
-pub const SWAP_STATE_SIZE: usize = 174;
+pub const SWAP_CORE_STATE_SIZE: usize = 174;
 
 /// Build swap_order cancel sigscript.
 ///
@@ -57,13 +57,13 @@ pub fn build_swap_cancel_sigscript(
 //   - All-or-nothing legs only (no ring partial — documented limitation).
 
 /// Swap v18 state size: 174B (v1 fields) + 9B (`[0x08][mmfee_bps 8B]`).
-pub const SWAP_V18_STATE_SIZE: usize = SWAP_STATE_SIZE + 9;
+pub const SWAP_STATE_SIZE: usize = SWAP_CORE_STATE_SIZE + 9;
 
 /// Expected v18 swap body length.
-pub const SWAP_V18_BODY_EXPECTED_LEN: usize = 77;
+pub const SWAP_BODY_EXPECTED_LEN: usize = 77;
 
 /// Swap v18 redeemScript size (183B state + v18 body).
-pub const SWAP_V18_RS_SIZE: usize = SWAP_V18_STATE_SIZE + SWAP_V18_BODY_EXPECTED_LEN;
+pub const SWAP_RS_SIZE: usize = SWAP_STATE_SIZE + SWAP_BODY_EXPECTED_LEN;
 
 /// Build the v18 swap body.
 ///
@@ -74,8 +74,8 @@ pub const SWAP_V18_RS_SIZE: usize = SWAP_V18_STATE_SIZE + SWAP_V18_BODY_EXPECTED
 ///
 /// Fill sigscript:   `[giver_idx][toi][Op1][pushData(RS)]`
 /// Cancel sigscript: `[pushData(sig+type 65B)][pushData(pk 32B)][Op0][pushData(RS)]`
-pub fn build_swap_v18_body() -> Vec<u8> {
-    use crate::contract::spot::order::{e_num, e_pick, e_roll, v17op::*};
+pub fn build_swap_body() -> Vec<u8> {
+    use crate::contract::spot::order::{e_num, e_pick, e_roll, ops::*};
     let mut b: Vec<u8> = Vec::with_capacity(128);
 
     e_roll(&mut b, 7); // selector
@@ -160,7 +160,7 @@ pub fn build_swap_v18_body() -> Vec<u8> {
 
 /// Parsed v18 swap order state fields.
 #[derive(Debug, Clone)]
-pub struct ParsedSwapOrderV18 {
+pub struct ParsedSwapOrder {
     /// Source token covenant ID (what the user is selling).
     pub source_token_cov_id: [u8; 32],
     /// Target token covenant ID (what the user wants to receive).
@@ -183,8 +183,8 @@ pub struct ParsedSwapOrderV18 {
 ///
 /// State layout: v1's 174B prefix (same offsets), then
 ///   `[0x08][mmfee_bps 8B]` = bytes 174..183.
-pub fn parse_swap_order_v18_rs(rs: &[u8]) -> Option<ParsedSwapOrderV18> {
-    if rs.len() != SWAP_V18_RS_SIZE {
+pub fn parse_swap_order_rs(rs: &[u8]) -> Option<ParsedSwapOrder> {
+    if rs.len() != SWAP_RS_SIZE {
         return None;
     }
     if rs[0] != 0x20 || rs[33] != 0x20 || rs[66] != 0x08
@@ -194,7 +194,7 @@ pub fn parse_swap_order_v18_rs(rs: &[u8]) -> Option<ParsedSwapOrderV18> {
         return None;
     }
     // Body signature: Op7 OpRoll (0x57 0x7a) — distinct from v1 (0x56 0x7a).
-    if rs[SWAP_V18_STATE_SIZE] != 0x57 || rs[SWAP_V18_STATE_SIZE + 1] != 0x7a {
+    if rs[SWAP_STATE_SIZE] != 0x57 || rs[SWAP_STATE_SIZE + 1] != 0x7a {
         return None;
     }
 
@@ -215,7 +215,7 @@ pub fn parse_swap_order_v18_rs(rs: &[u8]) -> Option<ParsedSwapOrderV18> {
         return None;
     }
 
-    Some(ParsedSwapOrderV18 {
+    Some(ParsedSwapOrder {
         source_token_cov_id: source_tcid,
         target_token_cov_id: target_tcid,
         min_target_amount: min_ta,
@@ -228,7 +228,7 @@ pub fn parse_swap_order_v18_rs(rs: &[u8]) -> Option<ParsedSwapOrderV18> {
 }
 
 /// Build the v18 swap_order redeemScript (183B state + v18 body).
-pub fn build_swap_v18_redeem_script(
+pub fn build_swap_redeem_script(
     source_token_cov_id: &[u8; 32],
     target_token_cov_id: &[u8; 32],
     min_target_amount: u64,
@@ -245,8 +245,8 @@ pub fn build_swap_v18_redeem_script(
     if max_matcher_fee_bps > 10000 {
         return Err(crate::KobError::Contract("max_matcher_fee_bps must be <= 10000".into()));
     }
-    let body = build_swap_v18_body();
-    let mut rs = Vec::with_capacity(SWAP_V18_STATE_SIZE + body.len());
+    let body = build_swap_body();
+    let mut rs = Vec::with_capacity(SWAP_STATE_SIZE + body.len());
     rs.push(0x20);
     rs.extend_from_slice(source_token_cov_id);
     rs.push(0x20);
@@ -262,7 +262,7 @@ pub fn build_swap_v18_redeem_script(
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(max_matcher_fee_bps));
     rs.extend_from_slice(&body);
-    debug_assert_eq!(rs.len(), SWAP_V18_RS_SIZE);
+    debug_assert_eq!(rs.len(), SWAP_RS_SIZE);
     Ok(rs)
 }
 
@@ -274,7 +274,7 @@ pub fn build_swap_v18_redeem_script(
 ///   swap's target tokens (its covenant id must equal `target_tcid`).
 /// * `target_output_idx` — output index where the owner receives target
 ///   tokens; must equal the giver's slot-0 authorized output.
-pub fn build_swap_v18_fill_sigscript(
+pub fn build_swap_fill_sigscript(
     giver_input_idx: u16,
     target_output_idx: u16,
     redeem_script: &[u8],
@@ -285,15 +285,4 @@ pub fn build_swap_v18_fill_sigscript(
     ss.push(0x51); // Op1 (selector = fill)
     ss.extend_from_slice(&push_data(redeem_script));
     ss
-}
-
-/// Build v18 swap cancel sigscript (same shape as v1, provided for symmetry).
-///
-/// Layout: `[pushData(sig+type 65B)][pushData(pk 32B)][Op0][pushData(RS)]`
-pub fn build_swap_v18_cancel_sigscript(
-    signature: &[u8; 64],
-    pubkey: &[u8; 32],
-    redeem_script: &[u8],
-) -> Vec<u8> {
-    build_swap_cancel_sigscript(signature, pubkey, redeem_script)
 }

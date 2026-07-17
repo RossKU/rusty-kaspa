@@ -223,7 +223,7 @@ pub async fn run(
         "buy" => {
             let tcid = parse_old_token(old_token)?;
             if old_version == 18 {
-                contract::spot::order::build_buy_v18_redeem_script(
+                contract::spot::order::build_buy_redeem_script(
                     &tcid, old_price_num, old_price_den, old_min_fill,
                     &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
             } else {
@@ -231,7 +231,7 @@ pub async fn run(
             }
         }
         "sell" if old_version == 18 => {
-            contract::spot::order::build_sell_v18_redeem_script(
+            contract::spot::order::build_sell_redeem_script(
                 old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
         }
         "sell" => {
@@ -351,7 +351,7 @@ pub async fn run(
     let sighash_0 = compute_sighash(&cancel_tx, 0)?;
     let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
     let cancel_sigscript = match old_side {
-        "buy" if old_version == 18 => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
+        "buy" if old_version == 18 => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
         // v18 sell cancel keeps the [sig][pk][Op0][RS] shape.
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
         _ => unreachable!(),
@@ -374,7 +374,7 @@ pub async fn run(
         let sighash_0 = compute_sighash(&cancel_tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match old_side {
-            "buy" if old_version == 18 => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
+            "buy" if old_version == 18 => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
             _ => unreachable!(),
         };
@@ -461,10 +461,10 @@ pub async fn run(
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
     let new_redeem_script = match new_params.side.as_str() {
-        "buy" if new_params.version == 18 => contract::spot::order::build_buy_v18_redeem_script(
+        "buy" if new_params.version == 18 => contract::spot::order::build_buy_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
             new_params.min_fill, &owner_hash, &new_spk_hash, &compute_p2pk_spk_hash(&pubkey), new_max_matcher_fee, 0, new_expiry,)?,
-        "sell" if new_params.version == 18 => contract::spot::order::build_sell_v18_redeem_script(
+        "sell" if new_params.version == 18 => contract::spot::order::build_sell_redeem_script(
             new_params.price_num, new_params.price_den, new_params.min_fill,
             &owner_hash, &new_spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), new_max_matcher_fee, 0, new_expiry,)?,
         "buy" | "sell" => anyhow::bail!(

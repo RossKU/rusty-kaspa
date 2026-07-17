@@ -15,10 +15,10 @@ use crate::contract::helpers::{gcd, push_index};
 /// script-size/op-count limits (1e6) are nowhere near binding. A crossing
 /// book with more than MAX_N same-token sells against one buy settles
 /// MAX_N-at-a-time across sequential txs.
-pub const BUY_ORDER_V18_MAX_N: usize = 8;
+pub const BUY_ORDER_MAX_N: usize = 8;
 
 // Opcode bytes (named for readability of the programmatic builders).
-pub(crate) mod v17op {
+pub(crate) mod ops {
     pub const OP0: u8 = 0x00;
     pub const OP1: u8 = 0x51;
     pub const DUP: u8 = 0x76;
@@ -66,12 +66,12 @@ pub(crate) mod v17op {
 // Emit `OpPick(depth)`.
 pub(crate) fn e_pick(b: &mut Vec<u8>, depth: usize) {
     push_index(b, depth as u16);
-    b.push(v17op::PICK);
+    b.push(ops::PICK);
 }
 // Emit `OpRoll(depth)`.
 pub(crate) fn e_roll(b: &mut Vec<u8>, depth: usize) {
     push_index(b, depth as u16);
-    b.push(v17op::ROLL);
+    b.push(ops::ROLL);
 }
 // Emit a numeric literal push.
 pub(crate) fn e_num(b: &mut Vec<u8>, n: u16) {
@@ -109,7 +109,7 @@ pub(crate) fn e_num(b: &mut Vec<u8>, n: u16) {
 // preserves the invariant the spec actually needs: the [3..11)/[12..20)
 // prefix offsets never move across branches.
 
-/// Build the v18 buy body (deterministic given `BUY_ORDER_V18_MAX_N`).
+/// Build the v18 buy body (deterministic given `BUY_ORDER_MAX_N`).
 ///
 /// State (178B): the v17 145B layout preceded by the owner KAS seat
 /// (`okspkh` = blake2b of the owner's raw P2PK SPK, the EXPIRE refund
@@ -121,9 +121,9 @@ pub(crate) fn e_num(b: &mut Vec<u8>, n: u16) {
 ///
 /// Selector dispatch: 0=CANCEL, 1=FILL, 2=PARTIAL-FILL, 3=CANCEL-MARK,
 /// 4=EXPIRE, 5=IOC.
-pub fn build_buy_v18_body() -> Vec<u8> {
-    use v17op::*;
-    const MAX_N: usize = BUY_ORDER_V18_MAX_N;
+pub fn build_buy_body() -> Vec<u8> {
+    use ops::*;
+    const MAX_N: usize = BUY_ORDER_MAX_N;
     let mut b: Vec<u8> = Vec::with_capacity(2048);
 
     // ===== DISPATCH: bring selector (depth 10) to top, branch on its value =====
@@ -166,7 +166,7 @@ pub fn build_buy_v18_body() -> Vec<u8> {
         b.push(IF); // selector == 0 -> CANCEL
         {
             b.push(DROP);
-            emit_cancel_body_v18(&mut b);
+            emit_cancel_body(&mut b);
         }
         b.push(ELSE);
         {
@@ -176,7 +176,7 @@ pub fn build_buy_v18_body() -> Vec<u8> {
             b.push(IF); // selector == 3 -> CANCEL-MARK
             {
                 b.push(DROP);
-                emit_cancel_body_v18(&mut b);
+                emit_cancel_body(&mut b);
             }
             b.push(ELSE);
             {
@@ -186,12 +186,12 @@ pub fn build_buy_v18_body() -> Vec<u8> {
                 b.push(IF); // selector == 2 -> PARTIAL-FILL (new in v18)
                 {
                     b.push(DROP);
-                    emit_partial_body_v18(&mut b, MAX_N);
+                    emit_partial_body(&mut b, MAX_N);
                 }
                 b.push(ELSE);
                 {
                     // selector is 1 (fill) or 5 (IOC fill); selector on top.
-                    emit_fill_body_v18(&mut b, MAX_N);
+                    emit_fill_body(&mut b, MAX_N);
                 }
                 b.push(ENDIF);
             }
@@ -209,8 +209,8 @@ pub fn build_buy_v18_body() -> Vec<u8> {
 /// Entry (selector dropped): expiry(0), cpend(1), mmfee(2), bspkh(3),
 ///   ohash(4), mfill(5), pden(6), pnum(7), tcid(8), okspkh(9), sig(10),
 ///   pk(11)
-fn emit_cancel_body_v18(b: &mut Vec<u8>) {
-    use v17op::*;
+fn emit_cancel_body(b: &mut Vec<u8>) {
+    use ops::*;
     e_pick(b, 11);
     b.push(BLAKE2B); // blake2b(pk)
     e_pick(b, 5); // ohash (depth 4 + 1)
@@ -234,8 +234,8 @@ fn emit_cancel_body_v18(b: &mut Vec<u8>) {
 /// Entry (selector on top): selector(0), expiry(1), cpend(2), mmfee_bps(3),
 ///   bspkh(4), ohash(5), mfill(6), pden(7), pnum(8), tcid(9), okspkh(10),
 ///   N(11), tii_MAX_N(12), tii_k(12 + MAX_N - k), tii_1(11 + MAX_N)
-fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
-    use v17op::*;
+fn emit_fill_body(b: &mut Vec<u8>, max_n: usize) {
+    use ops::*;
 
     // A) ioc_flag = (selector == 5), replacing selector at depth 0.
     e_num(b, 5);
@@ -439,8 +439,8 @@ fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
 /// Entry (selector dropped): expiry(0), cpend(1), mmfee(2), bspkh(3),
 ///   ohash(4), mfill(5), pden(6), pnum(7), tcid(8), okspkh(9), ri(10),
 ///   N(11), tii_MAX_N(12), tii_k(12 + MAX_N - k), tii_1(11 + MAX_N)
-fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
-    use v17op::*;
+fn emit_partial_body(b: &mut Vec<u8>, max_n: usize) {
+    use ops::*;
 
     // P1) F5: cpend == 0.
     e_pick(b, 1);
@@ -651,15 +651,15 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     }
 }
 
-/// Expected v18 buy body length (deterministic for `BUY_ORDER_V18_MAX_N`=8).
-pub const BUY_ORDER_V18_BODY_EXPECTED_LEN: usize = 1542;
+/// Expected v18 buy body length (deterministic for `BUY_ORDER_MAX_N`=8).
+pub const BUY_ORDER_BODY_EXPECTED_LEN: usize = 1542;
 
 /// v18 buy state size: the v17 145B layout preceded by `[0x20][okspkh 32B]`.
-pub const BUY_ORDER_V18_STATE_SIZE: usize = 178;
+pub const BUY_ORDER_STATE_SIZE: usize = 178;
 
 /// Expected v18 buy redeemScript length (178B state + body).
-pub const BUY_ORDER_V18_RS_EXPECTED_LEN: usize =
-    BUY_ORDER_V18_STATE_SIZE + BUY_ORDER_V18_BODY_EXPECTED_LEN;
+pub const BUY_ORDER_RS_EXPECTED_LEN: usize =
+    BUY_ORDER_STATE_SIZE + BUY_ORDER_BODY_EXPECTED_LEN;
 
 /// Build the v18 buy_order redeemScript (178B state + v18 body).
 ///
@@ -670,7 +670,7 @@ pub const BUY_ORDER_V18_RS_EXPECTED_LEN: usize =
 ///   `[0x20][tcid][0x08][pnum][0x08][pden][0x08][mfill][0x20][ohash]`
 ///   `[0x20][bspkh][0x08][mmfee_bps][cpend][0x08][expiry]`.
 /// `max_matcher_fee_bps` is BPS.
-pub fn build_buy_v18_redeem_script(
+pub fn build_buy_redeem_script(
     token_covenant_id: &[u8; 32],
     price_num: u64,
     price_den: u64,
@@ -700,8 +700,8 @@ pub fn build_buy_v18_redeem_script(
     let g = gcd(price_num, price_den);
     let price_num = if g > 0 { price_num / g } else { price_num };
     let price_den = if g > 0 { price_den / g } else { price_den };
-    let body = build_buy_v18_body();
-    let mut rs = Vec::with_capacity(BUY_ORDER_V18_STATE_SIZE + body.len());
+    let body = build_buy_body();
+    let mut rs = Vec::with_capacity(BUY_ORDER_STATE_SIZE + body.len());
     rs.push(0x20);
     rs.extend_from_slice(owner_kas_spk_hash);
     rs.push(0x20);
@@ -726,7 +726,7 @@ pub fn build_buy_v18_redeem_script(
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(expiry_daa));
     rs.extend_from_slice(&body);
-    debug_assert_eq!(rs.len(), BUY_ORDER_V18_RS_EXPECTED_LEN);
+    debug_assert_eq!(rs.len(), BUY_ORDER_RS_EXPECTED_LEN);
     Ok(rs)
 }
 
@@ -734,19 +734,19 @@ pub fn build_buy_v18_redeem_script(
 ///
 /// Layout: `[tii_1]...[tii_MAX_N][N][selector][pushData(RS)]` — always MAX_N
 /// tii pushes (unused slots padded with 0, never read since guarded by k<=N).
-pub fn build_buy_v18_fill_sigscript(
+pub fn build_buy_fill_sigscript(
     sell_input_indices: &[u16],
     ioc: bool,
     redeem_script: &[u8],
 ) -> Vec<u8> {
     assert!(!sell_input_indices.is_empty(), "at least one sell required");
     assert!(
-        sell_input_indices.len() <= BUY_ORDER_V18_MAX_N,
+        sell_input_indices.len() <= BUY_ORDER_MAX_N,
         "at most MAX_N sells per sweep"
     );
     let n = sell_input_indices.len();
-    let mut ss = Vec::with_capacity(BUY_ORDER_V18_MAX_N + 4 + redeem_script.len() + 3);
-    for i in 0..BUY_ORDER_V18_MAX_N {
+    let mut ss = Vec::with_capacity(BUY_ORDER_MAX_N + 4 + redeem_script.len() + 3);
+    for i in 0..BUY_ORDER_MAX_N {
         let v = if i < n { sell_input_indices[i] } else { 0 };
         push_index(&mut ss, v);
     }
@@ -760,19 +760,19 @@ pub fn build_buy_v18_fill_sigscript(
 ///
 /// Layout: `[tii_1]...[tii_MAX_N][N][ri][Op2][pushData(RS)]` where `ri` is the
 /// residual output index (self-SPK continuation carrying the unspent KAS).
-pub fn build_buy_v18_partial_fill_sigscript(
+pub fn build_buy_partial_fill_sigscript(
     sell_input_indices: &[u16],
     residual_output_idx: u16,
     redeem_script: &[u8],
 ) -> Vec<u8> {
     assert!(!sell_input_indices.is_empty(), "at least one sell required");
     assert!(
-        sell_input_indices.len() <= BUY_ORDER_V18_MAX_N,
+        sell_input_indices.len() <= BUY_ORDER_MAX_N,
         "at most MAX_N sells per sweep"
     );
     let n = sell_input_indices.len();
-    let mut ss = Vec::with_capacity(BUY_ORDER_V18_MAX_N + 6 + redeem_script.len() + 3);
-    for i in 0..BUY_ORDER_V18_MAX_N {
+    let mut ss = Vec::with_capacity(BUY_ORDER_MAX_N + 6 + redeem_script.len() + 3);
+    for i in 0..BUY_ORDER_MAX_N {
         let v = if i < n { sell_input_indices[i] } else { 0 };
         push_index(&mut ss, v);
     }
@@ -784,7 +784,7 @@ pub fn build_buy_v18_partial_fill_sigscript(
 }
 
 /// Build a v18 buy expire sigscript: `[Op4][pushData(RS)]`.
-pub fn build_buy_v18_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
+pub fn build_buy_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
     let mut ss = Vec::with_capacity(1 + redeem_script.len() + 3);
     ss.push(0x54); // Op4
     ss.extend_from_slice(&push_data(redeem_script));
@@ -793,7 +793,7 @@ pub fn build_buy_v18_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
 
 /// Build a v18 buy cancel/cancel-mark sigscript: `[pk][sig][selector][RS]`.
 /// selector = Op0 (cancel) or Op3 (cancel-mark). Same layout as v17.
-pub fn build_buy_v18_cancel_sigscript(
+pub fn build_buy_cancel_sigscript(
     pubkey: &[u8; 32],
     signature: &[u8; 64],
     mark: bool,
@@ -834,8 +834,8 @@ pub fn build_buy_v18_cancel_sigscript(
 ///     of the v14 raw-P2PK `sspkh` refund that stripped the binding.
 ///   - mmfee is BPS uniformly (the v14 absolute-sompi semantics die with v14);
 ///     the sell body itself never reads mmfee — the cap lives on the buy side.
-pub fn build_sell_v18_body() -> Vec<u8> {
-    use v17op::*;
+pub fn build_sell_body() -> Vec<u8> {
+    use ops::*;
     let mut b: Vec<u8> = Vec::with_capacity(512);
 
     // ===== DISPATCH: selector (depth 9) to top =====
@@ -889,11 +889,11 @@ pub fn build_sell_v18_body() -> Vec<u8> {
             b.push(EQUAL);
             b.push(IF); // selector == 1 -> FILL
             {
-                emit_sell_v18_fill(&mut b);
+                emit_sell_fill(&mut b);
             }
             b.push(ELSE); // selector == 0 -> CANCEL
             {
-                emit_sell_v18_cancel(&mut b, false);
+                emit_sell_cancel(&mut b, false);
             }
             b.push(ENDIF);
         }
@@ -905,7 +905,7 @@ pub fn build_sell_v18_body() -> Vec<u8> {
             b.push(IF); // selector == 5 -> IOC FILL
             {
                 b.push(DROP);
-                emit_sell_v18_ioc(&mut b);
+                emit_sell_ioc(&mut b);
             }
             b.push(ELSE);
             {
@@ -913,11 +913,11 @@ pub fn build_sell_v18_body() -> Vec<u8> {
                 b.push(EQUAL);
                 b.push(IF); // selector == 2 -> PARTIAL FILL
                 {
-                    emit_sell_v18_partial(&mut b);
+                    emit_sell_partial(&mut b);
                 }
                 b.push(ELSE); // selector == 3 -> CANCEL-MARK
                 {
-                    emit_sell_v18_cancel(&mut b, true);
+                    emit_sell_cancel(&mut b, true);
                 }
                 b.push(ENDIF);
             }
@@ -936,8 +936,8 @@ pub fn build_sell_v18_body() -> Vec<u8> {
 /// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
 ///   ohash(4), mfill(5), pden(6), pnum(7), otspkh(8), pden_att(9),
 ///   pnum_att(10), koi(11)
-fn emit_sell_v18_fill(b: &mut Vec<u8>) {
-    use v17op::*;
+fn emit_sell_fill(b: &mut Vec<u8>) {
+    use ops::*;
     // time gate
     b.push(DUP);
     b.push(OP0);
@@ -1018,8 +1018,8 @@ fn emit_sell_v18_fill(b: &mut Vec<u8>) {
 /// Entry (stale selector dropped): expiry(0), cpend(1), mmfee(2), sspkh(3),
 ///   ohash(4), mfill(5), pden(6), pnum(7), otspkh(8), fta(9), pden_att(10),
 ///   pnum_att(11), koi(12)
-fn emit_sell_v18_ioc(b: &mut Vec<u8>) {
-    use v17op::*;
+fn emit_sell_ioc(b: &mut Vec<u8>) {
+    use ops::*;
     b.push(DUP);
     b.push(OP0);
     b.push(NUMEQUAL);
@@ -1100,8 +1100,8 @@ fn emit_sell_v18_ioc(b: &mut Vec<u8>) {
 /// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
 ///   ohash(4), mfill(5), pden(6), pnum(7), otspkh(8), ri(9), fta(10),
 ///   pden_att(11), pnum_att(12), koi(13)
-fn emit_sell_v18_partial(b: &mut Vec<u8>) {
-    use v17op::*;
+fn emit_sell_partial(b: &mut Vec<u8>) {
+    use ops::*;
     b.push(DUP);
     b.push(OP0);
     b.push(NUMEQUAL);
@@ -1215,8 +1215,8 @@ fn emit_sell_v18_partial(b: &mut Vec<u8>) {
 
 /// v18 sell CANCEL (selector 0) / CANCEL-MARK (selector 3) — owner signature.
 /// Sigscript: `[sig][pk][Op0 or Op3][pushData(RS)]` (same shapes as v14).
-fn emit_sell_v18_cancel(b: &mut Vec<u8>, mark: bool) {
-    use v17op::*;
+fn emit_sell_cancel(b: &mut Vec<u8>, mark: bool) {
+    use ops::*;
     if mark {
         b.push(DROP); // expiry
         b.push(OP0);
@@ -1244,14 +1244,14 @@ fn emit_sell_v18_cancel(b: &mut Vec<u8>, mark: bool) {
 }
 
 /// Expected v18 sell body length.
-pub const SELL_ORDER_V18_BODY_EXPECTED_LEN: usize = 370;
+pub const SELL_ORDER_BODY_EXPECTED_LEN: usize = 370;
 
 /// v18 sell state size: the v14 112B layout preceded by `[0x20][otspkh 32B]`.
-pub const SELL_ORDER_V18_STATE_SIZE: usize = 145;
+pub const SELL_ORDER_STATE_SIZE: usize = 145;
 
 /// Expected v18 sell redeemScript length (145B state + body).
-pub const SELL_ORDER_V18_RS_EXPECTED_LEN: usize =
-    SELL_ORDER_V18_STATE_SIZE + SELL_ORDER_V18_BODY_EXPECTED_LEN;
+pub const SELL_ORDER_RS_EXPECTED_LEN: usize =
+    SELL_ORDER_STATE_SIZE + SELL_ORDER_BODY_EXPECTED_LEN;
 
 /// Build the v18 sell_order redeemScript (145B state + v18 body).
 ///
@@ -1260,7 +1260,7 @@ pub const SELL_ORDER_V18_RS_EXPECTED_LEN: usize =
 ///   token_unit P2SH SPK (`compute_token_unit_spk_hash`); the EXPIRE branch
 ///   refunds the token escrow here as a covenant-bound token_unit — then
 ///   the v14 112B layout unchanged. `max_matcher_fee_bps` is BPS.
-pub fn build_sell_v18_redeem_script(
+pub fn build_sell_redeem_script(
     price_num: u64,
     price_den: u64,
     min_fill: u64,
@@ -1289,8 +1289,8 @@ pub fn build_sell_v18_redeem_script(
     let g = gcd(price_num, price_den);
     let price_num = if g > 0 { price_num / g } else { price_num };
     let price_den = if g > 0 { price_den / g } else { price_den };
-    let body = build_sell_v18_body();
-    let mut rs = Vec::with_capacity(SELL_ORDER_V18_STATE_SIZE + body.len());
+    let body = build_sell_body();
+    let mut rs = Vec::with_capacity(SELL_ORDER_STATE_SIZE + body.len());
     rs.push(0x20);
     rs.extend_from_slice(owner_token_spk_hash);
     rs.push(0x08);
@@ -1313,7 +1313,7 @@ pub fn build_sell_v18_redeem_script(
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(expiry_daa));
     rs.extend_from_slice(&body);
-    debug_assert_eq!(rs.len(), SELL_ORDER_V18_RS_EXPECTED_LEN);
+    debug_assert_eq!(rs.len(), SELL_ORDER_RS_EXPECTED_LEN);
     Ok(rs)
 }
 
@@ -1321,7 +1321,7 @@ pub fn build_sell_v18_redeem_script(
 /// `[0x01, koi][0x08, pnum 8LE][0x08, pden 8LE]` (pnum at [3..11), pden at
 /// [12..20)). Prices are gcd-normalized so the attested bytes always equal
 /// the state bytes the RS builder wrote.
-fn push_v18_attested_prefix(ss: &mut Vec<u8>, kas_output_idx: u16, price_num: u64, price_den: u64) {
+fn push_attested_prefix(ss: &mut Vec<u8>, kas_output_idx: u16, price_num: u64, price_den: u64) {
     assert!(kas_output_idx <= 255, "koi must fit in 1 byte for the canonical convention");
     let g = gcd(price_num, price_den);
     let pnum = if g > 0 { price_num / g } else { price_num };
@@ -1337,14 +1337,14 @@ fn push_v18_attested_prefix(ss: &mut Vec<u8>, kas_output_idx: u16, price_num: u6
 /// Build v18 sell fill sigscript (canonical attestation layout).
 ///
 /// Layout: `[0x01,koi][0x08 pnum][0x08 pden][Op1][pushData(RS)]`.
-pub fn build_sell_v18_fill_sigscript(
+pub fn build_sell_fill_sigscript(
     kas_output_idx: u16,
     price_num: u64,
     price_den: u64,
     redeem_script: &[u8],
 ) -> Vec<u8> {
     let mut ss = Vec::with_capacity(21 + redeem_script.len() + 3);
-    push_v18_attested_prefix(&mut ss, kas_output_idx, price_num, price_den);
+    push_attested_prefix(&mut ss, kas_output_idx, price_num, price_den);
     ss.push(0x51); // Op1 (selector = fill)
     ss.extend_from_slice(&push_data(redeem_script));
     ss
@@ -1353,7 +1353,7 @@ pub fn build_sell_v18_fill_sigscript(
 /// Build v18 sell IOC fill sigscript (canonical attestation layout).
 ///
 /// Layout: `[0x01,koi][0x08 pnum][0x08 pden][0x08 fta][Op5][pushData(RS)]`.
-pub fn build_sell_v18_ioc_fill_sigscript(
+pub fn build_sell_ioc_fill_sigscript(
     kas_output_idx: u16,
     price_num: u64,
     price_den: u64,
@@ -1361,7 +1361,7 @@ pub fn build_sell_v18_ioc_fill_sigscript(
     redeem_script: &[u8],
 ) -> Vec<u8> {
     let mut ss = Vec::with_capacity(30 + redeem_script.len() + 3);
-    push_v18_attested_prefix(&mut ss, kas_output_idx, price_num, price_den);
+    push_attested_prefix(&mut ss, kas_output_idx, price_num, price_den);
     ss.push(0x08);
     ss.extend_from_slice(&u64_le(fill_token_amount));
     ss.push(0x55); // Op5 (selector = IOC fill)
@@ -1372,7 +1372,7 @@ pub fn build_sell_v18_ioc_fill_sigscript(
 /// Build v18 sell partial fill sigscript (canonical attestation layout).
 ///
 /// Layout: `[0x01,koi][0x08 pnum][0x08 pden][0x08 fta][ri][Op2][pushData(RS)]`.
-pub fn build_sell_v18_partial_fill_sigscript(
+pub fn build_sell_partial_fill_sigscript(
     kas_output_idx: u16,
     price_num: u64,
     price_den: u64,
@@ -1381,7 +1381,7 @@ pub fn build_sell_v18_partial_fill_sigscript(
     redeem_script: &[u8],
 ) -> Vec<u8> {
     let mut ss = Vec::with_capacity(33 + redeem_script.len() + 3);
-    push_v18_attested_prefix(&mut ss, kas_output_idx, price_num, price_den);
+    push_attested_prefix(&mut ss, kas_output_idx, price_num, price_den);
     ss.push(0x08);
     ss.extend_from_slice(&u64_le(fill_token_amount));
     push_index(&mut ss, residual_output_idx);
@@ -1391,7 +1391,7 @@ pub fn build_sell_v18_partial_fill_sigscript(
 }
 
 /// Build v18 sell expire sigscript: `[Op4][pushData(RS)]`.
-pub fn build_sell_v18_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
+pub fn build_sell_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
     let mut ss = Vec::with_capacity(1 + redeem_script.len() + 3);
     ss.push(0x54);
     ss.extend_from_slice(&push_data(redeem_script));
@@ -1401,7 +1401,7 @@ pub fn build_sell_v18_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
 /// Build v18 sell cancel-mark sigscript: `[sig][pk][Op3][pushData(RS)]`.
 /// (Plain cancel reuses `build_sell_cancel_sigscript` — identical shape,
 /// selector Op0.)
-pub fn build_sell_v18_cancel_mark_sigscript(
+pub fn build_sell_cancel_mark_sigscript(
     signature: &[u8; 64],
     pubkey: &[u8; 32],
     redeem_script: &[u8],

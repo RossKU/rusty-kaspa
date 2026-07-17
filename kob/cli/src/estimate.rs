@@ -44,55 +44,36 @@ const P2PK_SPK_SIZE: u64 = 34;
 const P2SH_SPK_SIZE: u64 = 35;
 
 
-/// buy_order v14 redeemScript: 145B state + 251B body = 396B.
-/// (Matches kob-core `parse::BUY_RS_SIZE = BUY_STATE_SIZE(145) + BUY_BODY_SIZE(251)`.
-/// The v14 body is 251B — 9B larger than the pre-IOC v13 body (242B) because
-/// v14 added the IOC fill sub-dispatch; see `order.rs`.)
-const BUY_RS_SIZE: u64 = 396;
-/// sell_order v14 redeemScript: 112B state + 315B body = 427B.
-/// (Matches kob-core `parse::SELL_RS_SIZE = SELL_STATE_SIZE(112) + SELL_BODY_SIZE(315)`.
-/// The v14 sell body is 315B — 60B larger than the v13 body (244B) from the
-/// v14 IOC fill path.)
-const SELL_RS_SIZE: u64 = 427;
-/// bracket_order v6 redeemScript: 224B state + 141B body = 365B.
-#[allow(dead_code)] // Kept for fee estimation reference
-const BRACKET_RS_SIZE: u64 = 365;
-/// oco_sell redeemScript: 139B state + 194B body = 333B.
-#[allow(dead_code)] // Kept for fee estimation reference
-const OCO_RS_SIZE: u64 = 333;
 /// call_option v3 redeemScript: 126B state + 33B body = 159B.
 const CALL_OPTION_RS_SIZE: u64 = 159;
 /// put_option v4 redeemScript: 159B state + 46B body = 205B.
 const PUT_OPTION_RS_SIZE: u64 = 205;
-/// swap_order redeemScript: 174B state + 69B body = 243B.
-const SWAP_RS_SIZE: u64 = 243;
 
-// --- v18 (unified spot generation, V18_DESIGN.md) ---
-/// buy v18 redeemScript: 145B state + 1525B body = 1670B.
+// --- spot generation (formerly v18; V18_DESIGN.md) ---
+/// buy redeemScript: 178B state + 1542B body.
+const BUY_RS_SIZE: u64 = 1720;
+/// sell redeemScript: 145B state + 370B body.
+const SELL_RS_SIZE: u64 = 515;
+/// oco_sell redeemScript: 172B state + 225B body.
 #[allow(dead_code)] // Kept for fee estimation reference
-const BUY_V18_RS_SIZE: u64 = 1720;
-/// sell v18 redeemScript: 112B state + 365B body = 477B.
+const OCO_RS_SIZE: u64 = 397;
+/// swap redeemScript: 183B state + 77B body.
 #[allow(dead_code)] // Kept for fee estimation reference
-const SELL_V18_RS_SIZE: u64 = 515;
-/// oco_sell v18 redeemScript: 139B state + 220B body = 359B.
+const SWAP_RS_SIZE: u64 = 260;
+/// bracket redeemScript: 224B state + 148B body.
 #[allow(dead_code)] // Kept for fee estimation reference
-const OCO_V18_RS_SIZE: u64 = 397;
-/// swap v18 redeemScript: 183B state + 77B body = 260B.
-#[allow(dead_code)] // Kept for fee estimation reference
-const SWAP_V18_RS_SIZE: u64 = 260;
-/// bracket v18 redeemScript: 224B state + 148B body = 372B.
-#[allow(dead_code)] // Kept for fee estimation reference
-const BRACKET_V18_RS_SIZE: u64 = 372;
+const BRACKET_RS_SIZE: u64 = 372;
 
-/// swap_order cancel sigscript: pushData(sig 65B) + pushData(pk 32B) + Op0 + pushData(243B RS)
-///   = 66 + 33 + 1 + 3 + 243 = 346.
-const SWAP_CANCEL_SS_SIZE: u64 = 346;
+/// swap cancel sigscript: pushData(sig 65B) + pushData(pk 32B) + Op0 + pushData(260B RS)
+///   = 66 + 33 + 1 + 3 + 260 = 363.
+const SWAP_CANCEL_SS_SIZE: u64 = 363;
 
-
-/// buy_v14 fill sigscript: 4 opcodes + pushData(396) = 4 + 3 + 396 = 403.
-const BUY_FILL_SS_SIZE: u64 = 403;
-/// sell_v14 fill sigscript: 2 opcodes + pushData(427) = 2 + 3 + 427 = 432.
-const SELL_FILL_SS_SIZE: u64 = 432;
+/// buy fill sigscript: MAX_N tii pushes + N + selector + pushData(1720B RS)
+///   ~= 12 + 4 + 1720 = 1736.
+const BUY_FILL_SS_SIZE: u64 = 1736;
+/// sell fill sigscript: canonical attested prefix (20B) + selector +
+/// pushData(515B RS) = 21 + 3 + 515 = 539.
+const SELL_FILL_SS_SIZE: u64 = 539;
 
 /// buy_v14 cancel sigscript: 1 + 66 + 33 + 3 + 396 = 499.
 const BUY_CANCEL_SS_SIZE: u64 = 499;
@@ -998,7 +979,7 @@ mod tests {
     }
 
     #[test]
-    fn tx_mass_match_v12() {
+    fn tx_mass_match_fill() {
         // Match TX: sell + buy + fee inputs, 3 outputs
         let inputs = vec![
             InputEstimate {
@@ -1026,13 +1007,13 @@ mod tests {
             OutputEstimate { label: "o2".to_string(), spk_size: P2PK_SPK_SIZE, value: 10_000 },
         ];
         let tm = compute_transaction_mass(&inputs, &outputs);
-        // Sell input: 44 + 3 + 432 = 479 (v14 SELL_FILL_SS_SIZE; >252 so varint = 3)
-        // Buy input:  44 + 3 + 403 = 450 (v14 BUY_FILL_SS_SIZE;  >252 so varint = 3)
-        // Fee input:  44 + 1 + 66  = 111
+        // Sell input: 44 + 3 + 539  = 586  (SELL_FILL_SS_SIZE; >252 so varint = 3)
+        // Buy input:  44 + 3 + 1736 = 1783 (BUY_FILL_SS_SIZE;  >252 so varint = 3)
+        // Fee input:  44 + 1 + 66   = 111
         // SigOps: 1 * 1000 = 1000
         // Outputs: (11+34) + (11+35) + (11+34) = 45 + 46 + 45 = 136
-        // Total: 68 + 479 + 450 + 111 + 1000 + 136 = 2244
-        assert_eq!(tm, 68 + 479 + 450 + 111 + 1000 + 136);
+        // Total: 68 + 586 + 1783 + 111 + 1000 + 136 = 3684
+        assert_eq!(tm, 68 + 586 + 1783 + 111 + 1000 + 136);
     }
 
 
@@ -1331,32 +1312,32 @@ mod tests {
     // --- v18 size constants pinned against the real builders ---
 
     #[test]
-    fn v18_rs_size_constants() {
+    fn rs_size_constants() {
         let h32 = [0u8; 32];
-        let buy = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let buy = kob_core::contract::spot::order::build_buy_redeem_script(
             &h32, 1, 2, 1000, &h32, &h32, &h32, 30, 0, 0,
         ).unwrap();
-        assert_eq!(BUY_V18_RS_SIZE, buy.len() as u64, "BUY_V18_RS_SIZE mismatch: {}", buy.len());
+        assert_eq!(BUY_RS_SIZE, buy.len() as u64, "BUY_RS_SIZE mismatch: {}", buy.len());
 
-        let sell = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        let sell = kob_core::contract::spot::order::build_sell_redeem_script(
             1, 2, 1000, &h32, &h32, &h32, 30, 0, 0,
         ).unwrap();
-        assert_eq!(SELL_V18_RS_SIZE, sell.len() as u64, "SELL_V18_RS_SIZE mismatch: {}", sell.len());
+        assert_eq!(SELL_RS_SIZE, sell.len() as u64, "SELL_RS_SIZE mismatch: {}", sell.len());
 
-        let oco = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+        let oco = kob_core::contract::spot::oco::build_oco_sell_redeem_script(
             2, 1, 1000, 1, 1, 1000, &h32, &h32, &h32, 30, 0, 0,
         ).unwrap();
-        assert_eq!(OCO_V18_RS_SIZE, oco.len() as u64, "OCO_V18_RS_SIZE mismatch: {}", oco.len());
+        assert_eq!(OCO_RS_SIZE, oco.len() as u64, "OCO_RS_SIZE mismatch: {}", oco.len());
 
-        let swap = kob_core::contract::spot::swap::build_swap_v18_redeem_script(
+        let swap = kob_core::contract::spot::swap::build_swap_redeem_script(
             &[1u8; 32], &[2u8; 32], 1000, &h32, &h32, &h32, 30,
         ).unwrap();
-        assert_eq!(SWAP_V18_RS_SIZE, swap.len() as u64, "SWAP_V18_RS_SIZE mismatch: {}", swap.len());
+        assert_eq!(SWAP_RS_SIZE, swap.len() as u64, "SWAP_RS_SIZE mismatch: {}", swap.len());
 
         let oco_spk = [0u8; 37];
-        let bracket = kob_core::contract::spot::bracket::build_bracket_v18_redeem_script(
+        let bracket = kob_core::contract::spot::bracket::build_bracket_redeem_script(
             0, &h32, 1, 2, &oco_spk, 1000, 100, 1000, &h32, &h32, &h32,
         ).unwrap();
-        assert_eq!(BRACKET_V18_RS_SIZE, bracket.len() as u64, "BRACKET_V18_RS_SIZE mismatch: {}", bracket.len());
+        assert_eq!(BRACKET_RS_SIZE, bracket.len() as u64, "BRACKET_RS_SIZE mismatch: {}", bracket.len());
     }
 }

@@ -103,9 +103,9 @@ pub async fn run(
     let current_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, 0, expiry_daa)?
+            contract::spot::order::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, 0, expiry_daa)?
         }
-        "sell" => contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, 0, expiry_daa)?,
+        "sell" => contract::spot::order::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, 0, expiry_daa)?,
         _ => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", side),
     };
 
@@ -113,9 +113,9 @@ pub async fn run(
     let target_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, 1, expiry_daa)?
+            contract::spot::order::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, 1, expiry_daa)?
         }
-        "sell" => contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, 1, expiry_daa)?,
+        "sell" => contract::spot::order::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, 1, expiry_daa)?,
         _ => unreachable!(),
     };
 
@@ -296,11 +296,11 @@ pub async fn run(
     let cancel_mark_sigscript = match side {
         "buy" => {
             // v18 buy cancel-mark: [pk][sig][Op3][RS].
-            contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
+            contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
         }
         "sell" => {
             // v18 sell cancel-mark: [sig][pk][Op3][RS].
-            contract::spot::order::build_sell_v18_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
+            contract::spot::order::build_sell_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
         }
         _ => unreachable!(),
     };
@@ -339,10 +339,10 @@ pub async fn run(
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_mark_sigscript = match side {
             "buy" => {
-                contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
+                contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
             }
             "sell" => {
-                contract::spot::order::build_sell_v18_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
+                contract::spot::order::build_sell_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
             }
             _ => unreachable!(),
         };

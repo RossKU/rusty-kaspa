@@ -14,7 +14,7 @@ use crate::contract::helpers::gcd;
 // branches, otspkh expire seat).
 
 /// Core OCO sell state layout size (the v18 state = `[0x20][otspkh]` + this).
-pub const OCO_SELL_STATE_SIZE: usize = 139;
+pub const OCO_SELL_CORE_STATE_SIZE: usize = 139;
 
 /// Build OCO sell cancel sigscript.
 ///
@@ -73,7 +73,7 @@ pub enum OcoPath {
 // at — this removes the old OCO-SL fixed-offset mismatch (the historic sweep
 // blocker) at L1.
 
-use crate::contract::spot::order::{e_num, e_pick, e_roll, v17op};
+use crate::contract::spot::order::{e_num, e_pick, e_roll, ops};
 
 /// Build the v18 OCO sell body.
 ///
@@ -88,8 +88,8 @@ use crate::contract::spot::order::{e_num, e_pick, e_roll, v17op};
 /// refunds the token escrow to `otspkh` as a covenant-bound token_unit via
 /// the Fix-3 per-input binding (auth[0] of self) — same form as the v18
 /// plain sell.
-pub fn build_oco_sell_v18_body() -> Vec<u8> {
-    use v17op::*;
+pub fn build_oco_sell_body() -> Vec<u8> {
+    use ops::*;
     let mut b: Vec<u8> = Vec::with_capacity(512);
 
     e_roll(&mut b, 12);
@@ -143,11 +143,11 @@ pub fn build_oco_sell_v18_body() -> Vec<u8> {
             b.push(EQUAL);
             b.push(IF); // selector == 1 -> TP FILL
             {
-                emit_oco_v18_fill(&mut b, true);
+                emit_oco_fill(&mut b, true);
             }
             b.push(ELSE); // selector == 0 -> CANCEL
             {
-                emit_oco_v18_cancel(&mut b);
+                emit_oco_cancel(&mut b);
             }
             b.push(ENDIF);
         }
@@ -156,7 +156,7 @@ pub fn build_oco_sell_v18_body() -> Vec<u8> {
             e_num(&mut b, 2);
             b.push(EQUAL);
             b.push(VERIFY);
-            emit_oco_v18_fill(&mut b, false);
+            emit_oco_fill(&mut b, false);
         }
         b.push(ENDIF);
     }
@@ -171,8 +171,8 @@ pub fn build_oco_sell_v18_body() -> Vec<u8> {
 /// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
 ///   ohash(4), mfill_sl(5), pden_sl(6), pnum_sl(7), mfill_tp(8), pden_tp(9),
 ///   pnum_tp(10), otspkh(11), pden_att(12), pnum_att(13), koi(14)
-fn emit_oco_v18_fill(b: &mut Vec<u8>, tp: bool) {
-    use v17op::*;
+fn emit_oco_fill(b: &mut Vec<u8>, tp: bool) {
+    use ops::*;
     // time gate
     b.push(DUP);
     b.push(OP0);
@@ -252,8 +252,8 @@ fn emit_oco_v18_fill(b: &mut Vec<u8>, tp: bool) {
 
 /// v18 OCO cancel (selector 0) — owner signature.
 /// Sigscript: `[sig][pk][Op0][pushData(RS)]` (same shape as v1).
-fn emit_oco_v18_cancel(b: &mut Vec<u8>) {
-    use v17op::*;
+fn emit_oco_cancel(b: &mut Vec<u8>) {
+    use ops::*;
     // entry: expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4), mfill_sl(5),
     //        pden_sl(6), pnum_sl(7), mfill_tp(8), pden_tp(9), pnum_tp(10),
     //        otspkh(11), pk(12), sig(13)
@@ -274,21 +274,21 @@ fn emit_oco_v18_cancel(b: &mut Vec<u8>) {
 }
 
 /// Expected v18 OCO sell body length.
-pub const OCO_SELL_V18_BODY_EXPECTED_LEN: usize = 225;
+pub const OCO_SELL_BODY_EXPECTED_LEN: usize = 225;
 
 /// v18 OCO sell state size: the v1 139B layout preceded by
 /// `[0x20][otspkh 32B]` (owner token seat).
-pub const OCO_SELL_V18_STATE_SIZE: usize = OCO_SELL_STATE_SIZE + 33;
+pub const OCO_SELL_STATE_SIZE: usize = OCO_SELL_CORE_STATE_SIZE + 33;
 
 /// v18 OCO sell redeemScript size (172B state + v18 body).
-pub const OCO_SELL_V18_RS_SIZE: usize = OCO_SELL_V18_STATE_SIZE + OCO_SELL_V18_BODY_EXPECTED_LEN;
+pub const OCO_SELL_RS_SIZE: usize = OCO_SELL_STATE_SIZE + OCO_SELL_BODY_EXPECTED_LEN;
 
 /// Build the v18 single-UTXO OCO sell redeemScript (172B state + v18 body).
 ///
 /// State: `[0x20][otspkh 32B]` (owner token seat = blake2b of the owner's
 /// token_unit P2SH SPK; the EXPIRE refund endpoint, binding preserved) then
 /// the v1 139B layout. `max_matcher_fee` is BPS in v18 (uniform).
-pub fn build_oco_sell_v18_redeem_script(
+pub fn build_oco_sell_redeem_script(
     price_num_tp: u64,
     price_den_tp: u64,
     min_fill_tp: u64,
@@ -324,8 +324,8 @@ pub fn build_oco_sell_v18_redeem_script(
     let pnum_sl = if g_sl > 0 { price_num_sl / g_sl } else { price_num_sl };
     let pden_sl = if g_sl > 0 { price_den_sl / g_sl } else { price_den_sl };
 
-    let body = build_oco_sell_v18_body();
-    let mut rs = Vec::with_capacity(OCO_SELL_V18_STATE_SIZE + body.len());
+    let body = build_oco_sell_body();
+    let mut rs = Vec::with_capacity(OCO_SELL_STATE_SIZE + body.len());
     rs.push(0x20);
     rs.extend_from_slice(owner_token_spk_hash);
     rs.push(0x08);
@@ -354,14 +354,14 @@ pub fn build_oco_sell_v18_redeem_script(
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(expiry_daa));
     rs.extend_from_slice(&body);
-    debug_assert_eq!(rs.len(), OCO_SELL_V18_RS_SIZE);
+    debug_assert_eq!(rs.len(), OCO_SELL_RS_SIZE);
     Ok(rs)
 }
 
 /// Build v18 OCO TP fill sigscript (canonical attestation layout).
 ///
 /// Layout: `[0x01,koi][0x08 pnum_tp][0x08 pden_tp][Op1][pushData(RS)]`.
-pub fn build_oco_sell_v18_tp_fill_sigscript(
+pub fn build_oco_sell_tp_fill_sigscript(
     kas_output_idx: u16,
     price_num_tp: u64,
     price_den_tp: u64,
@@ -386,7 +386,7 @@ pub fn build_oco_sell_v18_tp_fill_sigscript(
 /// Build v18 OCO SL fill sigscript (canonical attestation layout).
 ///
 /// Layout: `[0x01,koi][0x08 pnum_sl][0x08 pden_sl][Op2][pushData(RS)]`.
-pub fn build_oco_sell_v18_sl_fill_sigscript(
+pub fn build_oco_sell_sl_fill_sigscript(
     kas_output_idx: u16,
     price_num_sl: u64,
     price_den_sl: u64,
@@ -406,20 +406,4 @@ pub fn build_oco_sell_v18_sl_fill_sigscript(
     ss.push(0x52); // Op2 (selector = SL fill)
     ss.extend_from_slice(&push_data(redeem_script));
     ss
-}
-
-/// Build v18 OCO expire sigscript: `[Op4][pushData(RS)]` (same shape as v1;
-/// provided for naming symmetry).
-pub fn build_oco_sell_v18_expire_sigscript(redeem_script: &[u8]) -> Vec<u8> {
-    build_oco_sell_expire_sigscript(redeem_script)
-}
-
-/// Build v18 OCO cancel sigscript: `[sig][pk][Op0][pushData(RS)]` (same shape
-/// as v1; provided for naming symmetry).
-pub fn build_oco_sell_v18_cancel_sigscript(
-    signature: &[u8; 64],
-    pubkey: &[u8; 32],
-    redeem_script: &[u8],
-) -> Vec<u8> {
-    build_oco_sell_cancel_sigscript(signature, pubkey, redeem_script)
 }

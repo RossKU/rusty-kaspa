@@ -9,7 +9,7 @@ pub use kob_core::contract::perp::parse::{ParsedPerpOrder, PerpDeploySide, PERP_
 pub use kob_core::contract::lending::parse::{ParsedLendingOrder, LendingOrderType, parse_lending_rs, LOAN_OFFER_RS_SIZE, BORROW_REQUEST_RS_SIZE};
 pub use kob_core::contract::prediction::parse::{ParsedPredictionItem, PredictionItemType, parse_prediction_rs};
 pub use kob_core::{ParsedDcaOrder, parse_dca_order_rs, DCA_V2_RS_SIZE};
-pub use kob_core::contract::spot::swap::{ParsedSwapOrderV18, parse_swap_order_v18_rs, SWAP_V18_RS_SIZE};
+pub use kob_core::contract::spot::swap::{ParsedSwapOrder, parse_swap_order_rs, SWAP_RS_SIZE};
 
 /// Transaction data from block notifications or RPC queries.
 #[derive(Debug, Clone)]
@@ -58,7 +58,7 @@ pub enum ScanResult {
     Dca(ParsedDcaOrder, u32, u64),
     /// Swap order detected (swap_order, 243B RS).
     /// v18 swap order detected (swap v18, 260B RS — ring-eligible legs).
-    SwapV18(ParsedSwapOrderV18, u32, u64),
+    Swap(ParsedSwapOrder, u32, u64),
 }
 
 /// Scanner for detecting KOB deploy transactions and spent orders.
@@ -177,7 +177,7 @@ impl BlockScanner {
     /// Returns `ParsedOcoSell` instead of `ParsedOrder`.
     fn scan_oco_sell(&self, tx: &TransactionData) -> Option<(ParsedOcoSell, u32, u64)> {
         let v2 = kob_core::contract::parse_order_payload(&tx.payload)?;
-        if v2.rs_data.len() != kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE {
+        if v2.rs_data.len() != kob_core::contract::spot::oco::OCO_SELL_RS_SIZE {
             return None;
         }
         let rs_hash = kob_core::blake2b_256(&v2.rs_data);
@@ -356,8 +356,8 @@ impl BlockScanner {
             // max_matcher_fee as BPS (basis points of trade value). Convert
             // to absolute sompi so the matching engine can use it uniformly:
             // mmfee_sompi = value * bps / 10000.
-            max_matcher_fee: if parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN
-                || parsed.redeem_script.len() == kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN
+            max_matcher_fee: if parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_RS_EXPECTED_LEN
+                || parsed.redeem_script.len() == kob_core::contract::spot::order::SELL_ORDER_RS_EXPECTED_LEN
             {
                 value.saturating_mul(parsed._max_matcher_fee) / 10000
             } else {
@@ -428,7 +428,7 @@ impl BlockScanner {
                 // v18 OCO stores mmfee as BPS (uniform v18 semantics); the v1
                 // OCO stores absolute sompi. Same conversion as spot orders.
                 max_matcher_fee: if parsed.redeem_script.len()
-                    == kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE
+                    == kob_core::contract::spot::oco::OCO_SELL_RS_SIZE
                 {
                     value.saturating_mul(parsed._max_matcher_fee) / 10000
                 } else {
@@ -539,7 +539,7 @@ impl BlockScanner {
                         }
                     }
                 }
-            } else if v2.rs_data.len() == SWAP_V18_RS_SIZE {
+            } else if v2.rs_data.len() == SWAP_RS_SIZE {
                 // v18 swap (260B RS): ring-eligible leg (2-cycle/triangle).
                 let rs_hash = kob_core::blake2b_256(&v2.rs_data);
                 let p2sh_outputs: Vec<(u32, &TxOutputData, [u8; 32])> = tx
@@ -553,8 +553,8 @@ impl BlockScanner {
                     .collect();
                 for &(p2sh_idx, p2sh_out, ref p2sh_hash) in &p2sh_outputs {
                     if rs_hash == *p2sh_hash {
-                        if let Some(parsed) = parse_swap_order_v18_rs(&v2.rs_data) {
-                            return Some(ScanResult::SwapV18(parsed, p2sh_idx, p2sh_out.value));
+                        if let Some(parsed) = parse_swap_order_rs(&v2.rs_data) {
+                            return Some(ScanResult::Swap(parsed, p2sh_idx, p2sh_out.value));
                         }
                     }
                 }
@@ -1746,7 +1746,7 @@ mod tests {
         let ohash = [0xB1; 32];
         let bspkh = [0xC1; 32];
         let mmfee: u64 = 75;
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &tcid, pnum, pden, mfill, &ohash, &bspkh, &[0xF1; 32], mmfee, 0, expiry,
         ).unwrap();
         (rs, tcid, pnum, pden, mfill, ohash, bspkh, mmfee)
@@ -1758,7 +1758,7 @@ mod tests {
         let mfill: u64 = 500_000;
         let ohash = [0xD1; 32];
         let sspkh = [0xE1; 32];
-        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_sell_redeem_script(
             pnum, pden, mfill, &ohash, &sspkh, &[0xF2; 32], 0, 0, expiry,
         ).unwrap();
         (rs, pnum, pden, mfill, ohash, sspkh)

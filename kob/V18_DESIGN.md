@@ -1,6 +1,21 @@
 # V18 DESIGN FREEZE — single-generation spot, delete v14/v16/v17
 
-Status: frozen 2026-07-16. Implementation stages A–F below. Unreleased chain state → no migration.
+Status: frozen 2026-07-16. Stages A–E DONE (2026-07-17). Unreleased chain
+state → no migration.
+
+Stage E (deletion + rename) landed in three commits:
+- **E1** expire-seat covenant fix: buy state 145B→178B (owner KAS seat
+  `okspkh`, EXPIRE refunds there); sell 112B→145B and OCO 139B→172B (owner
+  token seat `otspkh`, EXPIRE refunds a covenant-bound token_unit via the
+  Fix-3 per-input binding). RS lengths buy 1720 / sell 515 / OCO 397.
+- **E2** delete all pre-v18 generations (v14/v16/v17 spot, v1 OCO/swap/
+  bracket, the KAS-bridged swap route, the 7B ownerless TOKEN_RS).
+- **E3** rename v18 → plain: the `_v18`/`_V18` suffixes are gone; a single
+  `pub const SPOT_GENERATION: u32 = 18` (in `contract/spot/mod.rs`) is the
+  only place the number 18 lives. The `version` u8 fields still REPORT 18
+  (engine/API consumers) via that const; on-chain dispatch is by RS length.
+
+Only Stage F (fresh live smoke on the renamed binary) remains.
 
 ## Goals
 1. One spot contract generation (v18) covering everything the matrix needs: N:M GTC/IOC sweep, buy partial-fill (old item C), OCO sweep-eligible (old OCO-SL blocker), token↔token ring settle incl. triangle (old item F, closes Fix-7 locally).

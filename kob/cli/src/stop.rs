@@ -414,7 +414,7 @@ async fn build_signed_buy_tx_json(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
-    let rs = contract::spot::order::build_buy_v18_redeem_script(
+    let rs = contract::spot::order::build_buy_redeem_script(
         &token_cov_id,
         price_num,
         price_den,
@@ -530,7 +530,7 @@ async fn build_signed_sell_tx_json(
     let owner_hash = blake2b_256(&pubkey);
     let seller_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
-    let rs = contract::spot::order::build_sell_v18_redeem_script(
+    let rs = contract::spot::order::build_sell_redeem_script(
         price_num,
         price_den,
         min_fill,

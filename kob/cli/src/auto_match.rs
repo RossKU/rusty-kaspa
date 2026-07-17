@@ -575,7 +575,7 @@ pub async fn run(
                             let mut tcid = [0u8; 32];
                             tcid.copy_from_slice(&pair_bytes);
                             if cached_version == 18 {
-                                kob_core::contract::spot::order::build_buy_v18_redeem_script(
+                                kob_core::contract::spot::order::build_buy_redeem_script(
                                     &tcid,
                                     cached.price_num,
                                     cached.price_den,
@@ -598,7 +598,7 @@ pub async fn run(
                             // Sells: v18 (unified spot) or the single legacy
                             // v14 layout.
                             if cached_version == 18 {
-                                kob_core::contract::spot::order::build_sell_v18_redeem_script(
+                                kob_core::contract::spot::order::build_sell_redeem_script(
                                     cached.price_num,
                                     cached.price_den,
                                     cached.min_fill,

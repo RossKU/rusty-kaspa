@@ -117,7 +117,7 @@ pub async fn run(
         };
 
         let rs = if entry.version == 18 {
-            contract::spot::order::build_sell_v18_redeem_script(
+            contract::spot::order::build_sell_redeem_script(
                 entry.price_num,
                 entry.price_den,
                 entry.min_fill,
@@ -199,7 +199,7 @@ pub async fn run(
         };
 
         let rs = if entry.version == 18 {
-            contract::spot::order::build_buy_v18_redeem_script(
+            contract::spot::order::build_buy_redeem_script(
                 &tcid,
                 entry.price_num,
                 entry.price_den,
@@ -300,7 +300,7 @@ pub async fn run(
             anyhow::bail!("--partial requires a v18 buy (Op2 partial fill); got v{}", buys[0].version);
         }
         println!("Partial (Op2): buy fills {} sell(s), residual continues", sells.len());
-        kob_engine::matcher::batch::plan_partial_match_v18(
+        kob_engine::matcher::batch::plan_partial_match(
             &sells,
             &buys[0],
             Some(wallet_utxo_info.clone()),
@@ -314,7 +314,7 @@ pub async fn run(
         //   N buys + 1 sell  → sell sweeps buys (plan_sell_ioc_match)
         if buys.len() == 1 && sells.len() >= 1 {
             println!("IOC direction: buy sweeps {} sells", sells.len());
-            kob_engine::matcher::batch::plan_ioc_match_v18(
+            kob_engine::matcher::batch::plan_ioc_match(
                 &sells,
                 &buys[0],
                 Some(wallet_utxo_info.clone()),
@@ -324,7 +324,7 @@ pub async fn run(
             )?
         } else if sells.len() == 1 && buys.len() >= 1 {
             println!("IOC direction: sell sweeps {} buys", buys.len());
-            kob_engine::matcher::batch::plan_sell_ioc_match_v18(
+            kob_engine::matcher::batch::plan_sell_ioc_match(
                 &sells[0],
                 &buys,
                 Some(wallet_utxo_info.clone()),
@@ -624,10 +624,10 @@ pub async fn run_ring(
             .map_err(|_| anyhow::anyhow!("--leg[{}]: invalid output index '{}'", i, parts[1]))?;
         let rs = hex::decode(parts[2])
             .map_err(|e| anyhow::anyhow!("--leg[{}]: invalid RS hex: {}", i, e))?;
-        let parsed = contract::spot::swap::parse_swap_order_v18_rs(&rs)
+        let parsed = contract::spot::swap::parse_swap_order_rs(&rs)
             .ok_or_else(|| anyhow::anyhow!(
                 "--leg[{}]: not a v18 swap RS (expected {} bytes, got {})",
-                i, contract::spot::swap::SWAP_V18_RS_SIZE, rs.len()
+                i, contract::spot::swap::SWAP_RS_SIZE, rs.len()
             ))?;
 
         // Owner SPK: explicit per-leg (2B version LE + script), or derived

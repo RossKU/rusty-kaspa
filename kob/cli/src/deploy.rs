@@ -407,7 +407,7 @@ pub async fn deploy_buy(
     let buyer_spk_hash = contract::compute_token_unit_spk_hash(&pubkey);
 
     let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
-    let redeem_script = contract::spot::order::build_buy_v18_redeem_script(
+    let redeem_script = contract::spot::order::build_buy_redeem_script(
         &token_cov_id,
         price_num,
         price_den,
@@ -810,7 +810,7 @@ pub async fn deploy_sell(
     let seller_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
     let sell_bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
-    let redeem_script = contract::spot::order::build_sell_v18_redeem_script(
+    let redeem_script = contract::spot::order::build_sell_redeem_script(
         price_num, price_den, min_fill, &owner_hash, &seller_spk_hash,
         &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
         sell_bps,
@@ -1339,7 +1339,7 @@ pub async fn deploy_oco_sell(
     } else {
         DEFAULT_MAX_MATCHER_FEE_BPS
     };
-    let redeem_script = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+    let redeem_script = kob_core::contract::spot::oco::build_oco_sell_redeem_script(
         tp_price_num, tp_price_den, tp_min_fill,
         sl_price_num, sl_price_den, sl_min_fill,
         &owner_hash, &seller_spk_hash,
@@ -1348,7 +1348,7 @@ pub async fn deploy_oco_sell(
         0, // cancel_pending
         expiry_daa.unwrap_or(0),
     )?;
-    assert_eq!(redeem_script.len(), kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE);
+    assert_eq!(redeem_script.len(), kob_core::contract::spot::oco::OCO_SELL_RS_SIZE);
 
     let p2sh = build_p2sh(&redeem_script);
 

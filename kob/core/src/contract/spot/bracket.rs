@@ -1,5 +1,5 @@
 use crate::primitives::{push_data, u64_le};
-use crate::contract::spot::order::{e_num, e_pick, e_roll, v17op};
+use crate::contract::spot::order::{e_num, e_pick, e_roll, ops};
 
 // ============================================================================
 // V18 BRACKET — receipt-gated IFD/IFO hard path (see kob/V18_DESIGN.md,
@@ -58,21 +58,21 @@ use crate::contract::spot::order::{e_num, e_pick, e_roll, v17op};
 // with the selector at depth 11 in every sigscript form.
 
 /// Bracket state size (224B, shared by v1 and v18).
-pub const BRACKET_V18_STATE_SIZE: usize = 224;
+pub const BRACKET_STATE_SIZE: usize = 224;
 
 /// Expected v18 bracket body length (deterministic; pinned in tests).
-pub const BRACKET_V18_BODY_EXPECTED_LEN: usize = 148;
+pub const BRACKET_BODY_EXPECTED_LEN: usize = 148;
 
 /// v18 bracket redeemScript size (224B state + v18 body).
-pub const BRACKET_V18_RS_SIZE: usize = BRACKET_V18_STATE_SIZE + BRACKET_V18_BODY_EXPECTED_LEN;
+pub const BRACKET_RS_SIZE: usize = BRACKET_STATE_SIZE + BRACKET_BODY_EXPECTED_LEN;
 
 /// Build the v18 bracket body.
 ///
 /// Selectors: 1 = FILL (entry execution), 0 = CANCEL (owner signature).
 /// Any other selector falls into the cancel branch and dies on the
 /// signature check (fail-closed).
-pub fn build_bracket_v18_body() -> Vec<u8> {
-    use v17op::*;
+pub fn build_bracket_body() -> Vec<u8> {
+    use ops::*;
     let mut b: Vec<u8> = Vec::with_capacity(256);
 
     // ===== DISPATCH: selector (depth 11) == 1 -> fill, else cancel =====
@@ -244,7 +244,7 @@ pub fn build_bracket_v18_body() -> Vec<u8> {
 /// See `build_bracket_redeem_script` for the argument docs; entry price is
 /// NOT gcd-normalized (v1 parity — the bracket price is never read through
 /// the canonical attestation offsets by other contracts).
-pub fn build_bracket_v18_redeem_script(
+pub fn build_bracket_redeem_script(
     entry_type: u64,
     token_cov_id: &[u8; 32],
     entry_price_num: u64,
@@ -269,8 +269,8 @@ pub fn build_bracket_v18_redeem_script(
     if min_fill == 0 {
         return Err(crate::KobError::Contract("min_fill must be > 0 (zero allows dust griefing)".into()));
     }
-    let body = build_bracket_v18_body();
-    let mut rs = Vec::with_capacity(BRACKET_V18_STATE_SIZE + body.len());
+    let body = build_bracket_body();
+    let mut rs = Vec::with_capacity(BRACKET_STATE_SIZE + body.len());
     // State (224 bytes, identical layout to v1)
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(entry_type));
@@ -295,7 +295,7 @@ pub fn build_bracket_v18_redeem_script(
     rs.push(0x20);
     rs.extend_from_slice(owner_hash);
     rs.extend_from_slice(&body);
-    debug_assert_eq!(rs.len(), BRACKET_V18_RS_SIZE);
+    debug_assert_eq!(rs.len(), BRACKET_RS_SIZE);
     Ok(rs)
 }
 
@@ -303,7 +303,7 @@ pub fn build_bracket_v18_redeem_script(
 ///
 /// sigOpCount = 0. The fill input's sequence must be >= 50 (CSV exposure
 /// delay, v18 fill-family parity).
-pub fn build_bracket_v18_fill_sigscript(redeem_script: &[u8]) -> Vec<u8> {
+pub fn build_bracket_fill_sigscript(redeem_script: &[u8]) -> Vec<u8> {
     let mut ss = Vec::with_capacity(1 + redeem_script.len() + 3);
     ss.push(0x51); // Op1 (selector = fill)
     ss.extend_from_slice(&push_data(redeem_script));
@@ -316,7 +316,7 @@ pub fn build_bracket_v18_fill_sigscript(redeem_script: &[u8]) -> Vec<u8> {
 /// sigOpCount = 1. Note the ordering differs from the v1 bracket cancel
 /// (`[Op0][sig][pk][RS]`): the v18 selector must sit directly below the
 /// state (depth 11), so sig/pk go BELOW the selector (v17/v18 convention).
-pub fn build_bracket_v18_cancel_sigscript(
+pub fn build_bracket_cancel_sigscript(
     signature: &[u8; 64],
     pubkey: &[u8; 32],
     redeem_script: &[u8],

@@ -149,17 +149,17 @@ pub fn detect_fill_from_sigscript(sigscript: &[u8]) -> Option<(String, u64, u64,
 
     // Validate full body bytecode matches the canonical v18 contract
     // (pre-v18 generations were removed in Stage E).
-    let body_offset = if len == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN {
+    let body_offset = if len == kob_core::contract::spot::order::BUY_ORDER_RS_EXPECTED_LEN {
         // V18 buy (unified spot). Body is generated programmatically.
-        let v18_body = kob_core::contract::spot::order::build_buy_v18_body();
+        let v18_body = kob_core::contract::spot::order::build_buy_body();
         let off = len - v18_body.len();
         if last_push[off..] != v18_body[..] {
             return None;
         }
         Some(off)
-    } else if len == kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN {
+    } else if len == kob_core::contract::spot::order::SELL_ORDER_RS_EXPECTED_LEN {
         // V18 sell (canonical price attestation).
-        let v18_body = kob_core::contract::spot::order::build_sell_v18_body();
+        let v18_body = kob_core::contract::spot::order::build_sell_body();
         let off = len - v18_body.len();
         if last_push[off..] != v18_body[..] {
             return None;
@@ -718,7 +718,7 @@ mod tests {
     fn make_buy_rs(tcid: &[u8; 32], pnum: u64, pden: u64) -> Vec<u8> {
         let ohash = [0u8; 32];
         let bspkh = [0u8; 32];
-        kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        kob_core::contract::spot::order::build_buy_redeem_script(
             tcid, pnum, pden, 1_000_000, &ohash, &bspkh, &[0u8; 32], 50, 0, 0,
         ).unwrap()
     }
@@ -727,7 +727,7 @@ mod tests {
     fn make_sell_rs(pnum: u64, pden: u64) -> Vec<u8> {
         let ohash = [0u8; 32];
         let sspkh = [0u8; 32];
-        kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        kob_core::contract::spot::order::build_sell_redeem_script(
             pnum, pden, 1_000_000, &ohash, &sspkh, &[0u8; 32], 50, 0, 0,
         ).unwrap()
     }
@@ -872,12 +872,12 @@ mod tests {
     }
 
     #[test]
-    fn detect_buy_fill_v18() {
+    fn detect_buy_fill() {
         let tcid = [0x42; 32];
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &tcid, 41, 152, 1_000_000, &[0u8; 32], &[0u8; 32], &[0u8; 32], 30, 0, 0,
         ).unwrap();
-        assert_eq!(rs.len(), kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN);
+        assert_eq!(rs.len(), kob_core::contract::spot::order::BUY_ORDER_RS_EXPECTED_LEN);
         let ss = make_fill_sigscript(&rs, &[&[0x01], &[0x02], &[0x00], &[0x03]]);
         let (token, pnum, pden, side) = detect_fill_from_sigscript(&ss).unwrap();
         assert_eq!(token, hex::encode(tcid));
@@ -887,11 +887,11 @@ mod tests {
     }
 
     #[test]
-    fn detect_sell_fill_v18() {
-        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+    fn detect_sell_fill() {
+        let rs = kob_core::contract::spot::order::build_sell_redeem_script(
             7, 9, 1_000_000, &[0u8; 32], &[0u8; 32], &[0u8; 32], 30, 0, 0,
         ).unwrap();
-        assert_eq!(rs.len(), kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN);
+        assert_eq!(rs.len(), kob_core::contract::spot::order::SELL_ORDER_RS_EXPECTED_LEN);
         let ss = make_fill_sigscript(&rs, &[&[0x00]]);
         let (_, pnum, pden, side) = detect_fill_from_sigscript(&ss).unwrap();
         assert_eq!(pnum, 7);
@@ -900,9 +900,9 @@ mod tests {
     }
 
     #[test]
-    fn detect_fill_v18_fake_body_rejected() {
+    fn detect_fill_fake_body_rejected() {
         // Right v18 buy length, wrong body bytes: must be rejected.
-        let len = kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN;
+        let len = kob_core::contract::spot::order::BUY_ORDER_RS_EXPECTED_LEN;
         let mut rs = vec![0xFFu8; len];
         rs[0] = 0x20; // plausible state prefix
         let ss = make_fill_sigscript(&rs, &[&[0x01]]);

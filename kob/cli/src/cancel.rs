@@ -178,10 +178,10 @@ pub async fn run(
     let redeem_script = match side {
         "buy" => {
             let tcid = parse_token_cov_id(token_cov_id_resolved.as_deref())?;
-            contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
+            contract::spot::order::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
         }
         "sell" => {
-            contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
+            contract::spot::order::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
         }
         other => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", other),
     };
@@ -360,7 +360,7 @@ pub async fn run(
 
     // Build the cancel sigscript for the order input
     let cancel_sigscript = match side {
-        "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
+        "buy" => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
         // v18 sell cancel keeps the [sig][pk][Op0][RS] shape.
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
         _ => unreachable!(),
@@ -394,7 +394,7 @@ pub async fn run(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match side {
-            "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
+            "buy" => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
             _ => unreachable!(),
         };

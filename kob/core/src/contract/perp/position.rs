@@ -877,10 +877,10 @@ pub fn compute_settlement_spot_spk_hashes(
     //     reachable, so the owner seats are pinned to the matcher hash as
     //     part of the canonical P2SH identity)
     use crate::contract::spot::order::{
-        build_buy_v18_redeem_script, build_sell_v18_redeem_script,
+        build_buy_redeem_script, build_sell_redeem_script,
     };
 
-    let buy_rs = build_buy_v18_redeem_script(
+    let buy_rs = build_buy_redeem_script(
         token_cov_id,
         entry_price_num,
         entry_price_den,
@@ -893,7 +893,7 @@ pub fn compute_settlement_spot_spk_hashes(
         0,                  // expiry_daa
     ).ok()?;
 
-    let sell_rs = build_sell_v18_redeem_script(
+    let sell_rs = build_sell_redeem_script(
         entry_price_num,
         entry_price_den,
         1,                  // min_fill

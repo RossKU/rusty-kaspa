@@ -237,7 +237,7 @@ pub async fn deploy_bracket_v4(
     // Build v18 bracket redeemScript (372B: 224B state identical to v1 +
     // v18 body — receipt-gated fill with CSV(50) exposure delay; the OCO
     // spawn must carry genuine token covenant on a buy entry).
-    let redeem_script = contract::spot::bracket::build_bracket_v18_redeem_script(
+    let redeem_script = contract::spot::bracket::build_bracket_redeem_script(
         entry_type,
         &token_cov_id,
         entry_num,
@@ -448,8 +448,8 @@ pub async fn fill_bracket_v4(
 ) -> anyhow::Result<()> {
     // Parse redeemScript: v18 only (372B).
     let redeem_script = hex::decode(rs_hex)?;
-    if redeem_script.len() == contract::spot::bracket::BRACKET_V18_RS_SIZE {
-        return fill_bracket_v18(
+    if redeem_script.len() == contract::spot::bracket::BRACKET_RS_SIZE {
+        return fill_bracket_inner(
             wallet_path, node_url, network,
             order_str, order_value_override, &redeem_script,
             receipt_str, receipt_value_override,
@@ -460,7 +460,7 @@ pub async fn fill_bracket_v4(
 
     anyhow::bail!(
         "bracket RS must be {} bytes (v18); pre-v18 brackets were removed in Stage E (got {})",
-        contract::spot::bracket::BRACKET_V18_RS_SIZE,
+        contract::spot::bracket::BRACKET_RS_SIZE,
         redeem_script.len()
     );
 }
@@ -484,7 +484,7 @@ pub async fn fill_bracket_v4(
 ///            (cov auth 3), [2] OCO spawn (cov auth 3), [3] token change ->
 ///            token_unit (cov auth 3)?, [4] KAS change?
 #[allow(clippy::too_many_arguments)]
-async fn fill_bracket_v18(
+async fn fill_bracket_inner(
     wallet_path: &Path,
     node_url: &str,
     network: Network,
@@ -758,7 +758,7 @@ async fn fill_bracket_v18(
     let sign_all = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
         let mut sigs: Vec<Vec<u8>> = Vec::with_capacity(tx.inputs.len());
         // [0] bracket fill sigscript (v18 builder; no signature).
-        sigs.push(contract::spot::bracket::build_bracket_v18_fill_sigscript(redeem_script));
+        sigs.push(contract::spot::bracket::build_bracket_fill_sigscript(redeem_script));
         // [1] fee P2PK.
         let sh1 = compute_sighash(tx, 1)?;
         sigs.push(signing::build_p2pk_sigscript(&signing::schnorr_sign(&privkey, &sh1)?));
@@ -843,10 +843,10 @@ pub async fn cancel_bracket_v4(
 
     // Parse redeemScript (365B = v1, 372B = v18)
     let redeem_script = hex::decode(rs_hex)?;
-    if redeem_script.len() != contract::spot::bracket::BRACKET_V18_RS_SIZE {
+    if redeem_script.len() != contract::spot::bracket::BRACKET_RS_SIZE {
         anyhow::bail!(
             "bracket RS must be {} bytes (v18); pre-v18 brackets were removed in Stage E (got {})",
-            contract::spot::bracket::BRACKET_V18_RS_SIZE,
+            contract::spot::bracket::BRACKET_RS_SIZE,
             redeem_script.len()
         );
     }
@@ -978,7 +978,7 @@ pub async fn cancel_bracket_v4(
     // v18: [pushData(sig+type)][pushData(pk)][Op0][pushData(RS)] (selector
     //      sits directly below the state, v17/v18 convention)
     let cancel_sigscript =
-        contract::spot::bracket::build_bracket_v18_cancel_sigscript(&sig_0, &pubkey, &redeem_script);
+        contract::spot::bracket::build_bracket_cancel_sigscript(&sig_0, &pubkey, &redeem_script);
 
     println!("Cancel SigScript: {} bytes (>= 400: {})", cancel_sigscript.len(), cancel_sigscript.len() >= 400);
 
@@ -1009,7 +1009,7 @@ pub async fn cancel_bracket_v4(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript =
-            contract::spot::bracket::build_bracket_v18_cancel_sigscript(&sig_0, &pubkey, &redeem_script);
+            contract::spot::bracket::build_bracket_cancel_sigscript(&sig_0, &pubkey, &redeem_script);
         let sighash_1 = compute_sighash(&tx, 1)?;
         let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
         let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
@@ -1118,7 +1118,7 @@ pub async fn run(
     // v18 OCO done-leg: both TP and SL branches are sweep-eligible via the
     // canonical price attestation, so the spawned exit order settles under
     // the normal v18 planners with no special-casing.
-    let oco_sell_rs = contract::spot::oco::build_oco_sell_v18_redeem_script(
+    let oco_sell_rs = contract::spot::oco::build_oco_sell_redeem_script(
         tp_price_num,
         tp_price_den,
         MIN_UTXO_VALUE,     // min_fill_tp
@@ -1166,7 +1166,7 @@ pub async fn run(
     };
 
     // Build v18 bracket redeemScript (single v18 oco_sell at output[2])
-    let redeem_script = contract::spot::bracket::build_bracket_v18_redeem_script(
+    let redeem_script = contract::spot::bracket::build_bracket_redeem_script(
         entry_type,
         &pair_id,
         entry_price_num,
@@ -1402,14 +1402,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bracket_v18_rs_length_and_sigscripts() {
+    fn bracket_rs_length_and_sigscripts() {
         let token_cov_id = [0x01u8; 32];
         let oco_spk = [0xAA; 37];
         let receipt_cov_id = [0xCC; 32];
         let trade_spk_hash = [0x11; 32];
         let owner_hash = [0xDD; 32];
 
-        let rs = contract::spot::bracket::build_bracket_v18_redeem_script(
+        let rs = contract::spot::bracket::build_bracket_redeem_script(
             0, &token_cov_id, 1, 2,
             &oco_spk, 5_000_000,
             100_000,
@@ -1420,20 +1420,20 @@ mod tests {
         ).unwrap();
         assert_eq!(
             rs.len(),
-            contract::spot::bracket::BRACKET_V18_RS_SIZE,
+            contract::spot::bracket::BRACKET_RS_SIZE,
             "v18 bracket RS must be {} bytes",
-            contract::spot::bracket::BRACKET_V18_RS_SIZE,
+            contract::spot::bracket::BRACKET_RS_SIZE,
         );
         assert_eq!(rs.len(), 372, "v18 bracket RS is 372 bytes (224B state + 148B body)");
 
         // Fill sigscript: [Op1][pushData(RS)] (selector dispatch, no sigLen
         // threshold in v18).
-        let fill_ss = contract::spot::bracket::build_bracket_v18_fill_sigscript(&rs);
+        let fill_ss = contract::spot::bracket::build_bracket_fill_sigscript(&rs);
         assert_eq!(fill_ss[0], 0x51, "fill selector is Op1");
         assert_eq!(fill_ss.len(), 1 + 3 + rs.len(), "Op1 + pushData2 header + RS");
 
         // Cancel sigscript: [sig+type][pk][Op0][RS] — selector below state.
-        let cancel_ss = contract::spot::bracket::build_bracket_v18_cancel_sigscript(
+        let cancel_ss = contract::spot::bracket::build_bracket_cancel_sigscript(
             &[0u8; 64], &[0u8; 32], &rs,
         );
         assert_eq!(cancel_ss[0] as usize, 65, "first push is sig+type (65B)");

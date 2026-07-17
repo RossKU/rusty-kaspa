@@ -1048,12 +1048,12 @@ async fn deploy_order(
         // token_unit P2SH SPK so fills deliver spendable KCC20 token_units.
         // The sell's sspkh stays raw P2PK (KAS proceeds). Must stay in
         // lockstep with cancel_order's reconstruction below.
-        "buy" => contract::spot::order::build_buy_v18_redeem_script(
+        "buy" => contract::spot::order::build_buy_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
             &owner_hash, &contract::compute_token_unit_spk_hash(&pubkey),
             &spk_hash, // okspkh: EXPIRE refunds KAS to the owner's raw P2PK
             crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
-        "sell" => contract::spot::order::build_sell_v18_redeem_script(
+        "sell" => contract::spot::order::build_sell_redeem_script(
             price_num, price_den, min_fill, &owner_hash, &spk_hash,
             &contract::compute_token_unit_spk_hash(&pubkey), // otspkh: EXPIRE token refund seat
             crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
@@ -1201,12 +1201,12 @@ async fn cancel_order(
         // Buy bspkh = token_unit P2SH hash (v18 delivery re-wrap) -- byte-
         // exact match with deploy_order's builder args or the P2SH will not
         // resolve and the cancel scan finds nothing.
-        "buy" => contract::spot::order::build_buy_v18_redeem_script(
+        "buy" => contract::spot::order::build_buy_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
             &owner_hash, &contract::compute_token_unit_spk_hash(&pubkey),
             &spk_hash, // okspkh: EXPIRE refunds KAS to the owner's raw P2PK
             crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
-        "sell" => contract::spot::order::build_sell_v18_redeem_script(
+        "sell" => contract::spot::order::build_sell_redeem_script(
             price_num, price_den, min_fill, &owner_hash, &spk_hash,
             &contract::compute_token_unit_spk_hash(&pubkey), // otspkh: EXPIRE token refund seat
             crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
@@ -1290,7 +1290,7 @@ async fn cancel_order(
     // v18 buy cancel: [pk][sig][Op0][RS] (v17/v18 convention);
     // v18 sell cancel keeps the v14 [sig][pk][Op0][RS] shape.
     let cancel_sigscript = match side {
-        "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
+        "buy" => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
         _ => unreachable!(),
     };
@@ -1312,7 +1312,7 @@ async fn cancel_order(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = utils::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match side {
-            "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
+            "buy" => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
             _ => unreachable!(),
         };

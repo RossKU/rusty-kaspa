@@ -216,7 +216,7 @@ struct SwapRsView {
 /// Parse a v18 swap RS into the common view (pre-v18 swaps were removed in
 /// Stage E).
 fn parse_swap_rs_any(rs: &[u8]) -> Option<SwapRsView> {
-    let p = contract::spot::swap::parse_swap_order_v18_rs(rs)?;
+    let p = contract::spot::swap::parse_swap_order_rs(rs)?;
     Some(SwapRsView {
         source_token_cov_id: p.source_token_cov_id,
         target_token_cov_id: p.target_token_cov_id,
@@ -275,7 +275,7 @@ async fn deploy(
 
     // Build RS — v18 swap (ring-eligible: token<->token 2-cycle / triangle
     // settles, per-leg F4 conservation cap in BPS; V18_DESIGN.md item F).
-    let redeem_script = contract::spot::swap::build_swap_v18_redeem_script(
+    let redeem_script = contract::spot::swap::build_swap_redeem_script(
         &source_tcid,
         &target_tcid,
         min_receive,
@@ -635,7 +635,7 @@ async fn cancel(
     let parsed = parse_swap_rs_any(&redeem_script)
         .ok_or_else(|| anyhow::anyhow!(
             "Invalid swap order RS: expected {} bytes (v18), got {}",
-            contract::spot::swap::SWAP_V18_RS_SIZE,
+            contract::spot::swap::SWAP_RS_SIZE,
             redeem_script.len(),
         ))?;
 
@@ -853,7 +853,7 @@ async fn info_cmd(
     let parsed = parse_swap_rs_any(&redeem_script)
         .ok_or_else(|| anyhow::anyhow!(
             "Invalid swap order RS: expected {} bytes (v18), got {}",
-            contract::spot::swap::SWAP_V18_RS_SIZE,
+            contract::spot::swap::SWAP_RS_SIZE,
             redeem_script.len(),
         ))?;
 

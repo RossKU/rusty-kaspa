@@ -73,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
                 .collect::<Result<_, _>>()?;
             let owner_hash = blake2b_256(&wallet.pubkey);
             let sspkh = compute_p2pk_spk_hash(&wallet.pubkey);
-            let rs = oco::build_oco_sell_v18_redeem_script(
+            let rs = oco::build_oco_sell_redeem_script(
                 p[0], p[1], p[2], p[3], p[4], p[5], &owner_hash, &sspkh,
                 &kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey), p[6], 0, p[7],
             )?;
@@ -105,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
             } else {
                 kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey)
             };
-            let rs = order::build_buy_v18_redeem_script(
+            let rs = order::build_buy_redeem_script(
                 &tcid, p[0], p[1], p[2], &owner_hash, &spkh,
                 &compute_p2pk_spk_hash(&wallet.pubkey), p[3], p[4] as u8, p[5],
             )?;
@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
                 .collect::<Result<_, _>>()?;
             let owner_hash = blake2b_256(&wallet.pubkey);
             let spkh = compute_p2pk_spk_hash(&wallet.pubkey);
-            let rs = order::build_sell_v18_redeem_script(
+            let rs = order::build_sell_redeem_script(
                 p[0], p[1], p[2], &owner_hash, &spkh,
                 &kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey), p[3], p[4] as u8, p[5],
             )?;
@@ -194,7 +194,7 @@ async fn main() -> anyhow::Result<()> {
             let sign_all = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
                 let sh = compute_sighash(tx, 0)?;
                 let sig = signing::schnorr_sign(&privkey, &sh)?;
-                Ok(vec![oco::build_oco_sell_v18_cancel_sigscript(
+                Ok(vec![oco::build_oco_sell_cancel_sigscript(
                     &sig,
                     &wallet.pubkey,
                     &rs,
@@ -310,7 +310,7 @@ async fn main() -> anyhow::Result<()> {
 
             let sign_all = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
                 let mut sigs = Vec::with_capacity(2);
-                sigs.push(order::build_sell_v18_partial_fill_sigscript(
+                sigs.push(order::build_sell_partial_fill_sigscript(
                     0, pnum, pden, fta, 1, &rs,
                 ));
                 let sh = compute_sighash(tx, 1)?;
@@ -343,11 +343,11 @@ async fn main() -> anyhow::Result<()> {
             let (expiry_daa, expire_ss) = match side {
                 "buy" => (
                     u64le(&rs[170..178]),
-                    order::build_buy_v18_expire_sigscript(&rs),
+                    order::build_buy_expire_sigscript(&rs),
                 ),
                 "sell" => (
                     u64le(&rs[137..145]),
-                    order::build_sell_v18_expire_sigscript(&rs),
+                    order::build_sell_expire_sigscript(&rs),
                 ),
                 _ => anyhow::bail!("side must be buy|sell"),
             };

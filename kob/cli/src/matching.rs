@@ -318,7 +318,7 @@ pub async fn run(
     }
     let buy_version: u8 = 18;
     let buy_rs = if buy_version == 18 {
-        contract::spot::order::build_buy_v18_redeem_script(
+        contract::spot::order::build_buy_redeem_script(
             &tcid,
             buy_price_num,
             buy_price_den,
@@ -334,7 +334,7 @@ pub async fn run(
         anyhow::bail!("Unsupported buy version {} (pre-v18 removed in Stage E)", buy_version);
     };
     let sell_rs = if version == 18 {
-        contract::spot::order::build_sell_v18_redeem_script(
+        contract::spot::order::build_sell_redeem_script(
             sell_price_num,
             sell_price_den,
             sell_min_fill,

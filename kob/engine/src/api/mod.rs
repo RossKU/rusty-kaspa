@@ -1610,7 +1610,7 @@ async fn handle_submit_ifd(
         crate::matcher::ifd::IfdSide::Buy => okspkh,
         crate::matcher::ifd::IfdSide::Sell => otspkh,
     };
-    let (b_rs, b_p2sh_hex, b_spk_hash_hex) = match crate::matcher::ifd::compute_order_b_scripts_v18(
+    let (b_rs, b_p2sh_hex, b_spk_hash_hex) = match crate::matcher::ifd::compute_order_b_scripts(
         &b_params,
         &owner_hash,
         &owner_spk_hash,
@@ -1662,7 +1662,7 @@ async fn handle_submit_ifd(
     // v18-only); this P2SH must match that deploy byte-exact.
     let a_rs = match req.order_a.side {
         crate::matcher::ifd::IfdSide::Buy => {
-            match kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            match kob_core::contract::spot::order::build_buy_redeem_script(
                 &a_token_bytes,
                 req.order_a.price_num,
                 req.order_a.price_den,
@@ -1676,7 +1676,7 @@ async fn handle_submit_ifd(
             }
         }
         crate::matcher::ifd::IfdSide::Sell => {
-            match kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            match kob_core::contract::spot::order::build_sell_redeem_script(
                 req.order_a.price_num,
                 req.order_a.price_den,
                 req.order_a.min_fill,
@@ -1791,7 +1791,7 @@ async fn handle_submit_ifo(
 
     // Compute OCO B script (single v18 oco_sell with TP + SL paths — both
     // branches sweep-eligible via the canonical attestation)
-    let (oco_rs, oco_p2sh_hex) = match crate::matcher::ifd::compute_oco_b_scripts_v18(
+    let (oco_rs, oco_p2sh_hex) = match crate::matcher::ifd::compute_oco_b_scripts(
         &req.token,
         &oco_params,
         &owner_hash,
@@ -1822,7 +1822,7 @@ async fn handle_submit_ifo(
 
     let a_rs = match req.order_a.side {
         crate::matcher::ifd::IfdSide::Buy => {
-            match kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            match kob_core::contract::spot::order::build_buy_redeem_script(
                 &a_token_bytes,
                 req.order_a.price_num,
                 req.order_a.price_den,
@@ -1836,7 +1836,7 @@ async fn handle_submit_ifo(
             }
         }
         crate::matcher::ifd::IfdSide::Sell => {
-            match kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            match kob_core::contract::spot::order::build_sell_redeem_script(
                 req.order_a.price_num,
                 req.order_a.price_den,
                 req.order_a.min_fill,

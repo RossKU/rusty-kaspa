@@ -387,7 +387,7 @@ impl IfdBook {
 /// the owner's token_unit P2SH SPK).
 ///
 /// Returns (rs_bytes, p2sh_script_hex, spk_hash_hex).
-pub fn compute_order_b_scripts_v18(
+pub fn compute_order_b_scripts(
     params: &OrderBParams,
     owner_hash: &[u8; 32],
     owner_spk_hash: &[u8; 32],
@@ -397,7 +397,7 @@ pub fn compute_order_b_scripts_v18(
     let token_bytes = parse_hex_32(&params.token)?;
 
     let rs = match params.side {
-        IfdSide::Buy => kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        IfdSide::Buy => kob_core::contract::spot::order::build_buy_redeem_script(
             &token_bytes,
             params.price_num,
             params.price_den,
@@ -410,7 +410,7 @@ pub fn compute_order_b_scripts_v18(
             params.expiry_daa,
         )
         .map_err(|e| e.to_string())?,
-        IfdSide::Sell => kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        IfdSide::Sell => kob_core::contract::spot::order::build_sell_redeem_script(
             params.price_num,
             params.price_den,
             params.min_fill,
@@ -437,10 +437,10 @@ pub fn compute_order_b_scripts_v18(
 /// The done-leg is a v18 OCO sell: both TP and SL branches carry the
 /// canonical price attestation, so (unlike the v1 OCO) the emitted order is
 /// sweep-eligible on BOTH branches. `max_matcher_fee_bps` as in
-/// `compute_order_b_scripts_v18`.
+/// `compute_order_b_scripts`.
 ///
 /// Returns (rs, p2sh_hex).
-pub fn compute_oco_b_scripts_v18(
+pub fn compute_oco_b_scripts(
     _token: &str,
     oco: &IfoOcoParams,
     owner_hash: &[u8; 32],
@@ -460,7 +460,7 @@ pub fn compute_oco_b_scripts_v18(
     owner_pubkey.copy_from_slice(&owner_spk[3..35]);
     let otspkh = kob_core::contract::compute_token_unit_spk_hash(&owner_pubkey);
 
-    let rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+    let rs = kob_core::contract::spot::oco::build_oco_sell_redeem_script(
         oco.tp_price_num,
         oco.tp_price_den,
         oco.tp_min_fill,
@@ -496,7 +496,7 @@ pub fn compute_oco_b_scripts_v18(
 /// carries no fee field — the matcher's compensation is the entry spread).
 ///
 /// Returns (bracket_rs, bracket_p2sh_hex, oco_rs, oco_p2sh_hex).
-pub fn compute_bracket_scripts_v18(
+pub fn compute_bracket_scripts(
     token: &str,
     entry_type: u64,
     entry_price_num: u64,
@@ -515,13 +515,13 @@ pub fn compute_bracket_scripts_v18(
 
     // Done-leg: v18 OCO sell (sweep-eligible on both branches).
     let (oco_rs, oco_p2sh_hex) =
-        compute_oco_b_scripts_v18(token, oco, owner_hash, owner_spk, max_matcher_fee_bps)?;
+        compute_oco_b_scripts(token, oco, owner_hash, owner_spk, max_matcher_fee_bps)?;
     let oco_p2sh = kob_core::p2sh::build_p2sh(&oco_rs);
     let mut oco_spk = [0u8; 37];
     oco_spk[0..2].copy_from_slice(&oco_p2sh.version.to_le_bytes());
     oco_spk[2..37].copy_from_slice(oco_p2sh.script());
 
-    let bracket_rs = kob_core::contract::spot::bracket::build_bracket_v18_redeem_script(
+    let bracket_rs = kob_core::contract::spot::bracket::build_bracket_redeem_script(
         entry_type,
         &token_bytes,
         entry_price_num,
@@ -928,15 +928,15 @@ mod tests {
 
 
     #[test]
-    fn compute_order_b_scripts_v18_buy_and_sell() {
+    fn compute_order_b_scripts_buy_and_sell() {
         let owner_hash = [0xbb; 32];
         let spk_hash = [0xcc; 32];
         let mut params = make_order_b_params(); // Sell
         let (rs, p2sh_hex, spk_hash_hex) =
-            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, &[0xEE; 32], 30).unwrap();
+            compute_order_b_scripts(&params, &owner_hash, &spk_hash, &[0xEE; 32], 30).unwrap();
         assert_eq!(
             rs.len(),
-            kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN,
+            kob_core::contract::spot::order::SELL_ORDER_RS_EXPECTED_LEN,
             "IFD sell done-leg must be a v18 sell RS"
         );
         assert_eq!(p2sh_hex.len(), 70);
@@ -944,10 +944,10 @@ mod tests {
 
         params.side = IfdSide::Buy;
         let (rs, p2sh_hex, _) =
-            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, &[0xEE; 32], 30).unwrap();
+            compute_order_b_scripts(&params, &owner_hash, &spk_hash, &[0xEE; 32], 30).unwrap();
         assert_eq!(
             rs.len(),
-            kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN,
+            kob_core::contract::spot::order::BUY_ORDER_RS_EXPECTED_LEN,
             "IFD buy done-leg must be a v18 buy RS"
         );
         assert_eq!(p2sh_hex.len(), 70);
@@ -955,13 +955,13 @@ mod tests {
         // v18 mmfee is BPS: the v14 sompi default (10_000_000) must be
         // rejected by the underlying builder, not silently embedded.
         assert!(
-            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, &[0xEE; 32], crate::DEFAULT_MAX_MATCHER_FEE).is_err(),
+            compute_order_b_scripts(&params, &owner_hash, &spk_hash, &[0xEE; 32], crate::DEFAULT_MAX_MATCHER_FEE).is_err(),
             "sompi-scale mmfee must be rejected for v18 (bps only)"
         );
     }
 
     #[test]
-    fn compute_oco_b_scripts_v18_produces_v18_oco_sell() {
+    fn compute_oco_b_scripts_produces_oco_sell() {
         let owner_hash = [0xbb; 32];
         let mut owner_spk = [0u8; 36];
         owner_spk[2] = 0x20;
@@ -980,19 +980,19 @@ mod tests {
         };
 
         let (rs, p2sh) =
-            compute_oco_b_scripts_v18(&"aa".repeat(32), &oco, &owner_hash, &owner_spk, 30).unwrap();
+            compute_oco_b_scripts(&"aa".repeat(32), &oco, &owner_hash, &owner_spk, 30).unwrap();
         assert_eq!(
             rs.len(),
-            kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE,
+            kob_core::contract::spot::oco::OCO_SELL_RS_SIZE,
             "IFO done-leg must be a v18 OCO sell RS (sweep-eligible on both branches)"
         );
         assert_eq!(p2sh.len(), 70);
     }
 
     #[test]
-    fn compute_bracket_scripts_v18_pins_v18_oco_p2sh() {
-        use kob_core::contract::spot::bracket::BRACKET_V18_RS_SIZE;
-        use kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE;
+    fn compute_bracket_scripts_pins_oco_p2sh() {
+        use kob_core::contract::spot::bracket::BRACKET_RS_SIZE;
+        use kob_core::contract::spot::oco::OCO_SELL_RS_SIZE;
         let owner_hash = [0xbb; 32];
         let trade_spk_hash = [0xcc; 32];
         let receipt_cov_id = [0xee; 32];
@@ -1011,7 +1011,7 @@ mod tests {
             sl_min_fill: 100_000,
         };
 
-        let (bracket_rs, bracket_p2sh_hex, oco_rs, oco_p2sh_hex) = compute_bracket_scripts_v18(
+        let (bracket_rs, bracket_p2sh_hex, oco_rs, oco_p2sh_hex) = compute_bracket_scripts(
             &"aa".repeat(32),
             0, // buy entry
             1,
@@ -1028,8 +1028,8 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(bracket_rs.len(), BRACKET_V18_RS_SIZE, "bracket must be v18");
-        assert_eq!(oco_rs.len(), OCO_SELL_V18_RS_SIZE, "done-leg must be a v18 OCO");
+        assert_eq!(bracket_rs.len(), BRACKET_RS_SIZE, "bracket must be v18");
+        assert_eq!(oco_rs.len(), OCO_SELL_RS_SIZE, "done-leg must be a v18 OCO");
         assert_eq!(bracket_p2sh_hex.len(), 70);
         assert_eq!(oco_p2sh_hex.len(), 70);
 

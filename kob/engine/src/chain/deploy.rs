@@ -83,7 +83,7 @@ pub fn build_buy_order_scripts(
     owner_kas_spk_hash: &[u8; 32],
     max_matcher_fee_bps: u64,
 ) -> (String, String, u16) {
-    let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+    let rs = kob_core::contract::spot::order::build_buy_redeem_script(
         token_cov_id, price_num, price_den, min_fill, owner_hash, buyer_spk_hash,
         owner_kas_spk_hash, max_matcher_fee_bps, 0, 0,).unwrap();
     let rs_hex = hex::encode(&rs);
@@ -104,7 +104,7 @@ pub fn build_sell_order_scripts(
     owner_token_spk_hash: &[u8; 32],
     max_matcher_fee_bps: u64,
 ) -> (String, String, u16) {
-    let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+    let rs = kob_core::contract::spot::order::build_sell_redeem_script(
         price_num, price_den, min_fill, owner_hash, seller_spk_hash, owner_token_spk_hash,
         max_matcher_fee_bps, 0, 0,).unwrap();
     let rs_hex = hex::encode(&rs);

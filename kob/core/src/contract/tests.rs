@@ -1428,39 +1428,39 @@ mod adversarial_tests {
     /// v18 body lengths are deterministic; pin them so the RS-length version
     /// tags (parse.rs dispatch) can never silently drift.
     #[test]
-    fn v18_body_lengths_pinned() {
+    fn body_lengths_pinned() {
         use crate::contract::spot::order::{
-            build_buy_v18_body, build_sell_v18_body,
-            BUY_ORDER_V18_BODY_EXPECTED_LEN, SELL_ORDER_V18_BODY_EXPECTED_LEN,
+            build_buy_body, build_sell_body,
+            BUY_ORDER_BODY_EXPECTED_LEN, SELL_ORDER_BODY_EXPECTED_LEN,
         };
-        use crate::contract::spot::oco::{build_oco_sell_v18_body, OCO_SELL_V18_BODY_EXPECTED_LEN};
-        use crate::contract::spot::swap::{build_swap_v18_body, SWAP_V18_BODY_EXPECTED_LEN};
-        use crate::contract::spot::bracket::{build_bracket_v18_body, BRACKET_V18_BODY_EXPECTED_LEN};
-        assert_eq!(build_buy_v18_body().len(), BUY_ORDER_V18_BODY_EXPECTED_LEN, "buy v18 body");
-        assert_eq!(build_sell_v18_body().len(), SELL_ORDER_V18_BODY_EXPECTED_LEN, "sell v18 body");
-        assert_eq!(build_oco_sell_v18_body().len(), OCO_SELL_V18_BODY_EXPECTED_LEN, "OCO v18 body");
-        assert_eq!(build_swap_v18_body().len(), SWAP_V18_BODY_EXPECTED_LEN, "swap v18 body");
-        assert_eq!(build_bracket_v18_body().len(), BRACKET_V18_BODY_EXPECTED_LEN, "bracket v18 body");
+        use crate::contract::spot::oco::{build_oco_sell_body, OCO_SELL_BODY_EXPECTED_LEN};
+        use crate::contract::spot::swap::{build_swap_body, SWAP_BODY_EXPECTED_LEN};
+        use crate::contract::spot::bracket::{build_bracket_body, BRACKET_BODY_EXPECTED_LEN};
+        assert_eq!(build_buy_body().len(), BUY_ORDER_BODY_EXPECTED_LEN, "buy v18 body");
+        assert_eq!(build_sell_body().len(), SELL_ORDER_BODY_EXPECTED_LEN, "sell v18 body");
+        assert_eq!(build_oco_sell_body().len(), OCO_SELL_BODY_EXPECTED_LEN, "OCO v18 body");
+        assert_eq!(build_swap_body().len(), SWAP_BODY_EXPECTED_LEN, "swap v18 body");
+        assert_eq!(build_bracket_body().len(), BRACKET_BODY_EXPECTED_LEN, "bracket v18 body");
     }
 
     /// Every dispatch RS length in the crate must be distinct — the RS
     /// length is the version tag throughout parse/scan/match. Post-E2 set:
     /// the five v18 spot lengths + the DCA covenant (374B).
     #[test]
-    fn v18_rs_lengths_no_collision() {
+    fn rs_lengths_no_collision() {
         use crate::contract::spot::order::{
-            BUY_ORDER_V18_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
+            BUY_ORDER_RS_EXPECTED_LEN, SELL_ORDER_RS_EXPECTED_LEN,
         };
-        use crate::contract::spot::bracket::BRACKET_V18_RS_SIZE;
-        use crate::contract::spot::oco::OCO_SELL_V18_RS_SIZE;
-        use crate::contract::spot::swap::SWAP_V18_RS_SIZE;
+        use crate::contract::spot::bracket::BRACKET_RS_SIZE;
+        use crate::contract::spot::oco::OCO_SELL_RS_SIZE;
+        use crate::contract::spot::swap::SWAP_RS_SIZE;
         use crate::contract::spot::dca::DCA_V2_RS_SIZE;
         let all = [
-            BUY_ORDER_V18_RS_EXPECTED_LEN,
-            SELL_ORDER_V18_RS_EXPECTED_LEN,
-            OCO_SELL_V18_RS_SIZE,
-            SWAP_V18_RS_SIZE,
-            BRACKET_V18_RS_SIZE,
+            BUY_ORDER_RS_EXPECTED_LEN,
+            SELL_ORDER_RS_EXPECTED_LEN,
+            OCO_SELL_RS_SIZE,
+            SWAP_RS_SIZE,
+            BRACKET_RS_SIZE,
             DCA_V2_RS_SIZE,
         ];
         for (i, a) in all.iter().enumerate() {
@@ -1474,21 +1474,21 @@ mod adversarial_tests {
 
     /// v18 bodies are generated programmatically; pin their hashes like v17.
     #[test]
-    fn v18_bytecode_stable() {
+    fn bytecode_stable() {
         use crate::p2sh::blake2b_256;
-        use crate::contract::spot::order::{build_buy_v18_body, build_sell_v18_body};
-        use crate::contract::spot::oco::build_oco_sell_v18_body;
-        use crate::contract::spot::swap::build_swap_v18_body;
+        use crate::contract::spot::order::{build_buy_body, build_sell_body};
+        use crate::contract::spot::oco::build_oco_sell_body;
+        use crate::contract::spot::swap::build_swap_body;
         let pins: &[(&str, Vec<u8>, &str)] = &[
-            ("BUY_ORDER_V18", build_buy_v18_body(),
+            ("BUY_ORDER", build_buy_body(),
              "3f1320143a652e2e9894ffac1b52f33e469e791e9c8ca10aaa9557b9c541a82a"),
-            ("SELL_ORDER_V18", build_sell_v18_body(),
+            ("SELL_ORDER", build_sell_body(),
              "ae49a66f3858cf509917453bdfa8a2dd44b4fbeeca5be3e69fe0773dc3e2eb50"),
-            ("OCO_SELL_V18", build_oco_sell_v18_body(),
+            ("OCO_SELL", build_oco_sell_body(),
              "2a750d668ead305605b79dd9f574cd5832a5c7d010d510411cdc7eec0388a40c"),
-            ("SWAP_ORDER_V18", build_swap_v18_body(),
+            ("SWAP_ORDER", build_swap_body(),
              "47552d56319a3b8a523ae4d467192db1496347ff4243f1eae5b31e36729eb0b3"),
-            ("BRACKET_V18", crate::contract::spot::bracket::build_bracket_v18_body(),
+            ("BRACKET", crate::contract::spot::bracket::build_bracket_body(),
              "169cdae3e31dcb11ea3f958611222dc0d59136f5c8b1d03d08ec5de7df5f1c3f"),
         ];
         let mut mismatches = Vec::new();
@@ -1508,14 +1508,14 @@ mod adversarial_tests {
     /// [0..2) and 0x08 push prefixes at 2 and 11. These are the offsets every
     /// v18 buy reads via OpTxInputScriptSigSubstr — they must never move.
     #[test]
-    fn v18_canonical_sigscript_offsets() {
+    fn canonical_sigscript_offsets() {
         use crate::contract::spot::order::{
-            build_sell_v18_redeem_script, build_sell_v18_fill_sigscript,
-            build_sell_v18_ioc_fill_sigscript, build_sell_v18_partial_fill_sigscript,
+            build_sell_redeem_script, build_sell_fill_sigscript,
+            build_sell_ioc_fill_sigscript, build_sell_partial_fill_sigscript,
         };
         use crate::contract::spot::oco::{
-            build_oco_sell_v18_redeem_script, build_oco_sell_v18_tp_fill_sigscript,
-            build_oco_sell_v18_sl_fill_sigscript,
+            build_oco_sell_redeem_script, build_oco_sell_tp_fill_sigscript,
+            build_oco_sell_sl_fill_sigscript,
         };
         let oh = [0xAA; 32];
         let sh = [0xBB; 32];
@@ -1524,17 +1524,17 @@ mod adversarial_tests {
         let (pnum, pden) = (12345678901u64, 987654321u64);
         let (pnum_sl, pden_sl) = (7u64, 3u64);
         let ts = [0xCC; 32]; // owner token seat (otspkh)
-        let sell_rs = build_sell_v18_redeem_script(pnum, pden, 1, &oh, &sh, &ts, 30, 0, 0).unwrap();
-        let oco_rs = build_oco_sell_v18_redeem_script(
+        let sell_rs = build_sell_redeem_script(pnum, pden, 1, &oh, &sh, &ts, 30, 0, 0).unwrap();
+        let oco_rs = build_oco_sell_redeem_script(
             pnum, pden, 1, pnum_sl, pden_sl, 1, &oh, &sh, &ts, 30, 0, 0,
         ).unwrap();
         let koi = 7u16;
         let cases: Vec<(&str, Vec<u8>, u64, u64)> = vec![
-            ("sell fill", build_sell_v18_fill_sigscript(koi, pnum, pden, &sell_rs), pnum, pden),
-            ("sell ioc", build_sell_v18_ioc_fill_sigscript(koi, pnum, pden, 55, &sell_rs), pnum, pden),
-            ("sell partial", build_sell_v18_partial_fill_sigscript(koi, pnum, pden, 55, 2, &sell_rs), pnum, pden),
-            ("oco tp", build_oco_sell_v18_tp_fill_sigscript(koi, pnum, pden, &oco_rs), pnum, pden),
-            ("oco sl", build_oco_sell_v18_sl_fill_sigscript(koi, pnum_sl, pden_sl, &oco_rs), pnum_sl, pden_sl),
+            ("sell fill", build_sell_fill_sigscript(koi, pnum, pden, &sell_rs), pnum, pden),
+            ("sell ioc", build_sell_ioc_fill_sigscript(koi, pnum, pden, 55, &sell_rs), pnum, pden),
+            ("sell partial", build_sell_partial_fill_sigscript(koi, pnum, pden, 55, 2, &sell_rs), pnum, pden),
+            ("oco tp", build_oco_sell_tp_fill_sigscript(koi, pnum, pden, &oco_rs), pnum, pden),
+            ("oco sl", build_oco_sell_sl_fill_sigscript(koi, pnum_sl, pden_sl, &oco_rs), pnum_sl, pden_sl),
         ];
         for (name, ss, pn, pd) in cases {
             assert_eq!(ss[0], 0x01, "{name}: koi must be a forced 2-byte push");
@@ -1549,13 +1549,13 @@ mod adversarial_tests {
     /// v18 RS roundtrips: parse_redeem_script tags version 18 by RS length;
     /// OCO v18 parses through the shared OCO parser; swap v18 parses mmfee.
     #[test]
-    fn v18_parse_roundtrips() {
+    fn parse_roundtrips() {
         use crate::contract::spot::order::{
-            build_buy_v18_redeem_script, build_sell_v18_redeem_script,
-            BUY_ORDER_V18_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
+            build_buy_redeem_script, build_sell_redeem_script,
+            BUY_ORDER_RS_EXPECTED_LEN, SELL_ORDER_RS_EXPECTED_LEN,
         };
-        use crate::contract::spot::oco::build_oco_sell_v18_redeem_script;
-        use crate::contract::spot::swap::{build_swap_v18_redeem_script, parse_swap_order_v18_rs, SWAP_V18_RS_SIZE};
+        use crate::contract::spot::oco::build_oco_sell_redeem_script;
+        use crate::contract::spot::swap::{build_swap_redeem_script, parse_swap_order_rs, SWAP_RS_SIZE};
         use crate::contract::spot::parse_redeem_script;
         use crate::contract::spot::parse::parse_oco_sell_redeem_script;
         let tcid = [0x11; 32];
@@ -1563,8 +1563,8 @@ mod adversarial_tests {
         let sh = [0x33; 32];
         let ks = [0x66; 32]; // owner KAS seat (okspkh)
         let ts = [0x77; 32]; // owner token seat (otspkh)
-        let buy = build_buy_v18_redeem_script(&tcid, 3, 2, 1_000_000, &oh, &sh, &ks, 30, 0, 555).unwrap();
-        assert_eq!(buy.len(), BUY_ORDER_V18_RS_EXPECTED_LEN);
+        let buy = build_buy_redeem_script(&tcid, 3, 2, 1_000_000, &oh, &sh, &ks, 30, 0, 555).unwrap();
+        assert_eq!(buy.len(), BUY_ORDER_RS_EXPECTED_LEN);
         let p = parse_redeem_script(&buy).expect("v18 buy parses");
         assert_eq!(p.version, 18);
         assert_eq!(p.order_type, crate::types::OrderSide::Buy);
@@ -1573,8 +1573,8 @@ mod adversarial_tests {
         assert_eq!(p.expiry_daa, Some(555));
         assert_eq!(p.owner_seat_hash, Some(ks), "v18 buy okspkh roundtrip");
 
-        let sell = build_sell_v18_redeem_script(5, 3, 2_000_000, &oh, &sh, &ts, 25, 0, 0).unwrap();
-        assert_eq!(sell.len(), SELL_ORDER_V18_RS_EXPECTED_LEN);
+        let sell = build_sell_redeem_script(5, 3, 2_000_000, &oh, &sh, &ts, 25, 0, 0).unwrap();
+        assert_eq!(sell.len(), SELL_ORDER_RS_EXPECTED_LEN);
         let p = parse_redeem_script(&sell).expect("v18 sell parses");
         assert_eq!(p.version, 18);
         assert_eq!(p.order_type, crate::types::OrderSide::Sell);
@@ -1583,15 +1583,15 @@ mod adversarial_tests {
         assert_eq!(p._max_matcher_fee, 25);
         assert_eq!(p.owner_seat_hash, Some(ts), "v18 sell otspkh roundtrip");
 
-        let oco = build_oco_sell_v18_redeem_script(5, 1, 500, 2, 1, 200, &oh, &sh, &ts, 30, 0, 0).unwrap();
+        let oco = build_oco_sell_redeem_script(5, 1, 500, 2, 1, 200, &oh, &sh, &ts, 30, 0, 0).unwrap();
         let p = parse_oco_sell_redeem_script(&oco).expect("v18 OCO parses");
         assert_eq!(p.price_num_tp, 5);
         assert_eq!(p.price_num_sl, 2);
         assert_eq!(p.owner_seat_hash, Some(ts), "v18 OCO otspkh roundtrip");
 
-        let swap = build_swap_v18_redeem_script(&tcid, &[0x44; 32], 9_000, &oh, &sh, &[0x55; 32], 40).unwrap();
-        assert_eq!(swap.len(), SWAP_V18_RS_SIZE);
-        let p = parse_swap_order_v18_rs(&swap).expect("v18 swap parses");
+        let swap = build_swap_redeem_script(&tcid, &[0x44; 32], 9_000, &oh, &sh, &[0x55; 32], 40).unwrap();
+        assert_eq!(swap.len(), SWAP_RS_SIZE);
+        let p = parse_swap_order_rs(&swap).expect("v18 swap parses");
         assert_eq!(p.min_target_amount, 9_000);
         assert_eq!(p.mmfee_bps, 40);
         assert_eq!(p.target_token_cov_id, [0x44; 32]);

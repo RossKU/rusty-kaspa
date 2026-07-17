@@ -1,30 +1,30 @@
 //! Crossing pair detection and match output computation.
 
 use kob_core::MIN_UTXO_VALUE;
-use kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE;
+use kob_core::contract::spot::oco::OCO_SELL_RS_SIZE;
 use kob_core::contract::spot::order::{
-    BUY_ORDER_V18_MAX_N, BUY_ORDER_V18_RS_EXPECTED_LEN,
-    SELL_ORDER_V18_RS_EXPECTED_LEN,
+    BUY_ORDER_MAX_N, BUY_ORDER_RS_EXPECTED_LEN,
+    SELL_ORDER_RS_EXPECTED_LEN,
 };
 use crate::order_book::{BookOrder, OrderBook, PairBook};
 
 /// True when a redeem script is a v18 buy (unified spot generation).
 /// RS length is the canonical generation discriminator in this codebase
 /// (version numbers are engine-layer labels).
-pub fn is_v18_buy(rs: &[u8]) -> bool {
-    rs.len() == BUY_ORDER_V18_RS_EXPECTED_LEN
+pub fn is_buy_rs(rs: &[u8]) -> bool {
+    rs.len() == BUY_ORDER_RS_EXPECTED_LEN
 }
 
 /// True when a redeem script is a v18 sell.
-pub fn is_v18_sell(rs: &[u8]) -> bool {
-    rs.len() == SELL_ORDER_V18_RS_EXPECTED_LEN
+pub fn is_sell_rs(rs: &[u8]) -> bool {
+    rs.len() == SELL_ORDER_RS_EXPECTED_LEN
 }
 
 /// True when a redeem script is a v18 OCO sell — sweep-eligible on BOTH
 /// branches (the canonical branch attestation removed the pre-v18 OCO-SL
 /// fixed-offset price-read blocker).
-pub fn is_v18_oco_sell(rs: &[u8]) -> bool {
-    rs.len() == OCO_SELL_V18_RS_SIZE
+pub fn is_oco_sell_rs(rs: &[u8]) -> bool {
+    rs.len() == OCO_SELL_RS_SIZE
 }
 
 /// Sweep-collection cap for a buy anchor: the contract's compile-time term
@@ -32,8 +32,8 @@ pub fn is_v18_oco_sell(rs: &[u8]) -> bool {
 /// beyond this would be rejected wholesale at plan time (or panic inside the
 /// sigscript builder), losing the whole group.
 pub fn max_sweep_sells_for_buy(rs: &[u8]) -> usize {
-    if is_v18_buy(rs) {
-        BUY_ORDER_V18_MAX_N
+    if is_buy_rs(rs) {
+        BUY_ORDER_MAX_N
     } else {
         MAX_BATCH_GROUP_SIZE
     }
@@ -490,7 +490,7 @@ fn find_sweep_groups(
             // losing the whole sweep; any sells beyond the cap stay
             // unclaimed for a follow-on group.
             let buy_rs = buy.redeem_script();
-            let is_v18_anchor = is_v18_buy(&buy_rs);
+            let is_spot_anchor = is_buy_rs(&buy_rs);
             let max_sells_for_buy = max_sweep_sells_for_buy(&buy_rs);
 
             for sell in &asks {
@@ -517,7 +517,7 @@ fn find_sweep_groups(
                 // anchor. Everything pre-v18 stays excluded; a solo OCO fill
                 // is unaffected in any generation.
                 if sell.oco_path.is_some()
-                    && !(is_v18_anchor && is_v18_oco_sell(&sell.redeem_script()))
+                    && !(is_spot_anchor && is_oco_sell_rs(&sell.redeem_script()))
                 {
                     continue;
                 }
@@ -1314,11 +1314,11 @@ fn find_available_ask<'a>(
 /// distinct sources, greedy first-found claiming). Pre-v18 (243B) swap
 /// entries are ignored — they settle via the KAS-bridged
 /// `execute_swap_fill` route.
-pub fn find_v18_rings(
+pub fn find_rings(
     swap_book: &crate::swap_book::SwapBook,
     spent_outpoints: Option<&std::collections::HashSet<String>>,
 ) -> Vec<Vec<crate::swap_book::SwapEntry>> {
-    use kob_core::contract::spot::swap::SWAP_V18_RS_SIZE;
+    use kob_core::contract::spot::swap::SWAP_RS_SIZE;
     use std::collections::HashSet;
 
     let empty_set = HashSet::new();
@@ -1330,7 +1330,7 @@ pub fn find_v18_rings(
         .into_iter()
         .filter(|e| {
             hex::decode(&e.redeem_script_hex)
-                .map(|rs| rs.len() == SWAP_V18_RS_SIZE)
+                .map(|rs| rs.len() == SWAP_RS_SIZE)
                 .unwrap_or(false)
                 && e.owner_spk.is_some()
                 && !spent.contains(&e.outpoint_key())
@@ -1856,17 +1856,17 @@ mod tests {
     }
 
     /// v18 sibling of the DoS #3 cap test: a v18-anchor buy-sweep collection
-    /// caps at BUY_ORDER_V18_MAX_N via `max_sweep_sells_for_buy`.
+    /// caps at BUY_ORDER_MAX_N via `max_sweep_sells_for_buy`.
     #[test]
-    fn test_v18_buy_sweep_capped_at_max_n() {
+    fn test_buy_sweep_capped_at_max_n() {
         let token = FAKE_TOKEN;
         let mut ob = OrderBook::new();
 
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xDD; 32], 2000, 0, 0,
         ).unwrap();
-        assert!(is_v18_buy(&rs), "helper must recognize the v18 buy RS");
-        assert_eq!(max_sweep_sells_for_buy(&rs), BUY_ORDER_V18_MAX_N);
+        assert!(is_buy_rs(&rs), "helper must recognize the v18 buy RS");
+        assert_eq!(max_sweep_sells_for_buy(&rs), BUY_ORDER_MAX_N);
         let mut buy = make_buy(1_000_000_000, 1, 1, token);
         buy.tx_id = format!("{:064x}", 2);
         buy.owner_hash = "aa".repeat(32);
@@ -1885,9 +1885,9 @@ mod tests {
         let g = &groups[0];
         assert!(g.is_buy_sweep);
         assert!(
-            g.fills.len() <= BUY_ORDER_V18_MAX_N,
+            g.fills.len() <= BUY_ORDER_MAX_N,
             "v18 buy sweep must be capped at MAX_N={}, got {}",
-            BUY_ORDER_V18_MAX_N, g.fills.len(),
+            BUY_ORDER_MAX_N, g.fills.len(),
         );
     }
 
@@ -1895,11 +1895,11 @@ mod tests {
     /// multi-sell sweep under a v18 buy anchor (the canonical branch
     /// attestation removed the pre-v18 OCO-SL fixed-offset blocker).
     #[test]
-    fn test_v18_oco_sell_included_in_v18_sweep() {
+    fn test_oco_sell_included_in_sweep() {
         let token = FAKE_TOKEN;
         let mut ob = OrderBook::new();
 
-        let buy_rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let buy_rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xDD; 32], 2000, 0, 0,
         ).unwrap();
         let mut buy = make_buy(2_000_000_000, 1, 1, token);
@@ -1913,10 +1913,10 @@ mod tests {
         sell_plain.owner_hash = "b1".repeat(32);
         ob.add_sell_order(sell_plain);
 
-        let oco_rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+        let oco_rs = kob_core::contract::spot::oco::build_oco_sell_redeem_script(
             2, 1, 1_000_000, 1, 2, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
-        assert!(is_v18_oco_sell(&oco_rs), "helper must recognize the v18 OCO RS");
+        assert!(is_oco_sell_rs(&oco_rs), "helper must recognize the v18 OCO RS");
         let mut sell_oco = make_sell(500_000_000, 1, 2, token);
         sell_oco.tx_id = format!("{:0>64}", "v18oco");
         sell_oco.owner_hash = "b2".repeat(32);
@@ -2910,10 +2910,10 @@ mod tests {
     }
 
     // ===============================================================
-    // v18 ring detection (find_v18_rings)
+    // v18 ring detection (find_rings)
     // ===============================================================
 
-    fn make_v18_swap_entry(
+    fn make_ring_swap_entry(
         id_byte: u8,
         source: [u8; 32],
         target: [u8; 32],
@@ -2926,7 +2926,7 @@ mod tests {
             s
         };
         let owner_spk_hash = kob_core::p2sh::compute_spk_hash(0, &owner_spk);
-        let rs = kob_core::contract::spot::swap::build_swap_v18_redeem_script(
+        let rs = kob_core::contract::spot::swap::build_swap_redeem_script(
             &source, &target, 1_000_000, &[0xBB; 32], &owner_spk_hash, &[0xEE; 32], 100,
         )
         .unwrap();
@@ -2957,11 +2957,11 @@ mod tests {
     const RING_TOKEN_C: [u8; 32] = [0xC3; 32];
 
     #[test]
-    fn find_v18_rings_detects_2_cycle() {
+    fn find_rings_detects_2_cycle() {
         let mut book = crate::swap_book::SwapBook::new();
-        book.add(make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
-        book.add(make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000));
-        let rings = find_v18_rings(&book, None);
+        book.add(make_ring_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
+        book.add(make_ring_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000));
+        let rings = find_rings(&book, None);
         assert_eq!(rings.len(), 1);
         assert_eq!(rings[0].len(), 2);
         // Closed cycle: leg i's target == leg (i+1)%n's source.
@@ -2971,12 +2971,12 @@ mod tests {
     }
 
     #[test]
-    fn find_v18_rings_detects_3_cycle_triangle() {
+    fn find_rings_detects_3_cycle_triangle() {
         let mut book = crate::swap_book::SwapBook::new();
-        book.add(make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
-        book.add(make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_C, 60_000_000));
-        book.add(make_v18_swap_entry(0x03, RING_TOKEN_C, RING_TOKEN_A, 70_000_000));
-        let rings = find_v18_rings(&book, None);
+        book.add(make_ring_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
+        book.add(make_ring_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_C, 60_000_000));
+        book.add(make_ring_swap_entry(0x03, RING_TOKEN_C, RING_TOKEN_A, 70_000_000));
+        let rings = find_rings(&book, None);
         assert_eq!(rings.len(), 1);
         assert_eq!(rings[0].len(), 3);
         for i in 0..3 {
@@ -2985,40 +2985,40 @@ mod tests {
     }
 
     #[test]
-    fn find_v18_rings_prefers_2_cycle_and_skips_spent() {
+    fn find_rings_prefers_2_cycle_and_skips_spent() {
         let mut book = crate::swap_book::SwapBook::new();
-        let e1 = make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000);
-        let e2 = make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
+        let e1 = make_ring_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000);
+        let e2 = make_ring_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
         let key1 = e1.outpoint_key();
         book.add(e1);
         book.add(e2);
         // Spending one leg kills the only ring.
         let mut spent = std::collections::HashSet::new();
         spent.insert(key1);
-        assert!(find_v18_rings(&book, Some(&spent)).is_empty());
+        assert!(find_rings(&book, Some(&spent)).is_empty());
     }
 
     #[test]
-    fn find_v18_rings_ignores_pre_v18_swaps_and_open_chains() {
+    fn find_rings_ignores_pre_swaps_and_open_chains() {
         let mut book = crate::swap_book::SwapBook::new();
         // Open chain A->B, B->C (no C->A): no ring.
-        book.add(make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
-        book.add(make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_C, 60_000_000));
-        assert!(find_v18_rings(&book, None).is_empty());
+        book.add(make_ring_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
+        book.add(make_ring_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_C, 60_000_000));
+        assert!(find_rings(&book, None).is_empty());
         // A pre-v18 (243B RS) B->A closer must NOT complete the ring.
-        let mut legacy = make_v18_swap_entry(0x03, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
+        let mut legacy = make_ring_swap_entry(0x03, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
         legacy.redeem_script_hex = "00".repeat(243);
         book.add(legacy);
-        assert!(find_v18_rings(&book, None).is_empty());
+        assert!(find_rings(&book, None).is_empty());
     }
 
     #[test]
-    fn find_v18_rings_requires_owner_spk() {
+    fn find_rings_requires_owner_spk() {
         let mut book = crate::swap_book::SwapBook::new();
-        book.add(make_v18_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
-        let mut e2 = make_v18_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
+        book.add(make_ring_swap_entry(0x01, RING_TOKEN_A, RING_TOKEN_B, 50_000_000));
+        let mut e2 = make_ring_swap_entry(0x02, RING_TOKEN_B, RING_TOKEN_A, 60_000_000);
         e2.owner_spk = None; // fill would be unbuildable — defer
         book.add(e2);
-        assert!(find_v18_rings(&book, None).is_empty());
+        assert!(find_rings(&book, None).is_empty());
     }
 }

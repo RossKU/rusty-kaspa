@@ -21,10 +21,10 @@ use crate::matcher::scanner::{
     BlockScanner, TransactionData, ScanResult,
     PerpDeploySide, LendingOrderType, PredictionItemType,
 };
-use kob_core::contract::spot::bracket::BRACKET_V18_RS_SIZE;
-use kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE;
+use kob_core::contract::spot::bracket::BRACKET_RS_SIZE;
+use kob_core::contract::spot::oco::OCO_SELL_RS_SIZE;
 use kob_core::contract::spot::order::{
-    BUY_ORDER_V18_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
+    BUY_ORDER_RS_EXPECTED_LEN, SELL_ORDER_RS_EXPECTED_LEN,
 };
 
 // CovenantCache / SpentTracker / fetch_wallet_utxos / check_mass_presubmit
@@ -429,18 +429,18 @@ pub(crate) fn pair_to_batch_orders(
     let buy_rs = hex::decode(&pair.buy.redeem_script_hex).unwrap_or_default();
 
     // v18-only RS-length gates (pre-v18 generations removed in Stage E).
-    if sell_rs.len() != SELL_ORDER_V18_RS_EXPECTED_LEN
-        && sell_rs.len() != OCO_SELL_V18_RS_SIZE
+    if sell_rs.len() != SELL_ORDER_RS_EXPECTED_LEN
+        && sell_rs.len() != OCO_SELL_RS_SIZE
     {
         warn!("[{}] Unsupported sell RS size {}, skipping (v18={}, oco18={})",
-            label, sell_rs.len(), SELL_ORDER_V18_RS_EXPECTED_LEN, OCO_SELL_V18_RS_SIZE);
+            label, sell_rs.len(), SELL_ORDER_RS_EXPECTED_LEN, OCO_SELL_RS_SIZE);
         return None;
     }
-    if buy_rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN
-        && buy_rs.len() != BRACKET_V18_RS_SIZE
+    if buy_rs.len() != BUY_ORDER_RS_EXPECTED_LEN
+        && buy_rs.len() != BRACKET_RS_SIZE
     {
         warn!("[{}] Unsupported buy RS size {}, skipping (v18={}, bracket18={})",
-            label, buy_rs.len(), BUY_ORDER_V18_RS_EXPECTED_LEN, BRACKET_V18_RS_SIZE);
+            label, buy_rs.len(), BUY_ORDER_RS_EXPECTED_LEN, BRACKET_RS_SIZE);
         return None;
     }
 
@@ -459,16 +459,10 @@ pub(crate) fn pair_to_batch_orders(
         }
     };
 
-    // Sell version: RS length is the canonical generation discriminator.
-    // v18 sells AND v18 OCO sells report 18 (the v18 planners accept both);
-    // everything pre-v18 keeps the legacy label 14.
-    let sell_version = if sell_rs.len() == SELL_ORDER_V18_RS_EXPECTED_LEN
-        || sell_rs.len() == OCO_SELL_V18_RS_SIZE
-    {
-        18u8
-    } else {
-        14u8
-    };
+    // Sell version: plain sells and OCO sells both report the spot
+    // generation (the sell/OCO length gate above already rejected anything
+    // else).
+    let sell_version = kob_core::contract::spot::SPOT_GENERATION as u8;
     let sell_order = crate::matcher::batch::BatchOrder {
         outpoint: (pair.sell.tx_id.clone(), pair.sell.index),
         order_type: crate::matcher::batch::OrderType::Sell,
@@ -486,17 +480,17 @@ pub(crate) fn pair_to_batch_orders(
         bracket_meta: None,
     };
 
-    let buy_version = if buy_rs.len() == BRACKET_V18_RS_SIZE {
+    let buy_version = if buy_rs.len() == BRACKET_RS_SIZE {
         // Bracket entries keep the legacy 16 label: brackets are NOT
         // fillable by the batch planners (their fill needs a receipt input +
         // OCO spawn, wired by the CLI `bracket fill` path), and labeling a
-        // v18 bracket 18 would mis-dispatch it into `plan_batch_match_v18`
-        // (which expects a v18 buy RS).
+        // bracket as a spot order would mis-dispatch it into
+        // `plan_batch_match` (which expects a spot buy RS).
         16u8
     } else {
-        18u8
+        kob_core::contract::spot::SPOT_GENERATION as u8
     };
-    let bracket_meta = if buy_rs.len() == BRACKET_V18_RS_SIZE {
+    let bracket_meta = if buy_rs.len() == BRACKET_RS_SIZE {
         extract_bracket_meta(&buy_rs)
     } else {
         None
@@ -546,16 +540,16 @@ pub(crate) fn book_order_to_batch_order(
     // v18-only RS-length gates (pre-v18 generations removed in Stage E).
     match order.side {
         crate::matcher::order_book::OrderSide::Sell => {
-            if rs.len() != SELL_ORDER_V18_RS_EXPECTED_LEN
-                && rs.len() != OCO_SELL_V18_RS_SIZE
+            if rs.len() != SELL_ORDER_RS_EXPECTED_LEN
+                && rs.len() != OCO_SELL_RS_SIZE
             {
                 warn!("[{}] Unsupported sell RS size {} for {}", label, rs.len(), order.outpoint_key());
                 return None;
             }
         }
         crate::matcher::order_book::OrderSide::Buy => {
-            if rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN
-                && rs.len() != BRACKET_V18_RS_SIZE
+            if rs.len() != BUY_ORDER_RS_EXPECTED_LEN
+                && rs.len() != BRACKET_RS_SIZE
             {
                 warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
                 return None;
@@ -576,13 +570,13 @@ pub(crate) fn book_order_to_batch_order(
         crate::matcher::order_book::OrderSide::Sell => crate::matcher::batch::OrderType::Sell,
     };
 
-    let version = if rs.len() == BRACKET_V18_RS_SIZE {
+    let version = if rs.len() == BRACKET_RS_SIZE {
         // Brackets keep the legacy 16 label — see pair_to_batch_orders.
         16u8
     } else {
-        18u8
+        kob_core::contract::spot::SPOT_GENERATION as u8
     };
-    let bracket_meta = if rs.len() == BRACKET_V18_RS_SIZE {
+    let bracket_meta = if rs.len() == BRACKET_RS_SIZE {
         extract_bracket_meta(&rs)
     } else {
         None
@@ -620,7 +614,7 @@ pub(crate) fn book_order_to_batch_order(
 fn extract_bracket_meta(rs: &[u8]) -> Option<crate::matcher::batch::BracketMeta> {
     // v1 (365B) and v18 (372B) brackets share the identical 224B state
     // layout — only the body differs — so one extractor serves both.
-    if rs.len() != BRACKET_V18_RS_SIZE {
+    if rs.len() != BRACKET_RS_SIZE {
         return None;
     }
 
@@ -2313,10 +2307,10 @@ fn process_block_txs_all(
                     counters.dca_added += 1;
                 }
             }
-            ScanResult::SwapV18(parsed, p2sh_idx, p2sh_value) => {
+            ScanResult::Swap(parsed, p2sh_idx, p2sh_value) => {
                 // v18 swap (260B RS): ring-eligible leg. Same SwapEntry shape
                 // as v1 — the RS length in redeem_script_hex is the generation
-                // discriminator (find_v18_rings filters on it; mmfee_bps is
+                // discriminator (find_rings filters on it; mmfee_bps is
                 // re-parsed from the RS at plan time).
                 let outpoint_key = format!("{}:{}", tx.tx_id, p2sh_idx);
                 if let Some(ref mut sb) = swap_book {
@@ -2917,8 +2911,8 @@ async fn expire_orders(
 
         // Expire sigscript is [Op4][pushData(RS)] for every v18 generation.
         let expire_ss = match order.side {
-            OrderSide::Buy => kob_core::contract::spot::order::build_buy_v18_expire_sigscript(&rs),
-            OrderSide::Sell => kob_core::contract::spot::order::build_sell_v18_expire_sigscript(&rs),
+            OrderSide::Buy => kob_core::contract::spot::order::build_buy_expire_sigscript(&rs),
+            OrderSide::Sell => kob_core::contract::spot::order::build_sell_expire_sigscript(&rs),
         };
 
         // Resolve the owner-seat SPK preimage.
@@ -3224,21 +3218,21 @@ async fn run_scan_cycle(
             // v18 rings settle token->token directly (2-cycle / triangle),
             // WITHOUT KAS-bridged buy/sell counterparties (the retired v1
             // swap route) — detected purely from the swap book.
-            let v18_rings = matching::find_v18_rings(&swab, Some(&swap_spent_keys));
+            let rings = matching::find_rings(&swab, Some(&swap_spent_keys));
             drop(swab);
 
             // --- v18 ring settles (item F) ---
-            if !v18_rings.is_empty() {
-                info!("[SCAN] Found {} v18 swap ring(s)", v18_rings.len());
+            if !rings.is_empty() {
+                info!("[SCAN] Found {} v18 swap ring(s)", rings.len());
             }
-            for ring in &v18_rings {
+            for ring in &rings {
                 // Skip rings touching outpoints consumed earlier this cycle.
                 if ring.iter().any(|e| spent_tracker.is_spent(&e.outpoint_key())) {
                     continue;
                 }
 
                 // SwapEntry -> RingLegOrder (owner_spk presence is guaranteed
-                // by find_v18_rings; decode defensively anyway).
+                // by find_rings; decode defensively anyway).
                 let mut leg_orders: Vec<crate::matcher::batch::RingLegOrder> = Vec::new();
                 let mut convert_ok = true;
                 for e in ring {
@@ -3465,7 +3459,7 @@ async fn run_scan_cycle(
             matching::GroupKind::BuySweep => {
                 // 1 v18 buy (in buys[0]) sweeps N sells via the per-sell-
                 // output IOC planner (per-term OpAuthOutputIdx binding).
-                crate::matcher::batch::plan_ioc_match_v18(
+                crate::matcher::batch::plan_ioc_match(
                     &sells, &buys[0], wallet_utxo,
                     &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
@@ -3474,7 +3468,7 @@ async fn run_scan_cycle(
                 // 1 v18 sell (in sells[0]) sweeps N buys via the full-
                 // absorption parity planner (v18 sweeps are structurally
                 // full-fill-only on the sell side — auth-slot-0 conflict).
-                crate::matcher::batch::plan_sell_ioc_match_v18(
+                crate::matcher::batch::plan_sell_ioc_match(
                     &sells[0], &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
@@ -3483,7 +3477,7 @@ async fn run_scan_cycle(
                 // 1:1 partial buy — the v18 Op2 path: the buy spends only
                 // part of its KAS and keeps a byte-exact self-SPK residual
                 // UTXO (item C).
-                crate::matcher::batch::plan_partial_match_v18(
+                crate::matcher::batch::plan_partial_match(
                     &sells, &buys[0], wallet_utxo,
                     &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                 )
@@ -3491,10 +3485,10 @@ async fn run_scan_cycle(
             matching::GroupKind::PartialSell => {
                 // 1:1 partial sell: sell IOC sweeps 1 buy. A v18 partial sell
                 // cannot settle against a v18 buy in the same tx (auth-slot-0
-                // conflict) — plan_sell_ioc_match_v18 selects a fully-
-                // absorbing buy instead or reports V18SellResidualUnsupported.
+                // conflict) — plan_sell_ioc_match selects a fully-
+                // absorbing buy instead or reports SellResidualUnsupported.
                 {
-                    crate::matcher::batch::plan_sell_ioc_match_v18(
+                    crate::matcher::batch::plan_sell_ioc_match(
                         &sells[0], &buys, wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                     )
@@ -3544,8 +3538,8 @@ async fn run_scan_cycle(
                 continue;
             }
             Err(ref e) if matches!(e,
-                crate::matcher::batch::BatchError::V18SellResidualUnsupported { .. }
-                | crate::matcher::batch::BatchError::V18CapInfeasible { .. }) => {
+                crate::matcher::batch::BatchError::SellResidualUnsupported { .. }
+                | crate::matcher::batch::BatchError::CapInfeasible { .. }) => {
                 // Structural v18 pairing issues, not order faults: a v18
                 // partial sell can't compose with a v18 buy in one tx, and
                 // the surplus cap depends on WHICH counterparty is chosen.
@@ -4717,7 +4711,7 @@ async fn run_scan_cycle(
 
             // v18 sell fill sigscript (canonical attested layout):
             // [0x01,koi=1][0x08 pnum][0x08 pden][Op1][pushData(RS)]
-            let sell_fill_ss = kob_core::contract::spot::order::build_sell_v18_fill_sigscript(
+            let sell_fill_ss = kob_core::contract::spot::order::build_sell_fill_sigscript(
                 1u16, sell.price_num, sell.price_den, &sell_rs,
             );
 
@@ -7734,7 +7728,7 @@ mod tests {
     // v18 wiring: version mapping, bracket meta, planner routing, ring TX
     // ===================================================================
 
-    fn v18_book_order(side: OrderSide, rs: Vec<u8>, value: u64) -> crate::matcher::order_book::BookOrder {
+    fn book_order(side: OrderSide, rs: Vec<u8>, value: u64) -> crate::matcher::order_book::BookOrder {
         crate::matcher::order_book::BookOrder {
             tx_id: "ab".repeat(32),
             index: 0,
@@ -7762,33 +7756,33 @@ mod tests {
     }
 
     #[test]
-    fn book_order_to_batch_order_maps_v18_buy_to_version_18() {
+    fn book_order_to_batch_order_maps_buy_to_version_18() {
         let token = [0xCD; 32];
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &token, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
-        assert_eq!(rs.len(), BUY_ORDER_V18_RS_EXPECTED_LEN);
-        let bo = v18_book_order(OrderSide::Buy, rs, 15_000_000);
+        assert_eq!(rs.len(), BUY_ORDER_RS_EXPECTED_LEN);
+        let bo = book_order(OrderSide::Buy, rs, 15_000_000);
         let batch = book_order_to_batch_order(&bo, "TEST").expect("v18 buy must convert");
         assert_eq!(batch.version, 18, "v18 buy RS must map to version 18 (planner dispatch key)");
         assert!(batch.bracket_meta.is_none());
     }
 
     #[test]
-    fn book_order_to_batch_order_maps_v18_sell_and_oco_to_version_18() {
-        let sell_rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+    fn book_order_to_batch_order_maps_sell_and_oco_to_version_18() {
+        let sell_rs = kob_core::contract::spot::order::build_sell_redeem_script(
             1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
-        assert_eq!(sell_rs.len(), SELL_ORDER_V18_RS_EXPECTED_LEN);
-        let bo = v18_book_order(OrderSide::Sell, sell_rs, 30_000_000);
+        assert_eq!(sell_rs.len(), SELL_ORDER_RS_EXPECTED_LEN);
+        let bo = book_order(OrderSide::Sell, sell_rs, 30_000_000);
         let batch = book_order_to_batch_order(&bo, "TEST").expect("v18 sell must convert");
         assert_eq!(batch.version, 18);
 
-        let oco_rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+        let oco_rs = kob_core::contract::spot::oco::build_oco_sell_redeem_script(
             2, 1, 1_000_000, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
-        assert_eq!(oco_rs.len(), OCO_SELL_V18_RS_SIZE);
-        let mut bo = v18_book_order(OrderSide::Sell, oco_rs, 30_000_000);
+        assert_eq!(oco_rs.len(), OCO_SELL_RS_SIZE);
+        let mut bo = book_order(OrderSide::Sell, oco_rs, 30_000_000);
         bo.oco_path = Some(kob_core::OcoPath::StopLoss);
         let batch = book_order_to_batch_order(&bo, "TEST").expect("v18 OCO must convert");
         assert_eq!(batch.version, 18, "v18 OCO sells are sweep-eligible under the v18 planners");
@@ -7796,27 +7790,27 @@ mod tests {
     }
 
     #[test]
-    fn v18_book_orders_route_through_v18_ioc_planner() {
+    fn book_orders_route_through_ioc_planner() {
         // The BuySweep dispatch keys off `buys[0].version == 18` ->
-        // plan_ioc_match_v18. Prove the converted orders actually plan
+        // plan_ioc_match. Prove the converted orders actually plan
         // (i.e. the dispatch precondition set up by
         // book_order_to_batch_order is sufficient for the v18 planner).
         let token = [0xCD; 32];
-        let buy_rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let buy_rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &token, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 2000, 0, 0,
         ).unwrap();
-        let sell_rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        let sell_rs = kob_core::contract::spot::order::build_sell_redeem_script(
             1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
         let buy = book_order_to_batch_order(
-            &v18_book_order(OrderSide::Buy, buy_rs, 16_000_000), "TEST",
+            &book_order(OrderSide::Buy, buy_rs, 16_000_000), "TEST",
         ).unwrap();
-        let mut sell_bo = v18_book_order(OrderSide::Sell, sell_rs, 30_000_000);
+        let mut sell_bo = book_order(OrderSide::Sell, sell_rs, 30_000_000);
         sell_bo.tx_id = "12".repeat(32);
         let sell = book_order_to_batch_order(&sell_bo, "TEST").unwrap();
         assert_eq!(buy.version, 18);
         assert_eq!(sell.version, 18);
-        let plan = crate::matcher::batch::plan_ioc_match_v18(
+        let plan = crate::matcher::batch::plan_ioc_match(
             &[sell], &buy, Some(("77".repeat(32), 0, 10_000_000)),
             &vec![0xBB; 34], 0, Some(30),
         ).expect("v18 IOC plan from engine-converted orders");
@@ -7840,7 +7834,7 @@ mod tests {
             let spk_hash = kob_core::p2sh::compute_spk_hash(0, &spk);
             // 1000 bps cap so the per-leg skim (amount/10000*bps) clears
             // MIN_UTXO_VALUE and is emitted as its own token output.
-            let rs = kob_core::contract::spot::swap::build_swap_v18_redeem_script(
+            let rs = kob_core::contract::spot::swap::build_swap_redeem_script(
                 &src, &tgt, 1_000_000, &[0xBB; 32], &spk_hash, &[0xEE; 32], 1000,
             ).unwrap();
             crate::matcher::batch::RingLegOrder {
@@ -7900,7 +7894,7 @@ mod tests {
         let tcid = [marker; 32];
         let ohash = [0xBB; 32];
         let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &tcid, 3, 2, 1_000_000, &ohash, &bspkh, &[0xF1; 32], 0, 0, 0,
         ).unwrap();
         let tx_id = format!("{:02x}", marker).repeat(32);
@@ -7912,7 +7906,7 @@ mod tests {
         let tcid = [0xAA; 32];
         let ohash = [0xBB; 32];
         let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &tcid, 3, 2, 1_000_000, &ohash, &bspkh, &[0xF1; 32], 0, 0, 0,).unwrap();
 
         let tx_id = "a".repeat(64);
@@ -7934,7 +7928,7 @@ mod tests {
         // process_block_txs skips such orders to prevent ghost entries.
         let ohash = [0xDD; 32];
         let sspkh = [0xEE; 32];
-        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_sell_redeem_script(
             5, 3, 2_000_000, &ohash, &sspkh, &[0xF2; 32], 0, 0, 0,).unwrap();
 
         let tx_id = "b".repeat(64);
@@ -7956,7 +7950,7 @@ mod tests {
         let tcid = [0xAA; 32];
         let ohash = [0xBB; 32];
         let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &tcid, 3, 2, 1_000_000, &ohash, &bspkh, &[0xF1; 32], 0, 0, 0,).unwrap();
 
         let tx_id = "a".repeat(64);
@@ -7993,14 +7987,14 @@ mod tests {
         let scanner = BlockScanner::new();
 
         // Deploy a buy order
-        let rs1 = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs1 = kob_core::contract::spot::order::build_buy_redeem_script(
             &[0xAA; 32], 3, 2, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xF1; 32], 0, 0, 0,).unwrap();
         let deploy1 = make_deploy_tx(&"a".repeat(64), &rs1, 10_000_000);
         process_block_txs(&[deploy1], &mut ob, &scanner);
         assert_eq!(ob.stats().total_bids, 1);
 
         // In the same block: deploy a sell order AND spend the buy order
-        let rs2 = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        let rs2 = kob_core::contract::spot::order::build_sell_redeem_script(
             5, 3, 2_000_000, &[0xDD; 32], &[0xEE; 32], &[0xF2; 32], 0, 0, 0,).unwrap();
         let deploy2 = make_deploy_tx(&"b".repeat(64), &rs2, 5_000_000);
 
@@ -8030,7 +8024,7 @@ mod tests {
         let ohash = [0xBB; 32];
         let bspkh = [0xCC; 32];
         // cancel_pending = 1
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &tcid, 3, 2, 1_000_000, &ohash, &bspkh, &[0xF1; 32], 0, 1, 0,).unwrap();
 
         let tx_id = "d".repeat(64);
@@ -8055,7 +8049,7 @@ mod tests {
         let mfill: u64 = 1_000_000;
         let ohash = [0xDD; 32];
         let sspkh = [0xEE; 32];
-        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_sell_redeem_script(
             pnum, pden, mfill, &ohash, &sspkh, &[0xF2; 32], 0, 0, 0,).unwrap();
         let _hash = kob_core::blake2b_256(&rs);
         let p2sh_spk = kob_core::build_p2sh(&rs);
@@ -8103,7 +8097,7 @@ mod tests {
         let mfill: u64 = 1_000_000;
         let ohash = [0xBB; 32];
         let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+        let rs = kob_core::contract::spot::order::build_buy_redeem_script(
             &tcid, pnum, pden, mfill, &ohash, &bspkh, &[0xF1; 32], 0, 0, 0,).unwrap();
         let p2sh_spk = kob_core::build_p2sh(&rs);
 

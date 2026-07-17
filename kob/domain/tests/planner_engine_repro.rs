@@ -20,7 +20,7 @@ use kaspa_txscript::engine_context::EngineCtx;
 use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_domain::batch::{
-    plan_batch_match, plan_ioc_match_v18, plan_partial_match_v18, plan_ring_match, BatchOrder,
+    plan_batch_match, plan_ioc_match, plan_partial_match, plan_ring_match, BatchOrder,
     BatchPlan, OrderType, OutputPurpose, RingLegOrder,
 };
 
@@ -65,8 +65,8 @@ fn exec_covenant_inputs(
     failures
 }
 
-fn make_sell_v18(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
-    let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+fn make_sell(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
+    let rs = kob_core::contract::spot::order::build_sell_redeem_script(
         price_num, price_den, 1_000_000, owner, sspkh, &[0xDD; 32], 30, 0, 0,
     ).unwrap();
     BatchOrder {
@@ -87,8 +87,8 @@ fn make_sell_v18(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token
     }
 }
 
-fn make_oco_sell_v18(id_byte: u8, amount: u64, tp: (u64, u64), sl: (u64, u64), path: kob_core::OcoPath, token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
-    let rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
+fn make_oco_sell(id_byte: u8, amount: u64, tp: (u64, u64), sl: (u64, u64), path: kob_core::OcoPath, token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
+    let rs = kob_core::contract::spot::oco::build_oco_sell_redeem_script(
         tp.0, tp.1, 1, sl.0, sl.1, 1, owner, sspkh, &[0xDD; 32], 30, 0, 0,
     ).unwrap();
     let (pn, pd) = match path {
@@ -113,8 +113,8 @@ fn make_oco_sell_v18(id_byte: u8, amount: u64, tp: (u64, u64), sl: (u64, u64), p
     }
 }
 
-fn make_buy_v18(id_byte: u8, amount: u64, price_num: u64, price_den: u64, min_fill: u64, token: [u8; 32], owner: &[u8; 32], bspkh: &[u8; 32], mmfee_bps: u64) -> BatchOrder {
-    let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+fn make_buy(id_byte: u8, amount: u64, price_num: u64, price_den: u64, min_fill: u64, token: [u8; 32], owner: &[u8; 32], bspkh: &[u8; 32], mmfee_bps: u64) -> BatchOrder {
+    let rs = kob_core::contract::spot::order::build_buy_redeem_script(
         &token, price_num, price_den, min_fill, owner, bspkh, &[0xDD; 32], mmfee_bps, 0, 0,
     ).unwrap();
     BatchOrder {
@@ -209,17 +209,17 @@ fn run_spot_plan(plan: &BatchPlan, wallet_value: u64) -> Vec<(usize, String)> {
 /// v18 GTC N:1 sweep planned by `plan_batch_match` (v18 dispatch), executed
 /// end-to-end against the real engine.
 #[test]
-fn v18_gtc_planner_sweep_passes_real_engine() {
+fn gtc_planner_sweep_passes_real_engine() {
     let pubkey = arr32(PUBKEY_HEX);
     let token = arr32(TOKEN_HEX);
     let owner_hash = kob_core::blake2b_256(&pubkey);
     let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
 
     let sells = vec![
-        make_sell_v18(0x10, 10_000_000, 99, 100, token, &owner_hash, &spk_hash),
-        make_sell_v18(0x11, 20_000_000, 99, 100, token, &owner_hash, &spk_hash),
+        make_sell(0x10, 10_000_000, 99, 100, token, &owner_hash, &spk_hash),
+        make_sell(0x11, 20_000_000, 99, 100, token, &owner_hash, &spk_hash),
     ];
-    let buys = vec![make_buy_v18(0x20, 30_000_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let buys = vec![make_buy(0x20, 30_000_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
     let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
 
     let plan = plan_batch_match(&sells, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000))
@@ -233,7 +233,7 @@ fn v18_gtc_planner_sweep_passes_real_engine() {
 /// P2SH SPK (the production deploy shape after D2) plans, delivers every
 /// BuyerTokens output on exactly that P2SH, and passes the real engine.
 #[test]
-fn v18_gtc_planner_token_unit_delivery_passes_real_engine() {
+fn gtc_planner_token_unit_delivery_passes_real_engine() {
     let pubkey = arr32(PUBKEY_HEX);
     let token = arr32(TOKEN_HEX);
     let owner_hash = kob_core::blake2b_256(&pubkey);
@@ -244,10 +244,10 @@ fn v18_gtc_planner_token_unit_delivery_passes_real_engine() {
     let token_unit_spk = kob_core::contract::build_token_unit_p2sh_spk(&pubkey);
 
     let sells = vec![
-        make_sell_v18(0x10, 10_000_000, 99, 100, token, &owner_hash, &sell_spk_hash),
-        make_sell_v18(0x11, 20_000_000, 99, 100, token, &owner_hash, &sell_spk_hash),
+        make_sell(0x10, 10_000_000, 99, 100, token, &owner_hash, &sell_spk_hash),
+        make_sell(0x11, 20_000_000, 99, 100, token, &owner_hash, &sell_spk_hash),
     ];
-    let mut buy = make_buy_v18(0x20, 30_000_000, 1, 1, 1_000_000, token, &owner_hash, &buy_spk_hash, 2000);
+    let mut buy = make_buy(0x20, 30_000_000, 1, 1, 1_000_000, token, &owner_hash, &buy_spk_hash, 2000);
     buy.counterparty_spk = token_unit_spk.script().to_vec();
     buy.counterparty_spk_version = token_unit_spk.version();
     let buys = vec![buy];
@@ -281,20 +281,20 @@ fn v18_gtc_planner_token_unit_delivery_passes_real_engine() {
 /// v18 GTC sweep with an OCO-SL term (OCO sweep enablement, the historic
 /// blocker): the OCO input executes its SL branch at the attested SL price.
 #[test]
-fn v18_gtc_planner_oco_sl_sweep_passes_real_engine() {
+fn gtc_planner_oco_sl_sweep_passes_real_engine() {
     let pubkey = arr32(PUBKEY_HEX);
     let token = arr32(TOKEN_HEX);
     let owner_hash = kob_core::blake2b_256(&pubkey);
     let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
 
     let sells = vec![
-        make_sell_v18(0x10, 10_000_000, 99, 100, token, &owner_hash, &spk_hash),
-        make_oco_sell_v18(
+        make_sell(0x10, 10_000_000, 99, 100, token, &owner_hash, &spk_hash),
+        make_oco_sell(
             0x11, 10_000_000, (3, 1), (99, 100), kob_core::OcoPath::StopLoss,
             token, &owner_hash, &spk_hash,
         ),
     ];
-    let buys = vec![make_buy_v18(0x20, 20_000_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let buys = vec![make_buy(0x20, 20_000_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
     let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
 
     let plan = plan_batch_match(&sells, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000))
@@ -303,31 +303,31 @@ fn v18_gtc_planner_oco_sl_sweep_passes_real_engine() {
     assert!(failures.is_empty(), "v18 OCO-SL sweep tx must pass the real engine; failures: {failures:?}");
 }
 
-/// v18 IOC sweep planned by `plan_ioc_match_v18`, executed end-to-end.
+/// v18 IOC sweep planned by `plan_ioc_match`, executed end-to-end.
 #[test]
-fn v18_ioc_planner_sweep_passes_real_engine() {
+fn ioc_planner_sweep_passes_real_engine() {
     let pubkey = arr32(PUBKEY_HEX);
     let token = arr32(TOKEN_HEX);
     let owner_hash = kob_core::blake2b_256(&pubkey);
     let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
 
-    let sell1 = make_sell_v18(0x10, 10_000_000, 1, 1, token, &owner_hash, &spk_hash);
-    let sell2 = make_sell_v18(0x11, 10_000_000, 1, 1, token, &owner_hash, &spk_hash);
-    let buy = make_buy_v18(0x20, 20_400_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000);
+    let sell1 = make_sell(0x10, 10_000_000, 1, 1, token, &owner_hash, &spk_hash);
+    let sell2 = make_sell(0x11, 10_000_000, 1, 1, token, &owner_hash, &spk_hash);
+    let buy = make_buy(0x20, 20_400_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000);
     let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
 
-    let plan = plan_ioc_match_v18(&[sell1, sell2], &buy, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000))
+    let plan = plan_ioc_match(&[sell1, sell2], &buy, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000))
         .expect("v18 IOC sweep must plan");
     assert_eq!(plan.sells.len(), 2, "both sells swept");
     let failures = run_spot_plan(&plan, 5_000_000);
     assert!(failures.is_empty(), "v18 IOC planner tx must pass the real engine; failures: {failures:?}");
 }
 
-/// v18 Op2 partial planned by `plan_partial_match_v18` — TWO chained events:
+/// v18 Op2 partial planned by `plan_partial_match` — TWO chained events:
 /// event 2 spends the residual UTXO (same RS, new amount) as a normal v18
 /// buy again, proving cross-tx chaining with the planner's own shapes.
 #[test]
-fn v18_partial_planner_chains_two_events_real_engine() {
+fn partial_planner_chains_two_events_real_engine() {
     let pubkey = arr32(PUBKEY_HEX);
     let token = arr32(TOKEN_HEX);
     let owner_hash = kob_core::blake2b_256(&pubkey);
@@ -336,9 +336,9 @@ fn v18_partial_planner_chains_two_events_real_engine() {
     let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
 
     // Event 1: 30M buy spends 10M against a 10M-token sell, keeps 20M.
-    let sell1 = make_sell_v18(0x10, 10_000_000, 99, 100, token, &owner_hash, &spk_hash);
-    let buy1 = make_buy_v18(0x20, 30_000_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000);
-    let plan1 = plan_partial_match_v18(&[sell1], &buy1, wallet.clone(), &matcher, 0, None)
+    let sell1 = make_sell(0x10, 10_000_000, 99, 100, token, &owner_hash, &spk_hash);
+    let buy1 = make_buy(0x20, 30_000_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000);
+    let plan1 = plan_partial_match(&[sell1], &buy1, wallet.clone(), &matcher, 0, None)
         .expect("partial event 1 must plan");
     let &(spent1, ri1, _) = plan1.buy_partial_fills.get(&0).expect("partial entry");
     let residual1 = plan1.outputs[ri1 as usize].value;
@@ -349,10 +349,10 @@ fn v18_partial_planner_chains_two_events_real_engine() {
 
     // Event 2: the residual UTXO (same RS => same P2SH) is a normal v18 buy
     // again; spend 15M of it against a 15M-token sell, keep 5M.
-    let sell2 = make_sell_v18(0x11, 15_000_000, 99, 100, token, &owner_hash, &spk_hash);
-    let mut buy2 = make_buy_v18(0x21, residual1, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000);
+    let sell2 = make_sell(0x11, 15_000_000, 99, 100, token, &owner_hash, &spk_hash);
+    let mut buy2 = make_buy(0x21, residual1, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000);
     buy2.redeem_script = buy1.redeem_script.clone(); // byte-exact continuation
-    let plan2 = plan_partial_match_v18(&[sell2], &buy2, wallet, &matcher, 0, None)
+    let plan2 = plan_partial_match(&[sell2], &buy2, wallet, &matcher, 0, None)
         .expect("partial event 2 must plan on the residual");
     let &(spent2, ri2, _) = plan2.buy_partial_fills.get(&0).expect("partial entry");
     assert_eq!(spent2, 15_000_000);
@@ -374,7 +374,7 @@ fn ring_owner_spk(seed: u8) -> Vec<u8> {
 fn make_ring_leg(id_byte: u8, source: [u8; 32], target: [u8; 32], amount: u64, min_target: u64, mmfee_bps: u64, owner_seed: u8) -> RingLegOrder {
     let owner_spk = ring_owner_spk(owner_seed);
     let owner_spk_hash = kob_core::p2sh::compute_spk_hash(0, &owner_spk);
-    let rs = kob_core::contract::spot::swap::build_swap_v18_redeem_script(
+    let rs = kob_core::contract::spot::swap::build_swap_redeem_script(
         &source, &target, min_target, &[0xBB; 32], &owner_spk_hash, &[0xEE; 32], mmfee_bps,
     ).unwrap();
     RingLegOrder {
@@ -447,7 +447,7 @@ const RING_C: [u8; 32] = [0xA3; 32];
 /// 2-cycle token<->token ring planned by `plan_ring_match` (with matcher
 /// skims at the per-leg F4 cap), executed end-to-end.
 #[test]
-fn v18_ring_planner_2cycle_passes_real_engine() {
+fn ring_planner_2cycle_passes_real_engine() {
     let (a0, a1) = (1_000_000_000u64, 2_000_000_000u64);
     let fee = |a: u64| a / 10000 * 100;
     let legs = vec![
@@ -460,7 +460,7 @@ fn v18_ring_planner_2cycle_passes_real_engine() {
 
 /// 3-cycle triangle ring planned by `plan_ring_match`, executed end-to-end.
 #[test]
-fn v18_ring_planner_3cycle_passes_real_engine() {
+fn ring_planner_3cycle_passes_real_engine() {
     let amounts = [1_000_000_000u64, 2_000_000_000, 3_000_000_000];
     let fee = |a: u64| a / 10000 * 100;
     let legs = vec![

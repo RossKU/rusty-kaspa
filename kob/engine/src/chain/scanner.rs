@@ -9,11 +9,7 @@ pub use kob_core::contract::perp::parse::{ParsedPerpOrder, PerpDeploySide, PERP_
 pub use kob_core::contract::lending::parse::{ParsedLendingOrder, LendingOrderType, parse_lending_rs, LOAN_OFFER_RS_SIZE, BORROW_REQUEST_RS_SIZE};
 pub use kob_core::contract::prediction::parse::{ParsedPredictionItem, PredictionItemType, parse_prediction_rs};
 pub use kob_core::{ParsedDcaOrder, parse_dca_order_rs, DCA_V2_RS_SIZE};
-pub use kob_core::{ParsedSwapOrder, parse_swap_order_rs, SWAP_RS_SIZE};
 pub use kob_core::contract::spot::swap::{ParsedSwapOrderV18, parse_swap_order_v18_rs, SWAP_V18_RS_SIZE};
-
-// Re-export spot RS size constants used by tests.
-pub use kob_core::contract::spot::parse::{BUY_RS_SIZE, SELL_RS_SIZE, BRACKET_RS_SIZE};
 
 /// Transaction data from block notifications or RPC queries.
 #[derive(Debug, Clone)]
@@ -61,7 +57,6 @@ pub enum ScanResult {
     /// DCA order detected (dca_order_v2, 369B RS).
     Dca(ParsedDcaOrder, u32, u64),
     /// Swap order detected (swap_order, 243B RS).
-    Swap(ParsedSwapOrder, u32, u64),
     /// v18 swap order detected (swap v18, 260B RS — ring-eligible legs).
     SwapV18(ParsedSwapOrderV18, u32, u64),
 }
@@ -182,9 +177,7 @@ impl BlockScanner {
     /// Returns `ParsedOcoSell` instead of `ParsedOrder`.
     fn scan_oco_sell(&self, tx: &TransactionData) -> Option<(ParsedOcoSell, u32, u64)> {
         let v2 = kob_core::contract::parse_order_payload(&tx.payload)?;
-        if v2.rs_data.len() != kob_core::OCO_SELL_RS_SIZE
-            && v2.rs_data.len() != kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE
-        {
+        if v2.rs_data.len() != kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE {
             return None;
         }
         let rs_hash = kob_core::blake2b_256(&v2.rs_data);
@@ -359,14 +352,11 @@ impl BlockScanner {
                 }
                 zk
             },
-            // V16/V17 buy orders and ALL v18 spot orders (buy AND sell — v18
-            // is BPS-uniform) store max_matcher_fee as BPS (basis points of
-            // trade value). Convert to absolute sompi so the matching engine
-            // can use it uniformly: mmfee_sompi = value * bps / 10000.
-            // For v14 buys and v14 sells: use raw value (already in sompi).
-            max_matcher_fee: if parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
-                || parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
-                || parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN
+            // All v18 spot orders (buy AND sell — v18 is BPS-uniform) store
+            // max_matcher_fee as BPS (basis points of trade value). Convert
+            // to absolute sompi so the matching engine can use it uniformly:
+            // mmfee_sompi = value * bps / 10000.
+            max_matcher_fee: if parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN
                 || parsed.redeem_script.len() == kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN
             {
                 value.saturating_mul(parsed._max_matcher_fee) / 10000
@@ -546,24 +536,6 @@ impl BlockScanner {
                     if rs_hash == *p2sh_hash {
                         if let Some(parsed) = parse_dca_order_rs(&v2.rs_data) {
                             return Some(ScanResult::Dca(parsed, p2sh_idx, p2sh_out.value));
-                        }
-                    }
-                }
-            } else if v2.rs_data.len() == SWAP_RS_SIZE {
-                let rs_hash = kob_core::blake2b_256(&v2.rs_data);
-                let p2sh_outputs: Vec<(u32, &TxOutputData, [u8; 32])> = tx
-                    .outputs
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(idx, out)| {
-                        parse_p2sh_script(&out.script, out.script_version)
-                            .map(|hash| (idx as u32, out, hash))
-                    })
-                    .collect();
-                for &(p2sh_idx, p2sh_out, ref p2sh_hash) in &p2sh_outputs {
-                    if rs_hash == *p2sh_hash {
-                        if let Some(parsed) = parse_swap_order_rs(&v2.rs_data) {
-                            return Some(ScanResult::Swap(parsed, p2sh_idx, p2sh_out.value));
                         }
                     }
                 }
@@ -863,34 +835,6 @@ impl TransactionData {
 mod tests {
     use super::*;
 
-    // Helper: build a known buy v12 RS using the kob-core builder
-    fn make_buy_v12_rs_default() -> (Vec<u8>, [u8; 32], u64, u64, u64, [u8; 32], [u8; 32], u64) {
-        let tcid = [0xAA; 32];
-        let pnum: u64 = 3;
-        let pden: u64 = 2;
-        let mfill: u64 = 1_000_000;
-        let ohash = [0xBB; 32];
-        let bspkh = [0xCC; 32];
-        let mmfee: u64 = 50_000;
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, pnum, pden, mfill, &ohash, &bspkh, mmfee, 0, 0,
-        ).unwrap();
-        (rs, tcid, pnum, pden, mfill, ohash, bspkh, mmfee)
-    }
-
-    // Helper: build a known sell v12 RS
-    fn make_sell_v12_rs_default() -> (Vec<u8>, u64, u64, u64, [u8; 32], [u8; 32]) {
-        let pnum: u64 = 5;
-        let pden: u64 = 3;
-        let mfill: u64 = 2_000_000;
-        let ohash = [0xDD; 32];
-        let sspkh = [0xEE; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(
-            pnum, pden, mfill, &ohash, &sspkh, 0, 0, 0,
-        ).unwrap();
-        (rs, pnum, pden, mfill, ohash, sspkh)
-    }
-
     // Helper: build a P2SH script from a hash
     fn make_p2sh_script(hash: &[u8; 32]) -> Vec<u8> {
         let mut s = Vec::with_capacity(35);
@@ -923,92 +867,9 @@ mod tests {
 
     // test_parse_buy_rs — parse known buy v12 RS
 
-    #[test]
-    fn test_parse_buy_v12_rs_default() {
-        let (rs, tcid, pnum, pden, mfill, ohash, bspkh, mmfee) = make_buy_v12_rs_default();
-        assert_eq!(rs.len(), BUY_RS_SIZE, "Buy RS must be 396 bytes");
-
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse buy v12 RS");
-        assert_eq!(parsed.order_type, OrderSide::Buy);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.token_cov_id, tcid);
-        assert_eq!(parsed.price_num, pnum);
-        assert_eq!(parsed.price_den, pden);
-        assert_eq!(parsed.min_fill, mfill);
-        assert_eq!(parsed.owner_hash, ohash);
-        assert_eq!(parsed.spk_hash, bspkh);
-        assert_eq!(parsed._max_matcher_fee, mmfee);
-        assert_eq!(parsed.cpend, 0);
-    }
-
-    #[test]
-    fn test_parse_buy_v12_cpend_1_default() {
-        let tcid = [0xAA; 32];
-        let ohash = [0xBB; 32];
-        let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, 50_000, 1, 0,
-        ).unwrap();
-
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse cpend=1");
-        assert_eq!(parsed.cpend, 1);
-    }
-
     // test_parse_sell_rs — sell v12
 
-    #[test]
-    fn test_parse_sell_v12_rs_default() {
-        let (rs, pnum, pden, mfill, ohash, sspkh) = make_sell_v12_rs_default();
-        assert_eq!(rs.len(), SELL_RS_SIZE, "Sell RS must be 427 bytes");
-
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse sell v12 RS");
-        assert_eq!(parsed.order_type, OrderSide::Sell);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.token_cov_id, [0u8; 32]); // sell has no tcid in RS
-        assert_eq!(parsed.price_num, pnum);
-        assert_eq!(parsed.price_den, pden);
-        assert_eq!(parsed.min_fill, mfill);
-        assert_eq!(parsed.owner_hash, ohash);
-        assert_eq!(parsed.spk_hash, sspkh);
-        assert_eq!(parsed._max_matcher_fee, 0);
-        assert_eq!(parsed.cpend, 0);
-    }
-
-    #[test]
-    fn test_parse_sell_v12_cpend_1_default() {
-        let ohash = [0xDD; 32];
-        let sspkh = [0xEE; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(
-            5, 3, 2_000_000, &ohash, &sspkh, 0, 1, 0,
-        ).unwrap();
-
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse sell cpend=1");
-        assert_eq!(parsed.cpend, 1);
-    }
-
     // test_p2sh_validation — RS hash matches P2SH
-
-    #[test]
-    fn test_p2sh_validation() {
-        let (rs, ..) = make_buy_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let p2sh_spk = kob_core::build_p2sh(&rs);
-
-        // Verify the hash matches
-        assert_eq!(&p2sh_spk.script()[2..34], &hash);
-
-        // Verify parse_p2sh_script extracts it
-        let extracted = parse_p2sh_script(&p2sh_spk.script(), 0).expect("Should parse P2SH");
-        assert_eq!(extracted, hash);
-    }
-
-    #[test]
-    fn test_p2sh_wrong_version() {
-        let (rs, ..) = make_buy_v12_rs_default();
-        let p2sh_spk = kob_core::build_p2sh(&rs);
-        // Version 1 should fail
-        assert!(parse_p2sh_script(&p2sh_spk.script(), 1).is_none());
-    }
 
     // test_order_book_crud — add/remove/query orders
 
@@ -1085,86 +946,6 @@ mod tests {
     }
 
     // test_scan_tx_deploy — mock TX with P2SH + payload -> OrderEntry
-
-    #[test]
-    fn test_scan_tx_deploy_buy_v12_default() {
-        let (rs, tcid, pnum, pden, mfill, ohash, bspkh, mmfee) = make_buy_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let p2sh_script = make_p2sh_script(&hash);
-
-        let tx = TransactionData {
-            tx_id: "a".repeat(64),
-            _version: 0,
-            inputs: vec![TxInputData {
-                prev_tx_id: "b".repeat(64),
-                prev_index: 0,
-                _sig_script: vec![],
-            }],
-            outputs: vec![
-                TxOutputData {
-                    value: 10_000_000,
-                    script_version: 0,
-                    script: p2sh_script,
-                    covenant_id: None,
-                },
-            ],
-            payload: make_payload(&rs),
-        };
-
-        let scanner = BlockScanner::new();
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "Should detect buy v12 deploy TX");
-
-        let (parsed, p2sh_idx, p2sh_value) = result.unwrap();
-        assert_eq!(p2sh_idx, 0);
-        assert_eq!(p2sh_value, 10_000_000);
-        assert_eq!(parsed.order_type, OrderSide::Buy);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.token_cov_id, tcid);
-        assert_eq!(parsed.price_num, pnum);
-        assert_eq!(parsed.price_den, pden);
-        assert_eq!(parsed.min_fill, mfill);
-        assert_eq!(parsed.owner_hash, ohash);
-        assert_eq!(parsed.spk_hash, bspkh);
-        assert_eq!(parsed._max_matcher_fee, mmfee);
-    }
-
-    #[test]
-    fn test_scan_tx_deploy_sell_v12_default() {
-        let (rs, pnum, pden, mfill, ohash, sspkh) = make_sell_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let p2sh_script = make_p2sh_script(&hash);
-
-        let tx = TransactionData {
-            tx_id: "c".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![
-                TxOutputData {
-                    value: 5_000_000,
-                    script_version: 0,
-                    script: p2sh_script,
-                    covenant_id: None,
-                },
-            ],
-            payload: make_payload(&rs),
-        };
-
-        let scanner = BlockScanner::new();
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "Should detect sell v12 deploy TX");
-
-        let (parsed, p2sh_idx, p2sh_value) = result.unwrap();
-        assert_eq!(p2sh_idx, 0);
-        assert_eq!(p2sh_value, 5_000_000);
-        assert_eq!(parsed.order_type, OrderSide::Sell);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.price_num, pnum);
-        assert_eq!(parsed.price_den, pden);
-        assert_eq!(parsed.min_fill, mfill);
-        assert_eq!(parsed.owner_hash, ohash);
-        assert_eq!(parsed.spk_hash, sspkh);
-    }
 
     // test_scan_tx_spend — mock TX spending an order -> removal
 
@@ -1243,65 +1024,6 @@ mod tests {
 
     // test_garbage_payload — garbage RS -> hash mismatch -> rejected
 
-    #[test]
-    fn test_garbage_payload() {
-        let garbage = vec![0xDEu8, 0xAD, 0xBE, 0xEF].into_iter().cycle().take(50).collect::<Vec<u8>>();
-        let garbage_hash = kob_core::blake2b_256(&garbage);
-
-        // Create a valid P2SH output with a DIFFERENT hash
-        let (rs, ..) = make_buy_v12_rs_default();
-        let real_hash = kob_core::blake2b_256(&rs);
-        let p2sh_script = make_p2sh_script(&real_hash);
-
-        assert_ne!(garbage_hash, real_hash, "Hashes must differ");
-
-        let tx = TransactionData {
-            tx_id: "g".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![
-                TxOutputData {
-                    value: 10_000_000,
-                    script_version: 0,
-                    script: p2sh_script,
-                    covenant_id: None,
-                },
-            ],
-            payload: make_payload(&garbage),
-        };
-
-        let scanner = BlockScanner::new();
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_none(), "Garbage payload hash mismatch should be rejected");
-    }
-
-    #[test]
-    fn test_garbage_payload_matching_hash_but_invalid_rs() {
-        // Even if the hash matches, an RS that doesn't parse should be rejected
-        let garbage = vec![0x00; BUY_RS_SIZE]; // Right size for buy v12 but wrong content
-        let hash = kob_core::blake2b_256(&garbage);
-        let p2sh_script = make_p2sh_script(&hash);
-
-        let tx = TransactionData {
-            tx_id: "h".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![
-                TxOutputData {
-                    value: 10_000_000,
-                    script_version: 0,
-                    script: p2sh_script,
-                    covenant_id: None,
-                },
-            ],
-            payload: make_payload(&garbage),
-        };
-
-        let scanner = BlockScanner::new();
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_none(), "RS with wrong structure should be rejected even with matching hash");
-    }
-
     // Payload parsing edge cases
 
     #[test]
@@ -1343,36 +1065,6 @@ mod tests {
         assert!(scanner.scan_tx(&tx).is_none());
     }
 
-    #[test]
-    fn test_oco_payload_scan() {
-        // Test OCO payload format (v2): KOB:2:<flags><buy_rs_len_u16_LE><buy_rs><sell_rs>
-        let (buy_rs, ..) = make_buy_v12_rs_default();
-        let (sell_rs, ..) = make_sell_v12_rs_default();
-        let buy_hash = kob_core::blake2b_256(&buy_rs);
-        let sell_hash = kob_core::blake2b_256(&sell_rs);
-        let buy_p2sh = make_p2sh_script(&buy_hash);
-        let sell_p2sh = make_p2sh_script(&sell_hash);
-
-        let tx = TransactionData {
-            tx_id: "z".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![
-                TxOutputData { value: 10_000_000, script_version: 0, script: buy_p2sh , covenant_id: None },
-                TxOutputData { value: 5_000_000, script_version: 0, script: sell_p2sh , covenant_id: None },
-            ],
-            payload: make_oco_payload(&buy_rs, &sell_rs),
-        };
-
-        let scanner = BlockScanner::new();
-        // scan_tx returns the first match (buy leg)
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "Should detect OCO buy leg from payload");
-        let (parsed, p2sh_idx, _) = result.unwrap();
-        assert_eq!(p2sh_idx, 0);
-        assert_eq!(parsed.order_type, OrderSide::Buy);
-    }
-
     // P2SH parsing edge cases
 
     #[test]
@@ -1397,106 +1089,7 @@ mod tests {
 
     // to_book_order conversion
 
-    #[test]
-    fn test_to_book_order_buy() {
-        let (rs, tcid, pnum, pden, mfill, ohash, bspkh, ..) = make_buy_v12_rs_default();
-        let parsed = BlockScanner::parse_redeem_script(&rs).unwrap();
-
-        let book_order = BlockScanner::to_book_order(
-            &parsed,
-            &"a".repeat(64),
-            0,
-            10_000_000,
-            None,
-        );
-
-        assert_eq!(book_order.tx_id, "a".repeat(64));
-        assert_eq!(book_order.index, 0);
-        assert_eq!(book_order.value, 10_000_000);
-        assert_eq!(book_order.token_cov_id, hex::encode(tcid));
-        assert_eq!(book_order.price_num, pnum);
-        assert_eq!(book_order.price_den, pden);
-        assert_eq!(book_order.min_fill, mfill);
-        assert_eq!(book_order.owner_hash, hex::encode(ohash));
-        assert_eq!(book_order.spk_hash, hex::encode(bspkh));
-        assert_eq!(book_order.side, OrderSide::Buy);
-        assert!(!book_order.redeem_script_hex.is_empty());
-        assert!(!book_order.p2sh_script_hex.is_empty());
-    }
-
-    #[test]
-    fn test_to_book_order_sell_with_override() {
-        let (rs, pnum, pden, mfill, ohash, sspkh) = make_sell_v12_rs_default();
-        let parsed = BlockScanner::parse_redeem_script(&rs).unwrap();
-
-        let tcid_override = "ff".repeat(32);
-        let book_order = BlockScanner::to_book_order(
-            &parsed,
-            &"c".repeat(64),
-            1,
-            5_000_000,
-            Some(&tcid_override),
-        );
-
-        assert_eq!(book_order.token_cov_id, tcid_override);
-        assert_eq!(book_order.price_num, pnum);
-        assert_eq!(book_order.price_den, pden);
-        assert_eq!(book_order.min_fill, mfill);
-        assert_eq!(book_order.owner_hash, hex::encode(ohash));
-        assert_eq!(book_order.spk_hash, hex::encode(sspkh));
-        assert_eq!(book_order.side, OrderSide::Sell);
-    }
-
     // Round-trip: build RS -> parse -> verify all fields (v12)
-
-    #[test]
-    fn test_roundtrip_buy_v12() {
-        let tcid = [0x12; 32];
-        let pnum = 12345u64;
-        let pden = 67890u64;
-        let mfill = 999_999u64;
-        let ohash = [0x34; 32];
-        let bspkh = [0x56; 32];
-        let mmfee = 77_777u64;
-
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, pnum, pden, mfill, &ohash, &bspkh, mmfee, 0, 0,
-        ).unwrap();
-        let parsed = BlockScanner::parse_redeem_script(&rs).unwrap();
-
-        // GCD normalization: 12345/67890 -> 823/4526 (GCD=15)
-        assert_eq!(parsed.token_cov_id, tcid);
-        assert_eq!(parsed.price_num, 823);
-        assert_eq!(parsed.price_den, 4526);
-        assert_eq!(parsed.min_fill, mfill);
-        assert_eq!(parsed.owner_hash, ohash);
-        assert_eq!(parsed.spk_hash, bspkh);
-        assert_eq!(parsed._max_matcher_fee, mmfee);
-        assert_eq!(parsed.cpend, 0);
-        assert_eq!(parsed.redeem_script, rs);
-    }
-
-    #[test]
-    fn test_roundtrip_sell_v12() {
-        let pnum = 54321u64;
-        let pden = 11111u64;
-        let mfill = 888_888u64;
-        let ohash = [0x78; 32];
-        let sspkh = [0x9A; 32];
-
-        let rs = kob_core::contract::build_sell_redeem_script(
-            pnum, pden, mfill, &ohash, &sspkh, 0, 0, 0,
-        ).unwrap();
-        let parsed = BlockScanner::parse_redeem_script(&rs).unwrap();
-
-        assert_eq!(parsed.price_num, pnum);
-        assert_eq!(parsed.price_den, pden);
-        assert_eq!(parsed.min_fill, mfill);
-        assert_eq!(parsed.owner_hash, ohash);
-        assert_eq!(parsed.spk_hash, sspkh);
-        assert_eq!(parsed.cpend, 0);
-        assert_eq!(parsed.redeem_script, rs);
-    }
 
     // Non-KOB RS should be rejected
 
@@ -1507,270 +1100,7 @@ mod tests {
         assert!(BlockScanner::parse_redeem_script(&rs).is_none());
     }
 
-    #[test]
-    fn test_right_size_wrong_body_signature() {
-        // BUY_RS_SIZE bytes (buy v12 size) but body doesn't start with expected bytes
-        let mut rs = vec![0x00; BUY_RS_SIZE];
-        rs[0] = 0x20; // right push prefix
-        rs[33] = 0x08;
-        rs[42] = 0x08;
-        rs[51] = 0x08;
-        rs[60] = 0x20;
-        rs[93] = 0x20;
-        rs[126] = 0x08;
-        rs[136] = 0x08; // expiry push
-        // Body starts at 145 with wrong bytes
-        rs[145] = 0xFF;
-        assert!(BlockScanner::parse_redeem_script(&rs).is_none());
-    }
-
     // E2E Integration: scanner -> order book -> matching engine pipeline
-
-    /// E2E: Scan a mock block with a buy deploy TX, add to order book,
-    /// then scan a sell deploy TX, add to book, verify matching finds a pair.
-    #[test]
-    fn e2e_scan_block_buy_sell_to_match() {
-        use crate::matcher::matching;
-        let scanner = BlockScanner::new();
-        let mut ob = OrderBook::new();
-        let fake_token = "0102030405060708091011121314151617181920212223242526272829303132";
-
-        // Deploy buy order via mock block TX
-        let (buy_rs, ..) = make_buy_v12_rs_default();
-        let buy_hash = kob_core::blake2b_256(&buy_rs);
-        let buy_tx = TransactionData {
-            tx_id: "b".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&buy_hash),
-                covenant_id: None,
-            }],
-            payload: make_payload(&buy_rs),
-        };
-
-        let (parsed_buy, idx, val) = scanner.scan_tx(&buy_tx).expect("buy should parse");
-        let buy_order = BlockScanner::to_book_order(&parsed_buy, &buy_tx.tx_id, idx, val, Some(fake_token));
-        ob.add_buy_order(buy_order);
-        assert_eq!(ob.stats().total_bids, 1);
-
-        // Deploy sell order via mock block TX
-        let (sell_rs, ..) = make_sell_v12_rs_default();
-        let sell_hash = kob_core::blake2b_256(&sell_rs);
-        let sell_tx = TransactionData {
-            tx_id: "c".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&sell_hash),
-                covenant_id: None,
-            }],
-            payload: make_payload(&sell_rs),
-        };
-
-        let (parsed_sell, idx2, val2) = scanner.scan_tx(&sell_tx).expect("sell should parse");
-        let sell_order = BlockScanner::to_book_order(&parsed_sell, &sell_tx.tx_id, idx2, val2, Some(fake_token));
-        ob.add_sell_order(sell_order);
-        assert_eq!(ob.stats().total_asks, 1);
-
-        // Matching engine should find crossing groups (allow self trade since owners differ)
-        let groups = matching::match_book_direct(&ob, true, None, u64::MAX);
-        // Whether they cross depends on price: buy pnum=3/pden=2 sell pnum=5/pden=3
-        // buy price = 3/2 tokens per KAS, sell price = 5/3 tokens per KAS
-        // Buy expects 10M * 3/2 = 15M tokens. Sell expects 10M * 5/3 = 16.66M KAS.
-        // These may or may not cross depending on surplus arithmetic.
-        // The key test is the pipeline works end-to-end without panics.
-        // At minimum we verify the engine ran and produced a result vector.
-        assert!(groups.len() <= 2, "Should produce 0-2 match groups");
-    }
-
-    /// E2E: Scanner dedup — same TX scanned twice should not create duplicate orders.
-    #[test]
-    fn e2e_scanner_dedup_prevents_duplicate() {
-        let scanner = BlockScanner::new();
-        let mut ob = OrderBook::new();
-        let fake_token = "0102030405060708091011121314151617181920212223242526272829303132";
-
-        let (buy_rs, ..) = make_buy_v12_rs_default();
-        let buy_hash = kob_core::blake2b_256(&buy_rs);
-        let buy_tx = TransactionData {
-            tx_id: "d".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&buy_hash),
-                covenant_id: None,
-            }],
-            payload: make_payload(&buy_rs),
-        };
-
-        // First scan: add order
-        let (parsed, idx, val) = scanner.scan_tx(&buy_tx).expect("first scan");
-        let order = BlockScanner::to_book_order(&parsed, &buy_tx.tx_id, idx, val, Some(fake_token));
-        let outpoint_key = order.outpoint_key();
-        assert!(!ob.contains_outpoint(&outpoint_key), "should not be in book yet");
-        ob.add_buy_order(order);
-        assert_eq!(ob.stats().total_bids, 1);
-
-        // Second scan: dedup check should detect existing outpoint
-        let (parsed2, idx2, val2) = scanner.scan_tx(&buy_tx).expect("second scan");
-        let order2 = BlockScanner::to_book_order(&parsed2, &buy_tx.tx_id, idx2, val2, Some(fake_token));
-        assert!(ob.contains_outpoint(&order2.outpoint_key()), "M-7: dedup should detect existing outpoint");
-        // Do NOT add — in production the scanner checks contains_outpoint before adding
-        assert_eq!(ob.stats().total_bids, 1, "still 1 bid after dedup");
-    }
-
-    /// E2E: Cancel detection — spent UTXO removes order from book.
-    #[test]
-    fn e2e_cancel_detection_removes_order() {
-        let scanner = BlockScanner::new();
-        let mut ob = OrderBook::new();
-        let fake_token = "0102030405060708091011121314151617181920212223242526272829303132";
-
-        // Deploy buy order
-        let (buy_rs, ..) = make_buy_v12_rs_default();
-        let buy_hash = kob_core::blake2b_256(&buy_rs);
-        let buy_tx_id = "e".repeat(64);
-        let buy_tx = TransactionData {
-            tx_id: buy_tx_id.clone(),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&buy_hash),
-                covenant_id: None,
-            }],
-            payload: make_payload(&buy_rs),
-        };
-        let (parsed, idx, val) = scanner.scan_tx(&buy_tx).expect("buy");
-        let order = BlockScanner::to_book_order(&parsed, &buy_tx.tx_id, idx, val, Some(fake_token));
-        ob.add_buy_order(order);
-        assert_eq!(ob.stats().total_bids, 1);
-
-        // Cancel TX spends the buy UTXO
-        let cancel_tx = TransactionData {
-            tx_id: "f".repeat(64),
-            _version: 0,
-            inputs: vec![TxInputData {
-                prev_tx_id: buy_tx_id,
-                prev_index: 0,
-                _sig_script: vec![],
-            }],
-            outputs: vec![],
-            payload: vec![],
-        };
-        let spent = BlockScanner::find_spent_orders(&cancel_tx, &ob);
-        assert_eq!(spent.len(), 1, "should detect spent order");
-        for key in &spent {
-            ob.remove_order(key);
-        }
-        assert_eq!(ob.stats().total_bids, 0, "order should be removed after cancel");
-    }
-
-    /// E2E: OCO payload — scan a TX with both buy and sell RS in one payload.
-    #[test]
-    fn e2e_oco_payload_scan() {
-        let scanner = BlockScanner::new();
-        let (buy_rs, ..) = make_buy_v12_rs_default();
-        let (sell_rs, ..) = make_sell_v12_rs_default();
-
-        let buy_hash = kob_core::blake2b_256(&buy_rs);
-        let sell_hash = kob_core::blake2b_256(&sell_rs);
-
-        // TX with two P2SH outputs (buy + sell) and OCO payload
-        let tx = TransactionData {
-            tx_id: "g".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![
-                TxOutputData {
-                    value: 10_000_000,
-                    script_version: 0,
-                    script: make_p2sh_script(&buy_hash),
-                    covenant_id: None,
-                },
-                TxOutputData {
-                    value: 5_000_000,
-                    script_version: 0,
-                    script: make_p2sh_script(&sell_hash),
-                    covenant_id: None,
-                },
-            ],
-            payload: make_oco_payload(&buy_rs, &sell_rs),
-        };
-
-        // scan_tx returns the first match (buy RS against output 0)
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "OCO payload should match at least one output");
-        let (parsed, p2sh_idx, _) = result.unwrap();
-        // Should match the buy RS against output 0
-        assert_eq!(p2sh_idx, 0);
-        assert_eq!(parsed.order_type, OrderSide::Buy);
-    }
-
-    /// E2E: Multiple TXs in a block — process several TXs, build up the book.
-    #[test]
-    fn e2e_multi_tx_block_processing() {
-        let scanner = BlockScanner::new();
-        let mut ob = OrderBook::new();
-        let fake_token = "0102030405060708091011121314151617181920212223242526272829303132";
-
-        // Simulate 3 buy deploy TXs with unique tx_ids
-        for i in 0..3u8 {
-            let tcid = [0xAA; 32];
-            let ohash = [0xBB; 32];
-            let bspkh = [0xCC; 32];
-            let rs = kob_core::contract::build_buy_redeem_script(
-                &tcid, 3, 2, 1_000_000, &ohash, &bspkh, 50_000, 0, 0,
-            ).unwrap();
-            let hash = kob_core::blake2b_256(&rs);
-            let tx_id = format!("{:02x}", i).repeat(32);
-            let tx = TransactionData {
-                tx_id: tx_id.clone(),
-                _version: 0,
-                inputs: vec![],
-                outputs: vec![TxOutputData {
-                    value: 10_000_000 + (i as u64) * 1_000_000,
-                    script_version: 0,
-                    script: make_p2sh_script(&hash),
-                    covenant_id: None,
-                }],
-                payload: make_payload(&rs),
-            };
-
-            if let Some((parsed, idx, val)) = scanner.scan_tx(&tx) {
-                let order = BlockScanner::to_book_order(&parsed, &tx.tx_id, idx, val, Some(fake_token));
-                if !ob.contains_outpoint(&order.outpoint_key()) {
-                    ob.add_buy_order(order);
-                }
-            }
-        }
-
-        assert_eq!(ob.stats().total_bids, 3, "3 unique buy orders should be in book");
-
-        // Non-KOB TX in the same block should be ignored
-        let normal_tx = TransactionData {
-            tx_id: "ff".repeat(32),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 50_000_000,
-                script_version: 0,
-                script: vec![0x20, 0xAA, 0xBB], // not P2SH
-                covenant_id: None,
-            }],
-            payload: vec![], // no payload
-        };
-        assert!(scanner.scan_tx(&normal_tx).is_none());
-        assert_eq!(ob.stats().total_bids, 3, "non-KOB TX should not affect book");
-    }
 
 
     // Payload v2 (post-only) scanner tests
@@ -1779,335 +1109,7 @@ mod tests {
         kob_core::contract::build_order_payload(rs, post_only)
     }
 
-    #[test]
-    fn scan_tx_v2_buy_post_only_true() {
-        let (rs, _, _, _, _, _, _, _) = make_buy_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let scanner = BlockScanner::new();
-        let tx = TransactionData {
-            tx_id: "f".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 15_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&hash),
-                covenant_id: None,
-            }],
-            payload: make_payload_v2(&rs, true),
-        };
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "v2 payload with post_only=true must be parsed");
-        let (parsed, idx, val) = result.unwrap();
-        assert!(parsed.post_only, "parsed order must have post_only=true");
-        assert_eq!(idx, 0);
-        assert_eq!(val, 15_000_000);
-    }
-
-    #[test]
-    fn scan_tx_v2_buy_post_only_false() {
-        let (rs, _, _, _, _, _, _, _) = make_buy_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let scanner = BlockScanner::new();
-        let tx = TransactionData {
-            tx_id: "e".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&hash),
-                covenant_id: None,
-            }],
-            payload: make_payload_v2(&rs, false),
-        };
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "v2 payload with post_only=false must be parsed");
-        let (parsed, _, _) = result.unwrap();
-        assert!(!parsed.post_only, "parsed order must have post_only=false");
-    }
-
-    #[test]
-    fn scan_tx_v1_payload_is_rejected() {
-        // v1 payloads lack counterparty_spk and are unmatchable — scan_tx must skip them.
-        let (rs, _, _, _, _, _, _, _) = make_buy_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let scanner = BlockScanner::new();
-        let tx = TransactionData {
-            tx_id: "d".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&hash),
-                covenant_id: None,
-            }],
-            payload: make_payload_v1(&rs),
-        };
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_none(), "v1 payload orders must be rejected by scan_tx");
-    }
-
-    #[test]
-    fn scan_tx_v1_sell_payload_is_rejected() {
-        // Sell orders with v1 payload should also be rejected.
-        let (rs, _, _, _, _, _) = make_sell_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let scanner = BlockScanner::new();
-        let tx = TransactionData {
-            tx_id: "e".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 5_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&hash),
-                covenant_id: None,
-            }],
-            payload: make_payload_v1(&rs),
-        };
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_none(), "v1 sell payload orders must be rejected by scan_tx");
-    }
-
-    #[test]
-    fn scan_tx_v2_sell_post_only() {
-        let (rs, _, _, _, _, _) = make_sell_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let scanner = BlockScanner::new();
-        let tx = TransactionData {
-            tx_id: "c".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 20_000_000,
-                script_version: 0,
-                script: make_p2sh_script(&hash),
-                covenant_id: None,
-            }],
-            payload: make_payload_v2(&rs, true),
-        };
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "v2 sell payload must be parsed");
-        let (parsed, _, _) = result.unwrap();
-        assert!(parsed.post_only, "sell order must inherit post_only from v2 payload");
-    }
-
-    #[test]
-    fn to_book_order_propagates_post_only() {
-        let (rs, _tcid, _pnum, _pden, _mfill, _ohash, _bspkh, _mmfee) = make_buy_v12_rs_default();
-        let mut parsed = BlockScanner::parse_redeem_script(&rs).expect("must parse");
-        parsed.post_only = true;
-        let book_order = BlockScanner::to_book_order(&parsed, "abc123", 0, 10_000_000, None);
-        assert!(book_order.post_only, "to_book_order must propagate post_only from ParsedOrder");
-
-        // Also verify it does NOT propagate when false
-        parsed.post_only = false;
-        let book_order2 = BlockScanner::to_book_order(&parsed, "abc123", 0, 10_000_000, None);
-        assert!(!book_order2.post_only);
-    }
-
     // v12 buy/sell RS parsing
-
-    // Helper: build a known buy v12 RS
-    fn make_buy_v12_rs(expiry: u64) -> (Vec<u8>, [u8; 32], u64, u64, u64, [u8; 32], [u8; 32], u64) {
-        let tcid = [0xA1; 32];
-        let pnum: u64 = 5;
-        let pden: u64 = 3;
-        let mfill: u64 = 1_000_000;
-        let ohash = [0xB1; 32];
-        let bspkh = [0xC1; 32];
-        let mmfee: u64 = 75_000;
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, pnum, pden, mfill, &ohash, &bspkh, mmfee, 0, expiry,
-        ).unwrap();
-        (rs, tcid, pnum, pden, mfill, ohash, bspkh, mmfee)
-    }
-
-    // Helper: build a known sell v12 RS
-    fn make_sell_v12_rs(expiry: u64) -> (Vec<u8>, u64, u64, u64, [u8; 32], [u8; 32]) {
-        let pnum: u64 = 8;
-        let pden: u64 = 5;
-        let mfill: u64 = 500_000;
-        let ohash = [0xD1; 32];
-        let sspkh = [0xE1; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(
-            pnum, pden, mfill, &ohash, &sspkh, 0, 0, expiry,
-        ).unwrap();
-        (rs, pnum, pden, mfill, ohash, sspkh)
-    }
-
-    #[test]
-    fn test_parse_buy_v12_rs_gtc() {
-        let (rs, tcid, pnum, pden, mfill, ohash, bspkh, mmfee) = make_buy_v12_rs(0);
-        assert_eq!(rs.len(), BUY_RS_SIZE, "Buy v12 RS must be {} bytes", BUY_RS_SIZE);
-
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse buy v12 RS");
-        assert_eq!(parsed.order_type, OrderSide::Buy);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.token_cov_id, tcid);
-        assert_eq!(parsed.price_num, pnum);
-        assert_eq!(parsed.price_den, pden);
-        assert_eq!(parsed.min_fill, mfill);
-        assert_eq!(parsed.owner_hash, ohash);
-        assert_eq!(parsed.spk_hash, bspkh);
-        assert_eq!(parsed._max_matcher_fee, mmfee);
-        assert_eq!(parsed.cpend, 0);
-        assert_eq!(parsed.expiry_daa, None, "GTC order (expiry=0) should have expiry_daa=None");
-    }
-
-    #[test]
-    fn test_parse_buy_v12_rs_gtd() {
-        let expiry: u64 = 123_456_789;
-        let (rs, _tcid, _pnum, _pden, _mfill, _ohash, _bspkh, _mmfee) = make_buy_v12_rs(expiry);
-        assert_eq!(rs.len(), BUY_RS_SIZE);
-
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse buy v12 RS");
-        assert_eq!(parsed.order_type, OrderSide::Buy);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.expiry_daa, Some(expiry), "GTD order should have expiry_daa set");
-    }
-
-    #[test]
-    fn test_parse_sell_v12_rs_gtc() {
-        let (rs, pnum, pden, mfill, ohash, sspkh) = make_sell_v12_rs(0);
-        assert_eq!(rs.len(), SELL_RS_SIZE, "Sell v12 RS must be {} bytes", SELL_RS_SIZE);
-
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse sell v12 RS");
-        assert_eq!(parsed.order_type, OrderSide::Sell);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.price_num, pnum);
-        assert_eq!(parsed.price_den, pden);
-        assert_eq!(parsed.min_fill, mfill);
-        assert_eq!(parsed.owner_hash, ohash);
-        assert_eq!(parsed.spk_hash, sspkh);
-        assert_eq!(parsed.cpend, 0);
-        assert_eq!(parsed.expiry_daa, None);
-    }
-
-    #[test]
-    fn test_parse_sell_v12_rs_gtd() {
-        let expiry: u64 = 987_654_321;
-        let (rs, _pnum, _pden, _mfill, _ohash, _sspkh) = make_sell_v12_rs(expiry);
-        assert_eq!(rs.len(), SELL_RS_SIZE);
-
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse sell v12 RS");
-        assert_eq!(parsed.order_type, OrderSide::Sell);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.expiry_daa, Some(expiry));
-    }
-
-    #[test]
-    fn test_parse_buy_v12_cpend_1() {
-        let tcid = [0xA1; 32];
-        let ohash = [0xB1; 32];
-        let bspkh = [0xC1; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, 1, 2, 1, &ohash, &bspkh, 50_000, 1, 500_000,
-        ).unwrap();
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse buy v12 cpend=1");
-        assert_eq!(parsed.cpend, 1);
-        assert_eq!(parsed.expiry_daa, Some(500_000));
-    }
-
-    #[test]
-    fn test_parse_sell_v12_cpend_1() {
-        let ohash = [0xD1; 32];
-        let sspkh = [0xE1; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(
-            3, 4, 1, &ohash, &sspkh, 0, 1, 750_000,
-        ).unwrap();
-        let parsed = BlockScanner::parse_redeem_script(&rs).expect("Should parse sell v12 cpend=1");
-        assert_eq!(parsed.cpend, 1);
-        assert_eq!(parsed.expiry_daa, Some(750_000));
-    }
-
-    #[test]
-    fn test_v12_buy_rs_size_constant() {
-        // Verify our constant matches the actual RS length from kob_core
-        let t = [0u8; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(&t, 1, 2, 1, &t, &t, 100_000, 0, 0).unwrap();
-        assert_eq!(rs.len(), BUY_RS_SIZE, "BUY_RS_SIZE constant must match actual RS length");
-        assert_eq!(BUY_RS_SIZE, 396);
-    }
-
-    #[test]
-    fn test_v12_sell_rs_size_constant() {
-        let t = [0u8; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(1, 2, 1, &t, &t, 0, 0, 0).unwrap();
-        assert_eq!(rs.len(), SELL_RS_SIZE, "SELL_RS_SIZE constant must match actual RS length");
-        assert_eq!(SELL_RS_SIZE, 427);
-    }
-
-    #[test]
-    fn test_v12_buy_state_layout() {
-        let t = [0u8; 32];
-        let rs_v12 = kob_core::contract::build_buy_redeem_script(&t, 1, 2, 1, &t, &t, 100_000, 0, 0).unwrap();
-        // State is 145 bytes: 136B base + 9B expiry
-        assert_eq!(rs_v12[136], 0x08, "expiry push opcode must be 0x08");
-        assert_eq!(rs_v12.len(), BUY_RS_SIZE);
-    }
-
-    #[test]
-    fn test_scan_tx_deploy_buy_v12() {
-        let (rs, _tcid, _pnum, _pden, _mfill, _ohash, _bspkh, _mmfee) = make_buy_v12_rs(1_000_000);
-        let rs_hash = kob_core::blake2b_256(&rs);
-        let p2sh_script = make_p2sh_script(&rs_hash);
-        let payload = make_payload(&rs);
-
-        let tx = TransactionData {
-            tx_id: "ff".repeat(32),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 50_000_000,
-                script_version: 0,
-                script: p2sh_script,
-                covenant_id: None,
-            }],
-            payload,
-        };
-
-        let scanner = BlockScanner::new();
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "Should detect v12 buy deploy");
-        let (parsed, idx, val) = result.unwrap();
-        assert_eq!(parsed.order_type, OrderSide::Buy);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(idx, 0);
-        assert_eq!(val, 50_000_000);
-    }
-
-    #[test]
-    fn test_scan_tx_deploy_sell_v12() {
-        let (rs, _pnum, _pden, _mfill, _ohash, _sspkh) = make_sell_v12_rs(2_000_000);
-        let rs_hash = kob_core::blake2b_256(&rs);
-        let p2sh_script = make_p2sh_script(&rs_hash);
-        let payload = make_payload(&rs);
-
-        let tx = TransactionData {
-            tx_id: "ee".repeat(32),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![TxOutputData {
-                value: 30_000_000,
-                script_version: 0,
-                script: p2sh_script,
-                covenant_id: None,
-            }],
-            payload,
-        };
-
-        let scanner = BlockScanner::new();
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_some(), "Should detect v12 sell deploy");
-        let (parsed, idx, val) = result.unwrap();
-        assert_eq!(parsed.order_type, OrderSide::Sell);
-        assert_eq!(parsed.version, 0);
-        assert_eq!(idx, 0);
-        assert_eq!(val, 30_000_000);
-    }
 
     // Freezable / ZK gating tests
 
@@ -2185,40 +1187,6 @@ mod tests {
     }
 
     // v1 payload rejection tests
-
-    #[test]
-    fn scan_tx_v1_oco_payload_is_rejected() {
-        // OCO payloads with v1 prefix should also be rejected.
-        let (buy_rs, ..) = make_buy_v12_rs_default();
-        let (sell_rs, ..) = make_sell_v12_rs_default();
-        let buy_hash = kob_core::blake2b_256(&buy_rs);
-        let buy_p2sh = make_p2sh_script(&buy_hash);
-        let sell_hash = kob_core::blake2b_256(&sell_rs);
-        let sell_p2sh = make_p2sh_script(&sell_hash);
-
-        let tx = TransactionData {
-            tx_id: "f".repeat(64),
-            _version: 0,
-            inputs: vec![],
-            outputs: vec![
-                TxOutputData { value: 10_000_000, script_version: 0, script: buy_p2sh , covenant_id: None },
-                TxOutputData { value: 5_000_000, script_version: 0, script: sell_p2sh , covenant_id: None },
-            ],
-            payload: {
-                // Build actual v1-format OCO payload (KOB:1: prefix, no flags byte)
-                let mut p = Vec::new();
-                p.extend_from_slice(b"KOB:1:");
-                p.extend_from_slice(&(buy_rs.len() as u16).to_le_bytes());
-                p.extend_from_slice(&buy_rs);
-                p.extend_from_slice(&sell_rs);
-                p
-            },
-        };
-
-        let scanner = BlockScanner::new();
-        let result = scanner.scan_tx(&tx);
-        assert!(result.is_none(), "v1 OCO payload orders must be rejected by scan_tx");
-    }
 
     // Expired order pruning (remove_expired) verification
 
@@ -2506,34 +1474,6 @@ mod tests {
     // Unified scan_tx_all tests
 
     #[test]
-    fn test_scan_tx_all_spot() {
-        let (rs, ..) = make_buy_v12_rs_default();
-        let hash = kob_core::blake2b_256(&rs);
-        let p2sh_script = make_p2sh_script(&hash);
-
-        let tx = TransactionData {
-            tx_id: "a".repeat(64),
-            _version: 0,
-            inputs: vec![TxInputData {
-                prev_tx_id: "b".repeat(64),
-                prev_index: 0,
-                _sig_script: vec![],
-            }],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: p2sh_script,
-                covenant_id: None,
-            }],
-            payload: make_payload(&rs),
-        };
-
-        let scanner = BlockScanner::new();
-        let result = scanner.scan_tx_all(&tx);
-        assert!(matches!(result, Some(ScanResult::Spot(..))));
-    }
-
-    #[test]
     fn test_scan_tx_all_perp() {
         let owner = [0xAA; 32];
         let rs = kob_core::perp::build_perp_deploy_redeem_script(
@@ -2786,5 +1726,316 @@ mod tests {
         let td = TransactionData::from_rpc_json(&json).expect("still parses, no panic");
         assert_eq!(td.outputs[0].script_version, 0);
         assert!(td.outputs[0].script.is_empty(), "malformed spk decodes to no bytes, not a panic");
+    }
+
+    fn make_buy_v12_rs_default() -> (Vec<u8>, [u8; 32], u64, u64, u64, [u8; 32], [u8; 32], u64) {
+        make_buy_v12_rs(0)
+    }
+
+    fn make_sell_v12_rs_default() -> (Vec<u8>, u64, u64, u64, [u8; 32], [u8; 32]) {
+        make_sell_v12_rs(0)
+    }
+
+    // Fixture helpers: known v18 buy/sell RS (ported from the retired v12
+    // fixtures — same field values, v18 builders with E1 owner seats).
+    fn make_buy_v12_rs(expiry: u64) -> (Vec<u8>, [u8; 32], u64, u64, u64, [u8; 32], [u8; 32], u64) {
+        let tcid = [0xA1; 32];
+        let pnum: u64 = 5;
+        let pden: u64 = 3;
+        let mfill: u64 = 1_000_000;
+        let ohash = [0xB1; 32];
+        let bspkh = [0xC1; 32];
+        let mmfee: u64 = 75;
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &tcid, pnum, pden, mfill, &ohash, &bspkh, &[0xF1; 32], mmfee, 0, expiry,
+        ).unwrap();
+        (rs, tcid, pnum, pden, mfill, ohash, bspkh, mmfee)
+    }
+
+    fn make_sell_v12_rs(expiry: u64) -> (Vec<u8>, u64, u64, u64, [u8; 32], [u8; 32]) {
+        let pnum: u64 = 8;
+        let pden: u64 = 5;
+        let mfill: u64 = 500_000;
+        let ohash = [0xD1; 32];
+        let sspkh = [0xE1; 32];
+        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            pnum, pden, mfill, &ohash, &sspkh, &[0xF2; 32], 0, 0, expiry,
+        ).unwrap();
+        (rs, pnum, pden, mfill, ohash, sspkh)
+    }
+
+    #[test]
+    fn test_garbage_payload() {
+        let garbage = vec![0xDEu8, 0xAD, 0xBE, 0xEF].into_iter().cycle().take(50).collect::<Vec<u8>>();
+        let garbage_hash = kob_core::blake2b_256(&garbage);
+
+        // Create a valid P2SH output with a DIFFERENT hash
+        let (rs, ..) = make_buy_v12_rs_default();
+        let real_hash = kob_core::blake2b_256(&rs);
+        let p2sh_script = make_p2sh_script(&real_hash);
+
+        assert_ne!(garbage_hash, real_hash, "Hashes must differ");
+
+        let tx = TransactionData {
+            tx_id: "g".repeat(64),
+            _version: 0,
+            inputs: vec![],
+            outputs: vec![
+                TxOutputData {
+                    value: 10_000_000,
+                    script_version: 0,
+                    script: p2sh_script,
+                    covenant_id: None,
+                },
+            ],
+            payload: make_payload(&garbage),
+        };
+
+        let scanner = BlockScanner::new();
+        let result = scanner.scan_tx(&tx);
+        assert!(result.is_none(), "Garbage payload hash mismatch should be rejected");
+    }
+
+    #[test]
+    fn test_p2sh_validation() {
+        let (rs, ..) = make_buy_v12_rs_default();
+        let hash = kob_core::blake2b_256(&rs);
+        let p2sh_spk = kob_core::build_p2sh(&rs);
+
+        // Verify the hash matches
+        assert_eq!(&p2sh_spk.script()[2..34], &hash);
+
+        // Verify parse_p2sh_script extracts it
+        let extracted = parse_p2sh_script(&p2sh_spk.script(), 0).expect("Should parse P2SH");
+        assert_eq!(extracted, hash);
+    }
+
+    #[test]
+    fn test_p2sh_wrong_version() {
+        let (rs, ..) = make_buy_v12_rs_default();
+        let p2sh_spk = kob_core::build_p2sh(&rs);
+        // Version 1 should fail
+        assert!(parse_p2sh_script(&p2sh_spk.script(), 1).is_none());
+    }
+
+    #[test]
+    fn scan_tx_v2_buy_post_only_true() {
+        let (rs, _, _, _, _, _, _, _) = make_buy_v12_rs_default();
+        let hash = kob_core::blake2b_256(&rs);
+        let scanner = BlockScanner::new();
+        let tx = TransactionData {
+            tx_id: "f".repeat(64),
+            _version: 0,
+            inputs: vec![],
+            outputs: vec![TxOutputData {
+                value: 15_000_000,
+                script_version: 0,
+                script: make_p2sh_script(&hash),
+                covenant_id: None,
+            }],
+            payload: make_payload_v2(&rs, true),
+        };
+        let result = scanner.scan_tx(&tx);
+        assert!(result.is_some(), "v2 payload with post_only=true must be parsed");
+        let (parsed, idx, val) = result.unwrap();
+        assert!(parsed.post_only, "parsed order must have post_only=true");
+        assert_eq!(idx, 0);
+        assert_eq!(val, 15_000_000);
+    }
+
+    #[test]
+    fn scan_tx_v2_buy_post_only_false() {
+        let (rs, _, _, _, _, _, _, _) = make_buy_v12_rs_default();
+        let hash = kob_core::blake2b_256(&rs);
+        let scanner = BlockScanner::new();
+        let tx = TransactionData {
+            tx_id: "e".repeat(64),
+            _version: 0,
+            inputs: vec![],
+            outputs: vec![TxOutputData {
+                value: 10_000_000,
+                script_version: 0,
+                script: make_p2sh_script(&hash),
+                covenant_id: None,
+            }],
+            payload: make_payload_v2(&rs, false),
+        };
+        let result = scanner.scan_tx(&tx);
+        assert!(result.is_some(), "v2 payload with post_only=false must be parsed");
+        let (parsed, _, _) = result.unwrap();
+        assert!(!parsed.post_only, "parsed order must have post_only=false");
+    }
+
+    #[test]
+    fn scan_tx_v2_sell_post_only() {
+        let (rs, _, _, _, _, _) = make_sell_v12_rs_default();
+        let hash = kob_core::blake2b_256(&rs);
+        let scanner = BlockScanner::new();
+        let tx = TransactionData {
+            tx_id: "c".repeat(64),
+            _version: 0,
+            inputs: vec![],
+            outputs: vec![TxOutputData {
+                value: 20_000_000,
+                script_version: 0,
+                script: make_p2sh_script(&hash),
+                covenant_id: None,
+            }],
+            payload: make_payload_v2(&rs, true),
+        };
+        let result = scanner.scan_tx(&tx);
+        assert!(result.is_some(), "v2 sell payload must be parsed");
+        let (parsed, _, _) = result.unwrap();
+        assert!(parsed.post_only, "sell order must inherit post_only from v2 payload");
+    }
+
+    #[test]
+    fn test_to_book_order_buy() {
+        let (rs, tcid, pnum, pden, mfill, ohash, bspkh, ..) = make_buy_v12_rs_default();
+        let parsed = BlockScanner::parse_redeem_script(&rs).unwrap();
+
+        let book_order = BlockScanner::to_book_order(
+            &parsed,
+            &"a".repeat(64),
+            0,
+            10_000_000,
+            None,
+        );
+
+        assert_eq!(book_order.tx_id, "a".repeat(64));
+        assert_eq!(book_order.index, 0);
+        assert_eq!(book_order.value, 10_000_000);
+        assert_eq!(book_order.token_cov_id, hex::encode(tcid));
+        assert_eq!(book_order.price_num, pnum);
+        assert_eq!(book_order.price_den, pden);
+        assert_eq!(book_order.min_fill, mfill);
+        assert_eq!(book_order.owner_hash, hex::encode(ohash));
+        assert_eq!(book_order.spk_hash, hex::encode(bspkh));
+        assert_eq!(book_order.side, OrderSide::Buy);
+        assert!(!book_order.redeem_script_hex.is_empty());
+        assert!(!book_order.p2sh_script_hex.is_empty());
+    }
+
+    #[test]
+    fn test_to_book_order_sell_with_override() {
+        let (rs, pnum, pden, mfill, ohash, sspkh) = make_sell_v12_rs_default();
+        let parsed = BlockScanner::parse_redeem_script(&rs).unwrap();
+
+        let tcid_override = "ff".repeat(32);
+        let book_order = BlockScanner::to_book_order(
+            &parsed,
+            &"c".repeat(64),
+            1,
+            5_000_000,
+            Some(&tcid_override),
+        );
+
+        assert_eq!(book_order.token_cov_id, tcid_override);
+        assert_eq!(book_order.price_num, pnum);
+        assert_eq!(book_order.price_den, pden);
+        assert_eq!(book_order.min_fill, mfill);
+        assert_eq!(book_order.owner_hash, hex::encode(ohash));
+        assert_eq!(book_order.spk_hash, hex::encode(sspkh));
+        assert_eq!(book_order.side, OrderSide::Sell);
+    }
+
+    #[test]
+    fn to_book_order_propagates_post_only() {
+        let (rs, _tcid, _pnum, _pden, _mfill, _ohash, _bspkh, _mmfee) = make_buy_v12_rs_default();
+        let mut parsed = BlockScanner::parse_redeem_script(&rs).expect("must parse");
+        parsed.post_only = true;
+        let book_order = BlockScanner::to_book_order(&parsed, "abc123", 0, 10_000_000, None);
+        assert!(book_order.post_only, "to_book_order must propagate post_only from ParsedOrder");
+
+        // Also verify it does NOT propagate when false
+        parsed.post_only = false;
+        let book_order2 = BlockScanner::to_book_order(&parsed, "abc123", 0, 10_000_000, None);
+        assert!(!book_order2.post_only);
+    }
+
+    /// E2E: Scanner dedup — same TX scanned twice should not create duplicate orders.
+    #[test]
+    fn e2e_scanner_dedup_prevents_duplicate() {
+        let scanner = BlockScanner::new();
+        let mut ob = OrderBook::new();
+        let fake_token = "0102030405060708091011121314151617181920212223242526272829303132";
+
+        let (buy_rs, ..) = make_buy_v12_rs_default();
+        let buy_hash = kob_core::blake2b_256(&buy_rs);
+        let buy_tx = TransactionData {
+            tx_id: "d".repeat(64),
+            _version: 0,
+            inputs: vec![],
+            outputs: vec![TxOutputData {
+                value: 10_000_000,
+                script_version: 0,
+                script: make_p2sh_script(&buy_hash),
+                covenant_id: None,
+            }],
+            payload: make_payload(&buy_rs),
+        };
+
+        // First scan: add order
+        let (parsed, idx, val) = scanner.scan_tx(&buy_tx).expect("first scan");
+        let order = BlockScanner::to_book_order(&parsed, &buy_tx.tx_id, idx, val, Some(fake_token));
+        let outpoint_key = order.outpoint_key();
+        assert!(!ob.contains_outpoint(&outpoint_key), "should not be in book yet");
+        ob.add_buy_order(order);
+        assert_eq!(ob.stats().total_bids, 1);
+
+        // Second scan: dedup check should detect existing outpoint
+        let (parsed2, idx2, val2) = scanner.scan_tx(&buy_tx).expect("second scan");
+        let order2 = BlockScanner::to_book_order(&parsed2, &buy_tx.tx_id, idx2, val2, Some(fake_token));
+        assert!(ob.contains_outpoint(&order2.outpoint_key()), "M-7: dedup should detect existing outpoint");
+        // Do NOT add — in production the scanner checks contains_outpoint before adding
+        assert_eq!(ob.stats().total_bids, 1, "still 1 bid after dedup");
+    }
+
+    /// E2E: Cancel detection — spent UTXO removes order from book.
+    #[test]
+    fn e2e_cancel_detection_removes_order() {
+        let scanner = BlockScanner::new();
+        let mut ob = OrderBook::new();
+        let fake_token = "0102030405060708091011121314151617181920212223242526272829303132";
+
+        // Deploy buy order
+        let (buy_rs, ..) = make_buy_v12_rs_default();
+        let buy_hash = kob_core::blake2b_256(&buy_rs);
+        let buy_tx_id = "e".repeat(64);
+        let buy_tx = TransactionData {
+            tx_id: buy_tx_id.clone(),
+            _version: 0,
+            inputs: vec![],
+            outputs: vec![TxOutputData {
+                value: 10_000_000,
+                script_version: 0,
+                script: make_p2sh_script(&buy_hash),
+                covenant_id: None,
+            }],
+            payload: make_payload(&buy_rs),
+        };
+        let (parsed, idx, val) = scanner.scan_tx(&buy_tx).expect("buy");
+        let order = BlockScanner::to_book_order(&parsed, &buy_tx.tx_id, idx, val, Some(fake_token));
+        ob.add_buy_order(order);
+        assert_eq!(ob.stats().total_bids, 1);
+
+        // Cancel TX spends the buy UTXO
+        let cancel_tx = TransactionData {
+            tx_id: "f".repeat(64),
+            _version: 0,
+            inputs: vec![TxInputData {
+                prev_tx_id: buy_tx_id,
+                prev_index: 0,
+                _sig_script: vec![],
+            }],
+            outputs: vec![],
+            payload: vec![],
+        };
+        let spent = BlockScanner::find_spent_orders(&cancel_tx, &ob);
+        assert_eq!(spent.len(), 1, "should detect spent order");
+        for key in &spent {
+            ob.remove_order(key);
+        }
+        assert_eq!(ob.stats().total_bids, 0, "order should be removed after cancel");
     }
 }

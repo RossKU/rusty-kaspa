@@ -129,16 +129,7 @@ pub async fn run(
                 entry.expiry_daa,
             )?
         } else {
-            contract::build_sell_redeem_script(
-                entry.price_num,
-                entry.price_den,
-                entry.min_fill,
-                &sell_owner,
-                &sell_spkh,
-                entry.max_matcher_fee,
-                0, // cancel_pending
-                entry.expiry_daa,
-            )?
+            anyhow::bail!("Sell order {} has unsupported version {} (pre-v18 removed in Stage E)", op_str, entry.version);
         };
         let p2sh = build_p2sh(&rs);
 
@@ -220,30 +211,8 @@ pub async fn run(
                 0, // cancel_pending
                 entry.expiry_daa,
             )?
-        } else if entry.version == 17 {
-            contract::build_buy_v17_redeem_script(
-                &tcid,
-                entry.price_num,
-                entry.price_den,
-                entry.min_fill,
-                &buy_owner,
-                &buy_spkh,
-                entry.max_matcher_fee, // v17 caches store BPS
-                0, // cancel_pending
-                entry.expiry_daa,
-            )?
         } else {
-            contract::build_buy_redeem_script(
-                &tcid,
-                entry.price_num,
-                entry.price_den,
-                entry.min_fill,
-                &buy_owner,
-                &buy_spkh,
-                entry.max_matcher_fee,
-                0, // cancel_pending
-                entry.expiry_daa,
-            )?
+            anyhow::bail!("Buy order {} has unsupported version {} (pre-v18 removed in Stage E)", op_str, entry.version);
         };
         let p2sh = build_p2sh(&rs);
 
@@ -345,55 +314,24 @@ pub async fn run(
         //   N buys + 1 sell  → sell sweeps buys (plan_sell_ioc_match)
         if buys.len() == 1 && sells.len() >= 1 {
             println!("IOC direction: buy sweeps {} sells", sells.len());
-            if buys[0].version == 18 {
-                kob_engine::matcher::batch::plan_ioc_match_v18(
-                    &sells,
-                    &buys[0],
-                    Some(wallet_utxo_info.clone()),
-                    &matcher_spk,
-                    0,
-                    fee_bps,
-                )?
-            } else if buys[0].version == 17 {
-                kob_engine::matcher::batch::plan_ioc_match_v17(
-                    &sells,
-                    &buys[0],
-                    Some(wallet_utxo_info.clone()),
-                    &matcher_spk,
-                    0,
-                    fee_bps,
-                )?
-            } else {
-                kob_engine::matcher::batch::plan_ioc_match(
-                    &sells,
-                    &buys[0],
-                    Some(wallet_utxo_info.clone()),
-                    &matcher_spk,
-                    0,
-                    fee_bps,
-                )?
-            }
+            kob_engine::matcher::batch::plan_ioc_match_v18(
+                &sells,
+                &buys[0],
+                Some(wallet_utxo_info.clone()),
+                &matcher_spk,
+                0,
+                fee_bps,
+            )?
         } else if sells.len() == 1 && buys.len() >= 1 {
             println!("IOC direction: sell sweeps {} buys", buys.len());
-            if sells[0].version == 18 {
-                kob_engine::matcher::batch::plan_sell_ioc_match_v18(
-                    &sells[0],
-                    &buys,
-                    Some(wallet_utxo_info.clone()),
-                    &matcher_spk,
-                    0,
-                    fee_bps,
-                )?
-            } else {
-                kob_engine::matcher::batch::plan_sell_ioc_match(
-                    &sells[0],
-                    &buys,
-                    Some(wallet_utxo_info.clone()),
-                    &matcher_spk,
-                    0,
-                    fee_bps,
-                )?
-            }
+            kob_engine::matcher::batch::plan_sell_ioc_match_v18(
+                &sells[0],
+                &buys,
+                Some(wallet_utxo_info.clone()),
+                &matcher_spk,
+                0,
+                fee_bps,
+            )?
         } else {
             anyhow::bail!(
                 "--ioc requires asymmetric orders: 1 buy + N sells or N buys + 1 sell, got {} buys + {} sells",

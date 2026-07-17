@@ -42,7 +42,7 @@ pub struct CachedOrder {
     pub min_fill: u64,
     /// Deployed UTXO value in sompi.
     pub value: u64,
-    /// Contract version (only 14 supported).
+    /// Contract version (v18).
     #[serde(default = "default_version")]
     pub version: u8,
     /// Expiry DAA score (v14 only, 0 = GTC).
@@ -51,7 +51,7 @@ pub struct CachedOrder {
 }
 
 fn default_version() -> u8 {
-    14
+    18
 }
 
 /// Result of a single cancel operation.
@@ -163,14 +163,8 @@ pub fn build_cancel_tx(
     let sig_0 = signing::schnorr_sign(privkey, &sighash_0)?;
 
     let cancel_sigscript = match order.side.as_str() {
-        "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN => {
-            contract::spot::order::build_buy_v18_cancel_sigscript(pubkey, &sig_0, false, &redeem_script)
-        }
-        "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN => {
-            contract::build_buy_v17_cancel_sigscript(pubkey, &sig_0, false, &redeem_script)
-        }
-        "buy" => contract::build_buy_cancel_sigscript(&sig_0, pubkey, &redeem_script),
-        // v18 sell cancel keeps the v14 [sig][pk][Op0][RS] shape.
+        "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(pubkey, &sig_0, false, &redeem_script),
+        // v18 sell cancel keeps the [sig][pk][Op0][RS] shape.
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, pubkey, &redeem_script),
         _ => anyhow::bail!("Unknown order side '{}'. Expected 'buy' or 'sell'.", order.side),
     };
@@ -201,13 +195,7 @@ pub fn build_cancel_tx(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(privkey, &sighash_0)?;
         let cancel_sigscript = match order.side.as_str() {
-            "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN => {
-                contract::spot::order::build_buy_v18_cancel_sigscript(pubkey, &sig_0, false, &redeem_script)
-            }
-            "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN => {
-                contract::build_buy_v17_cancel_sigscript(pubkey, &sig_0, false, &redeem_script)
-            }
-            "buy" => contract::build_buy_cancel_sigscript(&sig_0, pubkey, &redeem_script),
+            "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(pubkey, &sig_0, false, &redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, pubkey, &redeem_script),
             _ => unreachable!(),
         };
@@ -575,8 +563,8 @@ pub fn build_redeem_script_for_order(
     };
 
 
-    if order.version != 14 && order.version != 16 && order.version != 17 && order.version != 18 {
-        anyhow::bail!("Unsupported contract version {}. Only v14, v16, v17, and v18 are supported.", order.version);
+    if order.version != 18 {
+        anyhow::bail!("Unsupported contract version {}. Only v18 is supported.", order.version);
     }
 
     match order.side.as_str() {
@@ -586,34 +574,14 @@ pub fn build_redeem_script_for_order(
             let token_bytes = hex::decode(token_hex)?;
             let mut tcid = [0u8; 32];
             tcid.copy_from_slice(&token_bytes);
-            if order.version == 18 {
-                Ok(contract::spot::order::build_buy_v18_redeem_script(
-                    &tcid, order.price_num, order.price_den, order.min_fill,
-                    &owner_hash, &spk_hash, &compute_p2pk_spk_hash(pubkey), order.max_matcher_fee, 0, order.expiry_daa,)?)
-            } else if order.version == 17 {
-                Ok(contract::build_buy_v17_redeem_script(
-                    &tcid, order.price_num, order.price_den, order.min_fill,
-                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
-            } else if order.version == 16 {
-                Ok(contract::build_buy_v16_redeem_script(
-                    &tcid, order.price_num, order.price_den, order.min_fill,
-                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
-            } else {
-                Ok(contract::build_buy_redeem_script(
-                    &tcid, order.price_num, order.price_den, order.min_fill,
-                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
-            }
+            Ok(contract::spot::order::build_buy_v18_redeem_script(
+                &tcid, order.price_num, order.price_den, order.min_fill,
+                &owner_hash, &spk_hash, &compute_p2pk_spk_hash(pubkey), order.max_matcher_fee, 0, order.expiry_daa,)?)
         }
         "sell" => {
-            if order.version == 18 {
-                Ok(contract::spot::order::build_sell_v18_redeem_script(
-                    order.price_num, order.price_den, order.min_fill,
-                    &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(pubkey), order.max_matcher_fee, 0, order.expiry_daa,)?)
-            } else {
-                Ok(contract::build_sell_redeem_script(
-                    order.price_num, order.price_den, order.min_fill,
-                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
-            }
+            Ok(contract::spot::order::build_sell_v18_redeem_script(
+                order.price_num, order.price_den, order.min_fill,
+                &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(pubkey), order.max_matcher_fee, 0, order.expiry_daa,)?)
         }
         _ => anyhow::bail!("Unknown order side '{}'. Expected 'buy' or 'sell'.", order.side),
     }
@@ -633,7 +601,7 @@ mod tests {
             price_den: 1,
             min_fill: 1_000_000,
             value: 50_000_000,
-            version: 14,
+            version: 18,
             expiry_daa: 0,
         };
         let json = serde_json::to_string(&order).unwrap();
@@ -641,7 +609,7 @@ mod tests {
         assert_eq!(decoded.outpoint, "abc123:0");
         assert_eq!(decoded.side, "buy");
         assert_eq!(decoded.price_num, 100);
-        assert_eq!(decoded.version, 14);
+        assert_eq!(decoded.version, 18);
     }
 
     #[test]
@@ -656,7 +624,7 @@ mod tests {
             "value": 5000000
         }"#;
         let order: CachedOrder = serde_json::from_str(json).unwrap();
-        assert_eq!(order.version, 14, "default version must be 14");
+        assert_eq!(order.version, 18, "default version must be 18");
     }
 
     #[test]
@@ -706,7 +674,7 @@ mod tests {
     }
 
     #[test]
-    fn build_redeem_script_buy_v13() {
+    fn build_redeem_script_buy_v18() {
         let pubkey = [0x02u8; 32];
         let order = OrderCacheEntry::from(CachedOrder {
             outpoint: format!("{}:0", "ab".repeat(32)),
@@ -716,7 +684,7 @@ mod tests {
             price_den: 1,
             min_fill: 1_000_000,
             value: 50_000_000,
-            version: 14,
+            version: 18,
             expiry_daa: 0,
         });
 
@@ -728,7 +696,7 @@ mod tests {
     }
 
     #[test]
-    fn build_redeem_script_sell_v13() {
+    fn build_redeem_script_sell_v18() {
         let pubkey = [0x02u8; 32];
         let order = OrderCacheEntry::from(CachedOrder {
             outpoint: format!("{}:0", "cd".repeat(32)),
@@ -738,7 +706,7 @@ mod tests {
             price_den: 1,
             min_fill: 500_000,
             value: 20_000_000,
-            version: 14,
+            version: 18,
             expiry_daa: 0,
         });
 
@@ -857,13 +825,13 @@ mod tests {
     }
 
     #[test]
-    fn buy_v12_redeem_script_differs_by_price() {
+    fn buy_v18_redeem_script_differs_by_price() {
         let pubkey = [0x02u8; 32];
         let order1 = OrderCacheEntry::from(CachedOrder {
             outpoint: "a:0".into(), side: "buy".into(),
             token: Some("ff".repeat(32)),
             price_num: 100, price_den: 1, min_fill: 1_000_000, value: 50_000_000,
-            version: 14, expiry_daa: 0,
+            version: 18, expiry_daa: 0,
         });
         let order2 = OrderCacheEntry { price_num: 200, ..order1.clone() };
 
@@ -873,13 +841,13 @@ mod tests {
     }
 
     #[test]
-    fn sell_v12_redeem_script_differs_by_price() {
+    fn sell_v18_redeem_script_differs_by_price() {
         let pubkey = [0x02u8; 32];
         let order1 = OrderCacheEntry::from(CachedOrder {
             outpoint: "a:0".into(), side: "sell".into(),
             token: None,
             price_num: 5, price_den: 1, min_fill: 500_000, value: 20_000_000,
-            version: 14, expiry_daa: 0,
+            version: 18, expiry_daa: 0,
         });
         let order2 = OrderCacheEntry { price_num: 10, ..order1.clone() };
 

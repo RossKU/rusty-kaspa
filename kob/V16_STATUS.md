@@ -1,5 +1,7 @@
 # KOB v16 Buy Contract — Status
 
+> **Superseded by v18 (see V18_DESIGN.md).** The v16 contract described here was deleted in Stage E; this file is kept as a historical record.
+
 Tracks the v16 buy-contract implementation (fixes the v15 F6 cross-input
 surplus-cap flaw). Updated as work proceeds; phases are checkpointed with
 separate commits so the work is resumable after a crash.

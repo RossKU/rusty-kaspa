@@ -176,8 +176,8 @@ pub async fn run(
     };
     let old_token: Option<&str> = old_token_owned.as_deref();
 
-    if old_version != 14 && old_version != 16 && old_version != 17 && old_version != 18 {
-        anyhow::bail!("Unsupported old contract version {}. Only v14, v16, v17, and v18 are supported.", old_version);
+    if old_version != 18 {
+        anyhow::bail!("Unsupported old contract version {}. Only v18 is supported.", old_version);
     }
 
     if needs_cache && cached.is_some() {
@@ -226,18 +226,8 @@ pub async fn run(
                 contract::spot::order::build_buy_v18_redeem_script(
                     &tcid, old_price_num, old_price_den, old_min_fill,
                     &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
-            } else if old_version == 17 {
-                contract::build_buy_v17_redeem_script(
-                    &tcid, old_price_num, old_price_den, old_min_fill,
-                    &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
-            } else if old_version == 16 {
-                contract::build_buy_v16_redeem_script(
-                    &tcid, old_price_num, old_price_den, old_min_fill,
-                    &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
             } else {
-                contract::build_buy_redeem_script(
-                    &tcid, old_price_num, old_price_den, old_min_fill,
-                    &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
+                anyhow::bail!("Unsupported old version {} (pre-v18 removed in Stage E)", old_version);
             }
         }
         "sell" if old_version == 18 => {
@@ -245,8 +235,7 @@ pub async fn run(
                 old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
         }
         "sell" => {
-            contract::build_sell_redeem_script(
-                old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
+            anyhow::bail!("Unsupported old version {} (pre-v18 removed in Stage E)", old_version);
         }
         other => anyhow::bail!("Unknown old side '{}'. Use 'buy' or 'sell'.", other),
     };
@@ -363,9 +352,7 @@ pub async fn run(
     let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
     let cancel_sigscript = match old_side {
         "buy" if old_version == 18 => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
-        "buy" if old_version == 17 => contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
-        "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
-        // v18 sell cancel keeps the v14 [sig][pk][Op0][RS] shape.
+        // v18 sell cancel keeps the [sig][pk][Op0][RS] shape.
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
         _ => unreachable!(),
     };
@@ -388,8 +375,6 @@ pub async fn run(
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match old_side {
             "buy" if old_version == 18 => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
-            "buy" if old_version == 17 => contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
-            "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
             _ => unreachable!(),
         };
@@ -482,18 +467,8 @@ pub async fn run(
         "sell" if new_params.version == 18 => contract::spot::order::build_sell_v18_redeem_script(
             new_params.price_num, new_params.price_den, new_params.min_fill,
             &owner_hash, &new_spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), new_max_matcher_fee, 0, new_expiry,)?,
-        "buy" if new_params.version == 17 => contract::build_buy_v17_redeem_script(
-            &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
-        "buy" if new_params.version == 16 => contract::build_buy_v16_redeem_script(
-            &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
-        "buy" => contract::build_buy_redeem_script(
-            &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
-        "sell" => contract::build_sell_redeem_script(
-            new_params.price_num, new_params.price_den, new_params.min_fill,
-            &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+        "buy" | "sell" => anyhow::bail!(
+            "Unsupported new version {} (pre-v18 removed in Stage E)", new_params.version),
         other => anyhow::bail!("Unknown new side '{}'. Use 'buy' or 'sell'.", other),
     };
 
@@ -686,119 +661,6 @@ mod tests {
         let funding_value = amount + est_fee;
         let change = funding_value - amount - est_fee;
         assert_eq!(change, 0);
-    }
-
-    #[test]
-    fn old_buy_redeem_script_reconstruction() {
-        let pk = [0x02u8; 32];
-        let tcid = [0x01u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let rs = contract::build_buy_redeem_script(
-            &tcid, 100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let p2sh = build_p2sh(&rs);
-        assert_eq!(p2sh.script().len(), 35);
-        assert_eq!(p2sh.script()[0], 0xaa);
-        assert_eq!(p2sh.script()[34], 0x87);
-    }
-
-    #[test]
-    fn old_sell_redeem_script_reconstruction() {
-        let pk = [0x02u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let rs = contract::build_sell_redeem_script(
-            100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let p2sh = build_p2sh(&rs);
-        assert_eq!(p2sh.script().len(), 35);
-    }
-
-    #[test]
-    fn cancel_and_deploy_use_different_redeem_scripts() {
-        let pk = [0x02u8; 32];
-        let tcid = [0x01u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let old_rs = contract::build_buy_redeem_script(
-            &tcid, 100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let new_rs = contract::build_buy_redeem_script(
-            &tcid, 110, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_ne!(old_rs, new_rs);
-        let old_p2sh = build_p2sh(&old_rs);
-        let new_p2sh = build_p2sh(&new_rs);
-        assert_ne!(old_p2sh.script(), new_p2sh.script());
-    }
-
-    #[test]
-    fn new_buy_redeem_script_v12_valid() {
-        let pk = [0x02u8; 32];
-        let tcid = [0xAA; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let rs = contract::build_buy_redeem_script(
-            &tcid, 50, 1, 500_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 396); // v14 buy RS: 145 state + 251 body (kob-core BUY_RS_SIZE)
-    }
-
-    #[test]
-    fn new_sell_redeem_script_v12_valid() {
-        let pk = [0x02u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let rs = contract::build_sell_redeem_script(
-            50, 1, 500_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 427); // v14 sell RS: 112 state + 315 body (kob-core SELL_RS_SIZE)
-    }
-
-    #[test]
-    fn requote_preserves_owner_identity() {
-        let pk = [0x03u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let tcid = [0xFF; 32];
-        let old_rs = contract::build_buy_redeem_script(
-            &tcid, 100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let new_rs = contract::build_buy_redeem_script(
-            &tcid, 200, 1, 2_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let owner_hex = hex::encode(owner);
-        let old_hex = hex::encode(&old_rs);
-        let new_hex = hex::encode(&new_rs);
-        assert!(old_hex.contains(&owner_hex));
-        assert!(new_hex.contains(&owner_hex));
-    }
-
-    #[test]
-    fn requote_token_change() {
-        let pk = [0x02u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let tcid_old = [0x01; 32];
-        let tcid_new = [0x02; 32];
-        let old_rs = contract::build_buy_redeem_script(
-            &tcid_old, 100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let new_rs = contract::build_buy_redeem_script(
-            &tcid_new, 100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        assert_ne!(old_rs, new_rs);
-    }
-
-    #[test]
-    fn requote_side_change() {
-        let pk = [0x02u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let tcid = [0x01; 32];
-        let old_rs = contract::build_buy_redeem_script(
-            &tcid, 100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let new_rs = contract::build_sell_redeem_script(
-            100, 1, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        // A buy->sell requote must change the RS size. In v14 the sell RS
-        // (427B = 112 state + 315 body) is LARGER than the buy RS (396B =
-        // 145 state + 251 body) -- the reverse of v13 (buy 387 > sell 356),
-        // because the v14 IOC fill path grew the sell body (+60B) far more
-        // than the buy body (+9B). Assert the exact sizes + that they differ.
-        assert_eq!(old_rs.len(), 396, "v14 buy RS");
-        assert_eq!(new_rs.len(), 427, "v14 sell RS");
-        assert_ne!(old_rs.len(), new_rs.len(), "side change must alter the RS size");
     }
 
     #[test]

@@ -95,29 +95,17 @@ pub async fn run(
         Ok(tcid)
     };
 
-    if version != 14 && version != 16 && version != 17 && version != 18 {
-        anyhow::bail!("Unsupported contract version {}. Only v14, v16, v17, and v18 are supported.", version);
-    }
-    if version == 17 && side != "buy" {
-        anyhow::bail!("v17 is a buy-only contract; sell orders are single-version.");
+    if version != 18 {
+        anyhow::bail!("Unsupported contract version {}. Only v18 is supported.", version);
     }
 
     // Reconstruct the current redeemScript (cpend=0, the active order)
     let current_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            if version == 18 {
-                contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, 0, expiry_daa)?
-            } else if version == 17 {
-                contract::build_buy_v17_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
-            } else if version == 16 {
-                contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
-            } else {
-                contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?
-            }
+            contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, 0, expiry_daa)?
         }
-        "sell" if version == 18 => contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, 0, expiry_daa)?,
-        "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 0, expiry_daa)?,
+        "sell" => contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, 0, expiry_daa)?,
         _ => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", side),
     };
 
@@ -125,18 +113,9 @@ pub async fn run(
     let target_rs = match side {
         "buy" => {
             let tcid = parse_tcid(token_cov_id)?;
-            if version == 18 {
-                contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, 1, expiry_daa)?
-            } else if version == 17 {
-                contract::build_buy_v17_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
-            } else if version == 16 {
-                contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
-            } else {
-                contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?
-            }
+            contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, 1, expiry_daa)?
         }
-        "sell" if version == 18 => contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, 1, expiry_daa)?,
-        "sell" => contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, 1, expiry_daa)?,
+        "sell" => contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, 1, expiry_daa)?,
         _ => unreachable!(),
     };
 
@@ -315,58 +294,19 @@ pub async fn run(
 
     // Build the cancel-mark sigscript (inlined -- kob-core no longer exports these)
     let cancel_mark_sigscript = match side {
-        "buy" if version == 17 => {
-            // v17 buy cancel-mark: [pk] [sig] [Op3] [pushData(RS)] (selector at
-            // stack depth 9, so pk/sig go BELOW the selector -- see order.rs).
-            contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
-        }
-        "buy" if version == 18 => {
-            // v18 buy cancel-mark: [pk][sig][Op3][RS] (v17/v18 convention).
+        "buy" => {
+            // v18 buy cancel-mark: [pk][sig][Op3][RS].
             contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
         }
-        "sell" if version == 18 => {
+        "sell" => {
             // v18 sell cancel-mark: [sig][pk][Op3][RS].
             contract::spot::order::build_sell_v18_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
-        }
-        "buy" => {
-            // buy cancel-mark: [Op1] [pushData(sig65)] [pushData(pk32)] [pushData(RS)]
-            let mut ss = Vec::new();
-            ss.push(0x51); // Op1 selector
-            let mut sig_typed = sig_0.to_vec();
-            sig_typed.push(0x01); // sighash type
-            ss.push(sig_typed.len() as u8);
-            ss.extend_from_slice(&sig_typed);
-            ss.push(pubkey.len() as u8);
-            ss.extend_from_slice(&pubkey);
-            ss.extend_from_slice(&kob_core::push_data(&current_rs));
-            ss
-        }
-        "sell" => {
-            // sell cancel-mark: [pushData(sig65)] [pushData(pk32)] [Op3] [pushData(RS)]
-            let mut ss = Vec::new();
-            let mut sig_typed = sig_0.to_vec();
-            sig_typed.push(0x01); // sighash type
-            ss.push(sig_typed.len() as u8);
-            ss.extend_from_slice(&sig_typed);
-            ss.push(pubkey.len() as u8);
-            ss.extend_from_slice(&pubkey);
-            ss.push(0x53); // Op3 selector
-            ss.extend_from_slice(&kob_core::push_data(&current_rs));
-            ss
         }
         _ => unreachable!(),
     };
 
     println!("Cancel-Mark SigScript: {} bytes", cancel_mark_sigscript.len());
-    if version == 18 {
-        println!("  (v18 cancel-mark uses Op3 selector; v17/v18 stack convention)");
-    } else if side == "buy" && version == 17 {
-        println!("  (v17 buy cancel-mark uses Op3 selector; pk/sig below the selector)");
-    } else if side == "buy" {
-        println!("  (buy cancel-mark uses Op1 selector for MINIMALIF compliance)");
-    } else {
-        println!("  (sell cancel-mark uses Op3 selector via OpEqual dispatch)");
-    }
+    println!("  (v18 cancel-mark uses the Op3 selector)");
 
     // Sign input 1 (fee UTXO, P2PK)
     let sighash_1 = compute_sighash(&tx, 1)?;
@@ -398,38 +338,11 @@ pub async fn run(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_mark_sigscript = match side {
-            "buy" if version == 18 => {
+            "buy" => {
                 contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
             }
-            "sell" if version == 18 => {
-                contract::spot::order::build_sell_v18_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
-            }
-            "buy" if version == 17 => {
-                contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, true, &current_rs)
-            }
-            "buy" => {
-                let mut ss = Vec::new();
-                ss.push(0x51);
-                let mut sig_typed = sig_0.to_vec();
-                sig_typed.push(0x01);
-                ss.push(sig_typed.len() as u8);
-                ss.extend_from_slice(&sig_typed);
-                ss.push(pubkey.len() as u8);
-                ss.extend_from_slice(&pubkey);
-                ss.extend_from_slice(&kob_core::push_data(&current_rs));
-                ss
-            }
             "sell" => {
-                let mut ss = Vec::new();
-                let mut sig_typed = sig_0.to_vec();
-                sig_typed.push(0x01);
-                ss.push(sig_typed.len() as u8);
-                ss.extend_from_slice(&sig_typed);
-                ss.push(pubkey.len() as u8);
-                ss.extend_from_slice(&pubkey);
-                ss.push(0x53);
-                ss.extend_from_slice(&kob_core::push_data(&current_rs));
-                ss
+                contract::spot::order::build_sell_v18_cancel_mark_sigscript(&sig_0, &pubkey, &current_rs)
             }
             _ => unreachable!(),
         };
@@ -470,74 +383,4 @@ mod tests {
     use kob_core::contract;
     use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 
-    #[test]
-    fn cancel_mark_produces_different_p2sh() {
-        let pk = [0x02u8; 32];
-        let tcid = [0x01u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-
-        let rs_0 = contract::build_buy_redeem_script(
-            &tcid, 1, 2, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        let rs_1 = contract::build_buy_redeem_script(
-            &tcid, 1, 2, 1_000_000, &owner, &spk_hash, 0, 1, 0,).unwrap();
-
-        let p2sh_0 = build_p2sh(&rs_0);
-        let p2sh_1 = build_p2sh(&rs_1);
-
-        // cpend change must produce a different P2SH address
-        assert_ne!(
-            p2sh_0.script(), p2sh_1.script(),
-            "cpend=0 and cpend=1 must have different P2SH scripts"
-        );
-
-        // Both RS should have the same length (cpend=0 uses Op0, cpend=1 uses Op1, both 1 byte)
-        assert_eq!(
-            rs_0.len(),
-            rs_1.len(),
-            "RS length must be same for cpend=0 and cpend=1"
-        );
-    }
-
-    #[test]
-    fn buy_cancel_mark_sigscript_uses_op1() {
-        let pk = [0x02u8; 32];
-        let tcid = [0x01u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let rs = contract::build_buy_redeem_script(
-            &tcid, 1, 2, 1_000_000, &owner, &spk_hash, 0, 0, 0,).unwrap();
-        // Inline buy cancel-mark sigscript: [Op1] [pushData(sig65)] [pushData(pk32)] [pushData(RS)]
-        let sig = [0xAA; 64];
-        let mut ss = Vec::new();
-        ss.push(0x51); // Op1 selector
-        let mut sig_typed = sig.to_vec();
-        sig_typed.push(0x01);
-        ss.push(sig_typed.len() as u8);
-        ss.extend_from_slice(&sig_typed);
-        ss.push(pk.len() as u8);
-        ss.extend_from_slice(&pk);
-        ss.extend_from_slice(&kob_core::push_data(&rs));
-        assert_eq!(ss[0], 0x51, "Buy cancel-mark must start with Op1 (0x51)");
-    }
-
-    #[test]
-    fn sell_cancel_mark_sigscript_uses_op3() {
-        let pk = [0x02u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let rs = contract::build_sell_redeem_script(1, 2, 1_000_000, &owner, &spk_hash, 0, 0, 0).unwrap();
-        // Inline sell cancel-mark sigscript: [pushData(sig65)] [pushData(pk32)] [Op3] [pushData(RS)]
-        let sig = [0xAA; 64];
-        let mut ss = Vec::new();
-        let mut sig_typed = sig.to_vec();
-        sig_typed.push(0x01);
-        ss.push(sig_typed.len() as u8);
-        ss.extend_from_slice(&sig_typed);
-        ss.push(pk.len() as u8);
-        ss.extend_from_slice(&pk);
-        ss.push(0x53); // Op3 selector
-        ss.extend_from_slice(&kob_core::push_data(&rs));
-        assert_eq!(ss[99], 0x53, "Sell cancel-mark selector must be Op3 (0x53) at byte 99");
-    }
 }

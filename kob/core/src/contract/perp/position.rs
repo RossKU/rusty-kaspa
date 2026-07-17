@@ -871,30 +871,36 @@ pub fn compute_settlement_spot_spk_hashes(
     //   - min_fill = 1 (minimal, allows any fill amount)
     //   - owner_hash = matcher (matcher controls the settlement orders)
     //   - buyer/seller_spk_hash = matcher (matcher receives proceeds)
-    //   - max_matcher_fee = u64::MAX (no fee restriction)
+    //   - max_matcher_fee_bps = 10000 (the v18 maximum; no fee restriction)
     //   - cancel_pending = 0 (fillable)
-    //   - expiry_daa = 0 (GTC, no expiry)
-    use crate::contract::spot::order::{build_buy_redeem_script, build_sell_redeem_script};
+    //   - expiry_daa = 0 (GTC, no expiry — the expire seat is never
+    //     reachable, so the owner seats are pinned to the matcher hash as
+    //     part of the canonical P2SH identity)
+    use crate::contract::spot::order::{
+        build_buy_v18_redeem_script, build_sell_v18_redeem_script,
+    };
 
-    let buy_rs = build_buy_redeem_script(
+    let buy_rs = build_buy_v18_redeem_script(
         token_cov_id,
         entry_price_num,
         entry_price_den,
         1,                  // min_fill
         matcher_spk_hash,   // owner_hash
         matcher_spk_hash,   // buyer_spk_hash
-        u64::MAX,           // max_matcher_fee
+        matcher_spk_hash,   // okspkh (unreachable: GTC)
+        10_000,             // max_matcher_fee_bps
         0,                  // cancel_pending
         0,                  // expiry_daa
     ).ok()?;
 
-    let sell_rs = build_sell_redeem_script(
+    let sell_rs = build_sell_v18_redeem_script(
         entry_price_num,
         entry_price_den,
         1,                  // min_fill
         matcher_spk_hash,   // owner_hash
         matcher_spk_hash,   // seller_spk_hash
-        u64::MAX,           // max_matcher_fee
+        matcher_spk_hash,   // otspkh (unreachable: GTC)
+        10_000,             // max_matcher_fee_bps
         0,                  // cancel_pending
         0,                  // expiry_daa
     ).ok()?;

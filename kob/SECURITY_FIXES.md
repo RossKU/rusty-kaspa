@@ -1,5 +1,7 @@
 # KOB Security Fixes — release hardening (Phases 1-5)
 
+> **Superseded by v18 (see V18_DESIGN.md)** where this file describes pre-v18 contract code (deleted in Stage E); the fix rationale remains the historical record for the checks the v18 generation carries.
+
 5-phase release-hardening sequence. Phase 1: covenant fund-theft holes found
 in the adversarial audit of the spot ORDER/TOKEN covenants. Phase 2: x402
 facilitator hardening. Phase 3: a DoS byte-slice panic class in RPC/JSON

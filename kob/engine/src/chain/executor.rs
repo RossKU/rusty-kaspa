@@ -20,7 +20,6 @@ use crate::rpc::{RpcClient, RpcUtxo};
 use crate::matcher::scanner::{
     BlockScanner, TransactionData, ScanResult,
     PerpDeploySide, LendingOrderType, PredictionItemType,
-    BUY_RS_SIZE, SELL_RS_SIZE, BRACKET_RS_SIZE,
 };
 use kob_core::contract::spot::bracket::BRACKET_V18_RS_SIZE;
 use kob_core::contract::spot::oco::OCO_SELL_V18_RS_SIZE;
@@ -429,30 +428,19 @@ pub(crate) fn pair_to_batch_orders(
     let sell_rs = hex::decode(&pair.sell.redeem_script_hex).unwrap_or_default();
     let buy_rs = hex::decode(&pair.buy.redeem_script_hex).unwrap_or_default();
 
-    // sell RS: v14=416, OCO=333, v18=477, OCO-v18=359; buy RS: v14=396, v16=476, v17, v18
-    if sell_rs.len() != SELL_RS_SIZE
-        && sell_rs.len() != kob_core::OCO_SELL_RS_SIZE
-        && sell_rs.len() != SELL_ORDER_V18_RS_EXPECTED_LEN
+    // v18-only RS-length gates (pre-v18 generations removed in Stage E).
+    if sell_rs.len() != SELL_ORDER_V18_RS_EXPECTED_LEN
         && sell_rs.len() != OCO_SELL_V18_RS_SIZE
     {
-        warn!("[{}] Unsupported sell RS size {}, skipping (v14={}, oco={}, v18={}, oco18={})",
-            label, sell_rs.len(), SELL_RS_SIZE, kob_core::OCO_SELL_RS_SIZE,
-            SELL_ORDER_V18_RS_EXPECTED_LEN, OCO_SELL_V18_RS_SIZE);
+        warn!("[{}] Unsupported sell RS size {}, skipping (v18={}, oco18={})",
+            label, sell_rs.len(), SELL_ORDER_V18_RS_EXPECTED_LEN, OCO_SELL_V18_RS_SIZE);
         return None;
     }
-    if buy_rs.len() != BUY_RS_SIZE
-        && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
-        && buy_rs.len() != kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
-        && buy_rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN
-        && buy_rs.len() != BRACKET_RS_SIZE
+    if buy_rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN
         && buy_rs.len() != BRACKET_V18_RS_SIZE
     {
-        warn!("[{}] Unsupported buy RS size {}, skipping (v14={}, v16={}, v17={}, v18={}, bracket={}, bracket18={})",
-            label, buy_rs.len(), BUY_RS_SIZE,
-            kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN,
-            kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN,
-            BUY_ORDER_V18_RS_EXPECTED_LEN,
-            BRACKET_RS_SIZE, BRACKET_V18_RS_SIZE);
+        warn!("[{}] Unsupported buy RS size {}, skipping (v18={}, bracket18={})",
+            label, buy_rs.len(), BUY_ORDER_V18_RS_EXPECTED_LEN, BRACKET_V18_RS_SIZE);
         return None;
     }
 
@@ -498,30 +486,17 @@ pub(crate) fn pair_to_batch_orders(
         bracket_meta: None,
     };
 
-    let buy_version = if buy_rs.len() == BUY_ORDER_V18_RS_EXPECTED_LEN {
-        18u8
-    } else if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
-        17u8
-    } else if buy_rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
-        // NOTE: v16 (F6-fix buy contract) and bracket entries both report
-        // version 16 here -- that number alone does not distinguish the two
-        // contracts. `BatchOrder.version` is downstream engine/domain
-        // metadata only; the actual sigscript-building dispatch in
-        // `BatchPlan::build_tx` is keyed off RS length (BRACKET_RS_SIZE vs
-        // BUY_ORDER_V16_RS_EXPECTED_LEN), not this field. See
-        // V16_STATUS.md Phase 0 for the full collision writeup.
-        16u8
-    } else if buy_rs.len() == BRACKET_RS_SIZE || buy_rs.len() == BRACKET_V18_RS_SIZE {
-        // Bracket entries (v1 365B and v18 372B) keep the legacy 16 label:
-        // brackets are NOT fillable by the batch planners (their fill needs a
-        // receipt input + OCO spawn, wired by the CLI `bracket fill` path),
-        // and labeling a v18 bracket 18 would mis-dispatch it into
-        // `plan_batch_match_v18` (which expects a 1670B v18 buy RS).
+    let buy_version = if buy_rs.len() == BRACKET_V18_RS_SIZE {
+        // Bracket entries keep the legacy 16 label: brackets are NOT
+        // fillable by the batch planners (their fill needs a receipt input +
+        // OCO spawn, wired by the CLI `bracket fill` path), and labeling a
+        // v18 bracket 18 would mis-dispatch it into `plan_batch_match_v18`
+        // (which expects a v18 buy RS).
         16u8
     } else {
-        14u8
+        18u8
     };
-    let bracket_meta = if buy_rs.len() == BRACKET_RS_SIZE || buy_rs.len() == BRACKET_V18_RS_SIZE {
+    let bracket_meta = if buy_rs.len() == BRACKET_V18_RS_SIZE {
         extract_bracket_meta(&buy_rs)
     } else {
         None
@@ -568,13 +543,10 @@ pub(crate) fn book_order_to_batch_order(
 
     let rs = hex::decode(&order.redeem_script_hex).unwrap_or_default();
 
-    // RS sizes: sell v14=416, OCO=333, v18=477, OCO-v18=359;
-    //           buy v14=396, v16=476, v17, v18, bracket=365, bracket-v18=372
+    // v18-only RS-length gates (pre-v18 generations removed in Stage E).
     match order.side {
         crate::matcher::order_book::OrderSide::Sell => {
-            if rs.len() != SELL_RS_SIZE
-                && rs.len() != kob_core::OCO_SELL_RS_SIZE
-                && rs.len() != SELL_ORDER_V18_RS_EXPECTED_LEN
+            if rs.len() != SELL_ORDER_V18_RS_EXPECTED_LEN
                 && rs.len() != OCO_SELL_V18_RS_SIZE
             {
                 warn!("[{}] Unsupported sell RS size {} for {}", label, rs.len(), order.outpoint_key());
@@ -582,11 +554,7 @@ pub(crate) fn book_order_to_batch_order(
             }
         }
         crate::matcher::order_book::OrderSide::Buy => {
-            if rs.len() != BUY_RS_SIZE
-                && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
-                && rs.len() != kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
-                && rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN
-                && rs.len() != BRACKET_RS_SIZE
+            if rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN
                 && rs.len() != BRACKET_V18_RS_SIZE
             {
                 warn!("[{}] Unsupported buy RS size {} for {}", label, rs.len(), order.outpoint_key());
@@ -608,24 +576,13 @@ pub(crate) fn book_order_to_batch_order(
         crate::matcher::order_book::OrderSide::Sell => crate::matcher::batch::OrderType::Sell,
     };
 
-    let version = if rs.len() == BUY_ORDER_V18_RS_EXPECTED_LEN
-        || rs.len() == SELL_ORDER_V18_RS_EXPECTED_LEN
-        || rs.len() == OCO_SELL_V18_RS_SIZE
-    {
-        18u8
-    } else if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
-        17u8
-    } else if rs.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
-        // See buy_version comment above: v16-buy and bracket share the
-        // numeric label 16, disambiguated downstream by RS length.
-        16u8
-    } else if rs.len() == BRACKET_RS_SIZE || rs.len() == BRACKET_V18_RS_SIZE {
-        // v18 brackets keep the 16 label too — see pair_to_batch_orders.
+    let version = if rs.len() == BRACKET_V18_RS_SIZE {
+        // Brackets keep the legacy 16 label — see pair_to_batch_orders.
         16u8
     } else {
-        14u8
+        18u8
     };
-    let bracket_meta = if rs.len() == BRACKET_RS_SIZE || rs.len() == BRACKET_V18_RS_SIZE {
+    let bracket_meta = if rs.len() == BRACKET_V18_RS_SIZE {
         extract_bracket_meta(&rs)
     } else {
         None
@@ -663,7 +620,7 @@ pub(crate) fn book_order_to_batch_order(
 fn extract_bracket_meta(rs: &[u8]) -> Option<crate::matcher::batch::BracketMeta> {
     // v1 (365B) and v18 (372B) brackets share the identical 224B state
     // layout — only the body differs — so one extractor serves both.
-    if rs.len() != BRACKET_RS_SIZE && rs.len() != BRACKET_V18_RS_SIZE {
+    if rs.len() != BRACKET_V18_RS_SIZE {
         return None;
     }
 
@@ -1272,380 +1229,6 @@ pub async fn execute_batch_match(
         buy_count: plan.buys.len(),
         total_seller_kas,
         matcher_surplus: plan.matcher_surplus,
-    })
-}
-
-/// Execute a cross-pair swap fill: build and submit the atomic TX.
-///
-/// TX layout (defined by swap covenant in `swap.rs`):
-///   Inputs:  [0] swap UTXO, [1] sell_target, [2] buy_source, [3] wallet
-///   Outputs: [0] Token A → buyer, [1] Token B → swap owner, [2] KAS → seller, [3] change
-///
-/// The swap UTXO (input 0) carries the source token covenant binding.
-/// The sell_target (input 1) carries the target token covenant binding.
-/// Output[0] gets Token A covenant from input 0, output[1] gets Token B covenant from input 1.
-pub async fn execute_swap_fill(
-    rpc: &RpcClient,
-    sg: &crate::matcher::matching::CrossSwapGroup,
-    sell_target: &crate::matcher::batch::BatchOrder,
-    buy_source: &crate::matcher::batch::BatchOrder,
-    wallet_utxo: Option<(String, u32, u64)>,
-    wallet_spk: &[u8],
-    wallet_spk_version: u16,
-    config: &AppConfig,
-    spent_tracker: &mut SpentTracker,
-) -> Option<BatchMatchResult> {
-    // Helper: mark the 3 participating outpoints as failed (permanent) so
-    // Phase 3 does not retry this dead-end group.
-    let keys_of = || [
-        sg.swap.outpoint_key(),
-        sg.buy_source.outpoint_key(),
-        sg.sell_target.outpoint_key(),
-    ];
-
-    // --- Parse swap entry ---
-    let swap_rs = match hex::decode(&sg.swap.redeem_script_hex) {
-        Ok(rs) if !rs.is_empty() => rs,
-        _ => {
-            warn!("[SWAP-FILL] Failed to decode swap RS");
-            for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-            return None;
-        }
-    };
-    let swap_p2sh = kob_core::build_p2sh(&swap_rs);
-
-    // Owner SPK (hex: 2B version LE + script bytes) for target token output
-    let owner_spk_raw = match &sg.swap.owner_spk {
-        Some(h) => match hex::decode(h) {
-            Ok(v) if v.len() > 2 => v,
-            _ => {
-                warn!("[SWAP-FILL] Invalid owner_spk hex");
-                for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-                return None;
-            }
-        },
-        None => {
-            // Missing owner_spk is transient: the L1 scanner may populate it
-            // later by matching the SPK hash against observed TX outputs.
-            // Don't permanently blacklist the orders.
-            warn!("[SWAP-FILL] Missing owner_spk — cannot build fill (deferred)");
-            for k in keys_of().iter() { spent_tracker.mark_transient(k); }
-            return None;
-        }
-    };
-    let owner_spk_version = u16::from_le_bytes([owner_spk_raw[0], owner_spk_raw[1]]);
-    let owner_spk_script = &owner_spk_raw[2..];
-
-    // --- Receipt input index (rii) ---
-    // Swap covenant F1 checks: input[rii].covenant_id == receipt_cov_id.
-    // Source cov_id lives on input 0 (swap UTXO), target on input 1 (sell_target).
-    let rii: u16 = if sg.swap.receipt_cov_id == sg.swap.source_cov_id {
-        0
-    } else if sg.swap.receipt_cov_id == sg.sell_target.token_cov_id {
-        1
-    } else {
-        warn!(
-            "[SWAP-FILL] receipt_cov_id {} matches neither source {} nor target {} — skip",
-            &sg.swap.receipt_cov_id[..16.min(sg.swap.receipt_cov_id.len())],
-            &sg.swap.source_cov_id[..16.min(sg.swap.source_cov_id.len())],
-            &sg.sell_target.token_cov_id[..16.min(sg.sell_target.token_cov_id.len())],
-        );
-        // Receipt mismatch is specific to this swap order's config — permanent.
-        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-        return None;
-    };
-
-    // V16/V17 buy not supported in cross-pair swap: their F6 surplus check
-    // reads the counterparty sell's price via a fixed-offset sigscript read
-    // (see order.rs), which requires buy and sell to be the same token — not
-    // the case in a cross-pair swap fill (formerly also true of v15, now
-    // removed; v17 sums per-sell prices the same fixed-offset way).
-    if buy_source.redeem_script.len()
-        == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN
-        || buy_source.redeem_script.len()
-            == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
-    {
-        warn!("[SWAP-FILL] v16/v17 buy not supported in cross-pair swap — skip");
-        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-        return None;
-    }
-
-    // --- Sigscripts ---
-    // Input[0] swap:        [rii] [toi=1] [Op1] [pushData(RS)]
-    let swap_ss = kob_core::contract::spot::swap::build_swap_fill_sigscript(rii, 1, &swap_rs);
-    // Input[1] sell_target: [koi=2] [Op1] [pushData(RS)]
-    let sell_ss = kob_core::contract::spot::order::build_sell_fill_sigscript(2, &sell_target.redeem_script);
-    // Input[2] buy_source:  [toi=0] [tii=0] [coi=0] [Op1] [pushData(RS)]
-    let buy_ss = kob_core::contract::spot::order::build_buy_fill_sigscript(0, 0, 0, &buy_source.redeem_script);
-
-    // --- Wallet ---
-    let wallet = match wallet_utxo {
-        Some(w) => w,
-        None => {
-            // Transient: wallet may have UTXOs in the next cycle.
-            warn!("[SWAP-FILL] No wallet UTXO (deferred)");
-            for k in keys_of().iter() { spent_tracker.mark_transient(k); }
-            return None;
-        }
-    };
-
-    // --- Output values ---
-    let source_token_amount = sg.swap.value;       // Token A → buyer
-    let target_token_amount = sg.sell_target.value; // Token B → swap owner
-    let kas_to_seller = sg.kas_flow;
-
-    // Fee estimation: 4 inputs, 4 outputs, 1 sig_op (wallet)
-    let estimated_fee = kob_core::mass::estimate_compute_mass(4, 4, 1);
-
-    // Matcher change = surplus + wallet - fee
-    // (token values cancel: swap.value → output[0], sell.value → output[1])
-    let matcher_change = (sg.surplus + wallet.2).saturating_sub(estimated_fee);
-
-    // Minimum value checks — these are a function of the price/amount
-    // numbers on the orders themselves, so permanent for this triple.
-    if kas_to_seller < MIN_UTXO_VALUE {
-        warn!("[SWAP-FILL] KAS to seller {} below min {}", kas_to_seller, MIN_UTXO_VALUE);
-        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-        return None;
-    }
-    if matcher_change < MIN_UTXO_VALUE {
-        warn!("[SWAP-FILL] Matcher change {} below min {}", matcher_change, MIN_UTXO_VALUE);
-        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-        return None;
-    }
-
-    // --- Build sighash TX ---
-    let mut sighash_tx = kob_core::tx::Transaction::new(1);
-    sighash_tx.lock_time = 50;
-
-    // Input[0]: swap UTXO (covenant, CSV=50, sigOp=0)
-    sighash_tx.inputs.push(kob_core::tx::TxInput {
-        prev_tx_id: sg.swap.tx_id.clone(),
-        prev_index: sg.swap.index,
-        sequence: 50, sig_op_count: 0,
-        script_version: swap_p2sh.version,
-        script_bytes: swap_p2sh.script().to_vec(),
-        value: sg.swap.value,
-    });
-    // Input[1]: sell_target (covenant, CSV=50, sigOp=0)
-    let sell_p2sh = kob_core::build_p2sh(&sell_target.redeem_script);
-    sighash_tx.inputs.push(kob_core::tx::TxInput {
-        prev_tx_id: sell_target.outpoint.0.clone(),
-        prev_index: sell_target.outpoint.1,
-        sequence: 50, sig_op_count: 0,
-        script_version: sell_p2sh.version,
-        script_bytes: sell_p2sh.script().to_vec(),
-        value: sell_target.utxo_value,
-    });
-    // Input[2]: buy_source (covenant, CSV=50, sigOp=0)
-    let buy_p2sh = kob_core::build_p2sh(&buy_source.redeem_script);
-    sighash_tx.inputs.push(kob_core::tx::TxInput {
-        prev_tx_id: buy_source.outpoint.0.clone(),
-        prev_index: buy_source.outpoint.1,
-        sequence: 50, sig_op_count: 0,
-        script_version: buy_p2sh.version,
-        script_bytes: buy_p2sh.script().to_vec(),
-        value: buy_source.utxo_value,
-    });
-    // Input[3]: wallet (P2PK, seq=0, sigOp=1)
-    let wallet_input_idx: usize = 3;
-    sighash_tx.inputs.push(kob_core::tx::TxInput {
-        prev_tx_id: wallet.0.clone(),
-        prev_index: wallet.1,
-        sequence: 0, sig_op_count: 1,
-        script_version: wallet_spk_version,
-        script_bytes: wallet_spk.to_vec(),
-        value: wallet.2,
-    });
-
-    // --- Outputs ---
-    let source_cov_id = &sg.swap.source_cov_id;
-    let target_cov_id = &sg.swap.target_cov_id;
-    let source_hash = kob_core::compat::parse_hash(source_cov_id).unwrap();
-    let target_hash = kob_core::compat::parse_hash(target_cov_id).unwrap();
-
-    // Output[0]: Token A → buyer (covenant: source token, auth input 0)
-    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
-        source_token_amount, buy_source.counterparty_spk_version,
-        buy_source.counterparty_spk.clone(),
-        Some(kob_core::tx::CovenantBinding::new(0, source_hash)),
-    ));
-    // Output[1]: Token B → swap owner (covenant: target token, auth input 1)
-    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
-        target_token_amount, owner_spk_version,
-        owner_spk_script.to_vec(),
-        Some(kob_core::tx::CovenantBinding::new(1, target_hash)),
-    ));
-    // Output[2]: KAS → seller
-    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
-        kas_to_seller, sell_target.counterparty_spk_version,
-        sell_target.counterparty_spk.clone(), None,
-    ));
-    // Output[3]: matcher change
-    sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
-        matcher_change, wallet_spk_version,
-        wallet_spk.to_vec(), None,
-    ));
-
-    // --- RPC outputs ---
-    let buyer_spk_hex = hex::encode(&buy_source.counterparty_spk);
-    let owner_spk_hex = hex::encode(owner_spk_script);
-    let seller_spk_hex = hex::encode(&sell_target.counterparty_spk);
-    let matcher_spk_hex = hex::encode(wallet_spk);
-
-    let rpc_outputs = vec![
-        deploy::build_rpc_output_with_covenant(
-            source_token_amount, buy_source.counterparty_spk_version,
-            &buyer_spk_hex, 0, source_cov_id,
-        ),
-        deploy::build_rpc_output_with_covenant(
-            target_token_amount, owner_spk_version,
-            &owner_spk_hex, 1, target_cov_id,
-        ),
-        deploy::build_rpc_output(
-            kas_to_seller, sell_target.counterparty_spk_version, &seller_spk_hex,
-        ),
-        deploy::build_rpc_output(
-            matcher_change, wallet_spk_version, &matcher_spk_hex,
-        ),
-    ];
-
-    // --- RPC inputs (covenant inputs first, wallet last) ---
-    let mut rpc_inputs = vec![
-        deploy::build_rpc_input_with_sequence(
-            &sg.swap.tx_id, sg.swap.index, &hex::encode(&swap_ss), 0, 50,
-        ),
-        deploy::build_rpc_input_with_sequence(
-            &sell_target.outpoint.0, sell_target.outpoint.1,
-            &hex::encode(&sell_ss), 0, 50,
-        ),
-        deploy::build_rpc_input_with_sequence(
-            &buy_source.outpoint.0, buy_source.outpoint.1,
-            &hex::encode(&buy_ss), 0, 50,
-        ),
-    ];
-
-    // --- Sign wallet input ---
-    let mut privkey = config.private_key_bytes();
-    let sighash = match kob_core::compute_sighash(&sighash_tx, wallet_input_idx) {
-        Ok(sh) => sh,
-        Err(e) => {
-            privkey.zeroize();
-            error!("[SWAP-FILL] Sighash failed: {}", e);
-            for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-            return None;
-        }
-    };
-    let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
-        Ok(s) => s,
-        Err(e) => {
-            privkey.zeroize();
-            error!("[SWAP-FILL] Signing failed: {}", e);
-            for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-            return None;
-        }
-    };
-    privkey.zeroize();
-    let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
-    rpc_inputs.push(deploy::build_rpc_input(
-        &wallet.0, wallet.1, &hex::encode(&wallet_ss), 1,
-    ));
-
-    // --- Mass pre-check ---
-    // Inputs: all P2SH (35B) → p=1.
-    let in_cells: Vec<(u64, u64)> = vec![
-        (sg.swap.value, 1), (sell_target.utxo_value, 1),
-        (buy_source.utxo_value, 1), (wallet.2, 1),
-    ];
-    // Outputs: Token outputs carry covenant (p=2 for 33B P2PK + 32B cov);
-    // KAS/change outputs have no covenant (p=1).
-    let swap_out_plurality = |spk_len: usize, has_cov: bool| -> u64 {
-        (63 + spk_len + if has_cov { 32 } else { 0 }).div_ceil(100) as u64
-    };
-    let out_cells: Vec<(u64, u64)> = vec![
-        (source_token_amount, swap_out_plurality(buy_source.counterparty_spk.len(), true)),
-        (target_token_amount, swap_out_plurality(owner_spk_script.len(), true)),
-        (kas_to_seller, swap_out_plurality(sell_target.counterparty_spk.len(), false)),
-        (matcher_change, swap_out_plurality(wallet_spk.len(), false)),
-    ];
-    if check_mass_presubmit(&in_cells, &out_cells, "SWAP-FILL").is_none() {
-        for k in keys_of().iter() { spent_tracker.mark_failed(k); }
-        return None;
-    }
-
-    // --- Debug dump ---
-    info!("======================================================================");
-    info!("EXECUTING SWAP FILL: swap → buy_source(Token A) + sell_target(Token B)");
-    info!("======================================================================");
-    info!("  swap={}:{} (src_tok={})", &sg.swap.tx_id[..16.min(sg.swap.tx_id.len())], sg.swap.index, sg.swap.value);
-    info!("  sell_target={}:{} (tgt_tok={})", &sell_target.outpoint.0[..16.min(sell_target.outpoint.0.len())], sell_target.outpoint.1, sell_target.utxo_value);
-    info!("  buy_source={}:{} (kas={})", &buy_source.outpoint.0[..16.min(buy_source.outpoint.0.len())], buy_source.outpoint.1, buy_source.utxo_value);
-    info!("  kas_flow={} surplus={} fee={} matcher_change={} rii={}", kas_to_seller, sg.surplus, estimated_fee, matcher_change, rii);
-
-    // --- Submit ---
-    let payload = deploy::build_submit_payload_with_lock_time(1, rpc_inputs, rpc_outputs, 50);
-    let result = match rpc.submit_transaction(payload).await {
-        Ok(r) => r,
-        Err(e) => {
-            let err_str = e.to_string();
-            let is_transient = err_str.contains("sequence locks");
-            if is_transient {
-                warn!("[SWAP-FILL] CSV not yet mature (transient): {}", err_str);
-            } else {
-                error!("[SWAP-FILL] Submit failed: {}", err_str);
-            }
-            // Mark the 3 participating outpoints so Phase 3's None branch
-            // does NOT need to re-mark them (caller treats None uniformly).
-            let mark_all = |tracker: &mut SpentTracker| {
-                let keys = [
-                    sg.swap.outpoint_key(),
-                    sg.buy_source.outpoint_key(),
-                    sg.sell_target.outpoint_key(),
-                ];
-                for k in &keys {
-                    if is_transient {
-                        tracker.mark_transient(k);
-                    } else {
-                        tracker.mark_failed(k);
-                    }
-                }
-            };
-            mark_all(spent_tracker);
-            return None;
-        }
-    };
-    if !result.ok {
-        let err_str = result.error.clone().unwrap_or_else(|| "unknown".to_string());
-        let is_transient = err_str.contains("sequence locks");
-        if is_transient {
-            warn!("[SWAP-FILL] CSV not yet mature (TX rejected, transient): {}", err_str);
-        } else {
-            error!("[SWAP-FILL] TX rejected: {}", err_str);
-        }
-        let keys = [
-            sg.swap.outpoint_key(),
-            sg.buy_source.outpoint_key(),
-            sg.sell_target.outpoint_key(),
-        ];
-        for k in &keys {
-            if is_transient {
-                spent_tracker.mark_transient(k);
-            } else {
-                spent_tracker.mark_failed(k);
-            }
-        }
-        return None;
-    }
-
-    let tx_id = result.tx_id.unwrap_or_default();
-    info!("[SWAP-FILL] SUCCESS! TXID: {}", tx_id);
-
-    Some(BatchMatchResult {
-        tx_id,
-        sell_count: 1,
-        buy_count: 1,
-        total_seller_kas: kas_to_seller,
-        matcher_surplus: sg.surplus,
     })
 }
 
@@ -2730,48 +2313,6 @@ fn process_block_txs_all(
                     counters.dca_added += 1;
                 }
             }
-            ScanResult::Swap(parsed, p2sh_idx, p2sh_value) => {
-                let outpoint_key = format!("{}:{}", tx.tx_id, p2sh_idx);
-                if let Some(ref mut sb) = swap_book {
-                    if sb.contains(&outpoint_key) {
-                        continue; // dedup
-                    }
-                    let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
-                    // Extract owner SPK from the deploy TX outputs.
-                    let owner_spk = crate::matcher::scanner::extract_owner_spk(tx, &parsed.owner_spk_hash);
-                    if owner_spk.is_none() {
-                        debug!(
-                            "[SWAP] owner_spk not found in deploy TX for {}:{} — fill will be deferred",
-                            &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
-                        );
-                    }
-                    let entry = crate::matcher::swap_book::SwapEntry {
-                        tx_id: tx.tx_id.clone(),
-                        index: p2sh_idx,
-                        value: p2sh_value,
-                        source_cov_id: hex::encode(parsed.source_token_cov_id),
-                        target_cov_id: hex::encode(parsed.target_token_cov_id),
-                        min_target_amount: parsed.min_target_amount,
-                        owner_hash: hex::encode(parsed.owner_hash),
-                        owner_spk_hash: hex::encode(parsed.owner_spk_hash),
-                        receipt_cov_id: hex::encode(parsed.receipt_cov_id),
-                        redeem_script_hex: hex::encode(&parsed.redeem_script),
-                        p2sh_script_hex: hex::encode(&p2sh_spk.script()),
-                        p2sh_version: p2sh_spk.version,
-                        discovered_daa: current_daa,
-                        owner_spk,
-                    };
-                    info!(
-                        "[SCANNER-ALL] Discovered swap order: {} source={} target={} min_ta={}",
-                        &outpoint_key[..outpoint_key.len().min(20)],
-                        &entry.source_cov_id[..entry.source_cov_id.len().min(12)],
-                        &entry.target_cov_id[..entry.target_cov_id.len().min(12)],
-                        parsed.min_target_amount,
-                    );
-                    sb.add(entry);
-                    counters.swap_added += 1;
-                }
-            }
             ScanResult::SwapV18(parsed, p2sh_idx, p2sh_value) => {
                 // v18 swap (260B RS): ring-eligible leg. Same SwapEntry shape
                 // as v1 — the RS length in redeem_script_hex is the generation
@@ -3324,22 +2865,34 @@ async fn retract_reorged_trades(shared_state: &AppState, removed_block_hashes: &
     }
 }
 
-// Expire TX builder for v14 GTD orders
+// Auto-expire TX builder for v18 GTD orders
 
-/// Build and submit expire TXs for expired v14 orders.
+/// Build and submit expire TXs for expired v18 orders.
 ///
-/// v14 orders with `expiry_daa > 0` can be permissionlessly reclaimed after
-/// the DAA score exceeds the expiry. The expire TX:
-///   - Input: the expired order UTXO (P2SH, sigscript = expire sigscript)
-///   - Output: owner's address (from bspkh/sspkh in the RS), value = input - fee
-///   - lockTime = expiry_daa (required for CLTV to pass)
+/// v18 orders with `expiry_daa > 0` are permissionlessly reclaimable after
+/// the DAA score passes the expiry, but the v18 expire branches demand a
+/// FULL refund (`out[0].value >= input.value`), so the miner fee must come
+/// from a separate matcher wallet input (the pre-v18 1-in/1-out
+/// fee-from-refund shape is rejected on-chain). Shape:
+///   - in[0]  the expired order UTXO (sigscript = [Op4][RS], sigOp 0)
+///   - in[1]  matcher wallet UTXO (P2PK, signed — pays the fee)
+///   - out[0] FULL refund to the owner seat committed at rs[1..33):
+///            buy = okspkh (owner raw P2PK, plain KAS);
+///            sell/OCO = otspkh (owner token_unit P2SH) carrying the token
+///            CovenantBinding authorized by in[0]
+///   - out[1] wallet change
+///   - lockTime = expiry_daa (CLTV)
 ///
-/// Anyone can submit this TX; no owner signature is needed.
+/// The owner-seat SPK preimage is resolved from `counterparty_spk`: used
+/// directly when its hash matches the seat, or (for sells/OCO, whose
+/// counterparty_spk is the seller's raw P2PK) re-derived as the owner's
+/// token_unit P2SH. Orders whose preimage cannot be recovered are skipped
+/// (the owner can always self-expire via the CLI).
 async fn expire_orders(
     rpc: &RpcClient,
     expired_orders: &[crate::matcher::order_book::BookOrder],
     current_daa: u64,
-    _wallet_prefix: &str,
+    config: &AppConfig,
 ) -> u32 {
     use crate::matcher::order_book::OrderSide;
 
@@ -3352,28 +2905,31 @@ async fn expire_orders(
         };
 
         let rs = order.redeem_script();
-        if rs.is_empty() {
+        if rs.len() < 33 || rs[0] != 0x20 {
             warn!(
-                "[EXPIRE] Empty RS for order {}, skipping",
+                "[EXPIRE] Order {} RS has no v18 owner seat, skipping",
                 &order.outpoint_key()[..order.outpoint_key().len().min(20)],
             );
             continue;
         }
+        let mut seat = [0u8; 32];
+        seat.copy_from_slice(&rs[1..33]);
 
-        // Build expire sigscript based on order side
+        // Expire sigscript is [Op4][pushData(RS)] for every v18 generation.
         let expire_ss = match order.side {
-            OrderSide::Buy => kob_core::contract::build_buy_expire_sigscript(&rs),
-            OrderSide::Sell => kob_core::contract::build_sell_expire_sigscript(&rs),
+            OrderSide::Buy => kob_core::contract::spot::order::build_buy_v18_expire_sigscript(&rs),
+            OrderSide::Sell => kob_core::contract::spot::order::build_sell_v18_expire_sigscript(&rs),
         };
 
-        // Owner's SPK hash is in spk_hash. We need the actual SPK bytes
-        // to build the output. Try counterparty_spk (which for buy orders
-        // is the buyer's SPK, for sell orders the seller's SPK).
-        let owner_spk_hex = match &order.counterparty_spk {
-            Some(spk) if !spk.is_empty() => spk.clone(),
-            _ => {
-                // If counterparty_spk is not available, we can't build the
-                // expire output. The owner must self-expire via the CLI.
+        // Resolve the owner-seat SPK preimage.
+        let cp_spk_bytes = match order
+            .counterparty_spk
+            .as_ref()
+            .and_then(|h| hex::decode(h).ok())
+            .filter(|b| b.len() > 2)
+        {
+            Some(b) => b,
+            None => {
                 warn!(
                     "[EXPIRE] No counterparty SPK for expired order {}, skipping (owner must self-expire)",
                     &order.outpoint_key()[..order.outpoint_key().len().min(20)],
@@ -3381,43 +2937,163 @@ async fn expire_orders(
                 continue;
             }
         };
-        let _owner_spk = match hex::decode(&owner_spk_hex) {
-            Ok(spk) => spk,
-            Err(_) => continue,
+        let cp_ver = u16::from_le_bytes([cp_spk_bytes[0], cp_spk_bytes[1]]);
+        let cp_script = &cp_spk_bytes[2..];
+        let (seat_ver, seat_script): (u16, Vec<u8>) =
+            if kob_core::p2sh::compute_spk_hash(cp_ver, cp_script) == seat {
+                (cp_ver, cp_script.to_vec())
+            } else if cp_script.len() == 34 && cp_script[0] == 0x20 && cp_script[33] == 0xac {
+                // Seller raw P2PK: the token seat is the owner's token_unit
+                // P2SH derived from the embedded pubkey.
+                let mut pk = [0u8; 32];
+                pk.copy_from_slice(&cp_script[1..33]);
+                if kob_core::contract::compute_token_unit_spk_hash(&pk) == seat {
+                    let tu = kob_core::contract::build_token_unit_p2sh_spk(&pk);
+                    (tu.version(), tu.script().to_vec())
+                } else {
+                    warn!(
+                        "[EXPIRE] Cannot resolve owner seat for {}, skipping (owner must self-expire)",
+                        &order.outpoint_key()[..order.outpoint_key().len().min(20)],
+                    );
+                    continue;
+                }
+            } else {
+                warn!(
+                    "[EXPIRE] Cannot resolve owner seat for {}, skipping (owner must self-expire)",
+                    &order.outpoint_key()[..order.outpoint_key().len().min(20)],
+                );
+                continue;
+            };
+
+        // Sell/OCO refunds must carry the token CovenantBinding (authorized
+        // by the order input at index 0).
+        let token_cov_hex = if order.side == OrderSide::Sell {
+            if order.token_cov_id.len() != 64 {
+                warn!(
+                    "[EXPIRE] Sell {} missing token covenant id, skipping",
+                    &order.outpoint_key()[..order.outpoint_key().len().min(20)],
+                );
+                continue;
+            }
+            Some(order.token_cov_id.clone())
+        } else {
+            None
         };
 
-        // Deduct network fee from the order value (1 input, 1 output expire TX)
-        let expire_miner_fee = kob_core::mass::estimate_compute_mass(1, 1, 0);
-        let output_value = order.value.saturating_sub(expire_miner_fee);
-        if output_value < MIN_UTXO_VALUE {
-            warn!(
-                "[EXPIRE] Expired order {} value too low ({} < min {}), skipping",
-                &order.outpoint_key()[..order.outpoint_key().len().min(20)],
-                output_value,
-                MIN_UTXO_VALUE,
-            );
-            continue;
+        // Matcher wallet fee input.
+        let wallet_utxos = match rpc.get_spendable_utxos(&config.address, Some(0)).await {
+            Ok(u) if !u.is_empty() => u,
+            _ => {
+                warn!("[EXPIRE] No wallet UTXOs for the fee input, skipping cycle");
+                return expired_count;
+            }
+        };
+        let fee_utxo = match wallet_utxos.iter().max_by_key(|u| u.utxo_entry.amount) {
+            Some(u) if u.utxo_entry.amount > MIN_UTXO_VALUE => u.clone(),
+            _ => {
+                warn!("[EXPIRE] No suitable wallet fee UTXO, skipping cycle");
+                return expired_count;
+            }
+        };
+        let (wallet_spk_ver, wallet_spk_script) = fee_utxo.parse_spk();
+        let expire_fee = kob_core::mass::estimate_compute_mass(2, 2, rs.len()) + 500;
+        if fee_utxo.utxo_entry.amount <= expire_fee + MIN_UTXO_VALUE {
+            warn!("[EXPIRE] Wallet fee UTXO too small, skipping cycle");
+            return expired_count;
         }
+        let change_value = fee_utxo.utxo_entry.amount - expire_fee;
 
-        // Build TX
-        let input = deploy::build_rpc_input(
-            &order.tx_id,
-            order.index,
-            &hex::encode(&expire_ss),
-            0, // sigOpCount = 0 for covenant inputs
-        );
-        let output = deploy::build_rpc_output(
-            output_value,
-            0, // P2PK version
-            &owner_spk_hex,
-        );
+        // Sighash TX (in[1] = wallet P2PK, signed below).
+        let tx_version: u16 = if token_cov_hex.is_some() { 1 } else { 0 };
+        let mut sighash_tx = kob_core::tx::Transaction::new(tx_version);
+        sighash_tx.lock_time = expiry_daa;
+        let order_p2sh = kob_core::build_p2sh(&rs);
+        sighash_tx.inputs.push(kob_core::tx::TxInput {
+            prev_tx_id: order.tx_id.clone(),
+            prev_index: order.index,
+            sequence: 0,
+            sig_op_count: 0,
+            script_version: order_p2sh.version,
+            script_bytes: order_p2sh.script().to_vec(),
+            value: order.value,
+        });
+        sighash_tx.inputs.push(kob_core::tx::TxInput {
+            prev_tx_id: fee_utxo.outpoint.transaction_id.clone(),
+            prev_index: fee_utxo.outpoint.index,
+            sequence: 0,
+            sig_op_count: 1,
+            script_version: wallet_spk_ver,
+            script_bytes: wallet_spk_script.to_vec(),
+            value: fee_utxo.utxo_entry.amount,
+        });
+        let refund_cov = match &token_cov_hex {
+            Some(h) => match kob_core::compat::parse_hash(h) {
+                Ok(t) => Some(kob_core::tx::CovenantBinding::new(0, t)),
+                Err(e) => {
+                    warn!("[EXPIRE] Bad token covenant id for {}: {:?}", order.outpoint_key(), e);
+                    continue;
+                }
+            },
+            None => None,
+        };
+        sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+            order.value,
+            seat_ver,
+            seat_script.clone(),
+            refund_cov,
+        ));
+        sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+            change_value,
+            wallet_spk_ver,
+            wallet_spk_script.to_vec(),
+            None,
+        ));
 
-        // lockTime must be >= expiry_daa for CLTV to pass.
-        // Consensus enforces lockTime <= current_daa, so we use expiry_daa.
+        // Sign the wallet fee input.
+        let mut privkey = config.private_key_bytes();
+        let sighash = match kob_core::compute_sighash(&sighash_tx, 1) {
+            Ok(sh) => sh,
+            Err(e) => {
+                privkey.zeroize();
+                warn!("[EXPIRE] Sighash failed for {}: {}", order.outpoint_key(), e);
+                continue;
+            }
+        };
+        let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
+            Ok(s) => s,
+            Err(e) => {
+                privkey.zeroize();
+                warn!("[EXPIRE] Signing failed for {}: {}", order.outpoint_key(), e);
+                continue;
+            }
+        };
+        privkey.zeroize();
+        let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
+
+        // RPC payload.
+        let rpc_inputs = vec![
+            deploy::build_rpc_input(&order.tx_id, order.index, &hex::encode(&expire_ss), 0),
+            deploy::build_rpc_input(
+                &fee_utxo.outpoint.transaction_id,
+                fee_utxo.outpoint.index,
+                &hex::encode(&wallet_ss),
+                1,
+            ),
+        ];
+        let seat_spk_hex = hex::encode(&seat_script);
+        let rpc_outputs = vec![
+            match &token_cov_hex {
+                Some(h) => deploy::build_rpc_output_with_covenant(
+                    order.value, seat_ver, &seat_spk_hex, 0, h,
+                ),
+                None => deploy::build_rpc_output(order.value, seat_ver, &seat_spk_hex),
+            },
+            deploy::build_rpc_output(change_value, wallet_spk_ver, &hex::encode(&wallet_spk_script)),
+        ];
         let payload = deploy::build_submit_payload_with_lock_time(
-            0,
-            vec![input],
-            vec![output],
+            tx_version,
+            rpc_inputs,
+            rpc_outputs,
             expiry_daa,
         );
 
@@ -3425,7 +3101,7 @@ async fn expire_orders(
             Ok(result) if result.ok => {
                 let tx_id = result.tx_id.unwrap_or_default();
                 info!(
-                    "[EXPIRE] Reclaimed expired {} order {} -> TX {}",
+                    "[EXPIRE] Reclaimed expired {} order {} -> TX {} (full refund to the owner seat)",
                     if order.side == OrderSide::Buy { "BUY" } else { "SELL" },
                     &order.outpoint_key()[..order.outpoint_key().len().min(20)],
                     &tx_id[..tx_id.len().min(20)],
@@ -3545,184 +3221,11 @@ async fn run_scan_cycle(
                     swap_spent_keys.insert(key.clone());
                 }
             }
-            let swap_groups = matching::match_swap_routes(
-                order_book, &swab, Some(&swap_spent_keys), &std::collections::HashSet::new(),
-            );
             // v18 rings settle token->token directly (2-cycle / triangle),
-            // WITHOUT the KAS-bridged buy/sell counterparties the v1 route
-            // needs — detected purely from the swap book.
+            // WITHOUT KAS-bridged buy/sell counterparties (the retired v1
+            // swap route) — detected purely from the swap book.
             let v18_rings = matching::find_v18_rings(&swab, Some(&swap_spent_keys));
             drop(swab);
-
-            if !swap_groups.is_empty() {
-                info!(
-                    "[SCAN] Found {} cross-book swap route(s)",
-                    swap_groups.len(),
-                );
-            }
-
-            for sg in &swap_groups {
-                info!(
-                    "[SWAP-ROUTE] swap={} buy_source={} sell_target={} kas_flow={} surplus={}",
-                    &sg.swap.outpoint_key()[..sg.swap.outpoint_key().len().min(20)],
-                    &sg.buy_source.outpoint_key()[..sg.buy_source.outpoint_key().len().min(20)],
-                    &sg.sell_target.outpoint_key()[..sg.sell_target.outpoint_key().len().min(20)],
-                    sg.kas_flow,
-                    sg.surplus,
-                );
-
-                // Convert counterparty orders to BatchOrders
-                let buy_source_batch = match book_order_to_batch_order(&sg.buy_source, "SWAP-BUY") {
-                    Some(o) => o,
-                    None => {
-                        spent_tracker.mark_failed(&sg.buy_source.outpoint_key());
-                        continue;
-                    }
-                };
-                let sell_target_batch = match book_order_to_batch_order(&sg.sell_target, "SWAP-SELL") {
-                    Some(o) => o,
-                    None => {
-                        spent_tracker.mark_failed(&sg.sell_target.outpoint_key());
-                        continue;
-                    }
-                };
-
-                // Acquire wallet UTXOs
-                let utxos = match rpc
-                    .get_spendable_utxos(&config.address, Some(0))
-                    .await
-                {
-                    Ok(u) if !u.is_empty() => u,
-                    Ok(_) => {
-                        warn!("[SWAP-ROUTE] No wallet UTXOs available, skipping");
-                        continue;
-                    }
-                    Err(e) => {
-                        warn!("[SWAP-ROUTE] Failed to get wallet UTXOs: {}, skipping", e);
-                        continue;
-                    }
-                };
-                let (wallet_spk_version, wallet_spk_script) = utxos[0].parse_spk();
-                let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
-                let token_p2sh_hex = hex::encode(&token_p2sh.script());
-                let wallet_utxo = utxos.iter()
-                    .filter(|u| {
-                        let (_, script) = u.parse_spk();
-                        hex::encode(&script) != token_p2sh_hex
-                            && !spent_tracker.is_spent(&u.outpoint_key())
-                    })
-                    .max_by_key(|u| u.utxo_entry.amount)
-                    .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
-
-                // Build and submit the swap atomic TX directly (not via plan_batch_match,
-                // which can't handle cross-pair token routing).
-                // execute_swap_fill marks participating outpoints as transient
-                // (CSV not mature) or failed (permanent) on its own when it
-                // returns None. The caller only marks on the success path.
-                match execute_swap_fill(
-                    rpc, sg, &sell_target_batch, &buy_source_batch,
-                    wallet_utxo.clone(), &wallet_spk_script, wallet_spk_version, config,
-                    spent_tracker,
-                ).await {
-                    Some(batch_result) => {
-                        info!(
-                            "[SWAP-ROUTE] SUCCESS: tx={} kas_flow={} surplus={}",
-                            &batch_result.tx_id[..batch_result.tx_id.len().min(16)],
-                            sg.kas_flow,
-                            sg.surplus,
-                        );
-
-                        // Mark all 3 orders as spent
-                        let swap_key = sg.swap.outpoint_key();
-                        let buy_source_key = sg.buy_source.outpoint_key();
-                        let sell_target_key = sg.sell_target.outpoint_key();
-                        spent_tracker.mark_spent(&swap_key);
-                        spent_tracker.mark_spent(&buy_source_key);
-                        spent_tracker.mark_spent(&sell_target_key);
-                        let mut swap_marked_keys: Vec<String> =
-                            vec![swap_key, buy_source_key, sell_target_key];
-
-                        // Emit events for counterparty orders
-                        if let Some(ws) = ws_tx {
-                            crate::matcher::api::emit_order_filled(
-                                ws, &sg.buy_source.owner_hash, &sg.buy_source.outpoint_key(),
-                                &batch_result.tx_id,
-                                sg.buy_source.price_num, sg.buy_source.price_den,
-                                sg.buy_source.value, OrderSide::Buy,
-                                &sg.buy_source.token_cov_id,
-                            );
-                            crate::matcher::api::emit_order_filled(
-                                ws, &sg.sell_target.owner_hash, &sg.sell_target.outpoint_key(),
-                                &batch_result.tx_id,
-                                sg.sell_target.price_num, sg.sell_target.price_den,
-                                sg.sell_target.value, OrderSide::Sell,
-                                &sg.sell_target.token_cov_id,
-                            );
-                        }
-
-                        // Record trades for both legs. P1 fix: both legs
-                        // share batch_result.tx_id, so each needs a distinct
-                        // leg_index to avoid colliding trade ids.
-                        record_trade(
-                            shared_state,
-                            &batch_result.tx_id,
-                            0,
-                            &sg.buy_source.token_cov_id,
-                            sg.buy_source.price_num, sg.buy_source.price_den,
-                            sg.buy_source.value,
-                            Side::Buy,
-                            None,
-                        ).await;
-                        record_trade(
-                            shared_state,
-                            &batch_result.tx_id,
-                            1,
-                            &sg.sell_target.token_cov_id,
-                            sg.sell_target.price_num, sg.sell_target.price_den,
-                            sg.sell_target.value,
-                            Side::Sell,
-                            None,
-                        ).await;
-
-                        // Mark wallet outpoint as spent
-                        if let Some(ref wu) = wallet_utxo {
-                            let wk = format!("{}:{}", wu.0, wu.1);
-                            spent_tracker.mark_spent(&wk);
-                            swap_marked_keys.push(wk);
-                        }
-
-                        // Associate all 4 marked outpoints with the submit txid
-                        // so the mempool-aware prune preserves them while the
-                        // TX dwells in the mempool.
-                        if !batch_result.tx_id.is_empty() {
-                            spent_tracker.mark_submitted(
-                                &batch_result.tx_id,
-                                &swap_marked_keys,
-                            );
-                        }
-
-                        // Push MatchResult for stop/trailing stop triggers
-                        results.push(MatchResult {
-                            match_tx_id: batch_result.tx_id.clone(),
-                            match_type: MatchType::Full,
-                            seller_kas: sg.kas_flow,
-                            buyer_tokens: sg.sell_target.value,
-                            receipt_tx_id: batch_result.tx_id.clone(),
-                            receipt_idx: 0,
-                            receipt_value: 0,
-                            token_cov_id: sg.sell_target.token_cov_id.clone(),
-                            price_num: sg.sell_target.price_num,
-                            price_den: sg.sell_target.price_den,
-                        });
-                    }
-                    None => {
-                        // execute_swap_fill already marked the 3 outpoints
-                        // (transient for CSV, failed for permanent) before
-                        // returning. Just log here.
-                        warn!("[SWAP-ROUTE] Execution returned no result (see [SWAP-FILL] log above)");
-                    }
-                }
-            }
 
             // --- v18 ring settles (item F) ---
             if !v18_rings.is_empty() {
@@ -3775,14 +3278,8 @@ async fn run_scan_cycle(
                     }
                 };
                 let (ring_wallet_spk_version, ring_wallet_spk) = ring_utxos[0].parse_spk();
-                let ring_token_p2sh_hex =
-                    hex::encode(kob_core::build_p2sh(kob_core::TOKEN_RS).script());
                 let ring_wallet_utxo = ring_utxos.iter()
-                    .filter(|u| {
-                        let (_, script) = u.parse_spk();
-                        hex::encode(&script) != ring_token_p2sh_hex
-                            && !spent_tracker.is_spent(&u.outpoint_key())
-                    })
+                    .filter(|u| !spent_tracker.is_spent(&u.outpoint_key()))
                     .max_by_key(|u| u.utxo_entry.amount)
                     .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
@@ -3882,9 +3379,6 @@ async fn run_scan_cycle(
             None
         }
     };
-    let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
-    let token_p2sh_hex = hex::encode(&token_p2sh.script());
-
     for group in &opt_groups {
         info!(
             "[UNIFIED] Group kind={:?} sells={} buys={} surplus={}",
@@ -3962,88 +3456,45 @@ async fn run_scan_cycle(
             None => continue,
         };
         let wallet_utxo = utxos.iter()
-            .filter(|u| {
-                let (_, script) = u.parse_spk();
-                hex::encode(&script) != token_p2sh_hex
-                    && !spent_tracker.is_spent(&u.outpoint_key())
-            })
+            .filter(|u| !spent_tracker.is_spent(&u.outpoint_key()))
             .max_by_key(|u| u.utxo_entry.amount)
             .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
         // Plan using the appropriate planner based on GroupKind
         let plan_result = match group.kind {
             matching::GroupKind::BuySweep => {
-                // 1 buy (in buys[0]) sweeps N sells. v17/v18 buys use their
-                // dedicated per-sell-output IOC planners (plan_ioc_match's
-                // single merged BuyerTokens output doesn't match what those
-                // contracts' per-term OpAuthOutputIdx binding expects).
-                if buys[0].version == 18 {
-                    crate::matcher::batch::plan_ioc_match_v18(
-                        &sells, &buys[0], wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                } else if buys[0].version == 17 {
-                    crate::matcher::batch::plan_ioc_match_v17(
-                        &sells, &buys[0], wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                } else {
-                    crate::matcher::batch::plan_ioc_match(
-                        &sells, &buys[0], wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                }
+                // 1 v18 buy (in buys[0]) sweeps N sells via the per-sell-
+                // output IOC planner (per-term OpAuthOutputIdx binding).
+                crate::matcher::batch::plan_ioc_match_v18(
+                    &sells, &buys[0], wallet_utxo,
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                )
             }
             matching::GroupKind::SellSweep => {
-                // 1 sell (in sells[0]) sweeps N buys. v18 sells use the
-                // full-absorption parity planner (v18 sweeps are structurally
+                // 1 v18 sell (in sells[0]) sweeps N buys via the full-
+                // absorption parity planner (v18 sweeps are structurally
                 // full-fill-only on the sell side — auth-slot-0 conflict).
-                if sells[0].version == 18 {
-                    crate::matcher::batch::plan_sell_ioc_match_v18(
-                        &sells[0], &buys, wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                } else {
-                    crate::matcher::batch::plan_sell_ioc_match(
-                        &sells[0], &buys, wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                }
+                crate::matcher::batch::plan_sell_ioc_match_v18(
+                    &sells[0], &buys, wallet_utxo,
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                )
             }
             matching::GroupKind::PartialBuy => {
-                // 1:1 partial buy. v18 has a REAL partial path (Op2): the
-                // buy spends only part of its KAS and keeps a byte-exact
-                // self-SPK residual UTXO (item C). Pre-v18 buys emulate
-                // partials via their IOC selector.
-                if buys[0].version == 18 {
-                    crate::matcher::batch::plan_partial_match_v18(
-                        &sells, &buys[0], wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                } else if buys[0].version == 17 {
-                    crate::matcher::batch::plan_ioc_match_v17(
-                        &sells, &buys[0], wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                } else {
-                    crate::matcher::batch::plan_ioc_match(
-                        &sells, &buys[0], wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                }
+                // 1:1 partial buy — the v18 Op2 path: the buy spends only
+                // part of its KAS and keeps a byte-exact self-SPK residual
+                // UTXO (item C).
+                crate::matcher::batch::plan_partial_match_v18(
+                    &sells, &buys[0], wallet_utxo,
+                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                )
             }
             matching::GroupKind::PartialSell => {
                 // 1:1 partial sell: sell IOC sweeps 1 buy. A v18 partial sell
                 // cannot settle against a v18 buy in the same tx (auth-slot-0
                 // conflict) — plan_sell_ioc_match_v18 selects a fully-
                 // absorbing buy instead or reports V18SellResidualUnsupported.
-                if sells[0].version == 18 {
+                {
                     crate::matcher::batch::plan_sell_ioc_match_v18(
-                        &sells[0], &buys, wallet_utxo,
-                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                    )
-                } else {
-                    crate::matcher::batch::plan_sell_ioc_match(
                         &sells[0], &buys, wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                     )
@@ -5190,14 +4641,8 @@ async fn run_scan_cycle(
                     Some(x) => x,
                     None => continue,
                 };
-            let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
-            let token_p2sh_hex = hex::encode(&token_p2sh.script());
             let wallet_utxo = utxos.iter()
-                .filter(|u| {
-                    let (_, script) = u.parse_spk();
-                    hex::encode(&script) != token_p2sh_hex
-                        && !spent_tracker.is_spent(&u.outpoint_key())
-                })
+                .filter(|u| !spent_tracker.is_spent(&u.outpoint_key()))
                 .max_by_key(|u| u.utxo_entry.amount);
             let wallet_utxo = match wallet_utxo {
                 Some(u) => u,
@@ -5270,9 +4715,11 @@ async fn run_scan_cycle(
             //   [2] DCA continuation (if periods > 1), P2SH(new_rs)
             //   [2/3] wallet change (remaining KAS)
 
-            // Sell fill sigscript: [koi_opN][Op1][pushData(RS)]
-            // koi=1 (seller KAS output is at index 1)
-            let sell_fill_ss = kob_core::build_sell_fill_sigscript(1u16, &sell_rs);
+            // v18 sell fill sigscript (canonical attested layout):
+            // [0x01,koi=1][0x08 pnum][0x08 pden][Op1][pushData(RS)]
+            let sell_fill_ss = kob_core::contract::spot::order::build_sell_v18_fill_sigscript(
+                1u16, sell.price_num, sell.price_den, &sell_rs,
+            );
 
             // DCA fill sigscript.
             // For non-final fills: old_rs and new_rs are the current and updated RS.
@@ -6320,8 +5767,7 @@ pub async fn run_continuous_with_ws(
                     ob.remove_expired(current_daa)
                 };
                 if !expired_orders.is_empty() {
-                    let prefix = config.address.split(':').next().unwrap_or("kaspa");
-                    let count = expire_orders(&rpc_lock, &expired_orders, current_daa, prefix).await;
+                    let count = expire_orders(&rpc_lock, &expired_orders, current_daa, config).await;
                     if count > 0 {
                         info!("[EXPIRE] Expired {} order(s) at DAA score {}", count, current_daa);
                     }
@@ -6703,143 +6149,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn process_block_txs_adds_buy_order() {
-        let tcid = [0xAA; 32];
-        let ohash = [0xBB; 32];
-        let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, 0, 0, 0,).unwrap();
-
-        let tx_id = "a".repeat(64);
-        let deploy_tx = make_deploy_tx(&tx_id, &rs, 10_000_000);
-
-        let mut ob = OrderBook::new();
-        let scanner = BlockScanner::new();
-
-        let (added, removed) = process_block_txs(&[deploy_tx], &mut ob, &scanner);
-        assert_eq!(added, 1);
-        assert_eq!(removed, 0);
-        assert_eq!(ob.stats().total_bids, 1);
-        assert_eq!(ob.stats().total_asks, 0);
-    }
-
-    #[test]
-    fn process_block_txs_adds_sell_order() {
-        // H-3: Sell RSes do not embed token_cov_id (parsed as [0;32]).
-        // process_block_txs skips such orders to prevent ghost entries.
-        let ohash = [0xDD; 32];
-        let sspkh = [0xEE; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(
-            5, 3, 2_000_000, &ohash, &sspkh, 0, 0, 0,).unwrap();
-
-        let tx_id = "b".repeat(64);
-        let deploy_tx = make_deploy_tx(&tx_id, &rs, 5_000_000);
-
-        let mut ob = OrderBook::new();
-        let scanner = BlockScanner::new();
-
-        let (added, removed) = process_block_txs(&[deploy_tx], &mut ob, &scanner);
-        // Sell order has zero token_cov_id -> skipped (H-3 fix)
-        assert_eq!(added, 0);
-        assert_eq!(removed, 0);
-        assert_eq!(ob.stats().total_asks, 0);
-    }
-
-    #[test]
-    fn process_block_txs_removes_spent_order() {
-        // First, add an order
-        let tcid = [0xAA; 32];
-        let ohash = [0xBB; 32];
-        let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, 0, 0, 0,).unwrap();
-
-        let tx_id = "a".repeat(64);
-        let deploy_tx = make_deploy_tx(&tx_id, &rs, 10_000_000);
-
-        let mut ob = OrderBook::new();
-        let scanner = BlockScanner::new();
-
-        process_block_txs(&[deploy_tx], &mut ob, &scanner);
-        assert_eq!(ob.stats().total_bids, 1);
-
-        // Now create a TX that spends it
-        let spend_tx = TransactionData {
-            tx_id: "c".repeat(64),
-            _version: 0,
-            inputs: vec![TxInputData {
-                prev_tx_id: tx_id,
-                prev_index: 0,
-                _sig_script: vec![],
-            }],
-            outputs: vec![],
-            payload: vec![],
-        };
-
-        let (added, removed) = process_block_txs(&[spend_tx], &mut ob, &scanner);
-        assert_eq!(added, 0);
-        assert_eq!(removed, 1);
-        assert_eq!(ob.stats().total_bids, 0);
-    }
-
-    #[test]
-    fn process_block_txs_skips_cpend_order() {
-        let tcid = [0xAA; 32];
-        let ohash = [0xBB; 32];
-        let bspkh = [0xCC; 32];
-        // cancel_pending = 1
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, 0, 1, 0,).unwrap();
-
-        let tx_id = "d".repeat(64);
-        let deploy_tx = make_deploy_tx(&tx_id, &rs, 10_000_000);
-
-        let mut ob = OrderBook::new();
-        let scanner = BlockScanner::new();
-
-        let (added, _removed) = process_block_txs(&[deploy_tx], &mut ob, &scanner);
-        assert_eq!(added, 0, "cancel_pending orders should be skipped");
-        assert_eq!(ob.stats().total_bids, 0);
-    }
-
-    #[test]
-    fn process_block_txs_mixed_deploy_and_spend() {
-        let mut ob = OrderBook::new();
-        let scanner = BlockScanner::new();
-
-        // Deploy a buy order
-        let rs1 = kob_core::contract::build_buy_redeem_script(
-            &[0xAA; 32], 3, 2, 1_000_000, &[0xBB; 32], &[0xCC; 32], 0, 0, 0,).unwrap();
-        let deploy1 = make_deploy_tx(&"a".repeat(64), &rs1, 10_000_000);
-        process_block_txs(&[deploy1], &mut ob, &scanner);
-        assert_eq!(ob.stats().total_bids, 1);
-
-        // In the same block: deploy a sell order AND spend the buy order
-        let rs2 = kob_core::contract::build_sell_redeem_script(
-            5, 3, 2_000_000, &[0xDD; 32], &[0xEE; 32], 0, 0, 0,).unwrap();
-        let deploy2 = make_deploy_tx(&"b".repeat(64), &rs2, 5_000_000);
-
-        let spend_tx = TransactionData {
-            tx_id: "c".repeat(64),
-            _version: 0,
-            inputs: vec![TxInputData {
-                prev_tx_id: "a".repeat(64),
-                prev_index: 0,
-                _sig_script: vec![],
-            }],
-            outputs: vec![],
-            payload: vec![],
-        };
-
-        let (added, removed) = process_block_txs(&[spend_tx, deploy2], &mut ob, &scanner);
-        assert_eq!(removed, 1, "Buy order should be removed");
-        // H-3: sell RS has no token_cov_id (zero) -> skipped by scanner
-        assert_eq!(added, 0, "Sell order with zero token_cov_id must be skipped");
-        assert_eq!(ob.stats().total_bids, 0);
-        assert_eq!(ob.stats().total_asks, 0);
-    }
-
     // H1-CHUNK: chunked + checkpointed catch-up backfill.
 
     /// Sanity check on the checkpoint interval: large enough to batch I/O,
@@ -6848,120 +6157,6 @@ mod tests {
     fn catchup_chunk_size_is_reasonable() {
         assert!(CATCHUP_CHUNK_SIZE >= 10, "chunk size should batch multiple blocks per checkpoint I/O");
         assert!(CATCHUP_CHUNK_SIZE <= 500, "chunk size should bound worst-case re-scan work on crash");
-    }
-
-    fn make_buy_deploy_for_token(marker: u8) -> TransactionData {
-        let tcid = [marker; 32];
-        let ohash = [0xBB; 32];
-        let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, 0, 0, 0,
-        ).unwrap();
-        let tx_id = format!("{:02x}", marker).repeat(32);
-        make_deploy_tx(&tx_id, &rs, 10_000_000)
-    }
-
-    /// Core resume invariant: processing blocks in one uninterrupted pass
-    /// must produce the SAME final order-book state as processing chunk 1,
-    /// checkpointing (persisting the order book to disk), "restarting"
-    /// (reloading into a fresh in-memory book), then processing chunk 2
-    /// against the reloaded book.
-    ///
-    /// This exercises the exact mechanism `ScanCheckpointPaths::save` relies
-    /// on (`persistence::save_order_book` / `load_order_book`) against the
-    /// real scanning entrypoint (`process_block_txs`), without needing a
-    /// live RPC connection. It proves a crash after chunk 1 loses at most
-    /// chunk 2's re-scan work, and never double-processes or drops chunk 1's
-    /// orders.
-    #[tokio::test]
-    async fn catchup_resume_from_checkpoint_matches_uninterrupted_scan() {
-        let scanner = BlockScanner::new();
-
-        let chunk1_txs = vec![make_buy_deploy_for_token(1), make_buy_deploy_for_token(2)];
-        let chunk2_txs = vec![make_buy_deploy_for_token(3), make_buy_deploy_for_token(4)];
-
-        // Reference: uninterrupted single pass over both chunks.
-        let mut reference_ob = OrderBook::new();
-        process_block_txs(&chunk1_txs, &mut reference_ob, &scanner);
-        process_block_txs(&chunk2_txs, &mut reference_ob, &scanner);
-        let reference_stats = reference_ob.stats();
-        assert_eq!(reference_stats.pairs, 4, "sanity: 4 distinct tokens deployed");
-
-        // Chunked + checkpointed: process chunk 1, checkpoint to disk,
-        // simulate a crash (drop the live book), reload from disk, then
-        // process chunk 2 against the reloaded book -- exactly what a
-        // restarted daemon does after resuming from a persisted checkpoint.
-        let dir = std::env::temp_dir();
-        let ckpt_path = dir.join(format!(
-            "test_catchup_resume_{}_{}.json",
-            std::process::id(),
-            "a"
-        ));
-        let ckpt_path_str = ckpt_path.to_str().unwrap().to_string();
-
-        let mut live_ob = OrderBook::new();
-        process_block_txs(&chunk1_txs, &mut live_ob, &scanner);
-        persistence::save_order_book(&ckpt_path_str, &live_ob).expect("checkpoint save");
-        drop(live_ob); // simulate crash: in-memory state is gone
-
-        let reloaded = Arc::new(Mutex::new(OrderBook::new()));
-        persistence::load_order_book(&ckpt_path_str, &reloaded)
-            .await
-            .expect("checkpoint load");
-
-        {
-            let mut ob = reloaded.lock().await;
-            process_block_txs(&chunk2_txs, &mut ob, &scanner);
-        }
-        let resumed_stats = reloaded.lock().await.stats();
-
-        assert_eq!(
-            resumed_stats.total_bids, reference_stats.total_bids,
-            "resume must reconstruct the same order count as an uninterrupted scan"
-        );
-        assert_eq!(
-            resumed_stats.pairs, reference_stats.pairs,
-            "resume must reconstruct the same pair count (no double-processing, no drops)"
-        );
-
-        let _ = std::fs::remove_file(&ckpt_path_str);
-    }
-
-    /// A checkpoint taken after chunk 1 must reflect ONLY chunk 1's orders,
-    /// not chunk 2's -- proving the on-disk snapshot at a checkpoint boundary
-    /// is accurate ("scanned up to here"), and stays untouched until the
-    /// next explicit checkpoint (so a crash before the next checkpoint
-    /// re-scans only the unprocessed remainder, never loses chunk 1).
-    #[test]
-    fn catchup_checkpoint_snapshot_excludes_unprocessed_chunk() {
-        let scanner = BlockScanner::new();
-        let deploy1 = make_buy_deploy_for_token(0x11);
-        let deploy2 = make_buy_deploy_for_token(0x22);
-
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("test_catchup_snapshot_{}.json", std::process::id()));
-        let path_str = path.to_str().unwrap().to_string();
-
-        let mut ob = OrderBook::new();
-        process_block_txs(&[deploy1], &mut ob, &scanner);
-        persistence::save_order_book(&path_str, &ob).expect("checkpoint save");
-
-        let raw = std::fs::read_to_string(&path_str).unwrap();
-        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(parsed.as_object().unwrap().len(), 1, "checkpoint must contain only chunk 1's pair");
-
-        // Process chunk 2 in memory, but do NOT checkpoint again yet.
-        process_block_txs(&[deploy2], &mut ob, &scanner);
-        assert_eq!(ob.stats().pairs, 2, "in-memory book now has both pairs");
-
-        let raw_after = std::fs::read_to_string(&path_str).unwrap();
-        let parsed_after: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
-        assert_eq!(
-            parsed_after.as_object().unwrap().len(), 1,
-            "checkpoint file must stay at chunk 1's snapshot until the next explicit save"
-        );
-
-        let _ = std::fs::remove_file(&path_str);
     }
 
     #[test]
@@ -7014,64 +6209,6 @@ mod tests {
         };
         assert_eq!(mr_sell.match_type, MatchType::PartialSell);
         assert_eq!(mr_sell.seller_kas, 5_000_000);
-    }
-
-    // H-3: Sell orders with zero token_cov_id are skipped in process_block_txs
-    #[test]
-    fn process_block_txs_skips_sell_with_zero_token_cov_id() {
-        use crate::matcher::scanner::{BlockScanner, TransactionData, TxInputData, TxOutputData};
-
-        // Build a real sell v13 RS (token_cov_id not in RS -> parsed as [0;32])
-        let pnum: u64 = 5;
-        let pden: u64 = 3;
-        let mfill: u64 = 1_000_000;
-        let ohash = [0xDD; 32];
-        let sspkh = [0xEE; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(
-            pnum, pden, mfill, &ohash, &sspkh, 0, 0, 0,).unwrap();
-        let _hash = kob_core::blake2b_256(&rs);
-        let p2sh_spk = kob_core::build_p2sh(&rs);
-
-        let tx = TransactionData {
-            tx_id: "a".repeat(64),
-            _version: 0,
-            inputs: vec![TxInputData {
-                prev_tx_id: "b".repeat(64),
-                prev_index: 0,
-                _sig_script: vec![],
-            }],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: p2sh_spk.script().to_vec(),
-                covenant_id: None,
-            }],
-            payload: kob_core::contract::build_order_payload(&rs, false),
-        };
-
-        // Verify the RS parses and returns token_cov_id = [0;32]
-        let scanner = BlockScanner::new();
-        let scan_result = scanner.scan_tx(&tx);
-        assert!(scan_result.is_some(), "should detect sell deploy TX");
-        let (parsed, _, _) = scan_result.unwrap();
-        assert_eq!(parsed.token_cov_id, [0u8; 32], "sell RS has no token_cov_id");
-
-        // process_block_txs should skip this sell order
-        let mut ob = OrderBook::new();
-        let (added, removed) = process_block_txs(&[tx], &mut ob, &scanner);
-        assert_eq!(added, 0, "sell order with zero token_cov_id must be skipped");
-        assert_eq!(removed, 0);
-        assert_eq!(ob.stats().total_asks, 0, "order book must remain empty");
-    }
-
-    #[test]
-    fn token_unit_sigscript_is_push_data_token_rs() {
-        // Verify token_unit sigscript = pushData(TOKEN_RS) (no signature)
-        let ss = kob_core::push_data(kob_core::TOKEN_RS);
-        // TOKEN_RS is 7 bytes, so pushData = [7] + [7 bytes]
-        assert_eq!(ss.len(), 8, "pushData(TOKEN_RS) = 1 length byte + 7 body bytes");
-        assert_eq!(ss[0], 7, "length prefix for 7-byte TOKEN_RS");
-        assert_eq!(&ss[1..], kob_core::TOKEN_RS);
     }
 
     // H-5: SpentTracker failure cooldown tests
@@ -7399,52 +6536,6 @@ mod tests {
     }
 
     // M-7: Scanner order dedup
-
-    #[test]
-    fn m7_process_block_txs_dedup_prevents_double_add() {
-        use crate::matcher::scanner::{BlockScanner, TransactionData, TxInputData, TxOutputData};
-
-        // Build a real buy v8 RS
-        let tcid = [0xAA; 32];
-        let pnum: u64 = 1;
-        let pden: u64 = 2;
-        let mfill: u64 = 1_000_000;
-        let ohash = [0xBB; 32];
-        let bspkh = [0xCC; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &tcid, pnum, pden, mfill, &ohash, &bspkh, 0, 0, 0,).unwrap();
-        let p2sh_spk = kob_core::build_p2sh(&rs);
-
-        let tx = TransactionData {
-            tx_id: "d".repeat(64),
-            _version: 0,
-            inputs: vec![TxInputData {
-                prev_tx_id: "e".repeat(64),
-                prev_index: 0,
-                _sig_script: vec![],
-            }],
-            outputs: vec![TxOutputData {
-                value: 10_000_000,
-                script_version: 0,
-                script: p2sh_spk.script().to_vec(),
-                covenant_id: None,
-            }],
-            payload: kob_core::contract::build_order_payload(&rs, false),
-        };
-
-        let scanner = BlockScanner::new();
-        let mut ob = OrderBook::new();
-
-        // First pass: order should be added
-        let (added1, _) = process_block_txs(&[tx.clone()], &mut ob, &scanner);
-        assert_eq!(added1, 1, "first pass should add the order");
-        assert_eq!(ob.stats().total_bids, 1);
-
-        // Second pass (duplicate notification): order should be skipped
-        let (added2, _) = process_block_txs(&[tx.clone()], &mut ob, &scanner);
-        assert_eq!(added2, 0, "duplicate order must be skipped (M-7)");
-        assert_eq!(ob.stats().total_bids, 1, "order book must still have exactly 1 bid");
-    }
 
     #[test]
     fn m7_order_book_contains_outpoint() {
@@ -8705,37 +7796,6 @@ mod tests {
     }
 
     #[test]
-    fn extract_bracket_meta_v18_arm_matches_v1_offsets() {
-        // Same state args through both builders -> identical BracketMeta
-        // (the 372B v18 bracket keeps the v1 224B state layout byte-exact).
-        let token = [0x11; 32];
-        let mut oco_spk = [0u8; 37];
-        oco_spk[0..2].copy_from_slice(&0u16.to_le_bytes());
-        oco_spk[2] = 0xaa;
-        let rcid = [0x22; 32];
-        let tsh = [0x33; 32];
-        let ohash = [0x44; 32];
-        let v1 = kob_core::contract::spot::bracket::build_bracket_redeem_script(
-            0, &token, 1, 2, &oco_spk, 5_000_000, 1_000_000, 700, &rcid, &tsh, &ohash,
-        ).unwrap();
-        let v18 = kob_core::contract::spot::bracket::build_bracket_v18_redeem_script(
-            0, &token, 1, 2, &oco_spk, 5_000_000, 1_000_000, 700, &rcid, &tsh, &ohash,
-        ).unwrap();
-        assert_eq!(v1.len(), BRACKET_RS_SIZE);
-        assert_eq!(v18.len(), BRACKET_V18_RS_SIZE);
-        let m1 = extract_bracket_meta(&v1).expect("v1 meta");
-        let m18 = extract_bracket_meta(&v18).expect("v18 meta");
-        assert_eq!(m1.receipt_cov_id, m18.receipt_cov_id);
-        assert_eq!(m1.min_receipt_val, m18.min_receipt_val);
-        assert_eq!(m1.oco_spk, m18.oco_spk);
-        assert_eq!(m1.oco_spk_version, m18.oco_spk_version);
-        assert_eq!(m1.oco_min_val, m18.oco_min_val);
-        assert_eq!(m1.entry_type, m18.entry_type);
-        assert_eq!(m18.min_receipt_val, 700);
-        assert_eq!(m18.oco_min_val, 5_000_000);
-    }
-
-    #[test]
     fn v18_book_orders_route_through_v18_ioc_planner() {
         // The BuySweep dispatch keys off `buys[0].version == 18` ->
         // plan_ioc_match_v18. Prove the converted orders actually plan
@@ -8834,5 +7894,350 @@ mod tests {
             }
         }
         assert!(bound >= 3, "2 deliveries + at least 1 skim must be covenant-bound (got {})", bound);
+    }
+
+    fn make_buy_deploy_for_token(marker: u8) -> TransactionData {
+        let tcid = [marker; 32];
+        let ohash = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, &[0xF1; 32], 0, 0, 0,
+        ).unwrap();
+        let tx_id = format!("{:02x}", marker).repeat(32);
+        make_deploy_tx(&tx_id, &rs, 10_000_000)
+    }
+
+    #[test]
+    fn process_block_txs_adds_buy_order() {
+        let tcid = [0xAA; 32];
+        let ohash = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, &[0xF1; 32], 0, 0, 0,).unwrap();
+
+        let tx_id = "a".repeat(64);
+        let deploy_tx = make_deploy_tx(&tx_id, &rs, 10_000_000);
+
+        let mut ob = OrderBook::new();
+        let scanner = BlockScanner::new();
+
+        let (added, removed) = process_block_txs(&[deploy_tx], &mut ob, &scanner);
+        assert_eq!(added, 1);
+        assert_eq!(removed, 0);
+        assert_eq!(ob.stats().total_bids, 1);
+        assert_eq!(ob.stats().total_asks, 0);
+    }
+
+    #[test]
+    fn process_block_txs_adds_sell_order() {
+        // H-3: Sell RSes do not embed token_cov_id (parsed as [0;32]).
+        // process_block_txs skips such orders to prevent ghost entries.
+        let ohash = [0xDD; 32];
+        let sspkh = [0xEE; 32];
+        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            5, 3, 2_000_000, &ohash, &sspkh, &[0xF2; 32], 0, 0, 0,).unwrap();
+
+        let tx_id = "b".repeat(64);
+        let deploy_tx = make_deploy_tx(&tx_id, &rs, 5_000_000);
+
+        let mut ob = OrderBook::new();
+        let scanner = BlockScanner::new();
+
+        let (added, removed) = process_block_txs(&[deploy_tx], &mut ob, &scanner);
+        // Sell order has zero token_cov_id -> skipped (H-3 fix)
+        assert_eq!(added, 0);
+        assert_eq!(removed, 0);
+        assert_eq!(ob.stats().total_asks, 0);
+    }
+
+    #[test]
+    fn process_block_txs_removes_spent_order() {
+        // First, add an order
+        let tcid = [0xAA; 32];
+        let ohash = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, &[0xF1; 32], 0, 0, 0,).unwrap();
+
+        let tx_id = "a".repeat(64);
+        let deploy_tx = make_deploy_tx(&tx_id, &rs, 10_000_000);
+
+        let mut ob = OrderBook::new();
+        let scanner = BlockScanner::new();
+
+        process_block_txs(&[deploy_tx], &mut ob, &scanner);
+        assert_eq!(ob.stats().total_bids, 1);
+
+        // Now create a TX that spends it
+        let spend_tx = TransactionData {
+            tx_id: "c".repeat(64),
+            _version: 0,
+            inputs: vec![TxInputData {
+                prev_tx_id: tx_id,
+                prev_index: 0,
+                _sig_script: vec![],
+            }],
+            outputs: vec![],
+            payload: vec![],
+        };
+
+        let (added, removed) = process_block_txs(&[spend_tx], &mut ob, &scanner);
+        assert_eq!(added, 0);
+        assert_eq!(removed, 1);
+        assert_eq!(ob.stats().total_bids, 0);
+    }
+
+    #[test]
+    fn process_block_txs_mixed_deploy_and_spend() {
+        let mut ob = OrderBook::new();
+        let scanner = BlockScanner::new();
+
+        // Deploy a buy order
+        let rs1 = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &[0xAA; 32], 3, 2, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xF1; 32], 0, 0, 0,).unwrap();
+        let deploy1 = make_deploy_tx(&"a".repeat(64), &rs1, 10_000_000);
+        process_block_txs(&[deploy1], &mut ob, &scanner);
+        assert_eq!(ob.stats().total_bids, 1);
+
+        // In the same block: deploy a sell order AND spend the buy order
+        let rs2 = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            5, 3, 2_000_000, &[0xDD; 32], &[0xEE; 32], &[0xF2; 32], 0, 0, 0,).unwrap();
+        let deploy2 = make_deploy_tx(&"b".repeat(64), &rs2, 5_000_000);
+
+        let spend_tx = TransactionData {
+            tx_id: "c".repeat(64),
+            _version: 0,
+            inputs: vec![TxInputData {
+                prev_tx_id: "a".repeat(64),
+                prev_index: 0,
+                _sig_script: vec![],
+            }],
+            outputs: vec![],
+            payload: vec![],
+        };
+
+        let (added, removed) = process_block_txs(&[spend_tx, deploy2], &mut ob, &scanner);
+        assert_eq!(removed, 1, "Buy order should be removed");
+        // H-3: sell RS has no token_cov_id (zero) -> skipped by scanner
+        assert_eq!(added, 0, "Sell order with zero token_cov_id must be skipped");
+        assert_eq!(ob.stats().total_bids, 0);
+        assert_eq!(ob.stats().total_asks, 0);
+    }
+
+    #[test]
+    fn process_block_txs_skips_cpend_order() {
+        let tcid = [0xAA; 32];
+        let ohash = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        // cancel_pending = 1
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &tcid, 3, 2, 1_000_000, &ohash, &bspkh, &[0xF1; 32], 0, 1, 0,).unwrap();
+
+        let tx_id = "d".repeat(64);
+        let deploy_tx = make_deploy_tx(&tx_id, &rs, 10_000_000);
+
+        let mut ob = OrderBook::new();
+        let scanner = BlockScanner::new();
+
+        let (added, _removed) = process_block_txs(&[deploy_tx], &mut ob, &scanner);
+        assert_eq!(added, 0, "cancel_pending orders should be skipped");
+        assert_eq!(ob.stats().total_bids, 0);
+    }
+
+    // H-3: Sell orders with zero token_cov_id are skipped in process_block_txs
+    #[test]
+    fn process_block_txs_skips_sell_with_zero_token_cov_id() {
+        use crate::matcher::scanner::{BlockScanner, TransactionData, TxInputData, TxOutputData};
+
+        // Build a real sell v13 RS (token_cov_id not in RS -> parsed as [0;32])
+        let pnum: u64 = 5;
+        let pden: u64 = 3;
+        let mfill: u64 = 1_000_000;
+        let ohash = [0xDD; 32];
+        let sspkh = [0xEE; 32];
+        let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            pnum, pden, mfill, &ohash, &sspkh, &[0xF2; 32], 0, 0, 0,).unwrap();
+        let _hash = kob_core::blake2b_256(&rs);
+        let p2sh_spk = kob_core::build_p2sh(&rs);
+
+        let tx = TransactionData {
+            tx_id: "a".repeat(64),
+            _version: 0,
+            inputs: vec![TxInputData {
+                prev_tx_id: "b".repeat(64),
+                prev_index: 0,
+                _sig_script: vec![],
+            }],
+            outputs: vec![TxOutputData {
+                value: 10_000_000,
+                script_version: 0,
+                script: p2sh_spk.script().to_vec(),
+                covenant_id: None,
+            }],
+            payload: kob_core::contract::build_order_payload(&rs, false),
+        };
+
+        // Verify the RS parses and returns token_cov_id = [0;32]
+        let scanner = BlockScanner::new();
+        let scan_result = scanner.scan_tx(&tx);
+        assert!(scan_result.is_some(), "should detect sell deploy TX");
+        let (parsed, _, _) = scan_result.unwrap();
+        assert_eq!(parsed.token_cov_id, [0u8; 32], "sell RS has no token_cov_id");
+
+        // process_block_txs should skip this sell order
+        let mut ob = OrderBook::new();
+        let (added, removed) = process_block_txs(&[tx], &mut ob, &scanner);
+        assert_eq!(added, 0, "sell order with zero token_cov_id must be skipped");
+        assert_eq!(removed, 0);
+        assert_eq!(ob.stats().total_asks, 0, "order book must remain empty");
+    }
+
+    #[test]
+    fn m7_process_block_txs_dedup_prevents_double_add() {
+        use crate::matcher::scanner::{BlockScanner, TransactionData, TxInputData, TxOutputData};
+
+        // Build a real buy v8 RS
+        let tcid = [0xAA; 32];
+        let pnum: u64 = 1;
+        let pden: u64 = 2;
+        let mfill: u64 = 1_000_000;
+        let ohash = [0xBB; 32];
+        let bspkh = [0xCC; 32];
+        let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            &tcid, pnum, pden, mfill, &ohash, &bspkh, &[0xF1; 32], 0, 0, 0,).unwrap();
+        let p2sh_spk = kob_core::build_p2sh(&rs);
+
+        let tx = TransactionData {
+            tx_id: "d".repeat(64),
+            _version: 0,
+            inputs: vec![TxInputData {
+                prev_tx_id: "e".repeat(64),
+                prev_index: 0,
+                _sig_script: vec![],
+            }],
+            outputs: vec![TxOutputData {
+                value: 10_000_000,
+                script_version: 0,
+                script: p2sh_spk.script().to_vec(),
+                covenant_id: None,
+            }],
+            payload: kob_core::contract::build_order_payload(&rs, false),
+        };
+
+        let scanner = BlockScanner::new();
+        let mut ob = OrderBook::new();
+
+        // First pass: order should be added
+        let (added1, _) = process_block_txs(&[tx.clone()], &mut ob, &scanner);
+        assert_eq!(added1, 1, "first pass should add the order");
+        assert_eq!(ob.stats().total_bids, 1);
+
+        // Second pass (duplicate notification): order should be skipped
+        let (added2, _) = process_block_txs(&[tx.clone()], &mut ob, &scanner);
+        assert_eq!(added2, 0, "duplicate order must be skipped (M-7)");
+        assert_eq!(ob.stats().total_bids, 1, "order book must still have exactly 1 bid");
+    }
+
+    /// A checkpoint taken after chunk 1 must reflect ONLY chunk 1's orders,
+    /// not chunk 2's -- proving the on-disk snapshot at a checkpoint boundary
+    /// is accurate ("scanned up to here"), and stays untouched until the
+    /// next explicit checkpoint (so a crash before the next checkpoint
+    /// re-scans only the unprocessed remainder, never loses chunk 1).
+    #[test]
+    fn catchup_checkpoint_snapshot_excludes_unprocessed_chunk() {
+        let scanner = BlockScanner::new();
+        let deploy1 = make_buy_deploy_for_token(0x11);
+        let deploy2 = make_buy_deploy_for_token(0x22);
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("test_catchup_snapshot_{}.json", std::process::id()));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let mut ob = OrderBook::new();
+        process_block_txs(&[deploy1], &mut ob, &scanner);
+        persistence::save_order_book(&path_str, &ob).expect("checkpoint save");
+
+        let raw = std::fs::read_to_string(&path_str).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(parsed.as_object().unwrap().len(), 1, "checkpoint must contain only chunk 1's pair");
+
+        // Process chunk 2 in memory, but do NOT checkpoint again yet.
+        process_block_txs(&[deploy2], &mut ob, &scanner);
+        assert_eq!(ob.stats().pairs, 2, "in-memory book now has both pairs");
+
+        let raw_after = std::fs::read_to_string(&path_str).unwrap();
+        let parsed_after: serde_json::Value = serde_json::from_str(&raw_after).unwrap();
+        assert_eq!(
+            parsed_after.as_object().unwrap().len(), 1,
+            "checkpoint file must stay at chunk 1's snapshot until the next explicit save"
+        );
+
+        let _ = std::fs::remove_file(&path_str);
+    }
+
+    /// Core resume invariant: processing blocks in one uninterrupted pass
+    /// must produce the SAME final order-book state as processing chunk 1,
+    /// checkpointing (persisting the order book to disk), "restarting"
+    /// (reloading into a fresh in-memory book), then processing chunk 2
+    /// against the reloaded book.
+    ///
+    /// This exercises the exact mechanism `ScanCheckpointPaths::save` relies
+    /// on (`persistence::save_order_book` / `load_order_book`) against the
+    /// real scanning entrypoint (`process_block_txs`), without needing a
+    /// live RPC connection. It proves a crash after chunk 1 loses at most
+    /// chunk 2's re-scan work, and never double-processes or drops chunk 1's
+    /// orders.
+    #[tokio::test]
+    async fn catchup_resume_from_checkpoint_matches_uninterrupted_scan() {
+        let scanner = BlockScanner::new();
+
+        let chunk1_txs = vec![make_buy_deploy_for_token(1), make_buy_deploy_for_token(2)];
+        let chunk2_txs = vec![make_buy_deploy_for_token(3), make_buy_deploy_for_token(4)];
+
+        // Reference: uninterrupted single pass over both chunks.
+        let mut reference_ob = OrderBook::new();
+        process_block_txs(&chunk1_txs, &mut reference_ob, &scanner);
+        process_block_txs(&chunk2_txs, &mut reference_ob, &scanner);
+        let reference_stats = reference_ob.stats();
+        assert_eq!(reference_stats.pairs, 4, "sanity: 4 distinct tokens deployed");
+
+        // Chunked + checkpointed: process chunk 1, checkpoint to disk,
+        // simulate a crash (drop the live book), reload from disk, then
+        // process chunk 2 against the reloaded book -- exactly what a
+        // restarted daemon does after resuming from a persisted checkpoint.
+        let dir = std::env::temp_dir();
+        let ckpt_path = dir.join(format!(
+            "test_catchup_resume_{}_{}.json",
+            std::process::id(),
+            "a"
+        ));
+        let ckpt_path_str = ckpt_path.to_str().unwrap().to_string();
+
+        let mut live_ob = OrderBook::new();
+        process_block_txs(&chunk1_txs, &mut live_ob, &scanner);
+        persistence::save_order_book(&ckpt_path_str, &live_ob).expect("checkpoint save");
+        drop(live_ob); // simulate crash: in-memory state is gone
+
+        let reloaded = Arc::new(Mutex::new(OrderBook::new()));
+        persistence::load_order_book(&ckpt_path_str, &reloaded)
+            .await
+            .expect("checkpoint load");
+
+        {
+            let mut ob = reloaded.lock().await;
+            process_block_txs(&chunk2_txs, &mut ob, &scanner);
+        }
+        let resumed_stats = reloaded.lock().await.stats();
+
+        assert_eq!(
+            resumed_stats.total_bids, reference_stats.total_bids,
+            "resume must reconstruct the same order count as an uninterrupted scan"
+        );
+        assert_eq!(
+            resumed_stats.pairs, reference_stats.pairs,
+            "resume must reconstruct the same pair count (no double-processing, no drops)"
+        );
+
+        let _ = std::fs::remove_file(&ckpt_path_str);
     }
 }

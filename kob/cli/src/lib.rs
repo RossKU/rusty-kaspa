@@ -23,7 +23,6 @@ pub mod node;
 pub mod order_cache;
 pub mod options;
 pub mod orderbook;
-pub mod partial_fill;
 pub mod perp;
 pub mod receipt;
 pub mod recover;
@@ -205,10 +204,9 @@ pub enum Commands {
         #[arg(long)]
         order_value: Option<u64>,
 
-        /// Contract version (14, 16, or 17). Must match the version used to
-        /// deploy the order. For v17, --max-matcher-fee is the deployed
-        /// mmfee_bps (BPS), not sompi, since v17 reconstructs from that.
-        #[arg(long, default_value_t = 14)]
+        /// Contract version (v18). --max-matcher-fee is the deployed
+        /// mmfee_bps (BPS).
+        #[arg(long, default_value_t = 18)]
         version: u8,
 
         /// Expiry DAA score (required for v14 orders to reconstruct RS). 0 = GTC.
@@ -218,73 +216,6 @@ pub enum Commands {
         /// Fee UTXO outpoint (txid:index). Auto-selected from wallet if omitted.
         #[arg(long)]
         fee_utxo: Option<String>,
-
-        /// Max matcher fee (sompi) embedded in the redeemScript.
-        #[arg(long, default_value = "10000000")]
-        max_matcher_fee: u64,
-    },
-
-    /// Partially fill a buy or sell order.
-    ///
-    /// Fills a portion of an order, leaving a residual order UTXO with reduced value.
-    /// The residual order keeps the same parameters (price, min_fill, owner) and the
-    /// same P2SH address.
-    PartialFill {
-        /// Order outpoint to partially fill (txid:index).
-        #[arg(long)]
-        outpoint: String,
-
-        /// Order side: buy or sell.
-        #[arg(long)]
-        side: String,
-
-        /// Token covenant ID (hex, 64 chars).
-        #[arg(long)]
-        token: String,
-
-        /// Price numerator.
-        #[arg(long)]
-        price_num: u64,
-
-        /// Price denominator.
-        #[arg(long)]
-        price_den: u64,
-
-        /// Minimum fill amount.
-        #[arg(long)]
-        min_fill: u64,
-
-        /// Amount to fill: KAS sompi for buy orders, token sompi for sell orders.
-        #[arg(long)]
-        fill_amount: u64,
-
-        /// Order UTXO value in sompi (queried from chain if omitted).
-        #[arg(long)]
-        order_value: Option<u64>,
-
-        /// Owner hash (hex, 64 chars). Defaults to wallet owner hash.
-        #[arg(long)]
-        owner_hash: Option<String>,
-
-        /// SPK hash (hex, 64 chars). Defaults to wallet P2PK SPK hash.
-        #[arg(long)]
-        spk_hash: Option<String>,
-
-        /// Token UTXO outpoint for buy partial fill (txid:index). Provides tokens to buyer.
-        #[arg(long)]
-        token_outpoint: Option<String>,
-
-        /// Fee input outpoint (txid:index).
-        #[arg(long)]
-        fee_input: Option<String>,
-
-        /// Contract version (only 14 is supported).
-        #[arg(long, default_value = "14")]
-        version: u8,
-
-        /// Expiry DAA score (required for v14 RS reconstruction). 0 = GTC.
-        #[arg(long, default_value = "0")]
-        expiry: u64,
 
         /// Max matcher fee (sompi) embedded in the redeemScript.
         #[arg(long, default_value = "10000000")]
@@ -1835,10 +1766,6 @@ pub async fn dispatch(
                 max_matcher_fee,
                 mmfee_bps,
             } => {
-                // v18 (unified spot) is the sole deploy target; --mmfee-bps
-                // bumps an explicit --version 14 up to 18 for convenience.
-                // deploy_buy rejects any non-v18 version for new orders.
-                let version = if mmfee_bps.is_some() && version == 14 { 18 } else { version };
 
                 // Resolve token alias
                 let token = token::resolve_token(&token, None)?;
@@ -2350,47 +2277,6 @@ pub async fn dispatch(
             )
             .await?;
         }
-        Commands::PartialFill {
-            outpoint,
-            side,
-            token,
-            price_num,
-            price_den,
-            min_fill,
-            fill_amount,
-            order_value,
-            owner_hash,
-            spk_hash,
-            token_outpoint,
-            fee_input,
-            version,
-            expiry,
-            max_matcher_fee,
-        } => {
-            let token = token::resolve_token(&token, None)?;
-            partial_fill::run(
-                wallet_path,
-                node,
-                network,
-                &outpoint,
-                &side,
-                &token,
-                price_num,
-                price_den,
-                min_fill,
-                fill_amount,
-                order_value,
-                owner_hash.as_deref(),
-                spk_hash.as_deref(),
-                token_outpoint.as_deref(),
-                fee_input.as_deref(),
-                version,
-                fee,
-                expiry,
-                max_matcher_fee,
-            )
-            .await?;
-        }
         Commands::List { token } => {
             let token = if let Some(t) = token {
                 Some(token::resolve_token(&t, None)?)
@@ -2419,7 +2305,7 @@ pub async fn dispatch(
             seller_pubkey,
             fee_input,
             cross_pair,
-            token_outpoint,
+            token_outpoint: _,
             buy_token,
             version,
             buy_expiry,
@@ -2430,7 +2316,7 @@ pub async fn dispatch(
             tamper,
         } => {
             let token = token::resolve_token(&token, None)?;
-            let buy_token = if let Some(bt) = buy_token {
+            let _buy_token = if let Some(bt) = buy_token {
                 Some(token::resolve_token(&bt, None)?)
             } else {
                 None
@@ -2446,41 +2332,12 @@ pub async fn dispatch(
                 None
             };
             if cross_pair {
-                if tamper_mode.is_some() {
-                    anyhow::bail!("--tamper is not supported with --cross-pair");
-                }
-                matching::run_cross_pair(
-                    wallet_path,
-                    node,
-                    network,
-                    &buy,
-                    &sell,
-                    &token,
-                    buy_token.as_deref(),
-                    buy_price_num,
-                    buy_price_den,
-                    buy_min_fill,
-                    buy_value,
-                    buy_owner_hash.as_deref(),
-                    buy_spk_hash.as_deref(),
-                    sell_price_num,
-                    sell_price_den,
-                    sell_min_fill,
-                    sell_value,
-                    sell_owner_hash.as_deref(),
-                    sell_spk_hash.as_deref(),
-                    &buyer_pubkey,
-                    &seller_pubkey,
-                    token_outpoint.as_deref()
-                        .ok_or_else(|| anyhow::anyhow!("--token-outpoint is required for --cross-pair"))?,
-                    fee_input.as_deref(),
-                    version,
-                    fee,
-                    buy_expiry,
-                    sell_expiry,
-                )
-                .await?;
-            } else {
+                anyhow::bail!(
+                    "--cross-pair (KAS-bridged v8/v14 route) was removed in Stage E; \
+                     token<->token settles as v18 swap rings (`kob-cli match-ring`)."
+                );
+            }
+            {
                 matching::run(
                     wallet_path,
                     node,
@@ -2976,10 +2833,6 @@ pub async fn dispatch(
             };
             deploy::validate_amount_not_dust(new_amount, "--new-amount")?;
             let new_token = token::resolve_token(&new_token, None)?;
-            // v18 is the sole creatable contract generation (mirrors
-            // deploy.rs's gates); legacy explicit --new-version 14/17 are
-            // auto-bumped to 18 so old invocations keep working.
-            let new_version = if new_version == 14 || new_version == 17 { 18 } else { new_version };
             let new_params = requote::NewOrderParams {
                 side: new_side,
                 token: new_token,

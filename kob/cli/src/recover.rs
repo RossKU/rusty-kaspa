@@ -880,98 +880,6 @@ mod recover_orders_tests {
     // detect_order_type tests removed: function was replaced by core's parse_redeem_script
 
 
-    #[test]
-    fn parse_buy_v12_rs_extracts_owner_hash() {
-        let token_cov_id = [0xAA; 32];
-        let owner_hash = [0xBB; 32];
-        let spk_hash = [0xCC; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &token_cov_id, 1000, 1, 3_000_000, &owner_hash, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 396); // v14 buy RS: 145 state + 251 body (kob-core BUY_RS_SIZE)
-
-        let parsed = parse_redeem_script(&rs).unwrap();
-        assert_eq!(parsed.side, "buy");
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.price_num, 1000);
-        assert_eq!(parsed.price_den, 1);
-        assert_eq!(parsed.min_fill, 3_000_000);
-        assert_eq!(parsed.owner_hash, owner_hash);
-        assert_eq!(parsed.spk_hash, spk_hash);
-        assert_eq!(parsed.token_cov_id.unwrap(), token_cov_id);
-    }
-
-    #[test]
-    fn parse_sell_v12_rs_extracts_owner_hash() {
-        let owner_hash = [0xDD; 32];
-        let spk_hash = [0xEE; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(
-            500, 3, 1_000_000, &owner_hash, &spk_hash, 0, 0, 0,).unwrap();
-        assert_eq!(rs.len(), 427); // v14 sell RS: 112 state + 315 body (kob-core SELL_RS_SIZE)
-
-        let parsed = parse_redeem_script(&rs).unwrap();
-        assert_eq!(parsed.side, "sell");
-        assert_eq!(parsed.version, 0);
-        assert_eq!(parsed.price_num, 500);
-        assert_eq!(parsed.price_den, 3);
-        assert_eq!(parsed.min_fill, 1_000_000);
-        assert_eq!(parsed.owner_hash, owner_hash);
-        assert_eq!(parsed.spk_hash, spk_hash);
-        assert!(parsed.token_cov_id.is_none());
-    }
-
-    #[test]
-    fn owner_hash_verification_matches_pubkey() {
-        // Simulate: user has pubkey -> blake2b -> owner_hash -> must match parsed RS
-        let fake_pubkey = [0x99u8; 32];
-        let expected_owner = blake2b_256(&fake_pubkey);
-
-        let rs = kob_core::contract::build_sell_redeem_script(
-            100, 1, 1_000_000, &expected_owner, &[0; 32], 0, 0, 0,).unwrap();
-        let parsed = parse_redeem_script(&rs).unwrap();
-        assert_eq!(parsed.owner_hash, expected_owner);
-
-        // Different pubkey should NOT match
-        let other_pubkey = [0x88u8; 32];
-        let other_owner = blake2b_256(&other_pubkey);
-        assert_ne!(parsed.owner_hash, other_owner);
-    }
-
-
-    #[test]
-    fn build_cache_entry_from_parsed_order() {
-        let token_cov_id = [0xAA; 32];
-        let owner_hash = [0xBB; 32];
-        let spk_hash = [0xCC; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &token_cov_id, 1000, 1, 3_000_000, &owner_hash, &spk_hash, 0, 0, 0,).unwrap();
-        let parsed = parse_redeem_script(&rs).unwrap();
-
-        let pair_id = hex::encode(parsed.token_cov_id.unwrap());
-        let entry = OrderCacheEntry {
-            outpoint: "abcd1234:0".to_string(),
-            side: parsed.side.clone(),
-            pair_id: pair_id.clone(),
-            price_num: parsed.price_num,
-            price_den: parsed.price_den,
-            min_fill: parsed.min_fill,
-            owner_hash: hex::encode(parsed.owner_hash),
-            spk_hash: hex::encode(parsed.spk_hash),
-            p2sh_hash: parsed.p2sh_hash.clone(),
-            value: 50_000_000,
-            cancel_pending: false,
-            token: Some(pair_id),
-            version: 13,
-            expiry_daa: 0,
-            max_matcher_fee: 10_000_000,
-        };
-
-        assert_eq!(entry.side, "buy");
-        assert_eq!(entry.price_num, 1000);
-        assert_eq!(entry.price_den, 1);
-        assert_eq!(entry.min_fill, 3_000_000);
-        assert_eq!(entry.value, 50_000_000);
-        assert_eq!(entry.pair_id, "aa".repeat(32));
-    }
 
 
     #[test]
@@ -995,20 +903,6 @@ mod recover_orders_tests {
     }
 
 
-    #[test]
-    fn p2sh_hash_matches_build_p2sh() {
-        let token_cov_id = [0x11; 32];
-        let owner_hash = [0x22; 32];
-        let spk_hash = [0x33; 32];
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &token_cov_id, 50, 3, 1_000_000, &owner_hash, &spk_hash, 0, 0, 0,).unwrap();
-
-        let parsed = parse_redeem_script(&rs).unwrap();
-        let p2sh = build_p2sh(&rs);
-        let expected_hash = hex::encode(&p2sh.script()[2..34]);
-        assert_eq!(parsed.p2sh_hash, expected_hash);
-    }
-
 
     #[test]
     fn gtd_marker_found_at_end() {
@@ -1031,31 +925,4 @@ mod recover_orders_tests {
     }
 
 
-    #[test]
-    fn parse_buy_v12_with_cancel_pending() {
-        let token_cov_id = [0xAA; 32];
-        let owner_hash = [0xBB; 32];
-        let spk_hash = [0xCC; 32];
-        // cancel_pending = 1
-        let rs = kob_core::contract::build_buy_redeem_script(
-            &token_cov_id, 100, 1, 1_000_000, &owner_hash, &spk_hash, 0, 1, 0,).unwrap();
-        assert_eq!(rs.len(), 396); // v14 buy RS: 145 state + 251 body (kob-core BUY_RS_SIZE)
-
-        let parsed = parse_redeem_script(&rs).unwrap();
-        assert_eq!(parsed.owner_hash, owner_hash);
-        assert_eq!(parsed.price_num, 100);
-    }
-
-    #[test]
-    fn parse_sell_v12_with_cancel_pending() {
-        let owner_hash = [0xDD; 32];
-        let spk_hash = [0xEE; 32];
-        let rs = kob_core::contract::build_sell_redeem_script(
-            200, 1, 500_000, &owner_hash, &spk_hash, 0, 1, 0,).unwrap();
-        assert_eq!(rs.len(), 427); // v14 sell RS: 112 state + 315 body (kob-core SELL_RS_SIZE)
-
-        let parsed = parse_redeem_script(&rs).unwrap();
-        assert_eq!(parsed.owner_hash, owner_hash);
-        assert_eq!(parsed.price_num, 200);
-    }
 }

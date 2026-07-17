@@ -446,7 +446,7 @@ pub async fn fill_bracket_v4(
     fee_input_str: Option<&str>,
     token_utxo_str: Option<&str>,
 ) -> anyhow::Result<()> {
-    // Parse redeemScript: 372B = v18 (dedicated path), 365B = legacy v1.
+    // Parse redeemScript: v18 only (372B).
     let redeem_script = hex::decode(rs_hex)?;
     if redeem_script.len() == contract::spot::bracket::BRACKET_V18_RS_SIZE {
         return fill_bracket_v18(
@@ -458,353 +458,11 @@ pub async fn fill_bracket_v4(
         ).await;
     }
 
-    let wallet = WalletContext::load(wallet_path)?;
-    let pubkey = wallet.pubkey;
-    let privkey = *wallet.privkey_bytes();
-
-    let order_outpoint = Outpoint::parse(order_str)?;
-    let receipt_outpoint = Outpoint::parse(receipt_str)?;
-
-    if redeem_script.len() != 365 {
-        anyhow::bail!(
-            "bracket RS must be 365 (v1) or {} (v18) bytes, got {}",
-            contract::spot::bracket::BRACKET_V18_RS_SIZE,
-            redeem_script.len()
-        );
-    }
-    let p2sh = build_p2sh(&redeem_script);
-
-    // Extract OCO sell SPK (37B at offset: 9+33+9+9 = 60, then +1 push prefix = byte 61..98)
-    // State layout: [0x08][etype 8B][0x20][tcid 32B][0x08][epnum 8B][0x08][epden 8B]
-    //               [0x25][oco_spk 37B][0x08][oco_mv 8B][0x08][mfill 8B]...
-    // Offset of oco_spk push prefix: 9+33+9+9 = 60 -> oco_spk data at 61..98
-    let oco_spk_version = u16::from_le_bytes([redeem_script[61], redeem_script[62]]);
-    let oco_spk_script = &redeem_script[63..98]; // 35 bytes
-
-    println!("Fill bracket_order_v6");
-    println!("======================");
-    println!("Order:          {}", order_outpoint);
-    println!("Receipt:        {}", receipt_outpoint);
-    println!("RS:             {} bytes", redeem_script.len());
-    println!("P2SH SPK:       {}", hex::encode(&p2sh.script()));
-    println!();
-    println!("Output layout:");
-    println!("  [0] seller KAS:   {} sompi", seller_kas);
-    println!("  [1] buyer tokens: {} sompi", buyer_tokens);
-    println!("  [2] oco_sell:     {} sompi", oco_value);
-    println!();
-
-    // Connect
-    info!(order = %order_outpoint, "filling bracket_order_v6");
-    println!("Connecting to {}...", node_url);
-    let rpc = NodeClient::connect(node_url).await?;
-
-    // Resolve order value
-    let order_value = if let Some(v) = order_value_override {
-        v
-    } else {
-        let p2sh_addr = p2sh_to_address(&p2sh.script(), network.address_prefix());
-        println!("Querying bracket order value...");
-        let order_utxos = rpc.get_utxos_by_addresses(&[&p2sh_addr]).await?;
-        let utxo = order_utxos
-            .iter()
-            .find(|u| {
-                u.outpoint.transaction_id == order_outpoint.transaction_id
-                    && u.outpoint.index == order_outpoint.index
-            })
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Bracket order {} not found. It may be spent or use --order-value.",
-                    order_outpoint
-                )
-            })?;
-        utxo.utxo_entry.amount
-    };
-    println!("Order Value:    {} sompi", order_value);
-
-    // Resolve receipt UTXO details via getTransaction RPC.
-    // We always need the receipt SPK for sighash computation.
-    let receipt_value: u64;
-    let receipt_spk_script: Vec<u8>;
-    let receipt_spk_version: u16;
-
-    println!("Querying receipt UTXO via transaction lookup...");
-    let tx_data = rpc.call(
-        "getTransaction",
-        serde_json::json!({
-            "transactionId": receipt_outpoint.transaction_id,
-            "includeVerboseData": true,
-        }),
-    ).await;
-
-    match tx_data {
-        Ok(resp) => {
-            let outputs = resp.get("transaction")
-                .and_then(|t| t.get("outputs"))
-                .and_then(|o| o.as_array());
-            if let Some(outs) = outputs {
-                let idx = receipt_outpoint.index as usize;
-                if idx >= outs.len() {
-                    anyhow::bail!("Receipt output index {} is out of range (transaction has {} outputs). \
-                                  Check the receipt TXID and index.",
-                                  idx, outs.len());
-                }
-                let out = &outs[idx];
-                receipt_value = if let Some(rv) = receipt_value_override {
-                    rv
-                } else {
-                    out.get("value")
-                        .and_then(|v| v.as_u64())
-                        .ok_or_else(|| anyhow::anyhow!("Cannot read receipt output value from the node. The transaction may not be confirmed yet."))?
-                };
-                let spk = out.get("scriptPublicKey")
-                    .ok_or_else(|| anyhow::anyhow!("Receipt output is missing script data. The transaction may be malformed."))?;
-                receipt_spk_version = spk.get("version")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u16;
-                receipt_spk_script = hex::decode(
-                    spk.get("script")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow::anyhow!("Receipt output is missing the script field. The transaction may be malformed."))?
-                )?;
-            }
-            else {
-                anyhow::bail!("Cannot read receipt transaction outputs from the node. Verify the receipt TXID.");
-            }
-        }
-        Err(e) => {
-            anyhow::bail!(
-                "Failed to query receipt TX {}: {}. Ensure the TX is confirmed.",
-                receipt_outpoint.transaction_id, e
-            );
-        }
-    }
-
-    println!("Receipt Value:  {} sompi", receipt_value);
-
-    // Get funding UTXO
-    // Conservative fee estimate for 3-in/4-out bracket fill TX
-    let est_fee_budget = estimate_compute_mass(3, 4, 0) + 500;
-    let total_fixed_out = seller_kas + buyer_tokens + oco_value;
-    let total_inputs_min = order_value + receipt_value;
-    let extra_funding_needed = if total_fixed_out + est_fee_budget > total_inputs_min {
-        total_fixed_out + est_fee_budget - total_inputs_min
-    } else {
-        est_fee_budget // still need a fee UTXO for signing
-    };
-
-    let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
-
-    let fee_utxo = if let Some(fi) = fee_input_str {
-        let fi_outpoint = Outpoint::parse(fi)?;
-        wallet_utxos
-            .iter()
-            .find(|u| {
-                u.outpoint.transaction_id == fi_outpoint.transaction_id
-                    && u.outpoint.index == fi_outpoint.index
-            })
-            .ok_or_else(|| anyhow::anyhow!("The specified fee input {} was not found in the wallet. It may have been spent already.", fi))?
-    } else {
-        wallet_utxos
-            .iter()
-            .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= extra_funding_needed)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "No UTXO with at least {} sompi available for funding ({} UTXOs in wallet). \
-                     Fund the wallet or run `kob wallet consolidate`.",
-                    extra_funding_needed,
-                    wallet_utxos.len()
-                )
-            })?
-    };
-
-    println!(
-        "Fee UTXO:       {}:{} ({} sompi)",
-        fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
+    anyhow::bail!(
+        "bracket RS must be {} bytes (v18); pre-v18 brackets were removed in Stage E (got {})",
+        contract::spot::bracket::BRACKET_V18_RS_SIZE,
+        redeem_script.len()
     );
-
-    let total_in = order_value + fee_utxo.utxo_entry.amount + receipt_value;
-    let total_out = seller_kas + buyer_tokens + oco_value;
-
-    // Build fill TX (version 0)
-    let mut tx = Transaction::new(0);
-
-    // Input 0: bracket_order_v6 UTXO (sigOpCount = 0 for fill path)
-    tx.inputs.push(TxInput {
-        prev_tx_id: order_outpoint.transaction_id.clone(),
-        prev_index: order_outpoint.index,
-        sequence: 0,
-        sig_op_count: 0, // fill path has no CheckSig
-        script_version: p2sh.version,
-        script_bytes: p2sh.script().to_vec(),
-        value: order_value,
-    });
-
-    // Input 1: P2PK funding UTXO (sigOpCount = 1)
-    let fee_spk_bytes = fee_utxo.script_bytes();
-    tx.inputs.push(TxInput {
-        prev_tx_id: fee_utxo.outpoint.transaction_id.clone(),
-        prev_index: fee_utxo.outpoint.index,
-        sequence: 0,
-        sig_op_count: 1,
-        script_version: fee_utxo.utxo_entry.script_public_key.version,
-        script_bytes: fee_spk_bytes,
-        value: fee_utxo.utxo_entry.amount,
-    });
-
-    // Input 2: trade_receipt UTXO (sigOpCount = 1, v4 always requires recipient signature)
-    tx.inputs.push(TxInput {
-        prev_tx_id: receipt_outpoint.transaction_id.clone(),
-        prev_index: receipt_outpoint.index,
-        sequence: 0,
-        sig_op_count: 1,
-        script_version: receipt_spk_version,
-        script_bytes: receipt_spk_script,
-        value: receipt_value,
-    });
-
-    // Wallet SPK for seller/buyer outputs
-    let wallet_spk = hex::decode(&fee_utxo.utxo_entry.script_public_key.script)?;
-    let wallet_spk_version = fee_utxo.utxo_entry.script_public_key.version;
-
-    // Output 0: seller KAS
-    tx.outputs.push(TxOutput::new(seller_kas, wallet_spk_version, wallet_spk.clone(), None));
-
-    // Output 1: buyer tokens
-    tx.outputs.push(TxOutput::new(buyer_tokens, wallet_spk_version, wallet_spk.clone(), None));
-
-    // Output 2: oco_sell P2SH (single UTXO with TP + SL paths)
-    tx.outputs.push(TxOutput::new(oco_value, oco_spk_version, oco_spk_script.to_vec(), None));
-
-    // Output 3: tentative change for mass calculation
-    let tentative_change = total_in.saturating_sub(total_out + est_fee_budget);
-    if tentative_change >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(tentative_change, wallet_spk_version, wallet_spk.clone(), None));
-    }
-
-    // Phase 1: converge fee on change output (if present)
-    let has_change = tentative_change >= MIN_UTXO_VALUE;
-    let (est_fee, _) = if has_change {
-        let change_idx = tx.outputs.len() - 1;
-        converge_fee(&mut tx, total_in, change_idx, 0)
-    } else {
-        let f = kob_core::mass::calc_miner_fee(&tx);
-        (f, 0)
-    };
-
-    let change = if has_change {
-        tx.outputs.last().unwrap().value
-    } else {
-        total_in.saturating_sub(total_out + est_fee)
-    };
-
-    if total_in < total_out + est_fee {
-        anyhow::bail!(
-            "Insufficient total inputs ({}) for outputs ({}) + fee ({})",
-            total_in, total_out, est_fee
-        );
-    }
-
-    if has_change && change < MIN_UTXO_VALUE {
-        tx.outputs.pop();
-        if change > 0 {
-            tx.outputs[0].value += change;
-            println!("Change {} sompi below MIN_UTXO_VALUE, added to seller output.", change);
-        }
-    } else if !has_change && change >= MIN_UTXO_VALUE {
-        tx.outputs.push(TxOutput::new(change, wallet_spk_version, wallet_spk.clone(), None));
-    } else if !has_change && change > 0 {
-        tx.outputs[0].value += change;
-        println!("Change {} sompi below MIN_UTXO_VALUE, added to seller output.", change);
-    }
-
-    println!("Total In:       {} sompi", total_in);
-    println!("Total Out:      {} sompi + {} fee", total_out, est_fee);
-    if change >= MIN_UTXO_VALUE {
-        println!("Change:         {} sompi", change);
-    }
-    println!();
-
-    // Build sigscripts
-    // Input 0: bracket fill sigscript [Op1][pushData(RS)]
-    let bracket_fill_ss = contract::build_bracket_fill_sigscript(&redeem_script);
-    println!("Fill SigScript:  {} bytes (< 400: {})", bracket_fill_ss.len(), bracket_fill_ss.len() < 400);
-
-    // Input 1: P2PK signature
-    let sighash_1 = compute_sighash(&tx, 1)?;
-    let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
-    let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
-
-    // Input 2: receipt sigscript [push(sig 65B)] [push(pk 32B)] [pushData(receiptRS)]
-    // Receipt v4: always requires recipient signature (no trigger-read path).
-    let receipt_rs_bytes = hex::decode(receipt_rs_hex)?;
-    if receipt_rs_bytes.is_empty() {
-        anyhow::bail!("--receipt-rs cannot be empty. Provide the receipt redeemScript hex value.");
-    }
-    let receipt_sighash = compute_sighash(&tx, 2)?;
-    let receipt_sig = signing::schnorr_sign(&privkey, &receipt_sighash)?;
-    let receipt_sigscript = contract::build_receipt_consume_sigscript(
-        &receipt_sig,
-        &pubkey,
-        &receipt_rs_bytes,
-    );
-    println!("Receipt SS:      {} bytes (v4 consume, signed)", receipt_sigscript.len());
-
-    // Phase 2: exact mass check with real sigscripts
-    let sigscripts_fill = vec![bracket_fill_ss.clone(), fee_sigscript.clone(), receipt_sigscript.clone()];
-    let exact_mass = calc_mass_with_sigscripts(&tx, &sigscripts_fill);
-    let exact_fee = kob_core::mass::min_relay_fee(exact_mass);
-
-    let (bracket_fill_ss, fee_sigscript, receipt_sigscript, actual_fee) = if exact_fee != est_fee {
-        // Re-adjust change or seller output
-        if tx.outputs.len() > 4 {
-            let change_idx = tx.outputs.len() - 1;
-            let new_change = total_in.saturating_sub(total_out + exact_fee);
-            if new_change >= MIN_UTXO_VALUE {
-                tx.outputs[change_idx].value = new_change;
-            } else {
-                tx.outputs.pop();
-                if new_change > 0 {
-                    tx.outputs[0].value += new_change;
-                }
-            }
-        }
-        // Re-sign inputs 1 and 2
-        let sighash_1 = compute_sighash(&tx, 1)?;
-        let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
-        let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
-        let receipt_sighash = compute_sighash(&tx, 2)?;
-        let receipt_sig = signing::schnorr_sign(&privkey, &receipt_sighash)?;
-        let receipt_sigscript = contract::build_receipt_consume_sigscript(
-            &receipt_sig,
-            &pubkey,
-            &receipt_rs_bytes,
-        );
-        // Input 0 sigscript is data-only (no signature), no re-sign needed
-        (bracket_fill_ss, fee_sigscript, receipt_sigscript, exact_fee)
-    } else {
-        (bracket_fill_ss, fee_sigscript, receipt_sigscript, est_fee)
-    };
-
-    let fill_exact_compute = calc_mass_with_sigscripts(&tx, &[bracket_fill_ss.clone(), fee_sigscript.clone(), receipt_sigscript.clone()]);
-    println!("Compute mass:   {:>9} (exact, post-sign)", fill_exact_compute);
-    println!("Miner fee:      {:>9} sompi", actual_fee);
-    println!();
-
-    // Submit
-    let payload = to_rpc_payload(&tx, &[bracket_fill_ss, fee_sigscript, receipt_sigscript]);
-    println!("Submitting bracket fill transaction...");
-    let tx_id = rpc.submit_transaction(payload).await?;
-
-    println!();
-    println!("SUCCESS! Bracket order filled.");
-    println!("TXID: {}", tx_id);
-    println!();
-    println!("  [0] seller KAS:    {} sompi", tx.outputs[0].value);
-    println!("  [1] buyer tokens:  {} sompi", buyer_tokens);
-    println!("  [2] oco_sell:      {} sompi at {}:2", oco_value, tx_id);
-
-    Ok(())
 }
 
 /// Fill a v18 bracket (372B RS).
@@ -1185,17 +843,16 @@ pub async fn cancel_bracket_v4(
 
     // Parse redeemScript (365B = v1, 372B = v18)
     let redeem_script = hex::decode(rs_hex)?;
-    let is_v18 = redeem_script.len() == contract::spot::bracket::BRACKET_V18_RS_SIZE;
-    if redeem_script.len() != 365 && !is_v18 {
+    if redeem_script.len() != contract::spot::bracket::BRACKET_V18_RS_SIZE {
         anyhow::bail!(
-            "bracket RS must be 365 (v1) or {} (v18) bytes, got {}",
+            "bracket RS must be {} bytes (v18); pre-v18 brackets were removed in Stage E (got {})",
             contract::spot::bracket::BRACKET_V18_RS_SIZE,
             redeem_script.len()
         );
     }
     let p2sh = build_p2sh(&redeem_script);
 
-    println!("Cancel bracket ({})", if is_v18 { "v18" } else { "v6" });
+    println!("Cancel bracket (v18)");
     println!("========================");
     println!("Order:         {}", order_outpoint);
     println!("RS:            {} bytes", redeem_script.len());
@@ -1320,11 +977,8 @@ pub async fn cancel_bracket_v4(
     // v1:  [Op0][pushData(sig+type)][pushData(pk)][pushData(RS)]
     // v18: [pushData(sig+type)][pushData(pk)][Op0][pushData(RS)] (selector
     //      sits directly below the state, v17/v18 convention)
-    let cancel_sigscript = if is_v18 {
-        contract::spot::bracket::build_bracket_v18_cancel_sigscript(&sig_0, &pubkey, &redeem_script)
-    } else {
-        contract::build_bracket_cancel_sigscript(&sig_0, &pubkey, &redeem_script)
-    };
+    let cancel_sigscript =
+        contract::spot::bracket::build_bracket_v18_cancel_sigscript(&sig_0, &pubkey, &redeem_script);
 
     println!("Cancel SigScript: {} bytes (>= 400: {})", cancel_sigscript.len(), cancel_sigscript.len() >= 400);
 
@@ -1354,11 +1008,8 @@ pub async fn cancel_bracket_v4(
         // Re-sign with updated output value
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
-        let cancel_sigscript = if is_v18 {
-            contract::spot::bracket::build_bracket_v18_cancel_sigscript(&sig_0, &pubkey, &redeem_script)
-        } else {
-            contract::build_bracket_cancel_sigscript(&sig_0, &pubkey, &redeem_script)
-        };
+        let cancel_sigscript =
+            contract::spot::bracket::build_bracket_v18_cancel_sigscript(&sig_0, &pubkey, &redeem_script);
         let sighash_1 = compute_sighash(&tx, 1)?;
         let sig_1 = signing::schnorr_sign(&privkey, &sighash_1)?;
         let fee_sigscript = signing::build_p2pk_sigscript(&sig_1);
@@ -1751,26 +1402,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bracket_v6_rs_length() {
-        let token_cov_id = [0x01u8; 32];
-        let oco_spk = [0xAA; 37];
-        let receipt_cov_id = [0xCC; 32];
-        let trade_spk_hash = [0x11; 32];
-        let owner_hash = [0xDD; 32];
-
-        let rs = contract::build_bracket_redeem_script(
-            0, &token_cov_id, 1, 2,
-            &oco_spk, 5_000_000,
-            100_000,
-            5_000_000,
-            &receipt_cov_id,
-            &trade_spk_hash,
-            &owner_hash,
-        ).unwrap();
-        assert_eq!(rs.len(), 365, "bracket_order_v6 RS must be 365 bytes");
-    }
-
-    #[test]
     fn bracket_v18_rs_length_and_sigscripts() {
         let token_cov_id = [0x01u8; 32];
         let oco_spk = [0xAA; 37];
@@ -1817,27 +1448,6 @@ mod tests {
     }
 
     #[test]
-    fn bracket_v6_fill_sigscript_below_threshold() {
-        let rs = vec![0u8; 365]; // dummy 365B RS
-        let ss = contract::build_bracket_fill_sigscript(&rs);
-        // Fill: [Op1(1B)] + [pushData(365B) = 3+365 = 368B] = 369B
-        assert_eq!(ss.len(), 369, "fill sigscript must be 369 bytes");
-        assert!(ss.len() < 400, "fill sigscript must be < 400 threshold");
-    }
-
-    #[test]
-    fn bracket_v6_cancel_sigscript_above_threshold() {
-        let sig = [0xAA; 64];
-        let pk = [0xBB; 32];
-        let rs = vec![0u8; 365]; // dummy 365B RS
-        let ss = contract::build_bracket_cancel_sigscript(&sig, &pk, &rs);
-        // Cancel: [Op0(1B)] + [pushData(sig65) = 66B] + [pushData(pk32) = 33B]
-        //         + [pushData(RS365) = 3+365 = 368B] = 1+66+33+368 = 468B
-        assert_eq!(ss.len(), 468, "cancel sigscript must be 468 bytes");
-        assert!(ss.len() >= 400, "cancel sigscript must be >= 400 threshold");
-    }
-
-    #[test]
     fn bracket_params_validate_valid() {
         let params = BracketParams {
             pair_id: [0x01; 32],
@@ -1865,28 +1475,4 @@ mod tests {
         assert!(params.validate().is_err());
     }
 
-    #[test]
-    fn bracket_v6_oco_spk_extraction() {
-        // Build a real RS and verify we can extract OCO SPK at the correct offset
-        let token_cov_id = [0x01u8; 32];
-        let mut oco_spk = [0u8; 37];
-        oco_spk[0..2].copy_from_slice(&0u16.to_le_bytes());
-        oco_spk[2] = 0xaa; oco_spk[3] = 0x20;
-        for i in 4..36 { oco_spk[i] = 0xAA; }
-        oco_spk[36] = 0x87;
-
-        let receipt_cov_id = [0xCC; 32];
-        let trade_spk_hash = [0x11; 32];
-        let owner_hash = [0xDD; 32];
-
-        let rs = contract::build_bracket_redeem_script(
-            0, &token_cov_id, 1, 2,
-            &oco_spk, 5_000_000,
-            100_000, 5_000_000,
-            &receipt_cov_id, &trade_spk_hash, &owner_hash,
-        ).unwrap();
-
-        // Verify OCO SPK extraction at offset 61..98 (same position as old tp_spk)
-        assert_eq!(&rs[61..98], &oco_spk[..], "OCO SPK must be at RS[61..98]");
-    }
 }

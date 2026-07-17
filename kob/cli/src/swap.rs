@@ -209,23 +209,13 @@ struct SwapRsView {
     owner_hash: [u8; 32],
     owner_spk_hash: [u8; 32],
     receipt_cov_id: [u8; 32],
-    /// Some(bps) for v18; None for v1.
+    /// Matcher-fee cap in BPS (v18).
     mmfee_bps: Option<u64>,
 }
 
-/// Parse a swap RS of either generation into the common view.
+/// Parse a v18 swap RS into the common view (pre-v18 swaps were removed in
+/// Stage E).
 fn parse_swap_rs_any(rs: &[u8]) -> Option<SwapRsView> {
-    if let Some(p) = contract::parse_swap_order_rs(rs) {
-        return Some(SwapRsView {
-            source_token_cov_id: p.source_token_cov_id,
-            target_token_cov_id: p.target_token_cov_id,
-            min_target_amount: p.min_target_amount,
-            owner_hash: p.owner_hash,
-            owner_spk_hash: p.owner_spk_hash,
-            receipt_cov_id: p.receipt_cov_id,
-            mmfee_bps: None,
-        });
-    }
     let p = contract::spot::swap::parse_swap_order_v18_rs(rs)?;
     Some(SwapRsView {
         source_token_cov_id: p.source_token_cov_id,
@@ -641,12 +631,10 @@ async fn cancel(
     let outpoint = Outpoint::parse(outpoint_str)?;
     let redeem_script = hex::decode(rs_hex)?;
 
-    // Parse and validate the RS (v1 or v18 — cancel sigscript shape is
-    // identical in both generations).
+    // Parse and validate the RS (v18).
     let parsed = parse_swap_rs_any(&redeem_script)
         .ok_or_else(|| anyhow::anyhow!(
-            "Invalid swap order RS: expected {} (v1) or {} (v18) bytes, got {}",
-            contract::SWAP_RS_SIZE,
+            "Invalid swap order RS: expected {} bytes (v18), got {}",
             contract::spot::swap::SWAP_V18_RS_SIZE,
             redeem_script.len(),
         ))?;
@@ -864,8 +852,7 @@ async fn info_cmd(
 
     let parsed = parse_swap_rs_any(&redeem_script)
         .ok_or_else(|| anyhow::anyhow!(
-            "Invalid swap order RS: expected {} (v1) or {} (v18) bytes, got {}",
-            contract::SWAP_RS_SIZE,
+            "Invalid swap order RS: expected {} bytes (v18), got {}",
             contract::spot::swap::SWAP_V18_RS_SIZE,
             redeem_script.len(),
         ))?;

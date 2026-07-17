@@ -46,24 +46,23 @@ pub struct OrderCacheEntry {
     /// Used by cancel and cancel-all to reconstruct the redeemScript.
     #[serde(default)]
     pub token: Option<String>,
-    /// Contract version (only 14 supported).
+    /// Contract version (v18).
     #[serde(default = "default_cache_version")]
     pub version: u8,
-    /// Expiry DAA score (v14 only, 0 = GTC).
+    /// Expiry DAA score (0 = GTC).
     #[serde(default)]
     pub expiry_daa: u64,
-    /// Max matcher fee embedded in the redeemScript (sompi).
-    /// Defaults to 10_000_000 for backwards compatibility with existing cache entries.
+    /// Max matcher fee cap embedded in the redeemScript (BPS in v18).
     #[serde(default = "default_max_matcher_fee")]
     pub max_matcher_fee: u64,
 }
 
 fn default_cache_version() -> u8 {
-    14
+    18
 }
 
 fn default_max_matcher_fee() -> u64 {
-    10_000_000
+    crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS
 }
 
 /// Persistent order cache file.
@@ -145,7 +144,8 @@ impl From<crate::cancel_all::CachedOrder> for OrderCacheEntry {
             token: c.token,
             version: c.version,
             expiry_daa: c.expiry_daa,
-            max_matcher_fee: 10_000_000,
+            // v18 caches store BPS.
+            max_matcher_fee: crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         }
     }
 }
@@ -203,7 +203,7 @@ mod tests {
             "value": 5000000
         }"#;
         let entry: OrderCacheEntry = serde_json::from_str(json).unwrap();
-        assert_eq!(entry.version, 14, "default version must be 14");
+        assert_eq!(entry.version, 18, "default version must be 18");
     }
 
     #[test]

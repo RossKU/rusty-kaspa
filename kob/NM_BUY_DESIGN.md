@@ -1,5 +1,7 @@
 # N:M-capable buy covenant — design (Phase 1) + implementation status (Phase 2)
 
+> **Superseded by v18 (see V18_DESIGN.md).** The v17 N:M buy described here was carried into the v18 unified generation and the v17 code was deleted in Stage E; this file is kept as a historical record.
+
 Status: **IMPLEMENTED (Phase 2 complete); v17 is now the SOLE creatable buy
 contract (version-cleanup pass).** The v17 contract, its full adversarial
 matrix, all the recognition wiring, and the `plan_batch_match` N-per-sell emission

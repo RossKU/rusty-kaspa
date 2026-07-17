@@ -32,8 +32,9 @@ use kob_core::contract::spot::order::{
     build_buy_v18_cancel_sigscript, build_buy_v18_expire_sigscript,
     build_buy_v18_fill_sigscript, build_buy_v18_partial_fill_sigscript,
     build_buy_v18_redeem_script, build_sell_v18_expire_sigscript,
-    build_sell_v18_fill_sigscript, build_sell_v18_partial_fill_sigscript,
-    build_sell_v18_redeem_script, BUY_ORDER_V18_MAX_N,
+    build_sell_v18_fill_sigscript, build_sell_v18_ioc_fill_sigscript,
+    build_sell_v18_partial_fill_sigscript, build_sell_v18_redeem_script,
+    BUY_ORDER_V18_MAX_N,
 };
 use kob_core::contract::spot::swap::{build_swap_v18_fill_sigscript, build_swap_v18_redeem_script};
 use kob_core::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
@@ -1865,5 +1866,151 @@ fn v18_sell_expire_early_rejected() {
     for oco in [false, true] {
         let r = run_sell_expire(oco, true, true, 30_000_000, 500);
         assert!(r.is_err(), "expire (oco={oco}) before expiry_daa must fail (CLTV)");
+    }
+}
+
+// ===========================================================================
+// Sell IOC F4 residual conservation + builder output-ordering (ported from
+// the retired toccata_fill_repro suite to v18 shapes).
+// ===========================================================================
+
+/// Direct v18 sell IOC spend: sell (token 30M) + fee input; outputs =
+/// [0] seller KAS (koi=0), then residual/buyer token outputs in the given
+/// order (both covenant-bound to the sell input). `residual_value` lets the
+/// drain case short the self-continuation.
+fn run_sell_ioc_v18(residual_first: bool, residual_value: u64) -> Result<(), String> {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+
+    let token_in = 30_000_000u64;
+    let fta = 20_000_000u64; // residual = 10M
+    let sell_rs = build_sell_v18_redeem_script(
+        1, 1, 8_000_000, &owner_hash, &spk_hash, &spk_hash, 30, 0, 0,
+    )
+    .unwrap();
+    let sell_p2sh = build_p2sh(&sell_rs);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    let sell_ss = build_sell_v18_ioc_fill_sigscript(0, 1, 1, fta, &sell_rs);
+    let buyer_spk = p2pk_spk(&[0xcc; 32]);
+    let inputs = vec![
+        TransactionInput::new(op(0x10, 0), sell_ss, 50, 0),
+        TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1), // fee (not executed)
+    ];
+    let residual_out = TransactionOutput::with_covenant(
+        residual_value,
+        ScriptPublicKey::new(sell_p2sh.version(), sell_p2sh.script().into()),
+        Some(CovenantBinding::new(0, token_cov_id)),
+    );
+    let buyer_out = TransactionOutput::with_covenant(
+        fta,
+        buyer_spk,
+        Some(CovenantBinding::new(0, token_cov_id)),
+    );
+    let (out1, out2) = if residual_first { (residual_out, buyer_out) } else { (buyer_out, residual_out) };
+    let outputs = vec![
+        TransactionOutput::with_covenant(fta, wallet_spk.clone(), None), // [0] seller KAS (koi=0)
+        out1,
+        out2,
+    ];
+    let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+    let entries = vec![
+        UtxoEntry {
+            amount: token_in,
+            script_public_key: sell_p2sh,
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: Some(token_cov_id),
+        },
+        UtxoEntry {
+            amount: 260_000_000,
+            script_public_key: wallet_spk,
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        },
+    ];
+    exec_inputs(&tx, entries, 0).remove(0)
+}
+
+/// Honest IOC residual (auth[0] = self-continuation worth token_in - fta)
+/// passes; a matcher shorting the residual (drain) is rejected by F4.
+#[test]
+fn v18_sell_ioc_residual_drain_rejected_honest_passes() {
+    let ok = run_sell_ioc_v18(true, 10_000_000);
+    assert!(ok.is_ok(), "honest IOC residual must pass: {ok:?}");
+    let drained = run_sell_ioc_v18(true, 9_999_999);
+    assert!(drained.is_err(), "shorted IOC residual must be rejected by F4");
+}
+
+/// Builder ordering: the residual must be the sell input's auth[0] (first
+/// covenant output it authorizes). If the buyer output precedes it, auth[0]
+/// misresolves onto the buyer SPK and the self-continuation check fails.
+#[test]
+fn v18_sell_ioc_builder_layout_residual_at_auth0() {
+    let bad = run_sell_ioc_v18(false, 10_000_000);
+    assert!(bad.is_err(), "buyer output before the residual must fail the self-SPK check");
+}
+
+/// OCO fill F4 drain (ported): the OCO seller's own authorized token output
+/// underfunded below token_in must be rejected by the per-input F4.
+#[test]
+fn v18_oco_fill_underfunded_f4_rejected() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token_cov_id = hash32(TOKEN_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let spk_hash = compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+
+    let token_in = 30_000_000u64;
+    let oco_rs = build_oco_sell_v18_redeem_script(
+        99, 100, 1, 1, 2, 1, &owner_hash, &spk_hash, &spk_hash, 30, 0, 0,
+    )
+    .unwrap();
+    for (delivered, expect_ok) in [(token_in, true), (token_in - 1, false)] {
+        let ss = build_oco_sell_v18_tp_fill_sigscript(0, 99, 100, &oco_rs);
+        let inputs = vec![
+            TransactionInput::new(op(0x10, 0), ss, 50, 0),
+            TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1),
+        ];
+        let outputs = vec![
+            TransactionOutput::with_covenant(
+                token_in * 99 / 100,
+                wallet_spk.clone(),
+                None,
+            ), // [0] seller KAS (koi=0)
+            TransactionOutput::with_covenant(
+                delivered,
+                p2pk_spk(&[0xcc; 32]),
+                Some(CovenantBinding::new(0, token_cov_id)),
+            ), // [1] buyer tokens = auth[0] of the OCO input
+        ];
+        let tx = Transaction::new(1, inputs, outputs, 0, Default::default(), 0, vec![]);
+        let entries = vec![
+            UtxoEntry {
+                amount: token_in,
+                script_public_key: build_p2sh(&oco_rs),
+                block_daa_score: 0,
+                is_coinbase: false,
+                covenant_id: Some(token_cov_id),
+            },
+            UtxoEntry {
+                amount: 260_000_000,
+                script_public_key: wallet_spk.clone(),
+                block_daa_score: 0,
+                is_coinbase: false,
+                covenant_id: None,
+            },
+        ];
+        let res = exec_inputs(&tx, entries, 0).remove(0);
+        assert_eq!(
+            res.is_ok(),
+            expect_ok,
+            "OCO fill delivered={delivered} expected ok={expect_ok}: {res:?}"
+        );
     }
 }

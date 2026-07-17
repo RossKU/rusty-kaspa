@@ -115,7 +115,7 @@ pub enum EstimateCommand {
         #[arg(long)]
         amount: u64,
         /// Contract version (only 14 supported).
-        #[arg(long, default_value = "14")]
+        #[arg(long, default_value = "18")]
         version: u8,
     },
     /// Estimate fee for deploying a sell order.
@@ -124,7 +124,7 @@ pub enum EstimateCommand {
         #[arg(long)]
         amount: u64,
         /// Contract version (only 14 supported).
-        #[arg(long, default_value = "14")]
+        #[arg(long, default_value = "18")]
         version: u8,
     },
     /// Estimate fee for matching a buy and sell order.
@@ -136,7 +136,7 @@ pub enum EstimateCommand {
         #[arg(long)]
         sell_value: u64,
         /// Contract version (only 14 supported).
-        #[arg(long, default_value = "14")]
+        #[arg(long, default_value = "18")]
         version: u8,
     },
     /// Estimate fee for a partial fill.
@@ -151,7 +151,7 @@ pub enum EstimateCommand {
         #[arg(long)]
         order_value: u64,
         /// Contract version (only 14 supported).
-        #[arg(long, default_value = "14")]
+        #[arg(long, default_value = "18")]
         version: u8,
     },
     /// Estimate fee for cancelling an order.
@@ -163,7 +163,7 @@ pub enum EstimateCommand {
         #[arg(long)]
         order_value: u64,
         /// Contract version (only 14 supported).
-        #[arg(long, default_value = "14")]
+        #[arg(long, default_value = "18")]
         version: u8,
     },
     /// Estimate fee for consolidating multiple UTXOs into one.
@@ -878,12 +878,9 @@ pub fn run(cmd: &EstimateCommand) {
 }
 
 fn validate_version(version: u8) {
-    if version != 6 && version != 8 && version != 9 && version != 10 && version != 11 && version != 12 && version != 13 && version != 14 && version != 16 && version != 17 && version != 18 {
-        error!("unsupported contract version {}. Use 18 (or legacy: 6, 8-14, 16, 17).", version);
-        std::process::exit(1);
-    }
     if version != 18 {
-        eprintln!("WARNING: New deployments are v18-only. Got v{} (estimation still shown).", version);
+        error!("unsupported contract version {}. Only v18 is supported (pre-v18 removed in Stage E).", version);
+        std::process::exit(1);
     }
 }
 
@@ -1233,101 +1230,7 @@ mod tests {
     }
 
 
-    #[test]
-    fn buy_v12_fill_ss_size_matches() {
-        use kob_core::contract::{build_buy_redeem_script, build_buy_fill_sigscript};
-        let tcid = [0u8; 32];
-        let owner = [0u8; 32];
-        let bspkh = [0u8; 32];
-        let rs = build_buy_redeem_script(&tcid, 1, 2, 1000, &owner, &bspkh, 0, 0, 0).unwrap();
-        let ss = build_buy_fill_sigscript(1, 1, 0, &rs);
-        assert!(BUY_FILL_SS_SIZE >= ss.len() as u64,
-            "BUY_FILL_SS_SIZE ({}) < actual ({})", BUY_FILL_SS_SIZE, ss.len());
-    }
 
-    #[test]
-    fn sell_v12_fill_ss_size_matches() {
-        use kob_core::contract::{build_sell_redeem_script, build_sell_fill_sigscript};
-        let owner = [0u8; 32];
-        let sspkh = [0u8; 32];
-        let rs = build_sell_redeem_script(1, 2, 1000, &owner, &sspkh, 0, 0, 0).unwrap();
-        let ss = build_sell_fill_sigscript(0, &rs);
-        assert!(SELL_FILL_SS_SIZE >= ss.len() as u64,
-            "SELL_FILL_SS_SIZE ({}) < actual ({})", SELL_FILL_SS_SIZE, ss.len());
-    }
-
-    #[test]
-    fn buy_v12_rs_size_matches() {
-        use kob_core::contract::build_buy_redeem_script;
-        let tcid = [0u8; 32];
-        let owner = [0u8; 32];
-        let bspkh = [0u8; 32];
-        let rs = build_buy_redeem_script(&tcid, 1, 2, 1000, &owner, &bspkh, 0, 0, 0).unwrap();
-        assert_eq!(BUY_RS_SIZE, rs.len() as u64,
-            "BUY_RS_SIZE ({}) != actual ({})", BUY_RS_SIZE, rs.len());
-    }
-
-    #[test]
-    fn sell_v12_rs_size_matches() {
-        use kob_core::contract::build_sell_redeem_script;
-        let owner = [0u8; 32];
-        let sspkh = [0u8; 32];
-        let rs = build_sell_redeem_script(1, 2, 1000, &owner, &sspkh, 0, 0, 0).unwrap();
-        assert_eq!(SELL_RS_SIZE, rs.len() as u64,
-            "SELL_RS_SIZE ({}) != actual ({})", SELL_RS_SIZE, rs.len());
-    }
-
-
-    #[test]
-    fn buy_v12_cancel_ss_size_matches() {
-        use kob_core::contract::{build_buy_redeem_script, build_buy_cancel_sigscript};
-        let tcid = [0u8; 32];
-        let owner = [0u8; 32];
-        let bspkh = [0u8; 32];
-        let rs = build_buy_redeem_script(&tcid, 1, 2, 1000, &owner, &bspkh, 0, 0, 0).unwrap();
-        let sig = [0u8; 64];
-        let pubkey = [0u8; 32];
-        let ss = build_buy_cancel_sigscript(&sig, &pubkey, &rs);
-        assert_eq!(BUY_CANCEL_SS_SIZE, ss.len() as u64,
-            "BUY_CANCEL_SS_SIZE ({}) != actual ({})", BUY_CANCEL_SS_SIZE, ss.len());
-    }
-
-    #[test]
-    fn sell_v12_cancel_ss_size_matches() {
-        use kob_core::contract::{build_sell_redeem_script, build_sell_cancel_sigscript};
-        let owner = [0u8; 32];
-        let sspkh = [0u8; 32];
-        let rs = build_sell_redeem_script(1, 2, 1000, &owner, &sspkh, 0, 0, 0).unwrap();
-        let sig = [0u8; 64];
-        let pubkey = [0u8; 32];
-        let ss = build_sell_cancel_sigscript(&sig, &pubkey, &rs);
-        assert_eq!(SELL_CANCEL_SS_SIZE, ss.len() as u64,
-            "SELL_CANCEL_SS_SIZE ({}) != actual ({})", SELL_CANCEL_SS_SIZE, ss.len());
-    }
-
-
-    #[test]
-    fn buy_v12_partial_ss_size_matches() {
-        use kob_core::contract::{build_buy_redeem_script, build_buy_partial_fill_sigscript};
-        let tcid = [0u8; 32];
-        let owner = [0u8; 32];
-        let bspkh = [0u8; 32];
-        let rs = build_buy_redeem_script(&tcid, 1, 2, 1000, &owner, &bspkh, 0, 0, 0).unwrap();
-        let ss = build_buy_partial_fill_sigscript(&rs, 5_000_000, 2, 1);
-        assert_eq!(BUY_PARTIAL_SS_SIZE, ss.len() as u64,
-            "BUY_PARTIAL_SS_SIZE ({}) != actual ({})", BUY_PARTIAL_SS_SIZE, ss.len());
-    }
-
-    #[test]
-    fn sell_v12_partial_ss_size_matches() {
-        use kob_core::contract::{build_sell_redeem_script, build_sell_partial_fill_sigscript};
-        let owner = [0u8; 32];
-        let sspkh = [0u8; 32];
-        let rs = build_sell_redeem_script(1, 2, 1000, &owner, &sspkh, 0, 0, 0).unwrap();
-        let ss = build_sell_partial_fill_sigscript(&rs, 5_000_000, 0, 2);
-        assert_eq!(SELL_PARTIAL_SS_SIZE, ss.len() as u64,
-            "SELL_PARTIAL_SS_SIZE ({}) != actual ({})", SELL_PARTIAL_SS_SIZE, ss.len());
-    }
 
 
     #[test]
@@ -1366,16 +1269,6 @@ mod tests {
     fn oco_small_amount() {
         let est = estimate_oco(3_000_000);
         assert!(est.storage_mass >= 1_333_333);
-    }
-
-    #[test]
-    fn oco_rs_size_constant() {
-        use kob_core::contract::build_oco_sell_redeem_script;
-        let ohash = [0u8; 32];
-        let spkh = [0u8; 32];
-        let rs = build_oco_sell_redeem_script(2, 1, 1000, 1, 1, 1000, &ohash, &spkh, 10_000, 0, 0).unwrap();
-        assert_eq!(OCO_RS_SIZE, rs.len() as u64,
-            "OCO_RS_SIZE ({}) != actual ({})", OCO_RS_SIZE, rs.len());
     }
 
 
@@ -1433,21 +1326,6 @@ mod tests {
         assert!(est.required_fee > 0);
         // Storage mass dominated by small change output
         assert!(est.required_fee >= MIN_RELAY_FEE);
-    }
-
-    #[test]
-    fn bracket_v6_rs_size_constant() {
-        use kob_core::contract::build_bracket_redeem_script;
-        let tcid = [0u8; 32];
-        let oco_spk = [0u8; 37];
-        let rcid = [0u8; 32];
-        let tspk = [0u8; 32];
-        let ohash = [0u8; 32];
-        let rs = build_bracket_redeem_script(
-            0, &tcid, 1, 2, &oco_spk, 1000, 100, 1000, &rcid, &tspk, &ohash,
-        ).unwrap();
-        assert_eq!(BRACKET_RS_SIZE, rs.len() as u64,
-            "BRACKET_RS_SIZE ({}) != actual ({})", BRACKET_RS_SIZE, rs.len());
     }
 
     // --- v18 size constants pinned against the real builders ---

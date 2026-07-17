@@ -326,7 +326,7 @@ pub async fn deploy_buy(
     // remain fully parseable/cancellable/servicable for orders already
     // resting on-chain (deleted in Stage E).
     if version != 18 {
-        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v18 (unified spot) may be deployed; v14/v16/v17 are retained only for managing pre-existing on-chain orders.", version);
+        anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v18 (unified spot) exists; pre-v18 generations were removed in Stage E.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;
@@ -401,69 +401,24 @@ pub async fn deploy_buy(
 
     let owner_hash = blake2b_256(&pubkey);
     // v18 delivery re-wrap: fills must land tokens on the buyer's token_unit
-    // P2SH (KCC20 Standard State Header) rather than the raw P2PK SPK, so the
-    // delivered UTXO is readable by KCC20 tooling and spendable by
-    // `token transfer`. Pre-v18 generations keep the historical raw-P2PK
-    // commitment (live orders on chain still reconstruct byte-exactly).
-    let buyer_spk_hash = if version == 18 {
-        contract::compute_token_unit_spk_hash(&pubkey)
-    } else {
-        compute_p2pk_spk_hash(&pubkey)
-    };
+    // P2SH (KCC20 Standard State Header) rather than the raw P2PK SPK, so
+    // the delivered UTXO is readable by KCC20 tooling and spendable by
+    // `token transfer`.
+    let buyer_spk_hash = contract::compute_token_unit_spk_hash(&pubkey);
 
-    let redeem_script = if version == 18 {
-        let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
-        contract::spot::order::build_buy_v18_redeem_script(
-            &token_cov_id,
-            price_num,
-            price_den,
-            min_fill,
-            &owner_hash,
-            &buyer_spk_hash,
-            &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
-            bps,
-            0, // cancel_pending = 0 (active order)
-            expiry_daa.unwrap_or(0),
-        )?
-    } else if version == 17 {
-        let bps = mmfee_bps.unwrap_or(30); // default 0.3%
-        contract::build_buy_v17_redeem_script(
-            &token_cov_id,
-            price_num,
-            price_den,
-            min_fill,
-            &owner_hash,
-            &buyer_spk_hash,
-            bps,
-            0, // cancel_pending = 0 (active order)
-            expiry_daa.unwrap_or(0),
-        )?
-    } else if version == 16 {
-        let bps = mmfee_bps.unwrap_or(30); // default 0.3% for v16
-        contract::build_buy_v16_redeem_script(
-            &token_cov_id,
-            price_num,
-            price_den,
-            min_fill,
-            &owner_hash,
-            &buyer_spk_hash,
-            bps,
-            0, // cancel_pending = 0 (active order)
-            expiry_daa.unwrap_or(0),
-        )?
-    } else {
-        contract::build_buy_redeem_script(
-            &token_cov_id,
-            price_num,
-            price_den,
-            min_fill,
-            &owner_hash,
-            &buyer_spk_hash,
-            max_matcher_fee,
-            0, // cancel_pending = 0 (active order)
-            expiry_daa.unwrap_or(0),
-        )?
-    };
+    let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
+    let redeem_script = contract::spot::order::build_buy_v18_redeem_script(
+        &token_cov_id,
+        price_num,
+        price_den,
+        min_fill,
+        &owner_hash,
+        &buyer_spk_hash,
+        &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
+        bps,
+        0, // cancel_pending = 0 (active order)
+        expiry_daa.unwrap_or(0),
+    )?;
 
     let p2sh = build_p2sh(&redeem_script);
 
@@ -482,7 +437,7 @@ pub async fn deploy_buy(
         amount,
         amount as f64 / 1e8
     );
-    if version == 16 || version == 17 || version == 18 {
+    if version == 18 {
         let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
         println!("Max Matcher Fee: {} bps ({}%)", bps, bps as f64 / 100.0);
     } else {
@@ -772,7 +727,7 @@ pub async fn deploy_sell(
     // canonical price attestation on all fill-family branches + Fix-3
     // partial F4. v14 sells remain parseable/cancellable until Stage E.
     if version != 18 {
-        anyhow::bail!("Unsupported contract version {} for NEW sell deployment. Only v18 (unified spot) may be deployed; v14 is retained only for managing pre-existing on-chain orders.", version);
+        anyhow::bail!("Unsupported contract version {} for NEW sell deployment. Only v18 (unified spot) exists; pre-v18 generations were removed in Stage E.", version);
     }
 
     let wallet = WalletContext::load(wallet_path)?;

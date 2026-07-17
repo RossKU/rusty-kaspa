@@ -141,12 +141,10 @@ pub async fn run(
 
     let side = side.as_str();
 
-    // Reconstruct the redeemScript using the specified contract version.
-    // cancel_pending: 0 for normal orders, 1 after cancel-mark transition.
-    // v14/v16/v17 are not creatable anymore (deploy.rs gate) but MUST stay
-    // cancellable -- real on-chain servicing, not a new deploy.
-    if version != 14 && version != 16 && version != 17 && version != 18 {
-        anyhow::bail!("Unsupported contract version {}. Only v14, v16, v17, and v18 are supported.", version);
+    // Reconstruct the redeemScript. Pre-v18 generations were removed in
+    // Stage E (unreleased chain state — nothing pre-v18 remains serviceable).
+    if version != 18 {
+        anyhow::bail!("Unsupported contract version {}. Only v18 is supported.", version);
     }
     // Resolve max_matcher_fee: CLI override > cache > default.
     // For v16/v17/v18 this is BPS (basis points); v18 caches store bps.
@@ -180,22 +178,10 @@ pub async fn run(
     let redeem_script = match side {
         "buy" => {
             let tcid = parse_token_cov_id(token_cov_id_resolved.as_deref())?;
-            if version == 18 {
-                contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
-            } else if version == 17 {
-                contract::build_buy_v17_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
-            } else if version == 16 {
-                contract::build_buy_v16_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
-            } else {
-                contract::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
-            }
+            contract::spot::order::build_buy_v18_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
         }
         "sell" => {
-            if version == 18 {
-                contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
-            } else {
-                contract::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, max_matcher_fee, cancel_pending, expiry_daa)?
-            }
+            contract::spot::order::build_sell_v18_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
         }
         other => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", other),
     };
@@ -374,14 +360,8 @@ pub async fn run(
 
     // Build the cancel sigscript for the order input
     let cancel_sigscript = match side {
-        "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN => {
-            contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script)
-        }
-        "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN => {
-            contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script)
-        }
-        "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
-        // v18 sell cancel keeps the v14 [sig][pk][Op0][RS] shape.
+        "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
+        // v18 sell cancel keeps the [sig][pk][Op0][RS] shape.
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
         _ => unreachable!(),
     };
@@ -414,13 +394,7 @@ pub async fn run(
         let sighash_0 = compute_sighash(&tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match side {
-            "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN => {
-                contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script)
-            }
-            "buy" if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN => {
-                contract::build_buy_v17_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script)
-            }
-            "buy" => contract::build_buy_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
+            "buy" => contract::spot::order::build_buy_v18_cancel_sigscript(&pubkey, &sig_0, false, &redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &redeem_script),
             _ => unreachable!(),
         };
@@ -436,29 +410,11 @@ pub async fn run(
     let output_value = tx.outputs[fee_change_idx].value;
 
     println!("Cancel SigScript: {} bytes", cancel_sigscript.len());
-    if side == "buy"
-        && (redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN
-            || redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN)
-    {
-        // v17/v18 dispatch by an explicit selector (Op0 = cancel), not by a
-        // sigLen threshold, so there is no T2 to report.
-        println!("  (v17/v18 selector dispatch: Op0 cancel)");
-    } else if side == "buy" {
-        // T2 (the sigLen threshold that routes to the cancel/cancel-mark
-        // path) differs per buy contract version; pick the real one instead
-        // of a stale hardcoded constant left over from an older version.
-        let t2 = if redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
-            494
-        } else {
-            415 // v14
-        };
-        println!(
-            "  (>= T2={} triggers cancel path: {})",
-            t2,
-            if cancel_sigscript.len() >= t2 { "YES" } else { "NO -- ERROR" }
-        );
+    if side == "buy" {
+        // v18 dispatches by an explicit selector (Op0 = cancel).
+        println!("  (v18 selector dispatch: Op0 cancel)");
     } else {
-        println!("  (selector Op0 at position triggers cancel path via Op5 OpRoll)");
+        println!("  (selector Op0 routes to the cancel path)");
     }
     println!("Output Value:  {} sompi", output_value);
     println!();
@@ -531,36 +487,6 @@ mod tests {
     use super::*;
     use kob_core::contract;
     use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
-
-    #[test]
-    fn buy_cancel_sigscript_exceeds_t2_v12() {
-        let pk = [0x02u8; 32];
-        let tcid = [0x01u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let rs = contract::build_buy_redeem_script(&tcid, 1, 2, 1_000_000, &owner, &spk_hash, 0, 0, 0).unwrap();
-        let sig = [0xAA; 64];
-        let ss = contract::build_buy_cancel_sigscript(&sig, &pk, &rs);
-        // v12 RS is 415B; cancel sigscript = pushData(sig65) + pushData(pk32) + pushData(RS415)
-        assert!(
-            ss.len() >= 309,
-            "Buy v12 cancel sigscript must be >= T2(309) to trigger cancel path, got {}",
-            ss.len()
-        );
-    }
-
-    #[test]
-    fn sell_cancel_sigscript_has_op0_selector_v12() {
-        let pk = [0x02u8; 32];
-        let owner = blake2b_256(&pk);
-        let spk_hash = compute_p2pk_spk_hash(&pk);
-        let rs = contract::build_sell_redeem_script(1, 2, 1_000_000, &owner, &spk_hash, 0, 0, 0).unwrap();
-        let sig = [0xAA; 64];
-        let ss = contract::build_sell_cancel_sigscript(&sig, &pk, &rs);
-        // The structure is: pushData(sig65) + pushData(pk32) + Op0 + pushData(RS)
-        // Op0 is at byte 99 for sell cancel
-        assert_eq!(ss[99], 0x00, "Op0 selector must be at byte 99 for sell cancel");
-    }
 
     #[test]
     fn cancel_tx_output_value_correct() {

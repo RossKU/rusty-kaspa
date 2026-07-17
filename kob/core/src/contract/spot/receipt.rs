@@ -28,9 +28,6 @@ pub const RECEIPT_BODY: &[u8] = &[
     0x51,                         // Op1
 ];
 
-/// Token covenant redeemScript: OpCovInputCount(myCovenantId) >= 1 -> TRUE (7 bytes).
-pub const TOKEN_RS: &[u8] = &[0xb9, 0xcf, 0xd0, 0x51, 0xa2, 0x69, 0x51];
-
 /// Build buy_order cancel sigscript:
 /// [Op0] [pushData(sig+sighash_type 65B)] [pushData(pubkey 32B)] [pushData(RS)]
 pub fn build_buy_cancel_sigscript(

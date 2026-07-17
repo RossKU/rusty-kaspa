@@ -606,14 +606,8 @@ pub async fn run_deploy_test(
     }
     let (wallet_spk_version, wallet_spk_script) = batch_utxos[0].parse_spk();
 
-    // Find the best wallet UTXO for fee payment (largest non-token UTXO)
-    let token_p2sh = kob_core::build_p2sh(kob_core::TOKEN_RS);
-    let token_p2sh_hex = hex::encode(&token_p2sh.script());
+    // Find the best wallet UTXO for fee payment (largest UTXO)
     let wallet_utxo = batch_utxos.iter()
-        .filter(|u| {
-            let (_, script) = u.parse_spk();
-            hex::encode(&script) != token_p2sh_hex
-        })
         .max_by_key(|u| u.utxo_entry.amount)
         .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 

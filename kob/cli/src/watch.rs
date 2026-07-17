@@ -5,7 +5,6 @@
 //! Extracts price_num/price_den from the redeemScript bytes to provide
 //! trustless price information without depending on the Matcher API.
 
-use kob_core::{BUY_RS_SIZE, SELL_RS_SIZE};
 
 /// Maximum number of fills to keep in the rolling window per token.
 const MAX_FILLS_PER_TOKEN: usize = 20;
@@ -148,39 +147,13 @@ pub fn detect_fill_from_sigscript(sigscript: &[u8]) -> Option<(String, u64, u64,
     let last_push = extract_last_pushdata(sigscript)?;
     let len = last_push.len();
 
-    // Validate full body bytecode matches the canonical contract
-    let body_offset = if len == BUY_RS_SIZE {
-        let off = len - kob_core::BUY_ORDER_BODY.len();
-        if last_push[off..] != *kob_core::BUY_ORDER_BODY {
-            return None;
-        }
-        Some(off)
-    } else if len == kob_core::contract::spot::order::BUY_ORDER_V16_RS_EXPECTED_LEN {
-        // V16 buy (F6-fix contract).
-        let off = len - kob_core::contract::spot::order::BUY_ORDER_V16_BODY.len();
-        if last_push[off..] != *kob_core::contract::spot::order::BUY_ORDER_V16_BODY {
-            return None;
-        }
-        Some(off)
-    } else if len == kob_core::contract::spot::order::BUY_ORDER_V17_RS_EXPECTED_LEN {
-        // V17 buy (N:M sweep contract). Body is generated programmatically.
-        let v17_body = kob_core::contract::spot::order::build_buy_v17_body();
-        let off = len - v17_body.len();
-        if last_push[off..] != v17_body[..] {
-            return None;
-        }
-        Some(off)
-    } else if len == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN {
+    // Validate full body bytecode matches the canonical v18 contract
+    // (pre-v18 generations were removed in Stage E).
+    let body_offset = if len == kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN {
         // V18 buy (unified spot). Body is generated programmatically.
         let v18_body = kob_core::contract::spot::order::build_buy_v18_body();
         let off = len - v18_body.len();
         if last_push[off..] != v18_body[..] {
-            return None;
-        }
-        Some(off)
-    } else if len == SELL_RS_SIZE {
-        let off = len - kob_core::SELL_ORDER_BODY.len();
-        if last_push[off..] != *kob_core::SELL_ORDER_BODY {
             return None;
         }
         Some(off)
@@ -740,18 +713,23 @@ pub async fn run_watch(node_url: &str, token: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
-    // Helper: build a buy RS via core builder (uses coprime pnum/pden to avoid GCD reduction)
+    // Helper: build a v18 buy RS via core builder (coprime pnum/pden to
+    // avoid GCD reduction).
     fn make_buy_rs(tcid: &[u8; 32], pnum: u64, pden: u64) -> Vec<u8> {
         let ohash = [0u8; 32];
         let bspkh = [0u8; 32];
-        kob_core::build_buy_redeem_script(tcid, pnum, pden, 1_000_000, &ohash, &bspkh, 50_000, 0, 0).unwrap()
+        kob_core::contract::spot::order::build_buy_v18_redeem_script(
+            tcid, pnum, pden, 1_000_000, &ohash, &bspkh, &[0u8; 32], 50, 0, 0,
+        ).unwrap()
     }
 
-    // Helper: build a sell RS via core builder
+    // Helper: build a v18 sell RS via core builder
     fn make_sell_rs(pnum: u64, pden: u64) -> Vec<u8> {
         let ohash = [0u8; 32];
         let sspkh = [0u8; 32];
-        kob_core::build_sell_redeem_script(pnum, pden, 1_000_000, &ohash, &sspkh, 50_000, 0, 0).unwrap()
+        kob_core::contract::spot::order::build_sell_v18_redeem_script(
+            pnum, pden, 1_000_000, &ohash, &sspkh, &[0u8; 32], 50, 0, 0,
+        ).unwrap()
     }
 
     // Helper: build a sigscript with pushData(rs) as last element
@@ -817,7 +795,7 @@ mod tests {
     #[test]
     fn core_parse_sell_wrong_prefix() {
         let mut rs = make_sell_rs(3, 7);
-        rs[0] = 0x20; // Wrong prefix
+        rs[0] = 0x08; // Wrong prefix (v18 sell state starts with 0x20 otspkh)
         assert!(kob_core::parse_redeem_script(&rs).is_none());
     }
 
@@ -929,40 +907,6 @@ mod tests {
         rs[0] = 0x20; // plausible state prefix
         let ss = make_fill_sigscript(&rs, &[&[0x01]]);
         assert!(detect_fill_from_sigscript(&ss).is_none());
-    }
-
-    #[test]
-    fn detect_fill_fake_body_rejected() {
-        // Correct size and state prefix, but body bytes are all 0xFF (not the canonical bytecode).
-        // This simulates an attacker crafting a TX with matching pushData size.
-        let buy_body_offset = BUY_RS_SIZE - kob_core::BUY_ORDER_BODY.len();
-        let tcid = [0xab; 32];
-        let mut rs = vec![0u8; BUY_RS_SIZE];
-        rs[0] = 0x20;
-        rs[1..33].copy_from_slice(&tcid);
-        rs[33] = 0x08;
-        rs[34..42].copy_from_slice(&500u64.to_le_bytes());
-        rs[42] = 0x08;
-        rs[43..51].copy_from_slice(&1000u64.to_le_bytes());
-        // Fill body with garbage instead of canonical bytecode
-        for b in &mut rs[buy_body_offset..] {
-            *b = 0xff;
-        }
-        let ss = make_fill_sigscript(&rs, &[&[0x01]]);
-        assert!(detect_fill_from_sigscript(&ss).is_none(), "fake body must be rejected");
-
-        // Same for sell
-        let sell_body_offset = SELL_RS_SIZE - kob_core::SELL_ORDER_BODY.len();
-        let mut rs_sell = vec![0u8; SELL_RS_SIZE];
-        rs_sell[0] = 0x08;
-        rs_sell[1..9].copy_from_slice(&789u64.to_le_bytes());
-        rs_sell[9] = 0x08;
-        rs_sell[10..18].copy_from_slice(&1000u64.to_le_bytes());
-        for b in &mut rs_sell[sell_body_offset..] {
-            *b = 0xff;
-        }
-        let ss_sell = make_fill_sigscript(&rs_sell, &[&[0x01]]);
-        assert!(detect_fill_from_sigscript(&ss_sell).is_none(), "fake sell body must be rejected");
     }
 
     // --- scan_block_for_fills ---

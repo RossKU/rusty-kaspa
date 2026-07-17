@@ -410,6 +410,21 @@ pub enum Commands {
         /// exclusive with --ioc.
         #[arg(long, conflicts_with = "ioc")]
         partial: bool,
+
+        /// TIME-contract RS override for the sells (comma-separated hex,
+        /// positionally matched to --sell-outpoints). When set, the on-chain
+        /// redeemScript is used verbatim instead of the cache-rebuilt plain
+        /// v18 sell — this is what lets a plain v18 buy sweep a decay_sell /
+        /// twap_sell in one tx (the order cache does not store the schedule
+        /// fields; the planner re-classifies the kind from the RS bytes).
+        #[arg(long, value_delimiter = ',')]
+        sell_rs: Vec<String>,
+
+        /// TIME-contract RS override for the buys (comma-separated hex).
+        /// A decay_buy anchor (DECAY_BUY_RS_EXPECTED_LEN) routes to its
+        /// dedicated planners; a plain v18 buy is unchanged.
+        #[arg(long, value_delimiter = ',')]
+        buy_rs: Vec<String>,
     },
 
     /// Settle a v18 swap ring: 2-cycle (token<->token) or 3-cycle (triangle)
@@ -2754,6 +2769,8 @@ pub async fn dispatch(
             fee_bps,
             ioc,
             partial,
+            sell_rs,
+            buy_rs,
         } => {
             let token = token::resolve_token(&token, None)?;
             match_batch::run(
@@ -2767,6 +2784,8 @@ pub async fn dispatch(
                 fee_bps,
                 ioc,
                 partial,
+                &sell_rs,
+                &buy_rs,
             )
             .await?;
         }

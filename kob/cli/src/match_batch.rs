@@ -35,6 +35,8 @@ pub async fn run(
     fee_bps: Option<u16>,
     ioc: bool,
     partial: bool,
+    sell_rs_override: &[String],
+    buy_rs_override: &[String],
 ) -> anyhow::Result<()> {
     let wallet = WalletContext::load(wallet_path)?;
     let privkey = *wallet.privkey_bytes();
@@ -93,7 +95,7 @@ pub async fn run(
 
     // Build BatchOrders from cache + chain queries
     let mut sells = Vec::new();
-    for op in &sell_outpoints {
+    for (op_i, op) in sell_outpoints.iter().enumerate() {
         let op_str = format!("{}:{}", op.transaction_id, op.index);
         let entry = cache.orders.iter()
             .find(|e| e.outpoint == op_str)
@@ -116,7 +118,15 @@ pub async fn run(
             spk_hash
         };
 
-        let rs = if entry.version == 18 {
+        // TIME-contract RS override (positionally matched): use the deployed
+        // decay_sell / twap_sell redeemScript verbatim so the planner can
+        // re-classify the kind from the bytes. The order cache does not store
+        // the schedule fields, so the cache-rebuilt plain-sell RS would hash
+        // to the wrong P2SH and never match the on-chain UTXO.
+        let rs = if let Some(hex_rs) = sell_rs_override.get(op_i).filter(|s| !s.is_empty()) {
+            hex::decode(hex_rs.trim())
+                .map_err(|e| anyhow::anyhow!("--sell-rs[{}] not hex: {}", op_i, e))?
+        } else if entry.version == 18 {
             contract::spot::order::build_sell_redeem_script(
                 entry.price_num,
                 entry.price_den,
@@ -171,7 +181,7 @@ pub async fn run(
     }
 
     let mut buys = Vec::new();
-    for op in &buy_outpoints {
+    for (op_i, op) in buy_outpoints.iter().enumerate() {
         let op_str = format!("{}:{}", op.transaction_id, op.index);
         let entry = cache.orders.iter()
             .find(|e| e.outpoint == op_str)
@@ -198,7 +208,12 @@ pub async fn run(
             spk_hash
         };
 
-        let rs = if entry.version == 18 {
+        // TIME-contract RS override: a decay_buy (rising bid) redeemScript is
+        // used verbatim so `buy_is_decay` fires and the decay_buy planners run.
+        let rs = if let Some(hex_rs) = buy_rs_override.get(op_i).filter(|s| !s.is_empty()) {
+            hex::decode(hex_rs.trim())
+                .map_err(|e| anyhow::anyhow!("--buy-rs[{}] not hex: {}", op_i, e))?
+        } else if entry.version == 18 {
             contract::spot::order::build_buy_redeem_script(
                 &tcid,
                 entry.price_num,
@@ -273,9 +288,15 @@ pub async fn run(
     // Get wallet UTXOs for fee payment
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
 
-    // Select wallet UTXO for fee payment
+    // Select wallet UTXO for fee payment: SMALLEST sufficient non-P2SH UTXO.
+    // The planner returns the fee input's remainder as a WalletChange output
+    // (GTC/partial sweep cores), but the IOC/sell-IOC cores still lump it into
+    // the surplus; picking the smallest sufficient UTXO bounds any residual
+    // overpay there and minimises change churn on the fixed paths.
     let fee_utxo = wallet_utxos.iter()
-        .find(|u| !u.is_p2sh())
+        .filter(|u| !u.is_p2sh() && u.utxo_entry.amount >= 3_000_000)
+        .min_by_key(|u| u.utxo_entry.amount)
+        .or_else(|| wallet_utxos.iter().find(|u| !u.is_p2sh()))
         .ok_or_else(|| anyhow::anyhow!(
             "No spendable UTXO for fee. Fund the wallet or run `kob wallet consolidate`."
         ))?;

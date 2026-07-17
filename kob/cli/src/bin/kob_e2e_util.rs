@@ -33,7 +33,7 @@ use std::path::PathBuf;
 use kob_cli::cancel::kaspa_address_encode;
 use kob_cli::node::NodeClient;
 use kob_cli::signing;
-use kob_core::contract::spot::{oco, order};
+use kob_core::contract::spot::{decay, oco, order};
 use kob_core::mass::{calc_mass_with_sigscripts, min_relay_fee};
 use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 use kob_core::sighash::compute_sighash;
@@ -547,10 +547,284 @@ async fn main() -> anyhow::Result<()> {
             println!("TXID: {}", txid);
         }
 
+        // decay-fill <txid:idx> <rs_hex> <token_hex> <att_pnum> <att_pden> <lock_time>
+        //
+        // Direct decay_sell FULL fill (Op1) where the wallet is the taker
+        // (pays the KAS leg, receives all the tokens). Unlike `match-batch`
+        // (which always attests the correct f(L) and sets lock_time = tip),
+        // this lets you choose the attested price pair AND the tx lock_time,
+        // so it drives the whole decay adversarial matrix:
+        //   - honest:    att = f(L), lock_time = tip          -> ACCEPT (DK-1)
+        //   - stale D3:  att = start price, lock_time > t0     -> REJECT (D3)
+        //   - L=0:       lock_time = 0, att = start price      -> ACCEPT (DK-3i)
+        //   - NotFinal:  lock_time > tip                       -> node reject (DK-3ii)
+        //   - unix-ms:   lock_time >= 500_000_000_000, att=floor -> REJECT (D1, DK-4)
+        //
+        // Shape mirrors the proven harness `run_decay_sell_fill`:
+        //   in  [0] decay_sell covenant (seq 50, CSV), [1] wallet KAS+fee
+        //   out [0] seller KAS = token_in*att_pnum/att_pden (koi=0, sspkh)
+        //       [1] taker delivery = token_in (token_unit P2SH, cov auth 0)
+        //       [2] wallet change
+        "decay-fill" => {
+            let wallet = WalletContext::load(&wallet_path)?;
+            let privkey = *wallet.privkey_bytes();
+            let (op_txid, op_idx) = parse_outpoint(&args[2])?;
+            let rs = hex::decode(&args[3])?;
+            let token_hash = kob_core::compat::parse_hash(&args[4])
+                .map_err(|e| anyhow::anyhow!("token hash: {e:?}"))?;
+            let att_pnum: u64 = args[5].parse()?;
+            let att_pden: u64 = args[6].parse()?;
+            let lock_time: u64 = args[7].parse()?;
+
+            let p2sh = build_p2sh(&rs);
+            let addr = kaspa_address_encode("kaspatest", 8, &p2sh.script()[2..34]);
+            let rpc = NodeClient::connect(&node_url).await?;
+            let utxos = rpc.get_utxos_by_addresses(&[&addr]).await?;
+            let sell_utxo = utxos
+                .iter()
+                .find(|u| u.outpoint.transaction_id == op_txid && u.outpoint.index == op_idx)
+                .ok_or_else(|| anyhow::anyhow!("decay_sell UTXO {} not found on chain", args[2]))?;
+            let token_in = sell_utxo.utxo_entry.amount;
+            let seller_kas = token_in.saturating_mul(att_pnum) / att_pden;
+            println!(
+                "decay-fill: token_in={} att={}/{} seller_kas={} lock_time={}",
+                token_in, att_pnum, att_pden, seller_kas, lock_time
+            );
+
+            let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
+            let fee_utxo = wallet_utxos
+                .iter()
+                .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= seller_kas + 60_000_000)
+                .ok_or_else(|| anyhow::anyhow!("no wallet UTXO large enough for KAS leg + fee"))?;
+
+            let mut wallet_spk = Vec::with_capacity(34);
+            wallet_spk.push(0x20);
+            wallet_spk.extend_from_slice(&wallet.pubkey);
+            wallet_spk.push(0xac);
+
+            let mut tx = Transaction::new(1);
+            tx.lock_time = lock_time;
+            tx.inputs.push(TxInput {
+                prev_tx_id: op_txid.clone(),
+                prev_index: op_idx,
+                sequence: 50,
+                sig_op_count: 0,
+                script_version: p2sh.version,
+                script_bytes: p2sh.script().to_vec(),
+                value: token_in,
+            });
+            tx.inputs.push(TxInput {
+                prev_tx_id: fee_utxo.outpoint.transaction_id.clone(),
+                prev_index: fee_utxo.outpoint.index,
+                sequence: 0,
+                sig_op_count: 1,
+                script_version: fee_utxo.utxo_entry.script_public_key.version,
+                script_bytes: fee_utxo.script_bytes(),
+                value: fee_utxo.utxo_entry.amount,
+            });
+            let est_fee = 60_000u64;
+            // [0] seller KAS (koi=0)
+            tx.outputs.push(TxOutput::new(seller_kas, 0, wallet_spk.clone(), None));
+            // [1] taker token delivery (cov auth slot 0), spendable token_unit
+            let taker_tu = kob_core::contract::build_token_unit_p2sh_spk(&wallet.pubkey);
+            tx.outputs.push(TxOutput::new(
+                token_in,
+                taker_tu.version(),
+                taker_tu.script().to_vec(),
+                Some(CovenantBinding::new(0, token_hash)),
+            ));
+            // [2] wallet change
+            tx.outputs.push(TxOutput::new(
+                fee_utxo.utxo_entry.amount - seller_kas - est_fee,
+                0,
+                wallet_spk.clone(),
+                None,
+            ));
+
+            let sign_all = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
+                let mut sigs = Vec::with_capacity(2);
+                sigs.push(decay::build_decay_sell_fill_sigscript(0, att_pnum, att_pden, &rs));
+                let sh = compute_sighash(tx, 1)?;
+                sigs.push(signing::build_p2pk_sigscript(&signing::schnorr_sign(&privkey, &sh)?));
+                Ok(sigs)
+            };
+            let sigs = sign_all(&tx)?;
+            let exact_fee = fee_with_floor(min_relay_fee(calc_mass_with_sigscripts(&tx, &sigs)));
+            tx.outputs[2].value = fee_utxo.utxo_entry.amount - seller_kas - exact_fee;
+            let sigs = sign_all(&tx)?;
+            println!("exact fee: {} sompi", exact_fee);
+
+            let payload = to_rpc_payload(&tx, &sigs);
+            match rpc.submit_transaction(payload).await {
+                Ok(txid) => {
+                    println!("SUCCESS! decay_sell full fill accepted.");
+                    println!("TXID: {}", txid);
+                }
+                Err(e) => {
+                    println!("SUBMIT REJECTED: {}", e);
+                }
+            }
+        }
+
+        // twap-fill <txid:idx> <rs_hex> <token_hex> <pnum> <pden> <sequence> <full|FTA>
+        //
+        // Direct twap_sell fill with a CHOSEN input sequence and volume, to
+        // drive the pacing/cap covenant checks directly:
+        //   - full-fill token_in <= mpw, seq = twin  -> ACCEPT
+        //   - full-fill token_in >  mpw, seq = twin  -> REJECT (W2 bypass pin, TW-2)
+        //   - seq < twin                             -> node reject (CSV, TW-1)
+        //   - partial FTA (<token_in) leaves a residual that must itself age
+        //     `twin` before the next fill (TW-1 spacing).
+        // twap fill-family uses the PLAIN v18 sell sigscripts (§3.3).
+        //   in  [0] twap covenant (seq = <sequence>, CSV), [1] wallet KAS+fee
+        //   full:    out[0] seller KAS, [1] delivery token_in (cov auth0), [2] change
+        //   partial: out[0] seller KAS, [1] residual (self-P2SH, cov auth0),
+        //            [2] delivery FTA (cov auth0), [3] change
+        "twap-fill" => {
+            let wallet = WalletContext::load(&wallet_path)?;
+            let privkey = *wallet.privkey_bytes();
+            let (op_txid, op_idx) = parse_outpoint(&args[2])?;
+            let rs = hex::decode(&args[3])?;
+            let token_hash = kob_core::compat::parse_hash(&args[4])
+                .map_err(|e| anyhow::anyhow!("token hash: {e:?}"))?;
+            let pnum: u64 = args[5].parse()?;
+            let pden: u64 = args[6].parse()?;
+            let sequence: u64 = args[7].parse()?;
+            let vol_arg = args.get(8).map(String::as_str).unwrap_or("full");
+
+            let p2sh = build_p2sh(&rs);
+            let addr = kaspa_address_encode("kaspatest", 8, &p2sh.script()[2..34]);
+            let rpc = NodeClient::connect(&node_url).await?;
+            let utxos = rpc.get_utxos_by_addresses(&[&addr]).await?;
+            let sell_utxo = utxos
+                .iter()
+                .find(|u| u.outpoint.transaction_id == op_txid && u.outpoint.index == op_idx)
+                .ok_or_else(|| anyhow::anyhow!("twap_sell UTXO {} not found on chain", args[2]))?;
+            let token_in = sell_utxo.utxo_entry.amount;
+            let full = vol_arg == "full";
+            let fta = if full { token_in } else { vol_arg.parse()? };
+            let seller_kas = fta.saturating_mul(pnum) / pden;
+            let residual = token_in - fta;
+            println!(
+                "twap-fill: token_in={} fta={} residual={} seller_kas={} seq={} full={}",
+                token_in, fta, residual, seller_kas, sequence, full
+            );
+
+            let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
+            let fee_utxo = wallet_utxos
+                .iter()
+                .find(|u| !u.is_p2sh() && u.utxo_entry.amount >= seller_kas + 60_000_000)
+                .ok_or_else(|| anyhow::anyhow!("no wallet UTXO large enough for KAS leg + fee"))?;
+
+            let mut wallet_spk = Vec::with_capacity(34);
+            wallet_spk.push(0x20);
+            wallet_spk.extend_from_slice(&wallet.pubkey);
+            wallet_spk.push(0xac);
+            let taker_tu = kob_core::contract::build_token_unit_p2sh_spk(&wallet.pubkey);
+
+            let mut tx = Transaction::new(1);
+            tx.lock_time = 0;
+            tx.inputs.push(TxInput {
+                prev_tx_id: op_txid.clone(),
+                prev_index: op_idx,
+                sequence,
+                sig_op_count: 0,
+                script_version: p2sh.version,
+                script_bytes: p2sh.script().to_vec(),
+                value: token_in,
+            });
+            tx.inputs.push(TxInput {
+                prev_tx_id: fee_utxo.outpoint.transaction_id.clone(),
+                prev_index: fee_utxo.outpoint.index,
+                sequence: 0,
+                sig_op_count: 1,
+                script_version: fee_utxo.utxo_entry.script_public_key.version,
+                script_bytes: fee_utxo.script_bytes(),
+                value: fee_utxo.utxo_entry.amount,
+            });
+            let est_fee = 60_000u64;
+            tx.outputs.push(TxOutput::new(seller_kas, 0, wallet_spk.clone(), None));
+            let residual_idx;
+            if full {
+                residual_idx = 0u16; // unused
+                tx.outputs.push(TxOutput::new(
+                    token_in,
+                    taker_tu.version(),
+                    taker_tu.script().to_vec(),
+                    Some(CovenantBinding::new(0, token_hash)),
+                ));
+                tx.outputs.push(TxOutput::new(
+                    fee_utxo.utxo_entry.amount - seller_kas - est_fee,
+                    0,
+                    wallet_spk.clone(),
+                    None,
+                ));
+            } else {
+                // [1] residual continuation at the twap's own P2SH (cov auth0)
+                residual_idx = 1u16;
+                tx.outputs.push(TxOutput::new(
+                    residual,
+                    p2sh.version,
+                    p2sh.script().to_vec(),
+                    Some(CovenantBinding::new(0, token_hash)),
+                ));
+                // [2] taker delivery FTA (cov auth0)
+                tx.outputs.push(TxOutput::new(
+                    fta,
+                    taker_tu.version(),
+                    taker_tu.script().to_vec(),
+                    Some(CovenantBinding::new(0, token_hash)),
+                ));
+                // [3] change
+                tx.outputs.push(TxOutput::new(
+                    fee_utxo.utxo_entry.amount - seller_kas - est_fee,
+                    0,
+                    wallet_spk.clone(),
+                    None,
+                ));
+            }
+
+            let sign_all = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
+                let mut sigs = Vec::with_capacity(2);
+                if full {
+                    sigs.push(order::build_sell_fill_sigscript(0, pnum, pden, &rs));
+                } else {
+                    sigs.push(order::build_sell_partial_fill_sigscript(
+                        0, pnum, pden, fta, residual_idx, &rs,
+                    ));
+                }
+                let sh = compute_sighash(tx, 1)?;
+                sigs.push(signing::build_p2pk_sigscript(&signing::schnorr_sign(&privkey, &sh)?));
+                Ok(sigs)
+            };
+            let sigs = sign_all(&tx)?;
+            let exact_fee = fee_with_floor(min_relay_fee(calc_mass_with_sigscripts(&tx, &sigs)));
+            let change_idx = tx.outputs.len() - 1;
+            tx.outputs[change_idx].value = fee_utxo.utxo_entry.amount - seller_kas - exact_fee;
+            let sigs = sign_all(&tx)?;
+            println!("exact fee: {} sompi", exact_fee);
+
+            let payload = to_rpc_payload(&tx, &sigs);
+            match rpc.submit_transaction(payload).await {
+                Ok(txid) => {
+                    println!("SUCCESS! twap_sell fill accepted.");
+                    println!("TXID: {}", txid);
+                    if !full {
+                        println!("residual continuation at {}:1 ({} token sompi)", txid, residual);
+                    }
+                }
+                Err(e) => {
+                    println!("SUBMIT REJECTED: {}", e);
+                }
+            }
+        }
+
         _ => {
             eprintln!("usage:");
             eprintln!("  kob-e2e-util oco-spk <tp_num> <tp_den> <tp_mfill> <sl_num> <sl_den> <sl_mfill> <mmfee_bps> <expiry>");
             eprintln!("  kob-e2e-util sell-partial <txid:idx> <rs_hex> <token_hex> <fta>");
+            eprintln!("  kob-e2e-util decay-fill <txid:idx> <rs_hex> <token_hex> <att_pnum> <att_pden> <lock_time>");
+            eprintln!("  kob-e2e-util twap-fill <txid:idx> <rs_hex> <token_hex> <pnum> <pden> <sequence> <full|FTA>");
             eprintln!("  kob-e2e-util expire <txid:idx> <rs_hex> <buy|sell> [token_hex]");
             eprintln!("  kob-e2e-util sweep-unit-kas <txid:idx> [<txid:idx> ...]");
             eprintln!("env: NODE (ws url), WALLET (wallet.json path)");

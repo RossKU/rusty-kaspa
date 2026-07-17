@@ -966,6 +966,19 @@ impl BatchPlan {
             return;
         }
 
+        // Prefer returning the over-estimate to the matcher's own WALLET-CHANGE
+        // output (the matcher overpaid the Phase-1 fee estimate from its own
+        // fee UTXO): recover it in full there, leaving seller/buyer/matcher
+        // untouched. Only plans WITHOUT a wallet-change output fall back to the
+        // matcher-fee recovery below.
+        if let Some(idx) = self.outputs.iter()
+            .position(|o| o.purpose == OutputPurpose::WalletChange)
+        {
+            self.outputs[idx].value += delta;
+            self.total_fee -= delta;
+            return;
+        }
+
         // Compute bps cap (if set)
         let max_matcher = if let Some(bps) = self.fee_bps {
             let cap_128 = self.total_seller_kas as u128 * bps as u128 / 10000;
@@ -991,6 +1004,46 @@ impl BatchPlan {
         };
 
         self.total_fee = self.total_fee.saturating_sub(recovered);
+    }
+
+    /// Raise the miner fee to at least `floor` sompi by taking the shortfall
+    /// out of the matcher-side outputs (WalletChange first, then MatcherFee) —
+    /// never seller/buyer/delivery. Returns the amount actually bumped.
+    ///
+    /// Covenant-heavy settles (the LIMITS-re-freeze 5,655B buy in the
+    /// sigscript) can carry a node transient-mass floor above the compute-mass
+    /// `min_relay_fee`; this mirrors the CLI `match-batch` `KOB_FEE_FLOOR`
+    /// override so the ENGINE can also clear that floor. It only ever reduces
+    /// the matcher's own take, so F6 / covenant checks stay valid.
+    pub fn apply_fee_floor(&mut self, floor: u64) -> u64 {
+        if floor <= self.total_fee {
+            return 0;
+        }
+        let mut need = floor - self.total_fee;
+        let bumped = need;
+        for purpose in [OutputPurpose::WalletChange, OutputPurpose::MatcherFee] {
+            if need == 0 {
+                break;
+            }
+            if let Some(o) = self.outputs.iter_mut().find(|o| o.purpose == purpose) {
+                // Keep the output spendable (>= MIN_UTXO) or drop it entirely.
+                let take = if o.value.saturating_sub(need) >= MIN_UTXO_VALUE {
+                    need
+                } else {
+                    o.value
+                };
+                o.value -= take;
+                need -= take;
+            }
+        }
+        // Drop any now-dust matcher-side outputs (value < MIN_UTXO) into the fee.
+        self.outputs.retain(|o| {
+            !(matches!(o.purpose, OutputPurpose::WalletChange | OutputPurpose::MatcherFee)
+                && o.value < MIN_UTXO_VALUE)
+        });
+        let applied = bumped - need;
+        self.total_fee += applied;
+        applied
     }
 }
 
@@ -1597,7 +1650,7 @@ fn plan_gtc_sweep_core(
     let total_planned_out = total_seller_kas + total_buyer_tokens;
 
     let num_inputs = 1 + n + if wallet_utxo.is_some() { 1 } else { 0 };
-    let num_outputs = outputs.len() + 1; // + matcher fee
+    let num_outputs = outputs.len() + 2; // + matcher fee + wallet change
     let mut total_fee = kob_core::mass::min_relay_fee(
         kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
     );
@@ -1607,14 +1660,34 @@ fn plan_gtc_sweep_core(
             available: total_kas_in,
         });
     }
-    let raw_surplus = total_kas_in - total_planned_out - total_fee;
-    let (capped_matcher_kas, _refund) = apply_bps_cap(raw_surplus, total_seller_kas, fee_bps);
+    // The MATCHER's take is bounded by the buy's OVER-ESCROW (kas_in beyond the
+    // fair value it owes the sells), then the bps cap; over-escrow beyond the
+    // cap is left to the miner (buyer protection, unchanged policy). The WALLET
+    // fee input's remainder must NOT be treated as matcher surplus — otherwise
+    // a large fee UTXO gets dumped to the miner (a multi-KAS overpay). It
+    // returns to the matcher's own wallet as change.
+    let fair_sum_u64 = fair_sum.min(u64::MAX as u128) as u64;
+    let trade_over_escrow = buy.utxo_value.saturating_sub(fair_sum_u64);
+    let (capped_matcher_kas, _refund) = apply_bps_cap(trade_over_escrow, total_seller_kas, fee_bps);
     let (matcher_surplus, dropped_to_fee) =
         emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
     total_fee += dropped_to_fee;
-    // Surplus beyond the matcher's bps cap is left to the miner fee (same
-    // policy as the v17 sibling: only ever reduces the matcher take).
-    total_fee += raw_surplus.saturating_sub(matcher_surplus + dropped_to_fee);
+    // Trade over-escrow beyond the matcher's bps cap -> miner fee.
+    total_fee += trade_over_escrow.saturating_sub(matcher_surplus + dropped_to_fee);
+    // Wallet-input change: everything left after the trade outputs, the matcher
+    // take and the (miner) fee returns to the matcher's own wallet.
+    let spent = total_planned_out + matcher_surplus + total_fee;
+    let wallet_change = total_kas_in.saturating_sub(spent);
+    if wallet_change >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: wallet_change,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::WalletChange,
+        });
+    } else {
+        total_fee += wallet_change; // dust -> miner
+    }
 
     let sell_indices: Vec<u16> = (0..n as u16).collect();
 
@@ -2262,7 +2335,7 @@ fn plan_partial_sweep_core(
     let total_planned_out = total_seller_kas + token_sum + residual;
 
     let num_inputs = 1 + n + if wallet_utxo.is_some() { 1 } else { 0 };
-    let num_outputs = outputs.len() + 1; // + matcher fee
+    let num_outputs = outputs.len() + 2; // + matcher fee + wallet change
     let mut total_fee = kob_core::mass::min_relay_fee(
         kob_core::mass::estimate_compute_mass(num_inputs, num_outputs, 0),
     );
@@ -2272,12 +2345,30 @@ fn plan_partial_sweep_core(
             available: total_kas_in,
         });
     }
-    let raw_surplus = total_kas_in - total_planned_out - total_fee;
-    let (capped_matcher_kas, _refund) = apply_bps_cap(raw_surplus, total_seller_kas, fee_bps);
+    // Matcher take = the buy's over-escrow beyond the fair value it owes the
+    // sells AND its own KAS residual (F6-capped); over-escrow beyond the cap is
+    // left to the miner (buyer protection). The WALLET fee input's remainder
+    // returns to the matcher's own wallet as change — never dumped to the miner
+    // (that was a multi-KAS overpay with a large fee UTXO).
+    let trade_over_escrow =
+        buy_kas.saturating_sub(total_seller_kas.saturating_add(residual));
+    let (capped_matcher_kas, _refund) = apply_bps_cap(trade_over_escrow, total_seller_kas, fee_bps);
     let (matcher_surplus, dropped_to_fee) =
         emit_matcher_fee(&mut outputs, capped_matcher_kas, matcher_spk, matcher_spk_version);
     total_fee += dropped_to_fee;
-    total_fee += raw_surplus.saturating_sub(matcher_surplus + dropped_to_fee);
+    total_fee += trade_over_escrow.saturating_sub(matcher_surplus + dropped_to_fee);
+    let sum_out: u64 = outputs.iter().map(|o| o.value).sum();
+    let wallet_change = total_kas_in.saturating_sub(sum_out + total_fee);
+    if wallet_change >= MIN_UTXO_VALUE {
+        outputs.push(PlannedOutput {
+            value: wallet_change,
+            script_public_key: matcher_spk.to_vec(),
+            spk_version: matcher_spk_version,
+            purpose: OutputPurpose::WalletChange,
+        });
+    } else {
+        total_fee += wallet_change; // dust -> miner
+    }
 
     let sell_indices: Vec<u16> = (0..n as u16).collect();
     let mut buy_partial_fills: HashMap<usize, (u64, u16, u16)> = HashMap::new();
@@ -3137,6 +3228,44 @@ mod tests {
         // Canonical attestation offsets: pnum at [3..11), pden at [12..20).
         assert_eq!(&tx.inputs[0].sigscript[3..11], &99u64.to_le_bytes());
         assert_eq!(&tx.inputs[0].sigscript[12..20], &100u64.to_le_bytes());
+    }
+
+    /// Regression (live Stage-G): a LARGE wallet fee input must be returned to
+    /// the matcher wallet as change, NOT dumped to the miner fee beyond the
+    /// matcher's bps cap. Before the fix, `plan_gtc_sweep_core` folded the
+    /// wallet value into the "surplus" and left everything past the cap to the
+    /// miner — a multi-KAS overpay when the fee UTXO is large.
+    #[test]
+    fn test_wallet_fee_input_returned_as_change_not_dumped() {
+        let token = [0x52; 32];
+        let sells = vec![make_sell(0x10, 100_000_000, 1, 1, token)];
+        let buys = vec![make_buy(0x20, 100_000_000, 1, 1, token, 200)]; // 2% cap
+        let big_wallet = 500_000_000u64;
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, big_wallet));
+        let plan = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(200))
+            .expect("plan");
+
+        let wc: u64 = plan.outputs.iter()
+            .filter(|o| o.purpose == OutputPurpose::WalletChange)
+            .map(|o| o.value)
+            .sum();
+        assert!(
+            wc > big_wallet - 5_000_000,
+            "wallet change {} must be ~= the fee input {} minus a small relay fee \
+             (not dumped to the miner)",
+            wc, big_wallet
+        );
+        // KAS conservation: total_in == total_out + total_fee.
+        let total_in =
+            sells.iter().map(|s| s.utxo_value).sum::<u64>() + buys[0].utxo_value + big_wallet;
+        let total_out: u64 = plan.outputs.iter().map(|o| o.value).sum();
+        assert_eq!(total_in, total_out + plan.total_fee, "KAS must balance");
+        // The fee is the real relay fee, not the whole wallet input.
+        assert!(
+            plan.total_fee < 5_000_000,
+            "fee {} must be the real relay fee, not the dumped wallet input",
+            plan.total_fee
+        );
     }
 
     /// Item D pin: >1 v18 buy per settle tx is rejected FAIL-CLOSED, BY PROOF

@@ -965,12 +965,26 @@ pub async fn execute_batch_match(
             }
         }).collect();
         let (exact_fee, delta) = plan.converge_fee_exact(&sighash_tx, &sigscripts_for_conv);
-        if delta > 0 {
+        // Opt-in transient-mass fee floor (KOB_FEE_FLOOR sompi): covenant-heavy
+        // settles (the LIMITS-re-freeze 5,655B buy in the sigscript) can carry a
+        // node transient floor above the compute-mass min_relay_fee — mirrors the
+        // CLI match-batch KOB_FEE_FLOOR. Default (unset) leaves the fee path
+        // exactly as before, so the Stage-F engine settles are untouched.
+        let fee_floor = std::env::var("KOB_FEE_FLOOR").ok().and_then(|v| v.parse::<u64>().ok());
+        if delta > 0 || fee_floor.map_or(false, |f| f > plan.total_fee) {
             info!(
                 "[BATCH] Phase 2 fee convergence: exact={}, delta={} (recovered)",
                 exact_fee, delta
             );
-            plan.apply_exact_fee(exact_fee);
+            if delta > 0 {
+                plan.apply_exact_fee(exact_fee);
+            }
+            if let Some(f) = fee_floor {
+                let bumped = plan.apply_fee_floor(f);
+                if bumped > 0 {
+                    info!("[BATCH] KOB_FEE_FLOOR raised miner fee by {} sompi -> {}", bumped, plan.total_fee);
+                }
+            }
 
             // Rebuild sighash_tx outputs and rpc_outputs from adjusted plan.
             sighash_tx.outputs.clear();
@@ -1509,9 +1523,16 @@ pub async fn execute_oco_ratchet(
             inp.sigscript.clone()
         }
     }).collect();
+    // Opt-in transient-mass fee floor (KOB_FEE_FLOOR) — same rationale as
+    // execute_batch_match: the composed ratchet tx carries the 5,655B buy RS
+    // and its own two-RS ratchet sigscript, so its node transient floor can
+    // exceed the compute-mass min_relay_fee. Absorbed from the MatcherFee
+    // output below (the ratchet earns no protocol fee, §4.7).
+    let fee_floor = std::env::var("KOB_FEE_FLOOR").ok().and_then(|v| v.parse::<u64>().ok());
     let exact_fee = kob_core::mass::min_relay_fee(
         kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts),
-    );
+    )
+    .max(fee_floor.unwrap_or(0));
     if exact_fee > batch_tx.fee {
         let deficit = exact_fee - batch_tx.fee;
         let Some(mi) = plan

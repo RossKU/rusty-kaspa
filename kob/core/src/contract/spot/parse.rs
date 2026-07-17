@@ -61,6 +61,14 @@ pub struct ParsedOrder {
     /// refund endpoint); sell = `otspkh` (blake2b of the owner's token_unit
     /// P2SH SPK, EXPIRE token refund endpoint).
     pub owner_seat_hash: Option<[u8; 32]>,
+    /// Buy-side owner batch cap (LIMITS re-freeze): max sells the covenant
+    /// lets one settle sweep against this buy (1..=BUY_ORDER_MAX_N).
+    /// None for non-buy contracts.
+    pub n_max: Option<u8>,
+    /// Sell-side owner batch cap (LIMITS re-freeze): max same-token inputs
+    /// the covenant lets ride in one settle tx with this order (1..=255).
+    /// None for non-sell contracts.
+    pub batch_max: Option<u8>,
 }
 
 /// Core buy state layout size (the v18 state = `[0x20][okspkh]` + this).
@@ -86,6 +94,8 @@ pub struct ParsedOcoSell {
     pub redeem_script: Vec<u8>,
     /// v18 owner token seat `otspkh` (None for the v1 OCO).
     pub owner_seat_hash: Option<[u8; 32]>,
+    /// Owner batch cap (ratchet_oco only; None for the plain v18 OCO).
+    pub batch_max: Option<u8>,
 }
 
 /// Parse a redeemScript to extract order parameters.
@@ -95,11 +105,12 @@ pub struct ParsedOcoSell {
 pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
     match rs.len() {
         BUY_ORDER_RS_EXPECTED_LEN => {
-            // Buy v18 (unified spot: N:M sweep + Op2 partial): the v17 145B
-            // state layout preceded by [0x20][okspkh 32B] (178B state), body
-            // dispatch signature Op10 OpRoll = 0x5a 0x7a; the RS length is
-            // the version tag.
-            if rs[BUY_ORDER_STATE_SIZE] == 0x5a
+            // Buy v18 (unified spot: N:M sweep + Op2 partial + n_max owner
+            // batch cap): `[0x01][n_max]` + the v17 145B state layout
+            // preceded by [0x20][okspkh 32B] (180B state), body dispatch
+            // signature Op11 OpRoll = 0x5b 0x7a; the RS length is the
+            // version tag.
+            if rs[BUY_ORDER_STATE_SIZE] == 0x5b
                 && rs[BUY_ORDER_STATE_SIZE + 1] == 0x7a
             {
                 return parse_buy_state(rs);
@@ -108,10 +119,11 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
         }
         SELL_ORDER_RS_EXPECTED_LEN => {
             // Sell v18 (canonical price attestation + Fix-3 partial F4 +
-            // otspkh expire seat): the v14 112B layout preceded by
-            // [0x20][otspkh 32B] (145B state), body dispatch signature Op9
-            // OpRoll = 0x59 0x7a; the RS length is the version tag.
-            if rs[SELL_ORDER_STATE_SIZE] == 0x59
+            // otspkh expire seat + batch_max owner cap):
+            // `[0x02][batch_max][0x00]` + the v14 112B layout preceded by
+            // [0x20][otspkh 32B] (148B state), body dispatch signature Op10
+            // OpRoll = 0x5a 0x7a; the RS length is the version tag.
+            if rs[SELL_ORDER_STATE_SIZE] == 0x5a
                 && rs[SELL_ORDER_STATE_SIZE + 1] == 0x7a
             {
                 return parse_sell_state(rs);
@@ -133,24 +145,27 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
             None
         }
         TWAP_SELL_RS_EXPECTED_LEN => {
-            // twap_sell: `[0x08 twin][0x08 mpw]` + the v18 sell 145B state,
-            // body dispatch signature Op11 OpRoll = 0x5b 0x7a. Book view =
+            // twap_sell: `[0x02 batch_max 0x00][0x08 twin][0x08 mpw]` + the
+            // v18 sell core state, body dispatch signature Op12 OpRoll =
+            // 0x5c 0x7a. Book view =
             // an ordinary sell (the state price IS the executing price);
             // the rate-limit fields are exposed by
             // `parse_twap_sell_redeem_script`.
             parse_twap_sell_redeem_script(rs).map(|p| p.order)
         }
         DECAY_SELL_RS_EXPECTED_LEN => {
-            // decay_sell: `[0x08 dslope][0x08 t0][0x08 t_end]` + the v18
-            // sell 145B state, body dispatch signature Op12 OpRoll =
-            // 0x5c 0x7a. Book view carries the START price (pnum at t0);
+            // decay_sell: `[0x02 batch_max 0x00][0x08 dslope][0x08 t0]`
+            // `[0x08 t_end]` + the v18 sell core state, body dispatch
+            // signature Op13 OpRoll = 0x5d 0x7a. Book view carries the
+            // START price (pnum at t0);
             // `effective_price(now)` surfacing is a Stage-B/C concern via
             // `parse_decay_sell_redeem_script` + `decay_effective_pnum`.
             parse_decay_sell_redeem_script(rs).map(|p| p.order)
         }
         DECAY_BUY_RS_EXPECTED_LEN => {
-            // decay_buy: same three fields + the v18 buy 178B state, body
-            // dispatch signature Op13 OpRoll = 0x5d 0x7a.
+            // decay_buy: `[0x01 n_max]` + the three schedule fields + the
+            // v18 buy core state, body dispatch signature Op14 OpRoll =
+            // 0x5e 0x7a.
             parse_decay_buy_redeem_script(rs).map(|p| p.order)
         }
         _ => None,
@@ -210,40 +225,42 @@ pub fn parse_twap_sell_redeem_script(rs: &[u8]) -> Option<ParsedTwapSell> {
     if rs.len() != TWAP_SELL_RS_EXPECTED_LEN {
         return None;
     }
-    // Body dispatch signature: Op11 OpRoll.
-    if rs[TWAP_SELL_STATE_SIZE] != 0x5b || rs[TWAP_SELL_STATE_SIZE + 1] != 0x7a {
+    // Body dispatch signature: Op12 OpRoll.
+    if rs[TWAP_SELL_STATE_SIZE] != 0x5c || rs[TWAP_SELL_STATE_SIZE + 1] != 0x7a {
         return None;
     }
-    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x20 {
+    if rs[0] != 0x02 || rs[2] != 0x00 || rs[3] != 0x08 || rs[12] != 0x08 || rs[21] != 0x20 {
         return None;
     }
-    let twin = u64::from_le_bytes(rs[1..9].try_into().ok()?);
-    let mpw = u64::from_le_bytes(rs[10..18].try_into().ok()?);
-    if twin < 50 || mpw == 0 {
+    let batch_max = rs[1];
+    let twin = u64::from_le_bytes(rs[4..12].try_into().ok()?);
+    let mpw = u64::from_le_bytes(rs[13..21].try_into().ok()?);
+    if batch_max == 0 || twin < 50 || mpw == 0 {
         return None;
     }
     let mut seat = [0u8; 32];
-    seat.copy_from_slice(&rs[19..51]);
-    let mut o = parse_sell_state_at(rs, 51)?;
+    seat.copy_from_slice(&rs[22..54]);
+    let mut o = parse_sell_state_at(rs, 54)?;
     o.version = crate::contract::spot::SPOT_GENERATION as u8;
     o.owner_seat_hash = Some(seat);
+    o.batch_max = Some(batch_max);
     Some(ParsedTwapSell { twin, mpw, order: o })
 }
 
 /// Shared decay-field header parse: `[0x08 dslope][0x08 t0][0x08 t_end]`
-/// `[0x20 seat]` at RS offset 0; returns (dslope, t0, t_end, seat).
-fn parse_decay_header(rs: &[u8]) -> Option<(u64, u64, u64, [u8; 32])> {
-    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x08 || rs[27] != 0x20 {
+/// `[0x20 seat]` at RS offset `off`; returns (dslope, t0, t_end, seat).
+fn parse_decay_header(rs: &[u8], off: usize) -> Option<(u64, u64, u64, [u8; 32])> {
+    if rs[off] != 0x08 || rs[off + 9] != 0x08 || rs[off + 18] != 0x08 || rs[off + 27] != 0x20 {
         return None;
     }
-    let dslope = u64::from_le_bytes(rs[1..9].try_into().ok()?);
-    let t0 = u64::from_le_bytes(rs[10..18].try_into().ok()?);
-    let t_end = u64::from_le_bytes(rs[19..27].try_into().ok()?);
+    let dslope = u64::from_le_bytes(rs[off + 1..off + 9].try_into().ok()?);
+    let t0 = u64::from_le_bytes(rs[off + 10..off + 18].try_into().ok()?);
+    let t_end = u64::from_le_bytes(rs[off + 19..off + 27].try_into().ok()?);
     if dslope == 0 || t0 >= t_end {
         return None;
     }
     let mut seat = [0u8; 32];
-    seat.copy_from_slice(&rs[28..60]);
+    seat.copy_from_slice(&rs[off + 28..off + 60]);
     Some((dslope, t0, t_end, seat))
 }
 
@@ -252,14 +269,19 @@ pub fn parse_decay_sell_redeem_script(rs: &[u8]) -> Option<ParsedDecayOrder> {
     if rs.len() != DECAY_SELL_RS_EXPECTED_LEN {
         return None;
     }
-    // Body dispatch signature: Op12 OpRoll.
-    if rs[DECAY_SELL_STATE_SIZE] != 0x5c || rs[DECAY_SELL_STATE_SIZE + 1] != 0x7a {
+    // Body dispatch signature: Op13 OpRoll.
+    if rs[DECAY_SELL_STATE_SIZE] != 0x5d || rs[DECAY_SELL_STATE_SIZE + 1] != 0x7a {
         return None;
     }
-    let (dslope, t0, t_end, seat) = parse_decay_header(rs)?;
-    let mut o = parse_sell_state_at(rs, 60)?;
+    if rs[0] != 0x02 || rs[2] != 0x00 || rs[1] == 0 {
+        return None;
+    }
+    let batch_max = rs[1];
+    let (dslope, t0, t_end, seat) = parse_decay_header(rs, 3)?;
+    let mut o = parse_sell_state_at(rs, 63)?;
     o.version = crate::contract::spot::SPOT_GENERATION as u8;
     o.owner_seat_hash = Some(seat);
+    o.batch_max = Some(batch_max);
     Some(ParsedDecayOrder { dslope, t0, t_end, order: o })
 }
 
@@ -268,44 +290,61 @@ pub fn parse_decay_buy_redeem_script(rs: &[u8]) -> Option<ParsedDecayOrder> {
     if rs.len() != DECAY_BUY_RS_EXPECTED_LEN {
         return None;
     }
-    // Body dispatch signature: Op13 OpRoll.
-    if rs[DECAY_BUY_STATE_SIZE] != 0x5d || rs[DECAY_BUY_STATE_SIZE + 1] != 0x7a {
+    // Body dispatch signature: Op14 OpRoll.
+    if rs[DECAY_BUY_STATE_SIZE] != 0x5e || rs[DECAY_BUY_STATE_SIZE + 1] != 0x7a {
         return None;
     }
-    let (dslope, t0, t_end, seat) = parse_decay_header(rs)?;
-    let mut o = parse_buy_state_at(rs, 60)?;
+    if rs[0] != 0x01 {
+        return None;
+    }
+    let n_max = rs[1];
+    if n_max == 0 || n_max as usize > crate::contract::spot::order::BUY_ORDER_MAX_N {
+        return None;
+    }
+    let (dslope, t0, t_end, seat) = parse_decay_header(rs, 2)?;
+    let mut o = parse_buy_state_at(rs, 62)?;
     o.version = crate::contract::spot::SPOT_GENERATION as u8;
     o.owner_seat_hash = Some(seat);
+    o.n_max = Some(n_max);
     Some(ParsedDecayOrder { dslope, t0, t_end, order: o })
 }
 
-/// Parse a ratchet_oco redeemScript (208B state + body).
+/// Parse a ratchet_oco redeemScript (211B state + body).
 ///
-/// State layout: `[0x08 rstep][0x08 rgap][0x08 rwin][0x08 mrv]` at [0..36),
-/// then the v18 OCO 172B layout at offset 36 (`[0x20 otspkh]` + the 139B
-/// core; pnum_sl VALUE at [97..105)).
+/// State layout: `[0x02 batch_max 0x00]` at [0..3), then
+/// `[0x08 rstep][0x08 rgap][0x08 rwin][0x08 mrv]` at [3..39),
+/// then the v18 OCO 172B layout at offset 39 (`[0x20 otspkh]` + the 139B
+/// core; pnum_sl VALUE at [100..108)).
 pub fn parse_ratchet_oco_redeem_script(rs: &[u8]) -> Option<ParsedRatchetOco> {
     if rs.len() != RATCHET_OCO_RS_EXPECTED_LEN {
         return None;
     }
-    // Body dispatch signature: Op16 OpRoll.
-    if rs[RATCHET_OCO_STATE_SIZE] != 0x60 || rs[RATCHET_OCO_STATE_SIZE + 1] != 0x7a {
+    // Body dispatch signature: OpData1 17 OpRoll (depth 17 > 16 needs a
+    // data push, not an OP_N).
+    if rs[RATCHET_OCO_STATE_SIZE] != 0x01
+        || rs[RATCHET_OCO_STATE_SIZE + 1] != 0x11
+        || rs[RATCHET_OCO_STATE_SIZE + 2] != 0x7a
+    {
         return None;
     }
-    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x08 || rs[27] != 0x08 || rs[36] != 0x20 {
+    if rs[0] != 0x02 || rs[2] != 0x00 {
         return None;
     }
-    let rstep = u64::from_le_bytes(rs[1..9].try_into().ok()?);
-    let rgap = u64::from_le_bytes(rs[10..18].try_into().ok()?);
-    let rwin = u64::from_le_bytes(rs[19..27].try_into().ok()?);
-    let mrv = u64::from_le_bytes(rs[28..36].try_into().ok()?);
-    if rstep == 0 || rwin < 50 || mrv == 0 {
+    if rs[3] != 0x08 || rs[12] != 0x08 || rs[21] != 0x08 || rs[30] != 0x08 || rs[39] != 0x20 {
+        return None;
+    }
+    let batch_max = rs[1];
+    let rstep = u64::from_le_bytes(rs[4..12].try_into().ok()?);
+    let rgap = u64::from_le_bytes(rs[13..21].try_into().ok()?);
+    let rwin = u64::from_le_bytes(rs[22..30].try_into().ok()?);
+    let mrv = u64::from_le_bytes(rs[31..39].try_into().ok()?);
+    if batch_max == 0 || rstep == 0 || rwin < 50 || mrv == 0 {
         return None;
     }
     let mut seat = [0u8; 32];
-    seat.copy_from_slice(&rs[37..69]);
-    // v18 OCO core 139B layout at offset 69.
-    let s = &rs[69..69 + OCO_SELL_CORE_STATE_SIZE];
+    seat.copy_from_slice(&rs[40..72]);
+    // v18 OCO core 139B layout at offset 72.
+    let s = &rs[72..72 + OCO_SELL_CORE_STATE_SIZE];
     if s[0] != 0x08 || s[9] != 0x08 || s[18] != 0x08 { return None; }
     if s[27] != 0x08 || s[36] != 0x08 || s[45] != 0x08 { return None; }
     if s[54] != 0x20 || s[87] != 0x20 { return None; }
@@ -349,6 +388,7 @@ pub fn parse_ratchet_oco_redeem_script(rs: &[u8]) -> Option<ParsedRatchetOco> {
             expiry_daa: if expiry_daa_raw > 0 { Some(expiry_daa_raw) } else { None },
             redeem_script: rs.to_vec(),
             owner_seat_hash: Some(seat),
+            batch_max: Some(batch_max),
         },
     })
 }
@@ -380,19 +420,28 @@ pub fn parse_oco_sell_redeem_script(rs: &[u8]) -> Option<ParsedOcoSell> {
 ///   [0x08][mmfee 8B]    = bytes 126..135
 ///   [cpend 1B]          = byte 135
 ///   [0x08][expiry 8B]   = bytes 136..145
-/// Parse a v18 buy state (178B): `[0x20][okspkh 32B]` + the 145B layout.
+/// Parse a v18 buy state (180B): `[0x01][n_max]` + `[0x20][okspkh 32B]` +
+/// the 145B layout.
 fn parse_buy_state(rs: &[u8]) -> Option<ParsedOrder> {
     if rs.len() < BUY_ORDER_STATE_SIZE {
         return None;
     }
-    if rs[0] != 0x20 {
+    if rs[0] != 0x01 {
+        return None;
+    }
+    let n_max = rs[1];
+    if n_max == 0 || n_max as usize > crate::contract::spot::order::BUY_ORDER_MAX_N {
+        return None;
+    }
+    if rs[2] != 0x20 {
         return None;
     }
     let mut seat = [0u8; 32];
-    seat.copy_from_slice(&rs[1..33]);
-    let mut o = parse_buy_state_at(rs, 33)?;
+    seat.copy_from_slice(&rs[3..35]);
+    let mut o = parse_buy_state_at(rs, 35)?;
     o.version = crate::contract::spot::SPOT_GENERATION as u8;
     o.owner_seat_hash = Some(seat);
+    o.n_max = Some(n_max);
     Some(o)
 }
 
@@ -452,6 +501,8 @@ fn parse_buy_state_at(rs: &[u8], base: usize) -> Option<ParsedOrder> {
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
         ifd_order_b_rs: None,
         owner_seat_hash: None,
+        n_max: None,
+        batch_max: None,
     })
 }
 
@@ -466,19 +517,25 @@ fn parse_buy_state_at(rs: &[u8], base: usize) -> Option<ParsedOrder> {
 ///   [0x08][mmfee 8B]    = bytes 93..102
 ///   [cpend 1B]          = byte 102
 ///   [0x08][expiry 8B]   = bytes 103..112
-/// Parse a v18 sell state (145B): `[0x20][otspkh 32B]` + the 112B layout.
+/// Parse a v18 sell state (148B): `[0x02][batch_max][0x00]` +
+/// `[0x20][otspkh 32B]` + the 112B layout.
 fn parse_sell_state(rs: &[u8]) -> Option<ParsedOrder> {
     if rs.len() < SELL_ORDER_STATE_SIZE {
         return None;
     }
-    if rs[0] != 0x20 {
+    if rs[0] != 0x02 || rs[2] != 0x00 || rs[1] == 0 {
+        return None;
+    }
+    let batch_max = rs[1];
+    if rs[3] != 0x20 {
         return None;
     }
     let mut seat = [0u8; 32];
-    seat.copy_from_slice(&rs[1..33]);
-    let mut o = parse_sell_state_at(rs, 33)?;
+    seat.copy_from_slice(&rs[4..36]);
+    let mut o = parse_sell_state_at(rs, 36)?;
     o.version = crate::contract::spot::SPOT_GENERATION as u8;
     o.owner_seat_hash = Some(seat);
+    o.batch_max = Some(batch_max);
     Some(o)
 }
 
@@ -534,6 +591,8 @@ fn parse_sell_state_at(rs: &[u8], base: usize) -> Option<ParsedOrder> {
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
         ifd_order_b_rs: None,
         owner_seat_hash: None,
+        n_max: None,
+        batch_max: None,
     })
 }
 
@@ -619,6 +678,8 @@ fn parse_bracket_state(rs: &[u8]) -> Option<ParsedOrder> {
         expiry_daa: None,
         ifd_order_b_rs: None,
         owner_seat_hash: None,
+        n_max: None,
+        batch_max: None,
     })
 }
 
@@ -699,6 +760,7 @@ fn parse_oco_sell_state(rs: &[u8], base: usize) -> Option<ParsedOcoSell> {
         expiry_daa: if expiry_daa_raw > 0 { Some(expiry_daa_raw) } else { None },
         redeem_script: rs.to_vec(),
         owner_seat_hash: seat,
+        batch_max: None,
     })
 }
 
@@ -729,6 +791,8 @@ impl ParsedOcoSell {
             expiry_daa: self.expiry_daa,
             ifd_order_b_rs: None,
             owner_seat_hash: self.owner_seat_hash,
+            n_max: None,
+            batch_max: self.batch_max,
         }
     }
 }

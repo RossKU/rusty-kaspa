@@ -985,6 +985,13 @@ pub enum DeployCommands {
         /// When set, --max-matcher-fee is ignored. Default: 30.
         #[arg(long)]
         mmfee_bps: Option<u64>,
+
+        /// Owner batch cap (LIMITS re-freeze): max sells the covenant lets
+        /// one settle sweep against this buy (1..=32). Batch size = blast
+        /// radius — one double-spent input kills the whole settle. Default:
+        /// 32 (= MAX_N).
+        #[arg(long)]
+        n_max: Option<u8>,
     },
 
     /// Deploy a sell order (lock tokens, request KAS).
@@ -1079,6 +1086,13 @@ pub enum DeployCommands {
         /// E.g., 30 = 0.30% of trade value. Range: 0..=10000. Default: 30.
         #[arg(long)]
         mmfee_bps: Option<u64>,
+
+        /// Owner batch cap (LIMITS re-freeze): max same-token inputs the
+        /// covenant lets ride in one settle tx with this sell (1..=255).
+        /// Batch size = blast radius — one double-spent input kills the
+        /// whole settle. Default: 255.
+        #[arg(long)]
+        batch_max: Option<u8>,
     },
 
     /// Deploy a bracket order (OTOCO: entry + take-profit + stop-loss).
@@ -1766,6 +1780,7 @@ pub async fn dispatch(
                 post_only,
                 max_matcher_fee,
                 mmfee_bps,
+                n_max,
             } => {
 
                 // Resolve token alias
@@ -1854,6 +1869,7 @@ pub async fn dispatch(
                     expiry,
                     max_matcher_fee,
                     mmfee_bps,
+                    n_max,
                 )
                 .await?;
                 if tif_policy != tif::TimeInForce::Gtc {
@@ -1895,6 +1911,7 @@ pub async fn dispatch(
                 fee_utxo,
                 max_matcher_fee,
                 mmfee_bps,
+                batch_max,
             } => {
                 // Resolve token alias
                 let token = if let Some(t) = token {
@@ -1990,6 +2007,7 @@ pub async fn dispatch(
                     expiry,
                     max_matcher_fee,
                     mmfee_bps,
+                    batch_max,
                     token_utxo.as_deref(),
                     fee_utxo.as_deref(),
                 )

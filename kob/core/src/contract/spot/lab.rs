@@ -2,7 +2,7 @@
 //! measurement campaign recorded in `kob/BATCH_LIMITS.md`.
 //!
 //! The SHIPPING buy covenant is `order::build_buy_body()` with the frozen
-//! `BUY_ORDER_MAX_N = 8`. This module builds byte-compatible EXPERIMENTAL
+//! `BUY_ORDER_MAX_N = 32` (LIMITS re-freeze). This module builds EXPERIMENTAL
 //! variants whose only difference is the unrolled sweep slot count `max_n`
 //! (the same `emit_fill_body` / `emit_partial_body` emitters, so per-term
 //! semantics are identical). They exist to measure where one settle
@@ -11,9 +11,11 @@
 //! dispatches on the shipping RS lengths and every deploy path bails on
 //! anything else.
 //!
-//! Invariant pinned by `lab_max_n_8_matches_shipping_bytes`: `max_n == 8`
-//! reproduces the shipping RS byte-for-byte, so measurements at other
-//! `max_n` differ from the product only by the slot count.
+//! Invariant pinned by `lab_max_n_32_matches_shipping_bytes`: `max_n == 32`
+//! (the shipping `BUY_ORDER_MAX_N` since the LIMITS re-freeze) reproduces
+//! the shipping RS byte-for-byte, so measurements at other `max_n` differ
+//! from the product only by the slot count (and the derived `max_n + 2`
+//! partial-guard scan).
 
 use super::order::{
     emit_cancel_body, emit_fill_body, emit_partial_body, ops, e_num,
@@ -23,13 +25,13 @@ use crate::primitives::{push_data, u64_le};
 use crate::contract::helpers::{gcd, push_index};
 
 /// Build an EXPERIMENTAL v18-shaped buy body with `max_n` sweep slots.
-/// `max_n = 8` is byte-identical to the shipping `build_buy_body()`.
+/// `max_n = 32` is byte-identical to the shipping `build_buy_body()`.
 pub fn build_buy_body_lab(max_n: usize) -> Vec<u8> {
     use ops::*;
-    let mut b: Vec<u8> = Vec::with_capacity(2048);
+    let mut b: Vec<u8> = Vec::with_capacity(8192);
 
     // ===== DISPATCH (identical to order::build_buy_body) =====
-    e_num(&mut b, 10);
+    e_num(&mut b, 11);
     b.push(ROLL);
 
     b.push(DUP);
@@ -53,10 +55,9 @@ pub fn build_buy_body_lab(max_n: usize) -> Vec<u8> {
         b.push(TXINPUTAMOUNT);
         b.push(GTE);
         b.push(VERIFY);
-        for _ in 0..4 {
+        for _ in 0..5 {
             b.push(TWO_DROP);
         }
-        b.push(DROP);
     }
     b.push(ELSE);
     {
@@ -104,9 +105,11 @@ pub fn build_buy_body_lab(max_n: usize) -> Vec<u8> {
     b
 }
 
-/// Build an EXPERIMENTAL buy redeemScript (178B shipping state layout +
-/// `build_buy_body_lab(max_n)`). Same argument semantics as
-/// `order::build_buy_redeem_script`.
+/// Build an EXPERIMENTAL buy redeemScript (shipping state layout with
+/// `n_max = max_n` + `build_buy_body_lab(max_n)`). Same argument semantics
+/// as `order::build_buy_redeem_script`. For `max_n <= 127` the n_max field
+/// is the shipping fixed `[0x01][v]` push; larger lab variants use a 2-byte
+/// zero-padded push (the body reads it by STACK depth, not byte offset).
 #[allow(clippy::too_many_arguments)]
 pub fn build_buy_redeem_script_lab(
     max_n: usize,
@@ -132,6 +135,14 @@ pub fn build_buy_redeem_script_lab(
     let price_den = if g > 0 { price_den / g } else { price_den };
     let body = build_buy_body_lab(max_n);
     let mut rs = Vec::with_capacity(BUY_ORDER_STATE_SIZE + body.len());
+    if max_n <= 127 {
+        rs.push(0x01); // n_max (shipping encoding at max_n = 32)
+        rs.push(max_n as u8);
+    } else {
+        rs.push(0x02); // large lab variants: keep the value positive
+        rs.push((max_n & 0xff) as u8);
+        rs.push((max_n >> 8) as u8);
+    }
     rs.push(0x20);
     rs.extend_from_slice(owner_kas_spk_hash);
     rs.push(0x20);
@@ -212,21 +223,21 @@ mod tests {
         BUY_ORDER_RS_EXPECTED_LEN,
     };
 
-    /// The lab builder at max_n=8 must reproduce the SHIPPING bytecode
+    /// The lab builder at max_n=32 must reproduce the SHIPPING bytecode
     /// byte-for-byte — the measurement variants differ only in slot count.
     #[test]
-    fn lab_max_n_8_matches_shipping_bytes() {
-        assert_eq!(build_buy_body_lab(8), build_buy_body());
+    fn lab_max_n_32_matches_shipping_bytes() {
+        assert_eq!(build_buy_body_lab(32), build_buy_body());
         let tcid = [0x11u8; 32];
         let h = [0x22u8; 32];
         let ship = build_buy_redeem_script(&tcid, 3, 7, 1000, &h, &h, &h, 30, 0, 0).unwrap();
         let lab =
-            build_buy_redeem_script_lab(8, &tcid, 3, 7, 1000, &h, &h, &h, 30, 0, 0).unwrap();
+            build_buy_redeem_script_lab(32, &tcid, 3, 7, 1000, &h, &h, &h, 30, 0, 0).unwrap();
         assert_eq!(ship, lab);
         assert_eq!(ship.len(), BUY_ORDER_RS_EXPECTED_LEN);
         assert_eq!(
             build_buy_fill_sigscript(&[0, 1, 2], false, &ship),
-            build_buy_fill_sigscript_lab(8, &[0, 1, 2], false, &lab),
+            build_buy_fill_sigscript_lab(32, &[0, 1, 2], false, &lab),
         );
     }
 }

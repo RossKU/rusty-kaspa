@@ -1,6 +1,6 @@
 use crate::primitives::u64_le;
 use crate::contract::helpers::gcd;
-use crate::contract::spot::order::{e_num, e_pick, e_roll, ops};
+use crate::contract::spot::order::{e_num, e_pick, e_roll, emit_sell_batch_cap, ops};
 
 // ============================================================================
 // `twap_sell` — rate-limited sell (consensus CSV clock)
@@ -32,10 +32,13 @@ use crate::contract::spot::order::{e_num, e_pick, e_roll, ops};
 // ≤ mpw/twin, worst-case burst = mpw. The first fill also waits twin from
 // DEPLOY (the deploy UTXO's age gates it) — accepted and documented.
 //
-// State (163B = 18 + v18 sell 145), new fields PREPENDED:
-//   [0x08][twin 8B] [0x08][mpw 8B]  ‖  v18 sell 145B layout unchanged
-// stack at body start (11): expiry(0) … otspkh(8) mpw(9) twin(10);
-// selector at 11 (v18 sell: 9).
+// State (166B = 3 + 18 + v18 sell 145), new fields PREPENDED (the LIMITS
+// re-freeze adds the owner batch cap `[0x02][batch_max][0x00]` at the very
+// front = deepest on stack):
+//   [0x02][batch_max][0x00] [0x08][twin 8B] [0x08][mpw 8B]
+//   ‖ v18 sell 145B layout unchanged
+// stack at body start (12): expiry(0) … otspkh(8) mpw(9) twin(10)
+// batch_max(11); selector at 12 (v18 sell: 10).
 //
 // Engine note: fill-family inputs must carry `sequence = max(50, twin)` =
 // twin (builder enforces twin ≥ 50, which also covers the exposure delay).
@@ -49,15 +52,15 @@ use crate::contract::spot::order::{e_num, e_pick, e_roll, ops};
 
 /// Build the twap_sell body.
 ///
-/// Stack after state push (11 items):
+/// Stack after state push (12 items):
 ///   expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4), mfill(5), pden(6),
-///   pnum(7), otspkh(8), mpw(9), twin(10); selector at depth 11.
+///   pnum(7), otspkh(8), mpw(9), twin(10), batch_max(11); selector at 12.
 pub fn build_twap_sell_body() -> Vec<u8> {
     use ops::*;
     let mut b: Vec<u8> = Vec::with_capacity(512);
 
-    // ===== DISPATCH: selector (depth 11) to top =====
-    e_roll(&mut b, 11);
+    // ===== DISPATCH: selector (depth 12) to top =====
+    e_roll(&mut b, 12);
     b.push(DUP);
     e_num(&mut b, 4);
     b.push(EQUAL);
@@ -68,7 +71,7 @@ pub fn build_twap_sell_body() -> Vec<u8> {
         b.push(VERIFY); // expiry != 0 (GTC guard)
         b.push(CLTV);
         // stack: cpend(0), mmfee(1), sspkh(2), ohash(3), mfill(4), pden(5),
-        //        pnum(6), otspkh(7), mpw(8), twin(9)
+        //        pnum(6), otspkh(7), mpw(8), twin(9), batch_max(10)
         b.push(TXINPUTINDEX);
         b.push(OP0);
         b.push(AUTHOUTPUTIDX); // r = auth_outputs[self][0]
@@ -89,10 +92,11 @@ pub fn build_twap_sell_body() -> Vec<u8> {
         b.push(TXINPUTAMOUNT);
         b.push(GTE);
         b.push(VERIFY); // full refund
-        // 10 items: cpend..twin
+        // 11 items: cpend..batch_max
         for _ in 0..5 {
             b.push(TWO_DROP);
         }
+        b.push(DROP);
     }
     b.push(ELSE);
     {
@@ -150,7 +154,7 @@ pub fn build_twap_sell_body() -> Vec<u8> {
 ///
 /// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
 ///   ohash(4), mfill(5), pden(6), pnum(7), otspkh(8), mpw(9), twin(10),
-///   pden_att(11), pnum_att(12), koi(13)
+///   batch_max(11), pden_att(12), pnum_att(13), koi(14)
 fn emit_twap_sell_fill(b: &mut Vec<u8>) {
     use ops::*;
     // time gate
@@ -171,8 +175,11 @@ fn emit_twap_sell_fill(b: &mut Vec<u8>) {
     b.push(OP0);
     b.push(EQUAL);
     b.push(VERIFY);
-    // base(12): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
-    //   otspkh(6), mpw(7), twin(8), pden_att(9), pnum_att(10), koi(11)
+    // base(13): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
+    //   otspkh(6), mpw(7), twin(8), batch_max(9), pden_att(10), pnum_att(11),
+    //   koi(12)
+    // Owner batch cap (covenant-enforced): same-token input count <= batch_max.
+    emit_sell_batch_cap(b, 9);
     // W1: consensus real-age gate (T3): UTXO age >= twin.
     e_pick(b, 8); // twin
     b.push(CSV);
@@ -183,12 +190,12 @@ fn emit_twap_sell_fill(b: &mut Vec<u8>) {
     b.push(SWAP); // [mpw, vol]
     b.push(GTE);
     b.push(VERIFY); // mpw >= vol
-    // ATTESTATION: attested pair == state pair (v18-identical, +2 depths)
-    e_pick(b, 10); // pnum_att
+    // ATTESTATION: attested pair == state pair (v18-identical, +3 depths)
+    e_pick(b, 11); // pnum_att
     e_pick(b, 6); // pnum (5 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    e_pick(b, 9); // pden_att
+    e_pick(b, 10); // pden_att
     e_pick(b, 5); // pden (4 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
@@ -204,13 +211,13 @@ fn emit_twap_sell_fill(b: &mut Vec<u8>) {
     b.push(GTE);
     b.push(VERIFY);
     // KAS output >= expected_kas
-    e_pick(b, 12); // koi (11 + 1)
+    e_pick(b, 13); // koi (12 + 1)
     b.push(TXOUTPUTAMOUNT);
     b.push(SWAP);
     b.push(GTE);
     b.push(VERIFY);
     // F2: seller SPK hash
-    e_pick(b, 11); // koi
+    e_pick(b, 12); // koi
     b.push(TXOUTPUTSPK);
     b.push(BLAKE2B);
     e_pick(b, 2); // sspkh (1 + 1)
@@ -231,16 +238,17 @@ fn emit_twap_sell_fill(b: &mut Vec<u8>) {
     b.push(TXINPUTAMOUNT);
     b.push(GTE);
     b.push(VERIFY);
-    // cleanup: 12 items
+    // cleanup: 13 items
     for _ in 0..6 {
         b.push(TWO_DROP);
     }
+    b.push(DROP);
 }
 
 /// twap_sell IOC FILL (selector 5). Sigscript = v18 sell IOC shape.
 ///
 /// Entry (stale selector dropped): expiry(0)..otspkh(8), mpw(9), twin(10),
-///   fta(11), pden_att(12), pnum_att(13), koi(14)
+///   batch_max(11), fta(12), pden_att(13), pnum_att(14), koi(15)
 fn emit_twap_sell_ioc(b: &mut Vec<u8>) {
     use ops::*;
     b.push(DUP);
@@ -258,102 +266,15 @@ fn emit_twap_sell_ioc(b: &mut Vec<u8>) {
     b.push(OP0);
     b.push(EQUAL);
     b.push(VERIFY);
-    // base(13): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
-    //   otspkh(6), mpw(7), twin(8), fta(9), pden_att(10), pnum_att(11),
-    //   koi(12)
+    // base(14): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
+    //   otspkh(6), mpw(7), twin(8), batch_max(9), fta(10), pden_att(11),
+    //   pnum_att(12), koi(13)
+    // Owner batch cap.
+    emit_sell_batch_cap(b, 9);
     // W1
     e_pick(b, 8); // twin
     b.push(CSV);
     // W2: vol = fta (IOC form)
-    e_pick(b, 9); // fta
-    e_pick(b, 8); // mpw (7 + 1 for vol)
-    b.push(SWAP); // [mpw, vol]
-    b.push(GTE);
-    b.push(VERIFY); // mpw >= vol
-    // ATTESTATION
-    e_pick(b, 11); // pnum_att
-    e_pick(b, 6); // pnum (5 + 1)
-    b.push(EQUAL);
-    b.push(VERIFY);
-    e_pick(b, 10); // pden_att
-    e_pick(b, 5); // pden (4 + 1)
-    b.push(EQUAL);
-    b.push(VERIFY);
-    // fill_kas = fta * pnum / pden, >= mfill
-    e_pick(b, 9); // fta
-    e_pick(b, 6); // pnum (5 + 1)
-    b.push(MUL);
-    e_pick(b, 5); // pden (4 + 1)
-    b.push(DIV);
-    b.push(DUP);
-    e_pick(b, 5); // mfill (3 + 2)
-    b.push(GTE);
-    b.push(VERIFY);
-    // KAS output >= fill_kas
-    e_pick(b, 13); // koi (12 + 1)
-    b.push(TXOUTPUTAMOUNT);
-    b.push(SWAP);
-    b.push(GTE);
-    b.push(VERIFY);
-    // F2: seller SPK hash
-    e_pick(b, 12); // koi
-    b.push(TXOUTPUTSPK);
-    b.push(BLAKE2B);
-    e_pick(b, 2); // sspkh (1 + 1)
-    b.push(EQUAL);
-    b.push(VERIFY);
-    // F4: residual conservation (self-SPK continuation >= token_in - fta)
-    b.push(TXINPUTINDEX);
-    b.push(OP0);
-    b.push(AUTHOUTPUTIDX);
-    b.push(DUP);
-    b.push(TXOUTPUTSPK);
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTSPK);
-    b.push(EQUAL);
-    b.push(VERIFY);
-    b.push(TXOUTPUTAMOUNT);
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTAMOUNT);
-    e_pick(b, 11); // fta (9 + 2)
-    b.push(SUB);
-    b.push(GTE);
-    b.push(VERIFY);
-    // cleanup: 13 items
-    for _ in 0..6 {
-        b.push(TWO_DROP);
-    }
-    b.push(DROP);
-}
-
-/// twap_sell PARTIAL FILL (selector 2). Sigscript = v18 sell partial shape.
-///
-/// Entry (selector consumed): expiry(0)..otspkh(8), mpw(9), twin(10), ri(11),
-///   fta(12), pden_att(13), pnum_att(14), koi(15)
-fn emit_twap_sell_partial(b: &mut Vec<u8>) {
-    use ops::*;
-    b.push(DUP);
-    b.push(OP0);
-    b.push(NUMEQUAL);
-    b.push(NOTIF);
-    b.push(DUP);
-    b.push(TXLOCKTIME);
-    b.push(GT);
-    b.push(VERIFY);
-    b.push(ENDIF);
-    b.push(DROP);
-    e_num(b, 50);
-    b.push(CSV);
-    b.push(OP0);
-    b.push(EQUAL);
-    b.push(VERIFY);
-    // base(14): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
-    //   otspkh(6), mpw(7), twin(8), ri(9), fta(10), pden_att(11),
-    //   pnum_att(12), koi(13)
-    // W1
-    e_pick(b, 8); // twin
-    b.push(CSV);
-    // W2: vol = fta (PARTIAL form)
     e_pick(b, 10); // fta
     e_pick(b, 8); // mpw (7 + 1 for vol)
     b.push(SWAP); // [mpw, vol]
@@ -368,66 +289,30 @@ fn emit_twap_sell_partial(b: &mut Vec<u8>) {
     e_pick(b, 5); // pden (4 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    // fill_kas = fta * pnum / pden, >= mfill (keeps an fta copy on stack)
+    // fill_kas = fta * pnum / pden, >= mfill
     e_pick(b, 10); // fta
-    b.push(DUP);
-    e_pick(b, 7); // pnum (5 + 2)
-    b.push(MUL);
-    e_pick(b, 6); // pden (4 + 2)
-    b.push(DIV);
-    b.push(DUP);
-    e_pick(b, 6); // mfill (3 + 3)
-    b.push(GTE);
-    b.push(VERIFY);
-    // KAS output >= fill_kas
-    e_pick(b, 15); // koi (13 + 2)
-    b.push(TXOUTPUTAMOUNT);
-    b.push(SWAP);
-    b.push(GTE);
-    b.push(VERIFY);
-    // partial guard: token_in > fta
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTAMOUNT);
-    e_pick(b, 1); // fta copy
-    b.push(GT);
-    b.push(VERIFY);
-    // residual output SPK == own SPK (D&R continuation)
-    e_pick(b, 10); // ri (9 + 1)
-    b.push(TXOUTPUTSPK);
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTSPK);
-    b.push(EQUAL);
-    b.push(VERIFY);
-    // residual output value >= token_in - fta (consumes the fta copy)
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTAMOUNT);
-    e_roll(b, 1);
-    b.push(SUB);
-    e_pick(b, 10); // ri (9 + 1)
-    b.push(TXOUTPUTAMOUNT);
-    b.push(SWAP);
-    b.push(GTE);
-    b.push(VERIFY);
-    // residual-fill floor: (token_in - fta) * pnum / pden >= mfill
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTAMOUNT);
-    e_pick(b, 11); // fta (10 + 1)
-    b.push(SUB);
     e_pick(b, 6); // pnum (5 + 1)
     b.push(MUL);
     e_pick(b, 5); // pden (4 + 1)
     b.push(DIV);
-    e_pick(b, 4); // mfill (3 + 1)
+    b.push(DUP);
+    e_pick(b, 5); // mfill (3 + 2)
     b.push(GTE);
     b.push(VERIFY);
-    // F2: seller SPK hash on koi
+    // KAS output >= fill_kas
+    e_pick(b, 14); // koi (13 + 1)
+    b.push(TXOUTPUTAMOUNT);
+    b.push(SWAP);
+    b.push(GTE);
+    b.push(VERIFY);
+    // F2: seller SPK hash
     e_pick(b, 13); // koi
     b.push(TXOUTPUTSPK);
     b.push(BLAKE2B);
     e_pick(b, 2); // sspkh (1 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    // F4 (Fix-3): self-SPK residual worth >= token_in - fta
+    // F4: residual conservation (self-SPK continuation >= token_in - fta)
     b.push(TXINPUTINDEX);
     b.push(OP0);
     b.push(AUTHOUTPUTIDX);
@@ -450,11 +335,138 @@ fn emit_twap_sell_partial(b: &mut Vec<u8>) {
     }
 }
 
+/// twap_sell PARTIAL FILL (selector 2). Sigscript = v18 sell partial shape.
+///
+/// Entry (selector consumed): expiry(0)..otspkh(8), mpw(9), twin(10),
+///   batch_max(11), ri(12), fta(13), pden_att(14), pnum_att(15), koi(16)
+fn emit_twap_sell_partial(b: &mut Vec<u8>) {
+    use ops::*;
+    b.push(DUP);
+    b.push(OP0);
+    b.push(NUMEQUAL);
+    b.push(NOTIF);
+    b.push(DUP);
+    b.push(TXLOCKTIME);
+    b.push(GT);
+    b.push(VERIFY);
+    b.push(ENDIF);
+    b.push(DROP);
+    e_num(b, 50);
+    b.push(CSV);
+    b.push(OP0);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // base(15): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
+    //   otspkh(6), mpw(7), twin(8), batch_max(9), ri(10), fta(11),
+    //   pden_att(12), pnum_att(13), koi(14)
+    // Owner batch cap.
+    emit_sell_batch_cap(b, 9);
+    // W1
+    e_pick(b, 8); // twin
+    b.push(CSV);
+    // W2: vol = fta (PARTIAL form)
+    e_pick(b, 11); // fta
+    e_pick(b, 8); // mpw (7 + 1 for vol)
+    b.push(SWAP); // [mpw, vol]
+    b.push(GTE);
+    b.push(VERIFY); // mpw >= vol
+    // ATTESTATION
+    e_pick(b, 13); // pnum_att
+    e_pick(b, 6); // pnum (5 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    e_pick(b, 12); // pden_att
+    e_pick(b, 5); // pden (4 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // fill_kas = fta * pnum / pden, >= mfill (keeps an fta copy on stack)
+    e_pick(b, 11); // fta
+    b.push(DUP);
+    e_pick(b, 7); // pnum (5 + 2)
+    b.push(MUL);
+    e_pick(b, 6); // pden (4 + 2)
+    b.push(DIV);
+    b.push(DUP);
+    e_pick(b, 6); // mfill (3 + 3)
+    b.push(GTE);
+    b.push(VERIFY);
+    // KAS output >= fill_kas
+    e_pick(b, 16); // koi (14 + 2)
+    b.push(TXOUTPUTAMOUNT);
+    b.push(SWAP);
+    b.push(GTE);
+    b.push(VERIFY);
+    // partial guard: token_in > fta
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_pick(b, 1); // fta copy
+    b.push(GT);
+    b.push(VERIFY);
+    // residual output SPK == own SPK (D&R continuation)
+    e_pick(b, 11); // ri (10 + 1)
+    b.push(TXOUTPUTSPK);
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTSPK);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // residual output value >= token_in - fta (consumes the fta copy)
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_roll(b, 1);
+    b.push(SUB);
+    e_pick(b, 11); // ri (10 + 1)
+    b.push(TXOUTPUTAMOUNT);
+    b.push(SWAP);
+    b.push(GTE);
+    b.push(VERIFY);
+    // residual-fill floor: (token_in - fta) * pnum / pden >= mfill
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_pick(b, 12); // fta (11 + 1)
+    b.push(SUB);
+    e_pick(b, 6); // pnum (5 + 1)
+    b.push(MUL);
+    e_pick(b, 5); // pden (4 + 1)
+    b.push(DIV);
+    e_pick(b, 4); // mfill (3 + 1)
+    b.push(GTE);
+    b.push(VERIFY);
+    // F2: seller SPK hash on koi
+    e_pick(b, 14); // koi
+    b.push(TXOUTPUTSPK);
+    b.push(BLAKE2B);
+    e_pick(b, 2); // sspkh (1 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // F4 (Fix-3): self-SPK residual worth >= token_in - fta
+    b.push(TXINPUTINDEX);
+    b.push(OP0);
+    b.push(AUTHOUTPUTIDX);
+    b.push(DUP);
+    b.push(TXOUTPUTSPK);
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTSPK);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    b.push(TXOUTPUTAMOUNT);
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_pick(b, 13); // fta (11 + 2)
+    b.push(SUB);
+    b.push(GTE);
+    b.push(VERIFY);
+    // cleanup: 15 items
+    for _ in 0..7 {
+        b.push(TWO_DROP);
+    }
+    b.push(DROP);
+}
+
 /// twap_sell CANCEL (0) / CANCEL-MARK (3) — owner signature, NOT rate-gated.
 fn emit_twap_sell_cancel(b: &mut Vec<u8>, mark: bool) {
     use ops::*;
     // entry (selector consumed): expiry(0)..otspkh(8), mpw(9), twin(10),
-    //   pk(11), sig(12)
+    //   batch_max(11), pk(12), sig(13)
     if mark {
         b.push(DROP); // expiry
         b.push(OP0);
@@ -464,42 +476,36 @@ fn emit_twap_sell_cancel(b: &mut Vec<u8>, mark: bool) {
         b.push(TWO_DROP); // expiry + cpend
     }
     // stack: mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
-    //        otspkh(6), mpw(7), twin(8), pk(9), sig(10)
-    e_pick(b, 9); // pk
+    //        otspkh(6), mpw(7), twin(8), batch_max(9), pk(10), sig(11)
+    e_pick(b, 10); // pk
     b.push(BLAKE2B);
     e_pick(b, 3); // ohash (2 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    e_roll(b, 10); // sig
-    e_roll(b, 10); // pk
+    e_roll(b, 11); // sig
+    e_roll(b, 11); // pk
     b.push(CHECKSIG);
     b.push(VERIFY);
-    // 9 items
-    for _ in 0..4 {
+    // 10 items
+    for _ in 0..5 {
         b.push(TWO_DROP);
     }
-    b.push(DROP);
 }
 
 /// Expected twap_sell body length (pinned at Stage-A freeze).
-pub const TWAP_SELL_BODY_EXPECTED_LEN: usize = 406;
+pub const TWAP_SELL_BODY_EXPECTED_LEN: usize = 430;
 
-/// twap_sell state size: `[0x08 twin][0x08 mpw]` + v18 sell 145B.
-pub const TWAP_SELL_STATE_SIZE: usize = 18 + 145;
+/// twap_sell state size:
+/// `[0x02 batch_max 0x00][0x08 twin][0x08 mpw]` + v18 sell 145B.
+pub const TWAP_SELL_STATE_SIZE: usize = 3 + 18 + 145;
 
-/// Expected twap_sell redeemScript length (163B state + body).
+/// Expected twap_sell redeemScript length (166B state + body).
 pub const TWAP_SELL_RS_EXPECTED_LEN: usize =
     TWAP_SELL_STATE_SIZE + TWAP_SELL_BODY_EXPECTED_LEN;
 
-/// Build the twap_sell redeemScript (163B state + body).
-///
-/// State: `[0x08][twin][0x08][mpw]` then the v18 sell 145B layout unchanged
-/// (gcd-normalized price, exactly like the v18 sell — the attestation is a
-/// byte-equality against the same normalized sigscript builders).
-///
-/// Builder validation (§3.4): `50 ≤ twin ≤ 0xFFFF_FFFF` (CSV 32-bit mask)
-/// `∧ mpw ≥ 1 ∧ mpw×pnum/pden ≥ mfill` (else no event can satisfy both
-/// floors).
+/// Build the twap_sell redeemScript with the default owner batch cap
+/// `batch_max = 255` (see `build_twap_sell_redeem_script_with_caps`).
+#[allow(clippy::too_many_arguments)]
 pub fn build_twap_sell_redeem_script(
     twin: u64,
     mpw: u64,
@@ -513,6 +519,41 @@ pub fn build_twap_sell_redeem_script(
     cancel_pending: u8,
     expiry_daa: u64,
 ) -> crate::Result<Vec<u8>> {
+    build_twap_sell_redeem_script_with_caps(
+        255, twin, mpw, price_num, price_den, min_fill, owner_hash, seller_spk_hash,
+        owner_token_spk_hash, max_matcher_fee_bps, cancel_pending, expiry_daa,
+    )
+}
+
+/// Build the twap_sell redeemScript (166B state + body).
+///
+/// State: `[0x02][batch_max][0x00]` (owner batch cap, LIMITS re-freeze —
+/// same semantics/rationale as the v18 sell's) then `[0x08][twin]`
+/// `[0x08][mpw]` then the v18 sell 145B core layout unchanged
+/// (gcd-normalized price, exactly like the v18 sell — the attestation is a
+/// byte-equality against the same normalized sigscript builders).
+///
+/// Builder validation (§3.4): `50 ≤ twin ≤ 0xFFFF_FFFF` (CSV 32-bit mask)
+/// `∧ mpw ≥ 1 ∧ mpw×pnum/pden ≥ mfill` (else no event can satisfy both
+/// floors), plus `batch_max ≥ 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_twap_sell_redeem_script_with_caps(
+    batch_max: u8,
+    twin: u64,
+    mpw: u64,
+    price_num: u64,
+    price_den: u64,
+    min_fill: u64,
+    owner_hash: &[u8; 32],
+    seller_spk_hash: &[u8; 32],
+    owner_token_spk_hash: &[u8; 32],
+    max_matcher_fee_bps: u64,
+    cancel_pending: u8,
+    expiry_daa: u64,
+) -> crate::Result<Vec<u8>> {
+    if batch_max == 0 {
+        return Err(crate::KobError::Contract("batch_max must be >= 1".into()));
+    }
     if price_num == 0 {
         return Err(crate::KobError::Contract("price_num must be > 0".into()));
     }
@@ -549,6 +590,9 @@ pub fn build_twap_sell_redeem_script(
     }
     let body = build_twap_sell_body();
     let mut rs = Vec::with_capacity(TWAP_SELL_STATE_SIZE + body.len());
+    rs.push(0x02); // batch_max (2-byte zero-padded push)
+    rs.push(batch_max);
+    rs.push(0x00);
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(twin));
     rs.push(0x08);

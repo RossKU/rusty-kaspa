@@ -31,10 +31,11 @@ use kob_core::contract::spot::oco::{
 use kob_core::contract::spot::order::{
     build_buy_cancel_sigscript, build_buy_expire_sigscript,
     build_buy_fill_sigscript, build_buy_partial_fill_sigscript,
-    build_buy_redeem_script, build_sell_expire_sigscript,
-    build_sell_fill_sigscript, build_sell_ioc_fill_sigscript,
-    build_sell_partial_fill_sigscript, build_sell_redeem_script,
-    BUY_ORDER_MAX_N,
+    build_buy_redeem_script, build_buy_redeem_script_with_caps,
+    build_sell_expire_sigscript, build_sell_fill_sigscript,
+    build_sell_ioc_fill_sigscript, build_sell_partial_fill_sigscript,
+    build_sell_redeem_script, build_sell_redeem_script_with_caps,
+    BUY_GUARD_INPUTS, BUY_ORDER_MAX_N,
 };
 use kob_core::contract::spot::swap::{build_swap_fill_sigscript, build_swap_redeem_script};
 use kob_core::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
@@ -111,11 +112,20 @@ struct SellSpec {
     /// Attested (pnum, pden) in the sigscript; None = the state price.
     attested: Option<(u64, u64)>,
     token_out: TokenOut,
+    /// Owner batch cap in the sell state (LIMITS re-freeze).
+    batch_max: u8,
 }
 
 impl SellSpec {
     fn honest(price_num: u64, price_den: u64, tokens: u64) -> Self {
-        SellSpec { price_num, price_den, tokens, attested: None, token_out: TokenOut::Honest }
+        SellSpec {
+            price_num,
+            price_den,
+            tokens,
+            attested: None,
+            token_out: TokenOut::Honest,
+            batch_max: 255,
+        }
     }
 }
 
@@ -144,6 +154,11 @@ struct Scn {
     extra_wallet_inputs: usize,
     /// Residual output carries a DIFFERENT buy RS's P2SH (forgery test).
     forge_residual_spk: bool,
+    /// Owner batch cap in the buy state (LIMITS re-freeze).
+    buy_n_max: u8,
+    /// Hand-roll the fill sigscript with this N instead of tii.len()
+    /// (bypasses the builder assert for over-MAX_N adversarial shapes).
+    force_n: Option<u16>,
 }
 
 impl Scn {
@@ -162,6 +177,8 @@ impl Scn {
             dual_buy: false,
             extra_wallet_inputs: 0,
             forge_residual_spk: false,
+            buy_n_max: BUY_ORDER_MAX_N as u8,
+            force_n: None,
         }
     }
 }
@@ -193,9 +210,9 @@ fn run_sweep(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
     let mut inputs = Vec::new();
     let mut entries = Vec::new();
     for (i, s) in scn.sells.iter().enumerate() {
-        let rs = build_sell_redeem_script(
-            s.price_num, s.price_den, 1, &owner_hash, &spk_hash,
-        &spk_hash, 30, 0, 0,
+        let rs = build_sell_redeem_script_with_caps(
+            s.batch_max, s.price_num, s.price_den, 1, &owner_hash, &spk_hash,
+            &spk_hash, 30, 0, 0,
         )
         .unwrap();
         let (att_pn, att_pd) = s.attested.unwrap_or((s.price_num, s.price_den));
@@ -210,7 +227,8 @@ fn run_sweep(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
         });
     }
 
-    let buy_rs = build_buy_redeem_script(
+    let buy_rs = build_buy_redeem_script_with_caps(
+        scn.buy_n_max,
         &tcid_arr,
         scn.buy_price_num,
         scn.buy_price_den,
@@ -224,14 +242,28 @@ fn run_sweep(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
     )
     .unwrap();
     let residual_idx = (2 * n) as u16;
-    let buy_ss = match &scn.mode {
-        BuyMode::Fill { ioc } => build_buy_fill_sigscript(&scn.tii, *ioc, &buy_rs),
-        BuyMode::Partial { .. } => {
+    let buy_ss = match (&scn.mode, scn.force_n) {
+        (BuyMode::Fill { ioc }, None) => build_buy_fill_sigscript(&scn.tii, *ioc, &buy_rs),
+        (BuyMode::Fill { ioc }, Some(forced)) => {
+            // Hand-rolled fill sigscript with a forged N (the builder
+            // asserts N <= MAX_N, so adversarial N=33 must be assembled
+            // manually): [tii_1..tii_MAX_N][N][selector][pushData(RS)].
+            let mut ss = Vec::new();
+            for i in 0..BUY_ORDER_MAX_N {
+                let v = scn.tii.get(i).copied().unwrap_or(0);
+                kob_core::contract::helpers::push_index(&mut ss, v);
+            }
+            kob_core::contract::helpers::push_index(&mut ss, forced);
+            ss.push(if *ioc { 0x55 } else { 0x51 });
+            ss.extend_from_slice(&kob_core::primitives::push_data(&buy_rs));
+            ss
+        }
+        (BuyMode::Partial { .. }, _) => {
             build_buy_partial_fill_sigscript(&scn.tii, residual_idx, &buy_rs)
         }
     };
     let buy_idx = inputs.len();
-    inputs.push(TransactionInput::new(op(0x20, 0), buy_ss, 50, 0));
+    inputs.push(TransactionInput::new(op(0xA0, 0), buy_ss, 50, 0));
     entries.push(UtxoEntry {
         amount: scn.buy_kas_in,
         script_public_key: build_p2sh(&buy_rs),
@@ -244,7 +276,7 @@ fn run_sweep(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
         // A second UTXO with the SAME redeem script (same P2SH SPK). Its own
         // script is not executed here; its mere presence must trip the
         // spending buy's uniqueness guard.
-        inputs.push(TransactionInput::new(op(0x21, 0), vec![0x01, 0x00], 50, 0));
+        inputs.push(TransactionInput::new(op(0xA1, 0), vec![0x01, 0x00], 50, 0));
         entries.push(UtxoEntry {
             amount: scn.buy_kas_in,
             script_public_key: build_p2sh(&buy_rs),
@@ -255,7 +287,7 @@ fn run_sweep(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
     }
 
     // Fee/change placeholder input (not executed).
-    inputs.push(TransactionInput::new(op(0x30, 0), vec![0x41; 66], 0, 1));
+    inputs.push(TransactionInput::new(op(0xB0, 0), vec![0x41; 66], 0, 1));
     entries.push(UtxoEntry {
         amount: 1_000_000_000,
         script_public_key: wallet_spk.clone(),
@@ -264,7 +296,7 @@ fn run_sweep(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
         covenant_id: None,
     });
     for j in 0..scn.extra_wallet_inputs {
-        inputs.push(TransactionInput::new(op(0x40 + j as u8, 0), vec![0x41; 66], 0, 1));
+        inputs.push(TransactionInput::new(op(0xC0 + j as u8, 0), vec![0x41; 66], 0, 1));
         entries.push(UtxoEntry {
             amount: 1_000_000,
             script_public_key: wallet_spk.clone(),
@@ -306,7 +338,7 @@ fn run_sweep(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
             // A buy RS with a different state (price 3/1) — different P2SH.
             let other = build_buy_redeem_script(
                 &tcid_arr, 3, 1, scn.buy_mfill, &owner_hash, &spk_hash,
-        &spk_hash, scn.buy_mmfee_bps, 0, 0,
+                &spk_hash, scn.buy_mmfee_bps, 0, 0,
             )
             .unwrap();
             build_p2sh(&other)
@@ -328,7 +360,10 @@ fn run_sweep(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
 
 #[test]
 fn gtc_sweeps_all_arities_pass() {
-    for n in 1..=BUY_ORDER_MAX_N {
+    // Representative arities incl. both boundaries of the re-frozen
+    // MAX_N=32 slot table (1..=8 = the pre-refreeze range, 31/32 = the new
+    // top slots; every slot k is exercised by some N >= k in this set).
+    for n in [1usize, 2, 3, 4, 5, 6, 7, 8, 15, 16, 31, 32] {
         let (res, buy) = run_sweep(&honest(n));
         assert!(res[buy].is_ok(), "N={n} v18 buy must pass: {:?}", res[buy]);
         for i in 0..buy {
@@ -678,21 +713,105 @@ fn partial_cpend_rejected() {
     assert!(res[buy].is_err(), "cpend=1 partial must be rejected; got {:?}", res[buy]);
 }
 
-/// 17-input tx: the uniqueness guard scans only i=0..15, so it requires
-/// OpTxInputCount <= 16 — a 17th input (which could hide a second identical
-/// buy beyond the scan) fails the spend. 16 inputs exactly still pass.
+/// Uniqueness-guard boundary at the DERIVED bound (BUY_GUARD_INPUTS =
+/// MAX_N + 2 = 34): the scan covers i=0..33 and requires
+/// OpTxInputCount <= 34 — a 35th input (which could hide a second identical
+/// buy beyond the scan) fails the spend. 34 inputs exactly still pass.
 #[test]
 fn partial_input_count_guard() {
-    // sells(1) + buy + fee = 3 inputs; pad to exactly 16 -> pass.
+    assert_eq!(BUY_GUARD_INPUTS, 34, "derived guard bound = MAX_N + 2");
+    // sells(1) + buy + fee = 3 inputs; pad to exactly 34 -> pass.
     let mut scn = partial_event(30_000_000, 20_000_000, 10_000_000);
-    scn.extra_wallet_inputs = 13;
+    scn.extra_wallet_inputs = BUY_GUARD_INPUTS - 3;
     let (res, buy) = run_sweep(&scn);
-    assert!(res[buy].is_ok(), "16-input partial must pass: {:?}", res[buy]);
-    // Pad to 17 -> guard rejects.
+    assert!(res[buy].is_ok(), "34-input partial must pass: {:?}", res[buy]);
+    // Pad to 35 -> guard rejects.
     let mut scn = partial_event(30_000_000, 20_000_000, 10_000_000);
-    scn.extra_wallet_inputs = 14;
+    scn.extra_wallet_inputs = BUY_GUARD_INPUTS - 2;
     let (res, buy) = run_sweep(&scn);
-    assert!(res[buy].is_err(), "17-input partial must be rejected; got {:?}", res[buy]);
+    assert!(res[buy].is_err(), "35-input partial must be rejected; got {:?}", res[buy]);
+}
+
+// ===========================================================================
+// LIMITS re-freeze — owner batch caps (n_max / batch_max) + MAX_N boundary
+// ===========================================================================
+
+/// N=33 rejected BY THE COVENANT: the fill sigscript carries only MAX_N=32
+/// tii slots, and the in-body owner cap `N <= n_max` (n_max <= 32 enforced
+/// at build) kills any forged N above the slot table. Hand-rolled sigscript
+/// because the builder asserts N <= MAX_N.
+#[test]
+fn fill_n_33_rejected_by_covenant() {
+    let mut scn = honest(32);
+    scn.force_n = Some(33);
+    let (res, buy) = run_sweep(&scn);
+    assert!(res[buy].is_err(), "N=33 must be rejected by the covenant; got {:?}", res[buy]);
+    // Control: the same 32-sell shape with the honest N=32 passes.
+    let (res, buy) = run_sweep(&honest(32));
+    assert!(res[buy].is_ok(), "honest N=32 control must pass: {:?}", res[buy]);
+}
+
+/// Owner cap beats matcher: a buy deployed with n_max=4 rejects an N=5
+/// sweep even though the slot table (MAX_N=32) could carry it; N=4 passes.
+#[test]
+fn fill_n_above_n_max_rejected() {
+    let mut scn = honest(5);
+    scn.buy_n_max = 4;
+    let (res, buy) = run_sweep(&scn);
+    assert!(res[buy].is_err(), "N=5 > n_max=4 must be rejected; got {:?}", res[buy]);
+    let mut scn = honest(4);
+    scn.buy_n_max = 4;
+    let (res, buy) = run_sweep(&scn);
+    assert!(res[buy].is_ok(), "N=4 == n_max must pass: {:?}", res[buy]);
+}
+
+/// n_max=1 buy behaves as a strict 1:1 order: single-sell fill passes,
+/// any 2-sell sweep is rejected — on the fill AND the partial path.
+#[test]
+fn n_max_1_strict_one_to_one() {
+    let mut scn = honest(1);
+    scn.buy_n_max = 1;
+    let (res, buy) = run_sweep(&scn);
+    assert!(res[buy].is_ok(), "n_max=1 with N=1 must pass: {:?}", res[buy]);
+    let mut scn = honest(2);
+    scn.buy_n_max = 1;
+    let (res, buy) = run_sweep(&scn);
+    assert!(res[buy].is_err(), "n_max=1 with N=2 must be rejected; got {:?}", res[buy]);
+    // Partial path honors the same cap.
+    let mut scn = Scn::gtc(
+        vec![SellSpec::honest(99, 100, 4_000_000), SellSpec::honest(99, 100, 6_000_000)],
+        30_000_000,
+    );
+    scn.mode = BuyMode::Partial { residual: 20_000_000 };
+    scn.buy_n_max = 1;
+    let (res, buy) = run_sweep(&scn);
+    assert!(res[buy].is_err(), "n_max=1 partial with N=2 must be rejected; got {:?}", res[buy]);
+}
+
+/// Sell-side owner batch cap: in a batch of k=3 same-token sells, the sell
+/// deployed with batch_max=2 rejects ITS OWN branch (OpCovInputCount = 3 >
+/// 2) while the batch_max=255 sells and the buy pass — exactly the shape a
+/// planner must exclude that sell from.
+#[test]
+fn sell_batch_max_below_batch_size_rejected() {
+    let mut scn = honest(3);
+    scn.sells[1].batch_max = 2;
+    let (res, buy) = run_sweep(&scn);
+    assert!(res[1].is_err(), "batch_max=2 sell in a 3-batch must reject; got {:?}", res[1]);
+    assert!(res[0].is_ok(), "uncapped sell 0 must pass: {:?}", res[0]);
+    assert!(res[2].is_ok(), "uncapped sell 2 must pass: {:?}", res[2]);
+    assert!(res[buy].is_ok(), "buy must pass (per-input isolation): {:?}", res[buy]);
+    // Boundary: batch_max == k passes.
+    let mut scn = honest(3);
+    scn.sells[1].batch_max = 3;
+    let (res, _) = run_sweep(&scn);
+    assert!(res[1].is_ok(), "batch_max=3 sell in a 3-batch must pass: {:?}", res[1]);
+    // batch_max=1 solo sell still fills (count = 1).
+    let mut scn = honest(1);
+    scn.sells[0].batch_max = 1;
+    let (res, buy) = run_sweep(&scn);
+    assert!(res[0].is_ok(), "batch_max=1 solo sell must pass: {:?}", res[0]);
+    assert!(res[buy].is_ok(), "buy must pass: {:?}", res[buy]);
 }
 
 /// The partial path also carries the anti-double-count guard.

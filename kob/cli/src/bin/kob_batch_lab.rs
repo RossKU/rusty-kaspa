@@ -1,7 +1,7 @@
 //! EXPERIMENTAL batch-limit lab bin (kob/BATCH_LIMITS.md) — testnet only.
 //!
 //! Deploys and settles LARGE-N experimental buy covenants
-//! (`kob_core::contract::spot::lab`, slot count > the shipping MAX_N=8) to
+//! (`kob_core::contract::spot::lab`, slot count != the shipping MAX_N=32) to
 //! prove on a live node what the offline lab measures. NOT product code:
 //! the shipping deploy/parse/settle paths refuse these RS lengths by
 //! design, so this bin drives the node directly.

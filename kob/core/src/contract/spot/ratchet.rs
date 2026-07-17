@@ -1,6 +1,6 @@
 use crate::primitives::{push_data, u64_le};
 use crate::contract::helpers::push_index;
-use crate::contract::spot::order::{e_num, e_pick, e_roll, ops};
+use crate::contract::spot::order::{e_num, e_pick, e_roll, emit_sell_batch_cap, ops};
 
 // ============================================================================
 // `ratchet_oco` — OCO sell with a permissionless trailing-SL ratchet branch
@@ -31,14 +31,17 @@ use crate::contract::spot::order::{e_num, e_pick, e_roll, ops};
 // settles of this token), not a "true market price" — KOB has no market-price
 // concept; anyone can be both sides of a print at the cost of fees.
 //
-// State (208B = 36 + v18 OCO 172), new fields PREPENDED:
+// State (211B = 3 + 36 + v18 OCO 172), new fields PREPENDED (the LIMITS
+// re-freeze adds the owner batch cap `[0x02][batch_max][0x00]` at the very
+// front = deepest on stack; TP/SL fill branches enforce it):
+//   [0x02][batch_max][0x00]
 //   [0x08][rstep 8B][0x08][rgap 8B][0x08][rwin 8B][0x08][mrv 8B]
 //   ‖ v18 OCO 172B layout unchanged
-// stack at body start (16): expiry(0) … otspkh(11) mrv(12) rwin(13) rgap(14)
-//   rstep(15); selector at 16 (v18 OCO: 12).
-// RS byte offsets (all v18 OCO offsets +36): pnum_sl VALUE = [97..105) (its
-//   0x08 prefix at 96 is inside the fixed prefix), pden_sl = [106..114),
-//   pnum_tp = [70..78), cpend at 198, expiry value [200..208).
+// stack at body start (17): expiry(0) … otspkh(11) mrv(12) rwin(13) rgap(14)
+//   rstep(15) batch_max(16); selector at 17 (v18 OCO: 12).
+// RS byte offsets (all v18 OCO offsets +39): pnum_sl VALUE = [100..108) (its
+//   0x08 prefix at 99 is inside the fixed prefix), pden_sl = [109..117),
+//   pnum_tp = [73..81), cpend at 201, expiry value [203..211).
 //
 // Selector 3 = RATCHET (free in the v18 OCO map: 0=CANCEL, 1=TP, 2=SL,
 // 4=EXPIRE; OCO has no cancel-mark). sigOpCount = 0 (permissionless).
@@ -59,10 +62,10 @@ use crate::contract::spot::order::{e_num, e_pick, e_roll, ops};
 // the splice/attestation compare raw bytes. The TP/SL fill sigscript builders
 // below are correspondingly non-normalizing.
 
-/// pnum_sl VALUE window inside the ratchet_oco RS: bytes [97..105).
-pub const RATCHET_PNUM_SL_OFFSET: usize = 97;
+/// pnum_sl VALUE window inside the ratchet_oco RS: bytes [100..108).
+pub const RATCHET_PNUM_SL_OFFSET: usize = 100;
 /// End of the pnum_sl VALUE window (exclusive).
-pub const RATCHET_PNUM_SL_END: usize = 105;
+pub const RATCHET_PNUM_SL_END: usize = 108;
 
 // Extra opcode bytes not present in `order::ops`.
 const OP_NOT: u8 = 0x91;
@@ -86,17 +89,18 @@ fn push_p2sh_suffix(b: &mut Vec<u8>) {
 
 /// Build the ratchet_oco body.
 ///
-/// Stack after state push (16 items):
+/// Stack after state push (17 items):
 ///   expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4), mfill_sl(5),
 ///   pden_sl(6), pnum_sl(7), mfill_tp(8), pden_tp(9), pnum_tp(10),
-///   otspkh(11), mrv(12), rwin(13), rgap(14), rstep(15); selector at 16.
+///   otspkh(11), mrv(12), rwin(13), rgap(14), rstep(15), batch_max(16);
+///   selector at 17.
 ///
 /// Selectors: 0=CANCEL, 1=TP FILL, 2=SL FILL, 3=RATCHET, 4=EXPIRE.
 pub fn build_ratchet_oco_body() -> Vec<u8> {
     use ops::*;
     let mut b: Vec<u8> = Vec::with_capacity(768);
 
-    e_roll(&mut b, 16);
+    e_roll(&mut b, 17);
     b.push(DUP);
     e_num(&mut b, 4);
     b.push(EQUAL);
@@ -108,7 +112,8 @@ pub fn build_ratchet_oco_body() -> Vec<u8> {
         b.push(CLTV);
         // stack: cpend(0), mmfee(1), sspkh(2), ohash(3), mfill_sl(4),
         //        pden_sl(5), pnum_sl(6), mfill_tp(7), pden_tp(8), pnum_tp(9),
-        //        otspkh(10), mrv(11), rwin(12), rgap(13), rstep(14)
+        //        otspkh(10), mrv(11), rwin(12), rgap(13), rstep(14),
+        //        batch_max(15)
         b.push(TXINPUTINDEX);
         b.push(OP0);
         b.push(AUTHOUTPUTIDX); // r = auth_outputs[self][0]
@@ -129,11 +134,10 @@ pub fn build_ratchet_oco_body() -> Vec<u8> {
         b.push(TXINPUTAMOUNT);
         b.push(GTE);
         b.push(VERIFY); // full refund
-        // 15 items: cpend..rstep
-        for _ in 0..7 {
+        // 16 items: cpend..batch_max
+        for _ in 0..8 {
             b.push(TWO_DROP);
         }
-        b.push(DROP);
     }
     b.push(ELSE);
     {
@@ -184,7 +188,7 @@ pub fn build_ratchet_oco_body() -> Vec<u8> {
 /// `[0x01,koi][0x08 pnum][0x08 pden][Op1|Op2][pushData(RS)]` (raw pair).
 ///
 /// Entry (selector consumed): expiry(0)..otspkh(11), mrv(12), rwin(13),
-///   rgap(14), rstep(15), pden_att(16), pnum_att(17), koi(18)
+///   rgap(14), rstep(15), batch_max(16), pden_att(17), pnum_att(18), koi(19)
 fn emit_ratchet_oco_fill(b: &mut Vec<u8>, tp: bool) {
     use ops::*;
     // time gate
@@ -205,16 +209,19 @@ fn emit_ratchet_oco_fill(b: &mut Vec<u8>, tp: bool) {
     b.push(OP0);
     b.push(EQUAL);
     b.push(VERIFY);
-    // base(17): mmfee(0), sspkh(1), ohash(2), mfill_sl(3), pden_sl(4),
+    // base(18): mmfee(0), sspkh(1), ohash(2), mfill_sl(3), pden_sl(4),
     //   pnum_sl(5), mfill_tp(6), pden_tp(7), pnum_tp(8), otspkh(9), mrv(10),
-    //   rwin(11), rgap(12), rstep(13), pden_att(14), pnum_att(15), koi(16)
+    //   rwin(11), rgap(12), rstep(13), batch_max(14), pden_att(15),
+    //   pnum_att(16), koi(17)
+    // Owner batch cap (covenant-enforced): same-token input count <= batch_max.
+    emit_sell_batch_cap(b, 14);
     let (pnum_d, pden_d, mfill_d) = if tp { (8usize, 7usize, 6usize) } else { (5, 4, 3) };
     // ATTESTATION: attested pair == the EXECUTING branch's state pair
-    e_pick(b, 15); // pnum_att
+    e_pick(b, 16); // pnum_att
     e_pick(b, pnum_d + 1);
     b.push(EQUAL);
     b.push(VERIFY);
-    e_pick(b, 14); // pden_att
+    e_pick(b, 15); // pden_att
     e_pick(b, pden_d + 1);
     b.push(EQUAL);
     b.push(VERIFY);
@@ -230,13 +237,13 @@ fn emit_ratchet_oco_fill(b: &mut Vec<u8>, tp: bool) {
     b.push(GTE);
     b.push(VERIFY);
     // KAS output >= expected_kas
-    e_pick(b, 17); // koi (16 + 1)
+    e_pick(b, 18); // koi (17 + 1)
     b.push(TXOUTPUTAMOUNT);
     b.push(SWAP);
     b.push(GTE);
     b.push(VERIFY);
     // F2: seller SPK hash
-    e_pick(b, 16); // koi
+    e_pick(b, 17); // koi
     b.push(TXOUTPUTSPK);
     b.push(BLAKE2B);
     e_pick(b, 2); // sspkh (1 + 1)
@@ -257,11 +264,10 @@ fn emit_ratchet_oco_fill(b: &mut Vec<u8>, tp: bool) {
     b.push(TXINPUTAMOUNT);
     b.push(GTE);
     b.push(VERIFY);
-    // cleanup: 17 items
-    for _ in 0..8 {
+    // cleanup: 18 items
+    for _ in 0..9 {
         b.push(TWO_DROP);
     }
-    b.push(DROP);
 }
 
 /// ratchet_oco CANCEL (selector 0) — owner signature, never rate-limited.
@@ -269,23 +275,24 @@ fn emit_ratchet_oco_fill(b: &mut Vec<u8>, tp: bool) {
 fn emit_ratchet_oco_cancel(b: &mut Vec<u8>) {
     use ops::*;
     // entry: expiry(0)..otspkh(11), mrv(12), rwin(13), rgap(14), rstep(15),
-    //        pk(16), sig(17)
+    //        batch_max(16), pk(17), sig(18)
     b.push(TWO_DROP); // expiry + cpend
-    // mmfee(0)..otspkh(9), mrv(10), rwin(11), rgap(12), rstep(13), pk(14),
-    // sig(15)
-    e_pick(b, 14); // pk
+    // mmfee(0)..otspkh(9), mrv(10), rwin(11), rgap(12), rstep(13),
+    // batch_max(14), pk(15), sig(16)
+    e_pick(b, 15); // pk
     b.push(BLAKE2B);
     e_pick(b, 3); // ohash (2 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    e_roll(b, 15); // sig
-    e_roll(b, 15); // pk
+    e_roll(b, 16); // sig
+    e_roll(b, 16); // pk
     b.push(CHECKSIG);
     b.push(VERIFY);
-    // 14 items
+    // 15 items
     for _ in 0..7 {
         b.push(TWO_DROP);
     }
+    b.push(DROP);
 }
 
 /// The permissionless RATCHET branch (selector 3) — R1..R14 of §4.4.
@@ -293,7 +300,7 @@ fn emit_ratchet_oco_cancel(b: &mut Vec<u8>) {
 /// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
 ///   ohash(4), mfill_sl(5), pden_sl(6), pnum_sl(7), mfill_tp(8), pden_tp(9),
 ///   pnum_tp(10), otspkh(11), mrv(12), rwin(13), rgap(14), rstep(15),
-///   sii(16), old_rs(17), new_rs(18)
+///   batch_max(16), sii(17), old_rs(18), new_rs(19)
 fn emit_ratchet(b: &mut Vec<u8>) {
     use ops::*;
     // R1: rstep >= 1 (builder enforces it; in-branch check kept as defense
@@ -325,7 +332,7 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     e_pick(b, 13);
     b.push(CSV);
     // R5: sii != self.
-    e_pick(b, 16);
+    e_pick(b, 17);
     b.push(TXINPUTINDEX);
     b.push(NUMEQUAL);
     b.push(OP_NOT);
@@ -333,7 +340,7 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     // R6: same token — OpInputCovenantId(sii) == OpInputCovenantId(self).
     // (self-reference IS the tcid; a non-covenant input yields ZERO_HASH
     //  != own id => fail-closed)
-    e_pick(b, 16);
+    e_pick(b, 17);
     b.push(INPUTCOVENANTID);
     b.push(TXINPUTINDEX);
     b.push(INPUTCOVENANTID);
@@ -342,21 +349,21 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     // R7: canonical-shape guard on the sibling's sigscript: byte 0 == 0x01,
     // byte 2 == 0x08, byte 11 == 0x08 (token_unit 0x41, cancels 0x41/0x20,
     // expire 0x54, ratchet 0x4d are all killed by byte 0).
-    e_pick(b, 16);
+    e_pick(b, 17);
     b.push(OP0);
     b.push(OP1);
     b.push(TXINPUTSIGSUBSTR);
     b.push(OP1); // pushes [0x01]
     b.push(EQUAL);
     b.push(VERIFY);
-    e_pick(b, 16);
+    e_pick(b, 17);
     e_num(b, 2);
     e_num(b, 3);
     b.push(TXINPUTSIGSUBSTR);
     e_num(b, 8); // pushes [0x08]
     b.push(EQUAL);
     b.push(VERIFY);
-    e_pick(b, 16);
+    e_pick(b, 17);
     e_num(b, 11);
     e_num(b, 12);
     b.push(TXINPUTSIGSUBSTR);
@@ -364,15 +371,15 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     b.push(EQUAL);
     b.push(VERIFY);
     // R8: print read at the canonical offsets.
-    e_pick(b, 16);
+    e_pick(b, 17);
     e_num(b, 3);
     e_num(b, 11);
     b.push(TXINPUTSIGSUBSTR); // pnum_att
-    e_pick(b, 17); // sii (16 + 1)
+    e_pick(b, 18); // sii (17 + 1)
     e_num(b, 12);
     e_num(b, 20);
     b.push(TXINPUTSIGSUBSTR); // pden_att
-    // stack: pden_att(0), pnum_att(1), base(19) below
+    // stack: pden_att(0), pnum_att(1), base(20) below
     // R9: positivity guards — WITHOUT these, a hand-rolled sibling whose 8th
     // price byte has the high bit set makes pden_att negative as i64 => the
     // R11 cross-mul RHS goes negative => trigger passes vacuously. Mandatory.
@@ -386,9 +393,9 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     b.push(VERIFY); // pnum_att >= 1
     // R10 (G2): vol = token_in(sii); if sigscript[20] == 0x08 (IOC/partial)
     // then vol = min(vol, fta at [21..29)); require vol >= mrv.
-    e_pick(b, 18); // sii (16 + 2)
+    e_pick(b, 19); // sii (17 + 2)
     b.push(TXINPUTAMOUNT); // vol
-    e_pick(b, 19); // sii (16 + 3)
+    e_pick(b, 20); // sii (17 + 3)
     e_num(b, 20);
     e_num(b, 21);
     b.push(TXINPUTSIGSUBSTR);
@@ -396,7 +403,7 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     b.push(EQUAL);
     b.push(IF);
     {
-        e_pick(b, 19); // sii (16 + 3)
+        e_pick(b, 20); // sii (17 + 3)
         e_num(b, 21);
         e_num(b, 29);
         b.push(TXINPUTSIGSUBSTR); // fta
@@ -426,7 +433,7 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     // OpTxOutputAmount(koi) * pden_att >= vol * pnum_att. (koi bytes >= 0x80
     // read negative => OOB => fail-closed — such siblings cannot serve as
     // prints, documented.)
-    e_pick(b, 19); // sii (16 + 3)
+    e_pick(b, 20); // sii (17 + 3)
     b.push(OP1);
     e_num(b, 2);
     b.push(TXINPUTSIGSUBSTR); // koi byte
@@ -441,10 +448,11 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     // Drop the R8/R10 temporaries (vol, pden_att, pnum_att).
     b.push(DROP);
     b.push(TWO_DROP);
-    // back to base(19): expiry(0)..rstep(15), sii(16), old_rs(17), new_rs(18)
-    // R13 (DCA splice template, T8; window = pnum_sl value bytes [97..105)):
+    // back to base(20): expiry(0)..rstep(15), batch_max(16), sii(17),
+    // old_rs(18), new_rs(19)
+    // R13 (DCA splice template, T8; window = pnum_sl value bytes [100..108)):
     // R13a: old_rs authenticity: P2SH(blake2b(old_rs)) == OpTxInputSpk(self).
-    e_pick(b, 17); // old_rs
+    e_pick(b, 18); // old_rs
     b.push(BLAKE2B);
     push_p2sh_prefix(b);
     b.push(SWAP);
@@ -455,41 +463,41 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     b.push(TXINPUTSPK);
     b.push(EQUAL);
     b.push(VERIFY);
-    // R13b: prefix [0..97) byte-equal.
-    e_pick(b, 17); // old_rs
+    // R13b: prefix [0..100) byte-equal.
+    e_pick(b, 18); // old_rs
     b.push(OP0);
-    e_num(b, 97);
+    e_num(b, 100);
     b.push(OP_SUBSTR);
-    e_pick(b, 19); // new_rs (18 + 1)
+    e_pick(b, 20); // new_rs (19 + 1)
     b.push(OP0);
-    e_num(b, 97);
+    e_num(b, 100);
     b.push(OP_SUBSTR);
     b.push(EQUAL);
     b.push(VERIFY);
-    // R13c: suffix [105..size) byte-equal (EQUAL on unequal lengths fails =>
+    // R13c: suffix [108..size) byte-equal (EQUAL on unequal lengths fails =>
     // new_rs length is pinned = old's; the 8B window has no interior push
     // prefix to re-check).
-    e_pick(b, 17); // old_rs
+    e_pick(b, 18); // old_rs
     b.push(OP_SIZE);
-    e_num(b, 105);
+    e_num(b, 108);
     b.push(SWAP);
     b.push(OP_SUBSTR);
-    e_pick(b, 19); // new_rs (18 + 1)
+    e_pick(b, 20); // new_rs (19 + 1)
     b.push(OP_SIZE);
-    e_num(b, 105);
+    e_num(b, 108);
     b.push(SWAP);
     b.push(OP_SUBSTR);
     b.push(EQUAL);
     b.push(VERIFY);
-    // R13d: field: num(new[97..105)) == num(old[97..105)) + rstep (NUMEQUAL —
-    // T6: computed sum vs 8B window bytes).
-    e_pick(b, 18); // new_rs
-    e_num(b, 97);
-    e_num(b, 105);
+    // R13d: field: num(new[100..108)) == num(old[100..108)) + rstep
+    // (NUMEQUAL — T6: computed sum vs 8B window bytes).
+    e_pick(b, 19); // new_rs
+    e_num(b, 100);
+    e_num(b, 108);
     b.push(OP_SUBSTR);
-    e_pick(b, 18); // old_rs (17 + 1)
-    e_num(b, 97);
-    e_num(b, 105);
+    e_pick(b, 19); // old_rs (18 + 1)
+    e_num(b, 100);
+    e_num(b, 108);
     b.push(OP_SUBSTR);
     e_pick(b, 17); // rstep (15 + 2)
     b.push(ADD);
@@ -516,7 +524,7 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     b.push(AUTHOUTPUTIDX); // ci
     b.push(DUP);
     b.push(TXOUTPUTSPK); // spk(0), ci(1)
-    e_pick(b, 20); // new_rs (18 + 2)
+    e_pick(b, 21); // new_rs (19 + 2)
     b.push(BLAKE2B);
     push_p2sh_prefix(b);
     b.push(SWAP);
@@ -536,34 +544,66 @@ fn emit_ratchet(b: &mut Vec<u8>) {
     b.push(TXINPUTAMOUNT);
     b.push(GTE);
     b.push(VERIFY); // out >= full escrow
-    // R14: cleanup — 19 items (16 state + sii + old_rs + new_rs).
-    for _ in 0..9 {
+    // R14: cleanup — 20 items (17 state + sii + old_rs + new_rs).
+    for _ in 0..10 {
         b.push(TWO_DROP);
     }
-    b.push(DROP);
 }
 
 /// Expected ratchet_oco body length (pinned at Stage-A freeze).
-pub const RATCHET_OCO_BODY_EXPECTED_LEN: usize = 525;
+pub const RATCHET_OCO_BODY_EXPECTED_LEN: usize = 549;
 
-/// ratchet_oco state size:
+/// ratchet_oco state size: `[0x02 batch_max 0x00]`
 /// `[0x08 rstep][0x08 rgap][0x08 rwin][0x08 mrv]` + v18 OCO 172B.
-pub const RATCHET_OCO_STATE_SIZE: usize = 36 + 172;
+pub const RATCHET_OCO_STATE_SIZE: usize = 3 + 36 + 172;
 
-/// Expected ratchet_oco redeemScript length (208B state + body).
+/// Expected ratchet_oco redeemScript length (211B state + body).
 pub const RATCHET_OCO_RS_EXPECTED_LEN: usize =
     RATCHET_OCO_STATE_SIZE + RATCHET_OCO_BODY_EXPECTED_LEN;
 
-/// Build the ratchet_oco redeemScript (208B state + body).
+/// Build the ratchet_oco redeemScript with the default owner batch cap
+/// `batch_max = 255` (see `build_ratchet_oco_redeem_script_with_caps`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_ratchet_oco_redeem_script(
+    rstep: u64,
+    rgap: u64,
+    rwin: u64,
+    mrv: u64,
+    price_num_tp: u64,
+    price_den_tp: u64,
+    min_fill_tp: u64,
+    price_num_sl: u64,
+    price_den_sl: u64,
+    min_fill_sl: u64,
+    owner_hash: &[u8; 32],
+    seller_spk_hash: &[u8; 32],
+    owner_token_spk_hash: &[u8; 32],
+    max_matcher_fee_bps: u64,
+    cancel_pending: u8,
+    expiry_daa: u64,
+) -> crate::Result<Vec<u8>> {
+    build_ratchet_oco_redeem_script_with_caps(
+        255, rstep, rgap, rwin, mrv, price_num_tp, price_den_tp, min_fill_tp,
+        price_num_sl, price_den_sl, min_fill_sl, owner_hash, seller_spk_hash,
+        owner_token_spk_hash, max_matcher_fee_bps, cancel_pending, expiry_daa,
+    )
+}
+
+/// Build the ratchet_oco redeemScript (211B state + body).
 ///
-/// State: `[0x08][rstep][0x08][rgap][0x08][rwin][0x08][mrv]` then the v18
-/// OCO 172B layout unchanged. Price pairs are stored RAW (NOT gcd-normalized):
-/// `rstep` is declared in the user's `pden_sl` units and the splice compares
-/// raw bytes.
+/// State: `[0x02][batch_max][0x00]` (owner batch cap, LIMITS re-freeze —
+/// TP/SL fill branches enforce it; same semantics/rationale as the v18
+/// sell's) then `[0x08][rstep][0x08][rgap][0x08][rwin][0x08][mrv]` then the
+/// v18 OCO 172B layout unchanged. Price pairs are stored RAW (NOT
+/// gcd-normalized): `rstep` is declared in the user's `pden_sl` units and
+/// the splice compares raw bytes.
 ///
 /// Builder validation (§4.2): `rstep ≥ 1 ∧ 50 ≤ rwin ≤ 0xFFFF_FFFF ∧ mrv ≥ 1
-/// ∧ (pnum_sl + rstep)×pden_tp < pnum_tp×pden_sl` (initial headroom sanity).
-pub fn build_ratchet_oco_redeem_script(
+/// ∧ (pnum_sl + rstep)×pden_tp < pnum_tp×pden_sl` (initial headroom sanity),
+/// plus `batch_max ≥ 1`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_ratchet_oco_redeem_script_with_caps(
+    batch_max: u8,
     rstep: u64,
     rgap: u64,
     rwin: u64,
@@ -596,6 +636,9 @@ pub fn build_ratchet_oco_redeem_script(
     if max_matcher_fee_bps > 10000 {
         return Err(crate::KobError::Contract("max_matcher_fee_bps must be <= 10000".into()));
     }
+    if batch_max == 0 {
+        return Err(crate::KobError::Contract("batch_max must be >= 1".into()));
+    }
     if rstep == 0 {
         return Err(crate::KobError::Contract("rstep must be >= 1 (plain behavior = deploy the v18 OCO)".into()));
     }
@@ -621,6 +664,9 @@ pub fn build_ratchet_oco_redeem_script(
 
     let body = build_ratchet_oco_body();
     let mut rs = Vec::with_capacity(RATCHET_OCO_STATE_SIZE + body.len());
+    rs.push(0x02); // batch_max (2-byte zero-padded push)
+    rs.push(batch_max);
+    rs.push(0x00);
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(rstep));
     rs.push(0x08);
@@ -726,14 +772,19 @@ pub fn build_ratchet_oco_ratchet_sigscript(
 }
 
 /// Derive the ratchet continuation RS: `old_rs` with the pnum_sl value window
-/// [97..105) incremented by the RS's own `rstep` (bytes [1..9)). This is the
-/// exact splice R13 enforces; the scanner derives watch addresses with it
+/// [100..108) incremented by the RS's own `rstep` (bytes [4..12)). This is
+/// the exact splice R13 enforces; the scanner derives watch addresses with it
 /// (`new_rs(k) = old_rs with pnum_sl += k×rstep`, bounded by G3).
 pub fn derive_ratchet_continuation_rs(old_rs: &[u8]) -> crate::Result<Vec<u8>> {
-    if old_rs.len() != RATCHET_OCO_RS_EXPECTED_LEN || old_rs[0] != 0x08 || old_rs[96] != 0x08 {
+    if old_rs.len() != RATCHET_OCO_RS_EXPECTED_LEN
+        || old_rs[0] != 0x02
+        || old_rs[2] != 0x00
+        || old_rs[3] != 0x08
+        || old_rs[99] != 0x08
+    {
         return Err(crate::KobError::Contract("not a ratchet_oco redeemScript".into()));
     }
-    let rstep = u64::from_le_bytes(old_rs[1..9].try_into().expect("8B window"));
+    let rstep = u64::from_le_bytes(old_rs[4..12].try_into().expect("8B window"));
     let pnum_sl = u64::from_le_bytes(
         old_rs[RATCHET_PNUM_SL_OFFSET..RATCHET_PNUM_SL_END].try_into().expect("8B window"),
     );

@@ -5,7 +5,7 @@
 //! consensus mass model. Nothing here changes shipping bytecode: the
 //! shipping covenants come from the product builders, the large-N variants
 //! from the clearly-experimental `contract::spot::lab` module (whose
-//! `max_n = 8` is pinned byte-identical to shipping).
+//! `max_n = 32` is pinned byte-identical to shipping).
 //!
 //! Mass model (tn10 post-Toccata, all reproduced from this repo's vendored
 //! consensus — see `consensus/core/src/mass/mod.rs`, `mining/src/mempool/
@@ -766,9 +766,15 @@ fn live_form3_compute_mass_reproduced() {
     println!("live form-3 GTC 3:1 (merged seller, D2 deliveries):");
     header();
     row("GTC 3:1 live shape", 3, rs_len, &m);
+    // History: on the pre-LIMITS 8-slot bytecode this shape reproduced the
+    // live Stage-F point EXACTLY (6,563 grams, TXID 405dbe39...). The LIMITS
+    // re-freeze (MAX_N=32 + n_max/batch_max caps) voids that live proof; the
+    // same 3:1 shape on the re-frozen bytecode predicts 6,608 grams — pinned
+    // here as the model's post-refreeze prediction until the combined live
+    // stage re-proves it on-chain.
     assert_eq!(
-        m.compute, 6_563,
-        "offline mass model must reproduce the live Stage-F compute mass"
+        m.compute, 6_608,
+        "offline mass model prediction for the re-frozen 3:1 live shape"
     );
 }
 
@@ -790,9 +796,14 @@ fn shipping_gtc_sweep_masses() {
         assert!(m.fits_block(), "shipping N={n} must fit block limits: {m:?}");
         row("GTC (ship)", n, rs_len, &m);
         pts.push((n as f64, m.compute as f64));
+        // LIMITS re-freeze: the 32-slot buy body exceeds the 9,999-unit
+        // free allowance at EVERY N (slot guards execute even when idle) —
+        // the budget-0 era is over. sig_op_count = 1 on the buy input
+        // declares computeBudget 10 (109,999-unit capacity, the mapping the
+        // live N=32 run used); assert every shipping N stays inside it.
         assert!(
-            m.max_units <= 9_999,
-            "shipping sweeps must run on budget-0 inputs (free allowance); N={n} used {}",
+            m.max_units <= 109_999,
+            "shipping sweeps must fit a sig_op_count=1 budget; N={n} used {}",
             m.max_units
         );
     }
@@ -963,19 +974,16 @@ fn other_patterns_masses() {
     assert_all_pass("partial N=8", &results);
     row("Op2 partial (ship)", 8, rs_len, &m);
 
-    // Experimental partial ceiling: the self-instance uniqueness guard scans
-    // 16 inputs -> N=14 sells (16 inputs total) passes, N=15 (17) fails.
-    let (inputs, outputs, exec, rs_len) = sweep_parts(&cx, 14, 14, v, false, Some(50_000_000), 1_000_000_000);
+    // Partial ceiling at the DERIVED guard (LIMITS re-freeze): the
+    // self-instance uniqueness guard scans max_n + 2 inputs, so the shipping
+    // 32-slot covenant fills N=32 sells (34 inputs total) on the Op2 path.
+    // The 35-input rejection boundary is covenant-verified in
+    // spot_contracts::partial_input_count_guard.
+    let (inputs, outputs, exec, rs_len) = sweep_parts(&cx, 32, 32, v, false, Some(50_000_000), 1_000_000_000);
     let (m, results) = measure(1, &inputs, &outputs, 50, &exec);
-    assert_all_pass("partial N=14", &results);
-    row("Op2 partial (exp)", 14, rs_len, &m);
-    let (inputs, outputs, exec, _) = sweep_parts(&cx, 15, 15, v, false, Some(50_000_000), 1_000_000_000);
-    let (_, results) = measure(1, &inputs, &outputs, 50, &exec);
-    assert!(
-        results.last().unwrap().is_err(),
-        "partial with 17 tx inputs must trip the 16-input uniqueness guard"
-    );
-    println!("(Op2 partial hard ceiling: N=14 — 17th input trips the P5 guard, engine-verified)");
+    assert_all_pass("partial N=32", &results);
+    row("Op2 partial @MAX_N", 32, rs_len, &m);
+    println!("(Op2 partial ceiling: N=32 = 34 inputs, the derived MAX_N+2 guard bound)");
 
     // Sell-side IOC batch at N=8 (shipping; one payer wallet). Values sized
     // so the 2N covenant outputs (residual + delivery per sell) stay inside

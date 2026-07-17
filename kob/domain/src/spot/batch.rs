@@ -245,6 +245,9 @@ pub enum BatchError {
     /// (`spent - fair_sum <= spent/10000*mmfee_bps`) cannot be satisfied even
     /// at zero matcher surplus (integer-rounding gap exceeds the allowance).
     CapInfeasible { spent: u64, fair_sum: u64, cap: u64 },
+    /// A sell's covenant-enforced owner batch cap (`batch_max`) is smaller
+    /// than the planned batch size — the planner must exclude that sell.
+    BatchCapExceeded { outpoint: String, batch_max: u8, batch_size: usize },
     /// Ring: leg count outside `2..=RING_MAX`.
     RingLegCount { count: usize },
     /// Ring: the legs do not form a closed cycle (leg i's target token must
@@ -308,6 +311,13 @@ impl std::fmt::Display for BatchError {
             }
             BatchError::CapInfeasible { spent, fair_sum, cap } => {
                 write!(f, "v18 surplus cap infeasible: spent={} fair_sum={} allowed cap={}", spent, fair_sum, cap)
+            }
+            BatchError::BatchCapExceeded { outpoint, batch_max, batch_size } => {
+                write!(
+                    f,
+                    "sell {} carries batch_max={} but the planned batch has {} same-token inputs",
+                    outpoint, batch_max, batch_size
+                )
             }
             BatchError::RingLegCount { count } => {
                 write!(f, "ring has {} legs; supported range is 2..={}", count, RING_MAX)
@@ -555,7 +565,13 @@ impl BatchPlan {
                 tx_id: buy.outpoint.0.clone(),
                 index: buy.outpoint.1,
                 sigscript: ss,
-                sig_op_count: 0,
+                // LIMITS re-freeze: the 32-slot buy body exceeds the
+                // 9,999-unit free script allowance at every N, so the buy
+                // input declares a compute budget (sig_op_count = 1 ->
+                // computeBudget 10 = 109,999-unit capacity, the mapping the
+                // live N=32 run used). Bracket entries keep 0 (unchanged
+                // small body).
+                sig_op_count: if is_bracket { 0 } else { 1 },
             });
         }
 
@@ -757,7 +773,9 @@ impl BatchPlan {
                 prev_tx_id: buy.outpoint.0.clone(),
                 prev_index: buy.outpoint.1,
                 sequence: 50,
-                sig_op_count: 0,
+                // Compute-budget declaration for the 32-slot buy body (see
+                // build_tx): sig_op_count = 1 on non-bracket buy inputs.
+                sig_op_count: if buy.redeem_script.len() == BRACKET_RS_SIZE { 0 } else { 1 },
                 script_version: p2sh.version(),
                 script_bytes: p2sh.script().to_vec(),
                 value: buy.utxo_value,
@@ -979,16 +997,43 @@ fn distribute_buyer_refund(
 // above are untouched and die with Stage E.
 // ═════════════════════════════════════════════════════════════════════════
 
-/// Parse `mmfee_bps` out of a v18 buy redeemScript (state offset [160..168)).
+/// Owner batch cap of a v18 buy (n_max, LIMITS re-freeze): parsed from the
+/// RS; unparseable RSs fall back to MAX_N (validation elsewhere rejects).
+fn buy_n_max(buy: &BatchOrder) -> usize {
+    kob_core::contract::spot::parse::parse_redeem_script(&buy.redeem_script)
+        .and_then(|p| p.n_max)
+        .map(|v| v as usize)
+        .unwrap_or(BUY_ORDER_MAX_N)
+}
+
+/// Owner batch cap of a v18 sell (batch_max, LIMITS re-freeze). Covers the
+/// plain sell + OCO/twap/decay variants via their parse arms; contracts
+/// without the field (e.g. the plain v18 OCO) default to 255.
+fn sell_batch_max(sell: &BatchOrder) -> u8 {
+    let rs = &sell.redeem_script;
+    if let Some(p) = kob_core::contract::spot::parse::parse_redeem_script(rs) {
+        if let Some(bm) = p.batch_max {
+            return bm;
+        }
+    }
+    if let Some(p) = kob_core::contract::spot::parse::parse_ratchet_oco_redeem_script(rs) {
+        if let Some(bm) = p.oco.batch_max {
+            return bm;
+        }
+    }
+    255
+}
+
+/// Parse `mmfee_bps` out of a v18 buy redeemScript (state offset [162..170)).
 ///
-/// State layout (178B): `[0x20 okspkh]` then `[0x20 tcid][0x08 pnum]`
-/// `[0x08 pden][0x08 mfill][0x20 ohash][0x20 bspkh][0x08 mmfee][cpend]`
-/// `[0x08 expiry]` — mmfee bytes start after 33 + 127 = 160.
+/// State layout (180B): `[0x01 n_max][0x20 okspkh]` then `[0x20 tcid]`
+/// `[0x08 pnum][0x08 pden][0x08 mfill][0x20 ohash][0x20 bspkh][0x08 mmfee]`
+/// `[cpend][0x08 expiry]` — mmfee bytes start after 2 + 33 + 127 = 162.
 fn parse_buy_mmfee_bps(rs: &[u8]) -> Option<u64> {
     if rs.len() != BUY_ORDER_RS_EXPECTED_LEN {
         return None;
     }
-    Some(u64::from_le_bytes(rs[160..168].try_into().ok()?))
+    Some(u64::from_le_bytes(rs[162..170].try_into().ok()?))
 }
 
 /// Contract-order fair value of a full-filled sell term, exactly as the v18
@@ -1009,7 +1054,10 @@ fn validate_sweep(sells: &[BatchOrder], buys: &[BatchOrder]) -> Result<(), Batch
         return Err(BatchError::NoBuyOrders);
     }
     // Item D pin: never more than ONE v18 buy per settle (fail-closed by
-    // proof — see `test_multi_buy_rejected`).
+    // proof — see `test_multi_buy_rejected`). M=1 because cross-buy delivery
+    // disjointness is unprovable on-chain (buys carry no covenant id; the
+    // delivery outputs' single binding slot belongs to the token), so one
+    // buy per settle — M buys = M parallel txs.
     if buys.len() > 1 {
         return Err(BatchError::MultiBuyUnsupported { count: buys.len() });
     }
@@ -1025,6 +1073,23 @@ fn validate_sweep(sells: &[BatchOrder], buys: &[BatchOrder]) -> Result<(), Batch
             count: sells.len(),
             max: BUY_ORDER_MAX_N,
         });
+    }
+    // Owner batch caps (LIMITS re-freeze): the covenants enforce these
+    // on-chain; reject at plan time so a doomed tx is never built.
+    if sells.len() > buy_n_max(buy) {
+        return Err(BatchError::TooManySells {
+            count: sells.len(),
+            max: buy_n_max(buy),
+        });
+    }
+    for s in sells {
+        if (sell_batch_max(s) as usize) < sells.len() {
+            return Err(BatchError::BatchCapExceeded {
+                outpoint: format!("{}:{}", s.outpoint.0, s.outpoint.1),
+                batch_max: sell_batch_max(s),
+                batch_size: sells.len(),
+            });
+        }
     }
     let mut seen = HashSet::new();
     for o in sells.iter().chain(buys.iter()) {
@@ -1271,8 +1336,13 @@ pub fn plan_ioc_match(
     let buy_kas = buy.utxo_value;
     let mut kas_remaining = buy_kas;
     let mut filled: Vec<&BatchOrder> = Vec::new();
+    // Owner batch caps (LIMITS re-freeze): cap the sweep at the buy's n_max
+    // and track the included sells' minimum batch_max — a sell may only join
+    // while the resulting batch size respects every member's cap.
+    let n_cap = BUY_ORDER_MAX_N.min(buy_n_max(buy));
+    let mut min_cap: usize = usize::MAX;
     for sell in sells {
-        if filled.len() >= BUY_ORDER_MAX_N {
+        if filled.len() >= n_cap {
             break;
         }
         if sell.version != 18 {
@@ -1283,6 +1353,10 @@ pub fn plan_ioc_match(
         }
         if sell.price_den == 0 {
             continue;
+        }
+        let bm = sell_batch_max(sell) as usize;
+        if filled.len() + 1 > bm.min(min_cap) {
+            continue; // its (or a member's) batch_max would be exceeded
         }
         let sell_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
         if sell_kas_128 > u64::MAX as u128 {
@@ -1295,6 +1369,7 @@ pub fn plan_ioc_match(
         if kas_remaining >= sell_kas {
             filled.push(sell);
             kas_remaining -= sell_kas;
+            min_cap = min_cap.min(bm);
         } else {
             break;
         }
@@ -1508,12 +1583,19 @@ pub fn plan_partial_match(
     let buy_kas = buy.utxo_value;
     let mut filled: Vec<&BatchOrder> = Vec::new();
     let mut base_spent: u64 = 0; // Σ seller_kas
+    // Owner batch caps (LIMITS re-freeze): same rule as the GTC/IOC sweep.
+    let n_cap = BUY_ORDER_MAX_N.min(buy_n_max(buy));
+    let mut min_cap: usize = usize::MAX;
     for sell in sells {
-        if filled.len() >= BUY_ORDER_MAX_N {
+        if filled.len() >= n_cap {
             break;
         }
         if sell.version != 18 || sell.token_cov_id != buy.token_cov_id || sell.price_den == 0 {
             continue;
+        }
+        let bm = sell_batch_max(sell) as usize;
+        if filled.len() + 1 > bm.min(min_cap) {
+            continue; // its (or a member's) batch_max would be exceeded
         }
         let sell_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
         if sell_kas_128 > u64::MAX as u128 {
@@ -1526,6 +1608,7 @@ pub fn plan_partial_match(
         if base_spent + sell_kas <= buy_kas {
             filled.push(sell);
             base_spent += sell_kas;
+            min_cap = min_cap.min(bm);
         } else {
             break;
         }
@@ -1928,8 +2011,12 @@ pub fn plan_sell_ioc_match(
 // v18 ring planner (item F): 2..=RING_MAX swap-v18 legs, all-or-nothing
 // ═════════════════════════════════════════════════════════════════════════
 
-/// Maximum ring legs (2-cycle = token<->token, 3-cycle = triangle).
-pub const RING_MAX: usize = 3;
+/// Maximum ring legs (2-cycle = token<->token, 3-cycle = triangle, ...).
+///
+/// Planner-only cap: the swap covenant's checks are purely local and the VM
+/// is proven to 128 legs (kob/BATCH_LIMITS.md); 8 is matcher-optimizable
+/// headroom in the same spirit as MAX_N.
+pub const RING_MAX: usize = 8;
 
 /// One leg of a v18 swap ring: a resting swap-v18 order UTXO. Source/target
 /// tokens, `min_target` and `mmfee_bps` are parsed from the redeemScript
@@ -2449,11 +2536,14 @@ mod tests {
             "N > MAX_N must reject gracefully, got {:?}", r
         );
 
+        // N == MAX_N plans fine (per-sell values sized for the KIP-9
+        // storage floor at N=32, wallet sized for the ~5.4M-sompi min fee).
         let n = BUY_ORDER_MAX_N;
         let sells: Vec<BatchOrder> = (0..n as u8)
-            .map(|i| make_sell(0x70 + i, 5_000_000, 1, 1, token))
+            .map(|i| make_sell(0x70 + i, 400_000_000, 1, 1, token))
             .collect();
-        let buys = vec![make_buy(0x21, n as u64 * 5_000_000, 1, 1, token, 2000)];
+        let buys = vec![make_buy(0x21, n as u64 * 400_000_000, 1, 1, token, 2000)];
+        let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 50_000_000u64));
         let r = plan_batch_match(&sells, &buys, wallet, &matcher_spk(), 0, Some(2000));
         assert!(r.is_ok(), "N == MAX_N must plan fine: {:?}", r.err());
     }
@@ -2566,9 +2656,9 @@ mod tests {
         let sells: Vec<BatchOrder> = (0..(n_max as u8 + 2))
             .map(|i| make_sell(0x50 + i, 5_000_000, 1, 1, token))
             .collect();
-        // Affords more than MAX_N sells (41M vs 8*5M) but must cap; the
-        // 1M leftover stays within the 2000bps on-chain cap (8.2M).
-        let buy = make_buy(0x20, 41_000_000, 1, 1, token, 2000);
+        // Affords more than MAX_N sells (32*5M + 1M) but must cap; the
+        // 1M leftover stays within the 2000bps on-chain cap (32.2M).
+        let buy = make_buy(0x20, n_max as u64 * 5_000_000 + 1_000_000, 1, 1, token, 2000);
         let wallet = Some((hex::encode([0x99u8; 32]), 0u32, 5_000_000u64));
         let plan = plan_ioc_match(&sells, &buy, wallet, &matcher_spk(), 0, Some(2000))
             .expect("must plan (capped, not error)");
@@ -2890,11 +2980,16 @@ mod tests {
         let r = plan_ring_match(&[leg.clone()], wallet.clone(), &matcher_spk(), 0);
         assert!(matches!(r, Err(BatchError::RingLegCount { count: 1 })), "1 leg must reject, got {:?}", r);
 
-        let legs: Vec<RingLegOrder> = (0..4u8)
+        // RING_MAX + 1 legs (closure is checked after the count bound).
+        let over = (RING_MAX + 1) as u8;
+        let legs: Vec<RingLegOrder> = (0..over)
             .map(|i| make_ring_leg(0x20 + i, [i; 32], [i + 1; 32], 10_000_000, 10_000_000, 100, 0xF0 + i))
             .collect();
         let r = plan_ring_match(&legs, wallet, &matcher_spk(), 0);
-        assert!(matches!(r, Err(BatchError::RingLegCount { count: 4 })), "4 legs must reject, got {:?}", r);
+        assert!(
+            matches!(r, Err(BatchError::RingLegCount { count }) if count == RING_MAX + 1),
+            "RING_MAX+1 legs must reject, got {:?}", r
+        );
     }
 
     /// Ring closure: target/source chain must close into a cycle.

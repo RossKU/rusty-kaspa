@@ -386,6 +386,7 @@ async fn execute_operation(
                 None,  // expiry_daa: None = GTC
                 deploy::DEFAULT_MAX_MATCHER_FEE, // ignored for v18 (bps below)
                 Some(deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
+                None, // n_max: default owner batch cap (MAX_N)
             )
             .await?;
             // deploy_buy prints the TXID; we return None since we don't capture it
@@ -415,6 +416,7 @@ async fn execute_operation(
                 None,  // expiry_daa: None = GTC
                 deploy::DEFAULT_MAX_MATCHER_FEE, // ignored for v18 (bps below)
                 Some(deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
+                None,  // batch_max: default owner batch cap (255)
                 None,  // token_utxo: not supported in batch mode
                 None,  // fee_utxo: not supported in batch mode
             )

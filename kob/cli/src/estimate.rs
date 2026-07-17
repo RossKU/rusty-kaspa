@@ -50,10 +50,12 @@ const CALL_OPTION_RS_SIZE: u64 = 159;
 const PUT_OPTION_RS_SIZE: u64 = 205;
 
 // --- spot generation (formerly v18; V18_DESIGN.md) ---
-/// buy redeemScript: 178B state + 1542B body.
-const BUY_RS_SIZE: u64 = 1720;
-/// sell redeemScript: 145B state + 370B body.
-const SELL_RS_SIZE: u64 = 515;
+/// buy redeemScript: 180B state + 5475B body (LIMITS re-freeze: MAX_N=32
+/// slot table + n_max owner cap).
+const BUY_RS_SIZE: u64 = 5655;
+/// sell redeemScript: 148B state + 394B body (LIMITS re-freeze: batch_max
+/// owner cap).
+const SELL_RS_SIZE: u64 = 542;
 /// oco_sell redeemScript: 172B state + 225B body.
 #[allow(dead_code)] // Kept for fee estimation reference
 const OCO_RS_SIZE: u64 = 397;
@@ -68,12 +70,12 @@ const BRACKET_RS_SIZE: u64 = 372;
 ///   = 66 + 33 + 1 + 3 + 260 = 363.
 const SWAP_CANCEL_SS_SIZE: u64 = 363;
 
-/// buy fill sigscript: MAX_N tii pushes + N + selector + pushData(1720B RS)
-///   ~= 12 + 4 + 1720 = 1736.
-const BUY_FILL_SS_SIZE: u64 = 1736;
+/// buy fill sigscript: MAX_N=32 tii pushes + N + selector + pushData(5655B
+/// RS) ~= 40 + 4 + 3 + 5655 = 5702 (worst-case slot encoding).
+const BUY_FILL_SS_SIZE: u64 = 5702;
 /// sell fill sigscript: canonical attested prefix (20B) + selector +
-/// pushData(515B RS) = 21 + 3 + 515 = 539.
-const SELL_FILL_SS_SIZE: u64 = 539;
+/// pushData(542B RS) = 21 + 3 + 542 = 566.
+const SELL_FILL_SS_SIZE: u64 = 566;
 
 /// buy_v14 cancel sigscript: 1 + 66 + 33 + 3 + 396 = 499.
 const BUY_CANCEL_SS_SIZE: u64 = 499;
@@ -1007,13 +1009,13 @@ mod tests {
             OutputEstimate { label: "o2".to_string(), spk_size: P2PK_SPK_SIZE, value: 10_000 },
         ];
         let tm = compute_transaction_mass(&inputs, &outputs);
-        // Sell input: 44 + 3 + 539  = 586  (SELL_FILL_SS_SIZE; >252 so varint = 3)
-        // Buy input:  44 + 3 + 1736 = 1783 (BUY_FILL_SS_SIZE;  >252 so varint = 3)
+        // Sell input: 44 + 3 + 566  = 613  (SELL_FILL_SS_SIZE; >252 so varint = 3)
+        // Buy input:  44 + 3 + 5702 = 5749 (BUY_FILL_SS_SIZE;  >252 so varint = 3)
         // Fee input:  44 + 1 + 66   = 111
         // SigOps: 1 * 1000 = 1000
         // Outputs: (11+34) + (11+35) + (11+34) = 45 + 46 + 45 = 136
-        // Total: 68 + 586 + 1783 + 111 + 1000 + 136 = 3684
-        assert_eq!(tm, 68 + 586 + 1783 + 111 + 1000 + 136);
+        // Total: 68 + 613 + 5749 + 111 + 1000 + 136 = 7677
+        assert_eq!(tm, 68 + 613 + 5749 + 111 + 1000 + 136);
     }
 
 

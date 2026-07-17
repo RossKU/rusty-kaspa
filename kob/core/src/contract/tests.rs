@@ -1449,8 +1449,9 @@ mod adversarial_tests {
     /// `*_RS_SIZE`/`*_RS_EXPECTED_LEN` const in kob-core: the five v18 spot
     /// lengths + DCA + the four time contracts + lending/perp/x402.
     /// Collision policy at freeze: append one OpNop to the YOUNGER body —
-    /// never reshuffle state (not needed: realized lengths are all distinct;
-    /// the flagged decay_sell/ratchet_oco danger zone resolved to 622 vs 733).
+    /// never reshuffle state (not needed: realized lengths are all distinct
+    /// after the LIMITS re-freeze too — buy 5655 / sell 542 / twap 596 /
+    /// decay_sell 649 / ratchet_oco 760 / decay_buy 5895).
     #[test]
     fn rs_lengths_no_collision() {
         use crate::contract::spot::order::{
@@ -1512,11 +1513,14 @@ mod adversarial_tests {
         use crate::contract::spot::order::{build_buy_body, build_sell_body};
         use crate::contract::spot::oco::build_oco_sell_body;
         use crate::contract::spot::swap::build_swap_body;
+        // LIMITS re-freeze (MAX_N=32 + owner n_max/batch_max caps): buy and
+        // sell were deliberately re-frozen at these new bytes; OCO/swap/
+        // bracket remain byte-identical to the v18 freeze.
         let pins: &[(&str, Vec<u8>, &str)] = &[
             ("BUY_ORDER", build_buy_body(),
-             "3f1320143a652e2e9894ffac1b52f33e469e791e9c8ca10aaa9557b9c541a82a"),
+             "f8d3162f72b0b5af3a96bf26fa987948f4a1985952f9e3178917253198c6f568"),
             ("SELL_ORDER", build_sell_body(),
-             "ae49a66f3858cf509917453bdfa8a2dd44b4fbeeca5be3e69fe0773dc3e2eb50"),
+             "86d9bf28ffd94c87ab32a82c9ea8aac7a221d9f807bd4b4812a021056e6e9af5"),
             ("OCO_SELL", build_oco_sell_body(),
              "2a750d668ead305605b79dd9f574cd5832a5c7d010d510411cdc7eec0388a40c"),
             ("SWAP_ORDER", build_swap_body(),

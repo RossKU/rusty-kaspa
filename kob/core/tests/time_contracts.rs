@@ -145,7 +145,13 @@ fn wallet_input(b: u8) -> (TransactionInput, UtxoEntry) {
 }
 
 // ===========================================================================
-// v18 zero-diff pin (§0): this stage provably did not touch frozen bytecode.
+// Freeze pin. History: the original Stage-A zero-diff pin proved the time-
+// contracts stage did not touch v18 bytecode. The LIMITS re-freeze then
+// DELIBERATELY re-froze buy/sell (MAX_N=32 + owner n_max/batch_max caps) —
+// this pin is the POST-change freeze: buy/sell pinned at their new bytes,
+// OCO/swap/bracket byte-identical to the original v18 freeze. The pre-change
+// live proofs for the changed contracts are void; re-proof is planned in the
+// combined live stage.
 // ===========================================================================
 
 #[test]
@@ -165,12 +171,13 @@ fn v18_zero_diff_pin() {
     use kob_core::contract::spot::swap::{
         build_swap_body, SWAP_BODY_EXPECTED_LEN, SWAP_RS_SIZE, SWAP_STATE_SIZE,
     };
-    // Bodies byte-identical (blake2b) to the pre-Stage-A pins.
+    // Bodies byte-identical (blake2b) to the LIMITS re-freeze pins
+    // (buy/sell) and to the original v18 pins (OCO/swap/bracket).
     let pins: &[(&str, Vec<u8>, &str)] = &[
         ("BUY_ORDER", build_buy_body(),
-         "3f1320143a652e2e9894ffac1b52f33e469e791e9c8ca10aaa9557b9c541a82a"),
+         "f8d3162f72b0b5af3a96bf26fa987948f4a1985952f9e3178917253198c6f568"),
         ("SELL_ORDER", build_sell_body(),
-         "ae49a66f3858cf509917453bdfa8a2dd44b4fbeeca5be3e69fe0773dc3e2eb50"),
+         "86d9bf28ffd94c87ab32a82c9ea8aac7a221d9f807bd4b4812a021056e6e9af5"),
         ("OCO_SELL", build_oco_sell_body(),
          "2a750d668ead305605b79dd9f574cd5832a5c7d010d510411cdc7eec0388a40c"),
         ("SWAP_ORDER", build_swap_body(),
@@ -182,16 +189,17 @@ fn v18_zero_diff_pin() {
         assert_eq!(
             hex::encode(blake2b_256(body)),
             *expected_hex,
-            "v18 {name} body changed — the zero-diff freeze is violated"
+            "v18 {name} body changed — the freeze pin is violated"
         );
     }
-    // Length consts byte-identical to the frozen v18 values.
-    assert_eq!(BUY_ORDER_RS_EXPECTED_LEN, 1720);
-    assert_eq!(BUY_ORDER_STATE_SIZE, 178);
-    assert_eq!(BUY_ORDER_BODY_EXPECTED_LEN, 1542);
-    assert_eq!(SELL_ORDER_RS_EXPECTED_LEN, 515);
-    assert_eq!(SELL_ORDER_STATE_SIZE, 145);
-    assert_eq!(SELL_ORDER_BODY_EXPECTED_LEN, 370);
+    // Length consts pinned at the LIMITS re-freeze values (buy/sell) and
+    // the frozen v18 values (everything else).
+    assert_eq!(BUY_ORDER_RS_EXPECTED_LEN, 5655);
+    assert_eq!(BUY_ORDER_STATE_SIZE, 180);
+    assert_eq!(BUY_ORDER_BODY_EXPECTED_LEN, 5475);
+    assert_eq!(SELL_ORDER_RS_EXPECTED_LEN, 542);
+    assert_eq!(SELL_ORDER_STATE_SIZE, 148);
+    assert_eq!(SELL_ORDER_BODY_EXPECTED_LEN, 394);
     assert_eq!(OCO_SELL_RS_SIZE, 397);
     assert_eq!(OCO_SELL_STATE_SIZE, 172);
     assert_eq!(OCO_SELL_BODY_EXPECTED_LEN, 225);
@@ -207,13 +215,14 @@ fn v18_zero_diff_pin() {
     assert_eq!(DCA_ORDER_BODY.len(), 221);
 }
 
-/// Realized time-contract RS lengths (design §5 estimates vs freeze).
+/// Realized time-contract RS lengths (LIMITS re-freeze: +batch_max/n_max
+/// state and guards; decay_buy additionally inherits MAX_N=32).
 #[test]
 fn time_contract_rs_lengths_frozen() {
-    assert_eq!(TWAP_SELL_RS_EXPECTED_LEN, 569); // est ~575 +-10
-    assert_eq!(DECAY_SELL_RS_EXPECTED_LEN, 622); // est ~667 +-15
-    assert_eq!(RATCHET_OCO_RS_EXPECTED_LEN, 733); // est ~713 +-20
-    assert_eq!(DECAY_BUY_RS_EXPECTED_LEN, 1857); // est ~1842 +-25
+    assert_eq!(TWAP_SELL_RS_EXPECTED_LEN, 596); // pre-refreeze 569
+    assert_eq!(DECAY_SELL_RS_EXPECTED_LEN, 649); // pre-refreeze 622
+    assert_eq!(RATCHET_OCO_RS_EXPECTED_LEN, 760); // pre-refreeze 733
+    assert_eq!(DECAY_BUY_RS_EXPECTED_LEN, 5895); // pre-refreeze 1857
 }
 
 // ===========================================================================
@@ -704,6 +713,87 @@ fn decay_buy_partial_repriced() {
     assert!(b.is_ok(), "residual re-pricing at a later L must pass: {b:?}");
     let (_, b) = run_decay_buy(1900, 20_000_000, 10_999_999, Some(10_000_000));
     assert!(b.is_err(), "residual re-priced floor must bind");
+}
+
+/// LIMITS re-freeze parity: decay_buy carries the same MAX_N=32 slot table
+/// as the plain buy. A full 32-sell sweep settles against one decay_buy at
+/// the f(L) floor, and the pnum_eff floor still binds exactly at N=32
+/// (one token below rejects).
+#[test]
+fn decay_buy_max_n_32_parity() {
+    let c = ctx();
+    let n = 32usize;
+    let kas_in = 10_000_000u64;
+    // Floor at L=1500: kas_in/pden * pnum_eff = 10 * 1_500_000 = 15M tokens.
+    let per_sell_exact = 15_000_000u64 / n as u64; // 468_750, divides evenly
+    assert_eq!(per_sell_exact * n as u64, 15_000_000);
+    let run = |short: u64| -> Vec<Result<(), String>> {
+        let sell_rs = build_sell_redeem_script(
+            1, 2, 1, &c.owner_hash, &c.spk_hash, &c.spk_hash, 30, 0, 0,
+        )
+        .unwrap();
+        let buy_rs = build_decay_buy_redeem_script(
+            1000, 1000, 2000, &arr32(TOKEN_HEX), 2_000_000, 1_000_000, 1,
+            &c.owner_hash, &c.spk_hash, &c.spk_hash, 10000, 0, 0,
+        )
+        .unwrap();
+        let mut inputs = Vec::new();
+        let mut entries = Vec::new();
+        for i in 0..n {
+            let ss = build_sell_fill_sigscript(i as u16, 1, 2, &sell_rs);
+            inputs.push(TransactionInput::new(op(0x40 + i as u8, 0), ss, 50, 0));
+            entries.push(UtxoEntry {
+                amount: per_sell_exact,
+                script_public_key: build_p2sh(&sell_rs),
+                block_daa_score: 0,
+                is_coinbase: false,
+                covenant_id: Some(c.token),
+            });
+        }
+        let buy_idx = inputs.len();
+        let tii: Vec<u16> = (0..n as u16).collect();
+        inputs.push(TransactionInput::new(
+            op(0xA0, 0),
+            build_buy_fill_sigscript(&tii, false, &buy_rs),
+            50,
+            0,
+        ));
+        entries.push(UtxoEntry {
+            amount: kas_in,
+            script_public_key: build_p2sh(&buy_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        });
+        let (fi, fe) = wallet_input(0x30);
+        inputs.push(fi);
+        entries.push(fe);
+        let mut outputs = Vec::new();
+        for _ in 0..n {
+            outputs.push(TransactionOutput::with_covenant(
+                per_sell_exact / 2,
+                c.wallet_spk.clone(),
+                None,
+            ));
+        }
+        for i in 0..n {
+            // Delivery bound to sell i; the `short` run under-delivers on
+            // the LAST term (fails the buy floor at exactly one token).
+            let amt = if i == n - 1 { per_sell_exact - short } else { per_sell_exact };
+            outputs.push(TransactionOutput::with_covenant(
+                amt,
+                c.wallet_spk.clone(),
+                Some(CovenantBinding::new(i as u16, c.token)),
+            ));
+        }
+        outputs.push(TransactionOutput::with_covenant(500_000_000, c.wallet_spk.clone(), None));
+        let tx = Transaction::new(1, inputs, outputs, 1500, Default::default(), 0, vec![]);
+        exec_selected(&tx, entries, &[buy_idx])
+    };
+    let r = run(0).remove(0);
+    assert!(r.is_ok(), "decay_buy 32-sweep at the f(L) floor must pass: {r:?}");
+    let r = run(1).remove(0);
+    assert!(r.is_err(), "decay_buy 32-sweep one token below the f(L) floor must fail");
 }
 
 // ===========================================================================
@@ -1495,6 +1585,9 @@ fn ratchet_handrolled_rstep_zero_rejected() {
     let c = ctx();
     // Assemble the state manually (builder would reject rstep = 0).
     let mut rs = Vec::new();
+    rs.push(0x02); // batch_max = 255 (default encoding)
+    rs.push(0xff);
+    rs.push(0x00);
     for v in [0u64, 0, 60, 1_000_000] {
         rs.push(0x08);
         rs.extend_from_slice(&u64_le(v));

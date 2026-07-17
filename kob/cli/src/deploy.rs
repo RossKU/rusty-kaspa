@@ -319,6 +319,7 @@ pub async fn deploy_buy(
     expiry_daa: Option<u64>,
     max_matcher_fee: u64,
     mmfee_bps: Option<u64>,
+    n_max: Option<u8>,
 ) -> anyhow::Result<String> {
     // v18 (unified spot generation, V18_DESIGN.md) is the SOLE version new
     // buy deploys may target: N:M GTC/IOC sweep + Op2 partial fill + OCO
@@ -407,7 +408,11 @@ pub async fn deploy_buy(
     let buyer_spk_hash = contract::compute_token_unit_spk_hash(&pubkey);
 
     let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
-    let redeem_script = contract::spot::order::build_buy_redeem_script(
+    // Owner batch cap (LIMITS re-freeze): default = MAX_N unless the caller
+    // narrows the blast radius with --n-max.
+    let n_cap = n_max.unwrap_or(contract::spot::order::BUY_ORDER_MAX_N as u8);
+    let redeem_script = contract::spot::order::build_buy_redeem_script_with_caps(
+        n_cap,
         &token_cov_id,
         price_num,
         price_den,
@@ -720,6 +725,7 @@ pub async fn deploy_sell(
     expiry_daa: Option<u64>,
     max_matcher_fee: u64,
     mmfee_bps: Option<u64>,
+    batch_max: Option<u8>,
     token_utxo_str: Option<&str>,
     fee_utxo_str: Option<&str>,
 ) -> anyhow::Result<String> {
@@ -810,7 +816,10 @@ pub async fn deploy_sell(
     let seller_spk_hash = compute_p2pk_spk_hash(&pubkey);
 
     let sell_bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
-    let redeem_script = contract::spot::order::build_sell_redeem_script(
+    // Owner batch cap (LIMITS re-freeze): default = 255 unless the caller
+    // narrows the blast radius with --batch-max.
+    let redeem_script = contract::spot::order::build_sell_redeem_script_with_caps(
+        batch_max.unwrap_or(255),
         price_num, price_den, min_fill, &owner_hash, &seller_spk_hash,
         &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
         sell_bps,

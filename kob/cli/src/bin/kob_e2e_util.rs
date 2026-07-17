@@ -342,11 +342,11 @@ async fn main() -> anyhow::Result<()> {
 
             let (expiry_daa, expire_ss) = match side {
                 "buy" => (
-                    u64le(&rs[170..178]),
+                    u64le(&rs[172..180]), // +2 for the n_max state prefix
                     order::build_buy_expire_sigscript(&rs),
                 ),
                 "sell" => (
-                    u64le(&rs[137..145]),
+                    u64le(&rs[140..148]), // +3 for the batch_max state prefix
                     order::build_sell_expire_sigscript(&rs),
                 ),
                 _ => anyhow::bail!("side must be buy|sell"),

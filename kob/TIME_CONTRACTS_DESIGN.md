@@ -1,7 +1,11 @@
 # TIME CONTRACTS DESIGN FREEZE — decay limit, TWAP, trailing ratchet
 # (ADDITIVE contracts alongside the frozen v18 generation — NO generation bump)
 
-Status: design frozen 2026-07-17. Implementation NOT started (Stage A pending).
+Status: design frozen 2026-07-17. Stage A landed (`45ff9cc`); LIMITS
+re-freeze landed (`317f163` — MAX_N=32 / owner n_max+batch_max / ring 8;
+voids the prior live proofs of the six changed contracts, re-proof owed in
+Stage D); Stage B planners landed (`8d1c83e`). Stage C pending — scope
+includes the addenda and Stage-B residuals recorded in §7.
 Base: v18 single-generation spot (see `V18_DESIGN.md`), HEAD `b37c590`.
 History: this file was briefly `V19_TIME_DESIGN.md` (a generation-bump
 packaging); superseded same day by MK directive — **v18 stays frozen and
@@ -848,6 +852,20 @@ Composition (one per variant — the point of the additive packaging):
 - **C engine+cli**: deploy paths for the four kinds, scanner arms +
   ratchet-continuation tracking, `execute_oco_ratchet`, effective-price
   surfacing in API/book, CLI subcommands (§2.7/§3.5/§4.7).
+  **Stage-C addenda (agreed 2026-07-17, recorded here so they don't ride
+  only in conversation):**
+  - **C-a executor wiring of planner authority**: the executor must consume
+    `BatchPlan.lock_time` and the per-input `BatchTxInput.sequence` produced
+    by the Stage-B planners; today the executor sets its own values, so the
+    Stage-B authoritative time gates are not yet reflected in submitted txs.
+  - **C-b competing-matcher friendliness**: miner-style weighted-random
+    match selection plus collision backoff (on a lost race, back off and
+    re-plan instead of resubmitting the same sweep).
+  - **C-c TxSubmitter three-lane abstraction**: `Urgent` / `Free` / `Auto`
+    with per-tx lane selection; `Auto` falls back Urgent→Free. This is the
+    receiving port for the future miner-engine mode (fee-0 settle in
+    self-mined blocks) — that mode itself stays OUT of Stage C (separate
+    track, touches node/mining code).
 - **D live E2E**: testnet-10 forms of §6 (fund via kob-miner if needed; mint
   fresh SPA/SPB pattern tokens); TXIDs recorded in E2E_LIVE_RESULTS.md
   Stage-G.
@@ -855,6 +873,29 @@ Composition (one per variant — the point of the additive packaging):
   ENGINE_API_DESIGN touch-ups, this file gets a status update stamp (like
   V18_DESIGN's header), final regression sweep (which re-asserts the v18
   zero-diff pin).
+
+**Stage-B residuals (carry-forward, recorded 2026-07-17).** Small holes
+left by Stage B; picked up in Stage C unless marked otherwise:
+
+1. **Sell-anchored planners do not admit time variants** — time sells enter
+   only the buy-anchored sweep planners; the sell-anchored IOC path builds
+   the legacy Finalized shape (`domain/src/spot/batch.rs` Stage-B scope
+   note, `lock_time: 0`). Stage C either admits time variants there or
+   promotes this to an explicit non-goal at Stage E.
+2. **Ratchet sell-anchor path missing** — RT TP/SL branch fills ride only
+   buy-anchored plans, and `compose_settle_and_ratchet` assumes a buy-side
+   settle sibling; no sell-initiated composition exists. Same disposition
+   as (1).
+3. **`decay_buy` partial planner absent** — only `plan_decay_buy_match`
+   (GTC) and `plan_decay_buy_ioc_match` exist; the v18 partial-fill planner
+   shape is not mirrored for decay_buy (§6 DB-2 proves partial via the
+   residual re-price path, but planner support is owed).
+4. **R12 print selection is fail-closed and narrow** — only divisible
+   prints with `koi <= 127` qualify (`domain/src/spot/time_planner.rs`
+   skips `koi > 127`: the covenant's R12 reads koi as a single signed byte,
+   so >= 0x80 would read negative). Documented limitation, NOT Stage-C
+   work: settle shapes at MAX_N=32 stay far below 128 outputs; revisit only
+   if output counts ever approach the boundary.
 
 Build env: unchanged from V18_DESIGN §Build env (Termux cargo 1.94.1,
 `CARGO_TARGET_DIR=/root/kob-rust-target4`, per-crate commands only).

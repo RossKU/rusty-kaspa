@@ -51,42 +51,60 @@
         "properties": {
           "accepted": {
             "properties": {
-              "scheme": {
-                "const": "exact"
+              "scheme": { "const": "exact" },
+              "extra": {
+                "properties": {
+                  "binding": { "const": "kaspa-exact-v2" },
+                  "profile": { "const": "standard-native" }
+                },
+                "required": ["binding", "profile"]
               }
             },
-            "required": ["scheme"]
-          },
-          "payload": {
-            "properties": {
-              "type": {
-                "const": "exact-transaction"
-              }
-            },
-            "required": ["type"]
+            "required": ["scheme", "extra"]
           }
         },
-        "required": ["accepted", "payload"]
+        "required": ["accepted"]
       },
       "then": {
         "properties": {
+          "payload": {
+            "properties": {
+              "profile": { "const": "standard-native" }
+            },
+            "required": ["profile"],
+            "not": {
+              "required": ["challengeId"]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
           "accepted": {
             "properties": {
+              "scheme": { "const": "exact" },
               "extra": {
-                "required": [
-                  "templateId",
-                  "transactionEncoding",
-                  "borrowOutpoint",
-                  "borrowAmount",
-                  "borrowScriptPublicKey",
-                  "borrowRedeemScript",
-                  "additiveThresholdSompi",
-                  "paymentOutputIndex",
-                  "reservationId"
-                ]
+                "properties": {
+                  "binding": { "const": "kaspa-exact-v2" },
+                  "profile": { "const": "additive" }
+                },
+                "required": ["binding", "profile"]
               }
             },
-            "required": ["extra"]
+            "required": ["scheme", "extra"]
+          }
+        },
+        "required": ["accepted"]
+      },
+      "then": {
+        "properties": {
+          "payload": {
+            "properties": {
+              "profile": { "const": "additive" }
+            },
+            "required": ["profile", "challengeId"]
           }
         }
       }

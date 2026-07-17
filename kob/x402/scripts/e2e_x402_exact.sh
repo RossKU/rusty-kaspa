@@ -131,27 +131,39 @@ check "replay refused" "false" "$(echo "$V" | field isValid)"
 log "schema conformance (captured live messages vs vendored schemas)"
 conform() { if echo "$2" | grep -q "$3"; then echo "  PASS: $1"; PASS=$((PASS+1)); else echo "  FAIL: $1"; FAIL=$((FAIL+1)); fi; }
 RES=$(cat "$WORK/reserve.json"); PAY=$(cat "$WORK/req_happy.json"); SET="$S"
-# PaymentRequired
+# PaymentRequired (alpha.8: kaspa-exact-v2 + additive profile head/challenge vocabulary)
 conform "PaymentRequired x402Version=2"        "$RES" '"x402Version":2'
 conform "PaymentRequired resource.url"         "$RES" '"resource":{[^}]*"url"'
 conform "PaymentRequirements scheme=exact"     "$RES" '"scheme":"exact"'
 conform "PaymentRequirements asset=KAS"        "$RES" '"asset":"KAS"'
-conform "extra binding=kaspa-exact-v1"         "$RES" '"binding":"kaspa-exact-v1"'
+conform "extra binding=kaspa-exact-v2"         "$RES" '"binding":"kaspa-exact-v2"'
+conform "extra profile=additive"               "$RES" '"profile":"additive"'
 conform "extra templateId kip10-additive"      "$RES" '"templateId":"kaspa-x402-kip10-additive-v1"'
 conform "extra transactionEncoding"            "$RES" '"transactionEncoding":"kaspa-sdk-safe-json-v2.0.0"'
-conform "extra borrowScriptPublicKey 0000..."  "$RES" '"borrowScriptPublicKey":"0000'
-conform "extra reservationId 64hex"            "$RES" '"reservationId":"[0-9a-f]\{64\}"'
+conform "extra payToScriptPublicKey 0000..."   "$RES" '"payToScriptPublicKey":"0000'
+conform "extra headScriptPublicKey 0000..."    "$RES" '"headScriptPublicKey":"0000'
+conform "extra expectedHeadOutpoint"           "$RES" '"expectedHeadOutpoint":{'
+conform "extra headVersion"                    "$RES" '"headVersion":"0"'
+conform "extra challengeId 64hex"              "$RES" '"challengeId":"[0-9a-f]\{64\}"'
+conform "extra challengeExpiresAt ISO"         "$RES" '"challengeExpiresAt":"[0-9]\{4\}-'
+if echo "$RES" | grep -q '"borrowOutpoint"\|"reservationId"'; then echo "  FAIL: alpha.7 borrow/reservation fields must be gone"; FAIL=$((FAIL+1)); else echo "  PASS: no alpha.7 borrow/reservation fields"; PASS=$((PASS+1)); fi
 # PaymentPayload
 conform "PaymentPayload x402Version=2"         "$PAY" '"x402Version":2'
 conform "PaymentPayload has accepted"          "$PAY" '"accepted":'
 conform "payload type exact-transaction"       "$PAY" '"type":"exact-transaction"'
+conform "payload profile=additive"             "$PAY" '"profile":"additive"'
 conform "payload transactionEncoding"          "$PAY" '"transactionEncoding":"kaspa-sdk-safe-json-v2.0.0"'
+conform "payload challengeId 64hex"            "$PAY" '"challengeId":"[0-9a-f]\{64\}"'
+conform "payload requestHash"                  "$PAY" '"requestHash":"[0-9a-f]\{64\}"'
+conform "payload authorization version"        "$PAY" '"version":"kaspa-x402-exact-request-authorization-v1"'
 if echo "$PAY" | grep -q '"payload":{[^}]*"transactionId"'; then echo "  FAIL: exact payload must NOT carry transactionId"; FAIL=$((FAIL+1)); else echo "  PASS: no transactionId in exact payload"; PASS=$((PASS+1)); fi
 # SettlementResponse
 conform "SettlementResponse success=true"      "$SET" '"success":true'
 conform "SettlementResponse 64hex transaction" "$SET" '"transaction":"[0-9a-f]\{64\}"'
 conform "SettlementResponse has amount"        "$SET" '"amount":"'
 conform "SettlementResponse extensions.kaspa"  "$SET" '"extensions":{"kaspa"'
+conform "SettlementResponse exactProfile"      "$SET" '"exactProfile":"additive"'
+conform "SettlementResponse headOutpoint"      "$SET" '"headOutpoint":{'
 if echo "$SET" | grep -q '"extra":'; then echo "  FAIL: SettlementResponse must not have top-level extra"; FAIL=$((FAIL+1)); else echo "  PASS: no top-level extra in SettlementResponse"; PASS=$((PASS+1)); fi
 
 echo

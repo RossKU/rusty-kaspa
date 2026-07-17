@@ -3,6 +3,16 @@
 //! Tracks borrow terms: for each reservation the merchant funds a UTXO to the
 //! additive-borrow covenant P2SH; this provider computes that covenant, records
 //! the terms, and emits the v2 `PaymentRequirements.extra` the client needs.
+//!
+//! alpha.8 mapping: on the wire this is the `additive` profile of
+//! `kaspa-exact-v2`. One KOB reservation = one single-transition head chain:
+//! the funded borrow outpoint is the `expectedHeadOutpoint` (headVersion "0"),
+//! the covenant P2SH is the `headScriptPublicKey`/`headRedeemScript`, and the
+//! reservation id is the server-issued `challengeId`. NOTE: KOB's covenant
+//! construction keeps the merchant payment as a separate output (the covenant
+//! enforces continuation >= headAmount + threshold at the sigscript-designated
+//! index) rather than upstream's successor-delta-only construction — the wire
+//! shapes are alpha.8-conformant, the on-chain template is KOB's own.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -10,7 +20,10 @@ use std::time::{Duration, Instant};
 use kob_core::contract::x402_borrow::build_x402_borrow_redeem_script;
 use kob_settle::{blake2b_256, build_p2sh};
 
-use crate::wire_v2::{BINDING_EXACT, TEMPLATE_KIP10_ADDITIVE, TX_ENCODING_SAFE_JSON};
+use crate::wire_v2::{
+    iso8601_from_unix_secs, BINDING_EXACT, PROFILE_ADDITIVE, TEMPLATE_KIP10_ADDITIVE,
+    TX_ENCODING_SAFE_JSON,
+};
 
 /// Default reservation time-to-live. `/reserve` is unauthenticated, so a
 /// reservation that is never settled must not live forever in memory.
@@ -44,23 +57,47 @@ pub struct BorrowTerms {
     pub consumed: bool,
     /// When this reservation was recorded — drives TTL eviction.
     pub created_at: Instant,
+    /// Wall-clock expiry (unix secs) — emitted as `challengeExpiresAt`.
+    pub expires_at_unix: u64,
 }
 
 impl BorrowTerms {
-    /// `extra` object for the exact-scheme PaymentRequirements (v2).
+    /// Stable server-scoped head id for this (single-transition) additive
+    /// chain: blake2b("kob-x402-head:" || borrow_txid || ":" || index).
+    pub fn head_id(&self) -> String {
+        let seed = format!("kob-x402-head:{}:{}", self.borrow_txid, self.borrow_index);
+        hex::encode(blake2b_256(seed.as_bytes()))
+    }
+
+    /// `extra` object for the exact-scheme PaymentRequirements (alpha.8
+    /// `additive` profile shape; the alpha.7 borrow*/reservation* keys are
+    /// forbidden by the vendored schema).
     pub fn requirements_extra(&self) -> serde_json::Value {
+        let pay_to_spk = kob_settle::bech32::address_to_spk(&self.pay_to)
+            .map(|s| format!("0000{}", hex::encode(s)))
+            .unwrap_or_default();
         serde_json::json!({
             "binding": BINDING_EXACT,
+            "profile": PROFILE_ADDITIVE,
             "finality": "accepted",
-            "templateId": TEMPLATE_KIP10_ADDITIVE,
             "transactionEncoding": TX_ENCODING_SAFE_JSON,
-            "borrowOutpoint": { "txid": self.borrow_txid, "index": self.borrow_index },
-            "borrowAmount": self.borrow_amount.to_string(),
-            "borrowScriptPublicKey": format!("0000{}", hex::encode(&self.p2sh_script)),
-            "borrowRedeemScript": hex::encode(&self.redeem_script),
+            // Derived from payTo (merchant identity). KOB deviation from the
+            // upstream reference: upstream additive pays the merchant through
+            // the head successor (payTo == head P2SH), while KOB's covenant
+            // pays the merchant at a separate output, so payToScriptPublicKey
+            // here is the merchant SPK, not headScriptPublicKey.
+            "payToScriptPublicKey": pay_to_spk,
+            "templateId": TEMPLATE_KIP10_ADDITIVE,
+            "headId": self.head_id(),
+            "headVersion": "0",
+            "expectedHeadOutpoint": { "txid": self.borrow_txid, "index": self.borrow_index },
+            "headAmount": self.borrow_amount.to_string(),
+            "headScriptPublicKey": format!("0000{}", hex::encode(&self.p2sh_script)),
+            "headRedeemScript": hex::encode(&self.redeem_script),
             "additiveThresholdSompi": self.additive_threshold.to_string(),
+            "challengeId": self.reservation_id,
+            "challengeExpiresAt": iso8601_from_unix_secs(self.expires_at_unix),
             "paymentOutputIndex": self.payment_output_index,
-            "reservationId": self.reservation_id,
             "assetKind": "native",
             "assetDecimals": 8,
         })
@@ -186,6 +223,11 @@ impl ReservationProvider {
             ));
         }
         let (redeem_script, p2sh_script, _addr) = borrow_covenant(pay_to, borrow_amount, additive_threshold)?;
+        let expires_at_unix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+            + self.ttl.as_secs();
         let terms = BorrowTerms {
             reservation_id: reservation_id.clone(),
             pay_to: pay_to.to_string(),
@@ -202,6 +244,7 @@ impl ReservationProvider {
             request_hash,
             consumed: false,
             created_at: Instant::now(),
+            expires_at_unix,
         };
         self.active_hashes.insert(merchant_spk_hash);
         self.by_id.insert(reservation_id, terms.clone());
@@ -242,14 +285,29 @@ mod tests {
     fn reserve_records_and_extra_conforms() {
         let mut rp = ReservationProvider::new();
         let rid = "ab".repeat(32);
-        let t = rp.reserve(rid.clone(), &testnet_addr(1), 250, &"cd".repeat(32), 0, 100_000_000, 3000, 1, None).unwrap();
+        let t = rp.reserve(rid.clone(), &testnet_addr(1), 250, &"cd".repeat(32), 0, 100_000_000, 3000, 0, None).unwrap();
         let extra = t.requirements_extra();
+        // alpha.8 additive-profile shape.
         assert_eq!(extra["binding"], BINDING_EXACT);
+        assert_eq!(extra["profile"], PROFILE_ADDITIVE);
         assert_eq!(extra["templateId"], TEMPLATE_KIP10_ADDITIVE);
-        assert_eq!(extra["borrowAmount"], "100000000");
+        assert_eq!(extra["headAmount"], "100000000");
+        assert_eq!(extra["headVersion"], "0");
+        assert_eq!(extra["expectedHeadOutpoint"]["txid"], "cd".repeat(32));
         assert_eq!(extra["additiveThresholdSompi"], "3000");
-        assert!(extra["borrowScriptPublicKey"].as_str().unwrap().starts_with("0000aa"));
-        assert_eq!(extra["reservationId"], rid);
+        assert!(extra["headScriptPublicKey"].as_str().unwrap().starts_with("0000aa"));
+        assert!(extra["payToScriptPublicKey"].as_str().unwrap().starts_with("0000"));
+        assert_eq!(extra["headId"].as_str().unwrap().len(), 64);
+        assert_eq!(extra["challengeId"], rid);
+        assert!(extra["challengeExpiresAt"].as_str().unwrap().ends_with('Z'));
+        assert!(
+            crate::wire_v2::unix_secs_from_iso8601(extra["challengeExpiresAt"].as_str().unwrap()).is_some(),
+            "challengeExpiresAt must be schema-shaped ISO-8601"
+        );
+        // The forbidden alpha.7 keys are gone.
+        for k in ["borrowOutpoint", "borrowAmount", "borrowScriptPublicKey", "borrowRedeemScript", "reservationId"] {
+            assert!(extra.get(k).is_none(), "alpha.7 key {} must not be emitted", k);
+        }
         assert!(rp.get(&rid).is_some());
         rp.mark_consumed(&rid);
         assert!(rp.get(&rid).unwrap().consumed);

@@ -22,9 +22,11 @@ use crate::scheme_kcc20;
 use crate::scheme_native;
 use crate::fingerprint;
 use crate::wire_v2::{
-    errors, AwaitRequest, FacilitatorRequest, KaspaSettleExt, PaymentRequired, PaymentRequirements,
-    Resource, SettlementResponse, VerifyResponse, ASSET_KAS, BINDING_EXACT, BINDING_KCC20,
-    BINDING_NATIVE, NETWORK_TESTNET10, SCHEME_EXACT, X402_VERSION,
+    errors, unix_secs_from_iso8601, AwaitRequest, FacilitatorRequest, KaspaSettleExt, Outpoint,
+    PaymentRequired, PaymentRequirements, Resource, SettlementResponse, VerifyResponse, ASSET_KAS,
+    AUTHORIZATION_VERSION, BINDING_EXACT, BINDING_KCC20, BINDING_NATIVE, NETWORK_TESTNET10,
+    PROFILE_ADDITIVE, PROFILE_STANDARD_NATIVE, SCHEME_EXACT, TEMPLATE_KIP10_ADDITIVE,
+    TX_ENCODING_SAFE_JSON, X402_VERSION,
 };
 
 type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -211,6 +213,10 @@ struct Validated {
     /// successful settle can `mark_consumed` it (frees its continuation
     /// target and lets TTL/cap eviction drop it). `None` for native/KCC20.
     reservation_id: Option<String>,
+    /// Scheme/profile-specific settlement-extension base (exactProfile, head
+    /// lineage, ...). `finalize` fills the per-settlement fields (payment
+    /// output index, finality, requestHash) on top of this.
+    settle_ext: KaspaSettleExt,
 }
 
 // Wire-error mapping is aligned across schemes for the same logical failure:
@@ -249,18 +255,21 @@ fn now_nanos() -> u128 {
         .unwrap_or(0)
 }
 
-/// Map a KIP-10 exact reject to a closed wire error code.
+/// Map an exact-v2 reject (either profile) to a closed wire error code.
 fn exact_reject_code(r: scheme_exact::ExactReject) -> &'static str {
     use scheme_exact::ExactReject::*;
     match r {
-        WrongRecipient | Underpayment | UnderThreshold | WrongPaymentOutputIndex => {
-            errors::INVALID_PAYMENT_REQUIREMENTS
-        }
+        // The payment does not satisfy the offer's economic/profile shape.
+        // alpha.8: exact is an equality, so Overpayment is refused like
+        // Underpayment; duplicate merchant outputs / extra outputs violate the
+        // canonical standard-native shape.
+        WrongRecipient | Underpayment | Overpayment | UnderThreshold | WrongPaymentOutputIndex
+        | DuplicateMerchantOutput | TooManyOutputs => errors::INVALID_PAYMENT_REQUIREMENTS,
         // Aligned with native/kcc20: a bad request binding is a payload issue.
         FingerprintMismatch => errors::INVALID_PAYLOAD,
         // Spending a wrong/stale outpoint is an on-chain state conflict.
         WrongBorrowOutpoint => errors::INVALID_TRANSACTION_STATE,
-        Malformed | BadEncoding | NoInputs => errors::INVALID_PAYLOAD,
+        Malformed | BadEncoding | NoInputs | WrongVersion | NonEmptyPayload => errors::INVALID_PAYLOAD,
     }
 }
 
@@ -304,6 +313,12 @@ impl<B: ChainBackend> Facilitator<B> {
         resource_url: &str,
         request_hash: Option<String>,
     ) -> Result<PaymentRequired, String> {
+        // alpha.8 additive profile: `paymentOutputIndex` is const 0 on the
+        // wire (kaspa-requirements-extra.schema.json). The provider itself
+        // stays generic, but a wire-facing offer must be schema-conformant.
+        if payment_output_index != 0 {
+            return Err("alpha.8 additive profile requires paymentOutputIndex 0".to_string());
+        }
         let seed = format!("{}:{}:{}", borrow_txid, borrow_index, now_nanos());
         let reservation_id = hex::encode(kob_settle::blake2b_256(seed.as_bytes()));
         let terms = {
@@ -359,9 +374,62 @@ impl<B: ChainBackend> Facilitator<B> {
         let binding = requirements.binding().unwrap_or_default();
         let is_native = binding == BINDING_NATIVE;
 
-        // KIP-10 additive exact (strict interop) — handled here (string-encoded
-        // transaction + reservation lookup).
+        // Strict-interop exact (kaspa-exact-v2, alpha.8 profile split) —
+        // handled here (string-encoded transaction; profile-routed).
         if binding == BINDING_EXACT {
+            let profile = requirements.profile().ok_or(errors::INVALID_PAYMENT_REQUIREMENTS)?.to_string();
+            // The payload must select the SAME profile the accepted offer
+            // carries (payment-payload.schema.json conditional).
+            if pp.profile() != Some(profile.as_str()) {
+                return Err(errors::INVALID_PAYLOAD);
+            }
+            // payToScriptPublicKey is mandatory for every exact v2 offer and
+            // MUST equal the SPK independently derived from payTo.
+            let derived_spk = kob_settle::bech32::address_to_spk(&requirements.pay_to)
+                .map(|s| format!("0000{}", hex::encode(s)))
+                .map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?;
+            match requirements.pay_to_script_public_key() {
+                Some(spk) if spk.eq_ignore_ascii_case(&derived_spk) => {}
+                _ => return Err(errors::INVALID_PAYMENT_REQUIREMENTS),
+            }
+            // alpha.8: the signed payer request authorization is MANDATORY for
+            // both profiles. Enforced structurally here: version const, digest
+            // (32-byte hex) / signature (64-byte hex) shapes, and unexpired
+            // expiry. Byte-level digest recomputation + Schnorr verification
+            // against the authorizing funding input is NOT yet possible from
+            // the published upstream artifacts: the vectors carry only the
+            // final digest/signature, not the digest preimage layout as bytes
+            // (same gap as the consensus vectors' txid preimages — see
+            // interop_tests.rs; feedback filed upstream).
+            let auth = pp.authorization().ok_or(errors::INVALID_PAYLOAD)?;
+            let is_hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
+            if auth.version != AUTHORIZATION_VERSION
+                || auth.digest.len() != 64
+                || !is_hex(&auth.digest)
+                || auth.signature.len() != 128
+                || !is_hex(&auth.signature)
+            {
+                return Err(errors::INVALID_PAYLOAD);
+            }
+            let expires = unix_secs_from_iso8601(&auth.expires_at).ok_or(errors::INVALID_PAYLOAD)?;
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            if expires <= now_secs {
+                return Err(errors::INVALID_PAYLOAD);
+            }
+            // alpha.8: requestHash is mandatory in the exact payload; when the
+            // resource server supplied its independently computed hash on the
+            // facilitator request, the payload value is EVIDENCE to compare,
+            // never an independent statement of the request.
+            let payload_rh = pp.request_hash().ok_or(errors::INVALID_PAYLOAD)?.to_string();
+            if let Some(server_rh) = req.request_hash.as_deref() {
+                if server_rh != payload_rh {
+                    return Err(errors::INVALID_PAYLOAD);
+                }
+            }
+
             let enc = transaction.as_str().ok_or(errors::INVALID_PAYLOAD)?;
             let encoding = pp.payload.get("transactionEncoding").and_then(|v| v.as_str()).unwrap_or("");
             let poi = pp
@@ -369,9 +437,56 @@ impl<B: ChainBackend> Facilitator<B> {
                 .get("paymentOutputIndex")
                 .and_then(|v| v.as_u64())
                 .ok_or(errors::INVALID_PAYLOAD)? as u32;
-            let req_hash = pp.request_hash().map(|s| s.to_string());
-            let rid = requirements.reservation_id().ok_or(errors::INVALID_PAYMENT_REQUIREMENTS)?;
-            // Only settle a reservation we issued and that is not yet consumed.
+
+            // ---- standard-native (default profile): plain exact transfer ----
+            if profile == PROFILE_STANDARD_NATIVE {
+                // challengeId is additive-only (schema forbids it here).
+                if pp.challenge_id().is_some() {
+                    return Err(errors::INVALID_PAYLOAD);
+                }
+                // No reservation carries the binding for this profile, so the
+                // resource server's own requestHash on the facilitator request
+                // is REQUIRED (facilitator-profile.md: mandatory for exact).
+                let server_rh = req.request_hash.clone().ok_or(errors::INVALID_PAYLOAD)?;
+                let amount = requirements
+                    .amount_sompi()
+                    .map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?;
+                let v = scheme_exact::verify_exact_standard_native(
+                    enc, encoding, poi, &from, &requirements.pay_to, amount,
+                )
+                .map_err(exact_reject_code)?;
+                let validated = Validated {
+                    artifact_id: v.artifact_id,
+                    payer: v.payer,
+                    pay_output_index: v.payment_output_index,
+                    input_outpoints: v.input_outpoints,
+                    tx: v.tx,
+                    pay_to: requirements.pay_to.clone(),
+                    confirm_address: requirements.pay_to.clone(),
+                    amount,
+                    binding_fingerprint: server_rh,
+                    reservation_id: None,
+                    settle_ext: KaspaSettleExt {
+                        exact_profile: Some(PROFILE_STANDARD_NATIVE.to_string()),
+                        transaction_encoding: Some(TX_ENCODING_SAFE_JSON.to_string()),
+                        ..Default::default()
+                    },
+                };
+                self.check_inputs_on_chain(&validated.input_outpoints, &[from.clone()], None).await?;
+                return Ok(validated);
+            }
+            if profile != PROFILE_ADDITIVE {
+                return Err(errors::INVALID_PAYMENT_REQUIREMENTS);
+            }
+
+            // ---- additive profile (KIP-10 head; KOB covenant template) ----
+            // The server-issued challengeId keys the reservation, and the
+            // payload must echo it (payment-payload.schema.json conditional).
+            let rid = requirements.challenge_id().ok_or(errors::INVALID_PAYMENT_REQUIREMENTS)?;
+            if pp.challenge_id() != Some(rid) {
+                return Err(errors::INVALID_PAYLOAD);
+            }
+            // Only settle a challenge we issued and that is not yet consumed.
             // ALL economic terms come from the stored reservation, never the
             // caller-supplied requirements.
             let (t, borrow_owner) = {
@@ -385,14 +500,15 @@ impl<B: ChainBackend> Facilitator<B> {
                     .map_err(|_| errors::UNEXPECTED_SETTLE_ERROR)?;
                 (t, owner)
             };
-            // Caller-supplied requirements must agree with the stored terms.
+            // Caller-supplied requirements must agree with the stored terms
+            // (alpha.8 head/challenge field names).
             let req_matches_terms = requirements.amount_sompi().map(|a| a == t.amount).unwrap_or(false)
                 && requirements.pay_to == t.pay_to
                 && requirements
-                    .borrow_outpoint()
+                    .expected_head_outpoint()
                     .map(|o| o.txid.eq_ignore_ascii_case(&t.borrow_txid) && o.index == t.borrow_index)
                     .unwrap_or(false)
-                && requirements.borrow_amount_sompi() == Some(t.borrow_amount)
+                && requirements.head_amount_sompi() == Some(t.borrow_amount)
                 && requirements.additive_threshold_sompi() == Some(t.additive_threshold)
                 && requirements.payment_output_index() == Some(t.payment_output_index);
             if !req_matches_terms {
@@ -406,7 +522,7 @@ impl<B: ChainBackend> Facilitator<B> {
             // artifact_id).
             let bound_hash = t.request_hash.clone().ok_or(errors::INVALID_PAYLOAD)?;
             let v = scheme_exact::verify_exact_kip10(
-                enc, encoding, poi, req_hash.as_deref(), &from, Some(bound_hash.as_str()), &t,
+                enc, encoding, poi, Some(payload_rh.as_str()), &from, Some(bound_hash.as_str()), &t,
             )
             .map_err(exact_reject_code)?;
             let validated = Validated {
@@ -420,6 +536,16 @@ impl<B: ChainBackend> Facilitator<B> {
                 amount: t.amount,
                 binding_fingerprint: bound_hash,
                 reservation_id: Some(rid.to_string()),
+                settle_ext: KaspaSettleExt {
+                    exact_profile: Some(PROFILE_ADDITIVE.to_string()),
+                    transaction_encoding: Some(TX_ENCODING_SAFE_JSON.to_string()),
+                    template_id: Some(TEMPLATE_KIP10_ADDITIVE.to_string()),
+                    head_id: Some(t.head_id()),
+                    head_version: Some("0".to_string()),
+                    head_outpoint: Some(Outpoint { txid: t.borrow_txid.clone(), index: t.borrow_index }),
+                    challenge_id: Some(rid.to_string()),
+                    ..Default::default()
+                },
             };
             // On-chain: every input unspent across [borrow P2SH, payer].
             self.check_inputs_on_chain(&validated.input_outpoints, &[borrow_owner, from.clone()], None).await?;
@@ -458,6 +584,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
                         binding_fingerprint,
                         reservation_id: None,
+                        settle_ext: KaspaSettleExt::default(),
                     },
                     owners,
                     None,
@@ -485,6 +612,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
                         binding_fingerprint,
                         reservation_id: None,
+                        settle_ext: KaspaSettleExt::default(),
                     },
                     owners,
                     Some(asset),
@@ -580,7 +708,7 @@ impl<B: ChainBackend> Facilitator<B> {
         };
         let Validated {
             artifact_id, payer, pay_output_index, input_outpoints, tx, pay_to, confirm_address, amount,
-            binding_fingerprint, reservation_id,
+            binding_fingerprint, reservation_id, settle_ext,
         } = validated;
         let request_hash = req.payment_payload.request_hash().map(|s| s.to_string());
 
@@ -608,7 +736,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         if let Some(chain_txid) = rec.chain_txid.clone() {
                             drop(store);
                             let resp = self
-                                .finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash)
+                                .finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash, settle_ext)
                                 .await;
                             self.consume_reservation_if_settled(&resp, reservation_id.as_deref()).await;
                             return resp;
@@ -656,7 +784,7 @@ impl<B: ChainBackend> Facilitator<B> {
                         let _ = store.record(base.with_chain_txid(landed.clone()));
                     }
                     let resp = self
-                        .finalize(net, &artifact_id, &landed, pay_output_index, &confirm_address, amount, Some(payer), request_hash)
+                        .finalize(net, &artifact_id, &landed, pay_output_index, &confirm_address, amount, Some(payer), request_hash, settle_ext)
                         .await;
                     self.consume_reservation_if_settled(&resp, reservation_id.as_deref()).await;
                     return resp;
@@ -689,7 +817,7 @@ impl<B: ChainBackend> Facilitator<B> {
             let _ = store.record(base.with_chain_txid(chain_txid.clone()));
         }
 
-        let resp = self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash).await;
+        let resp = self.finalize(net, &artifact_id, &chain_txid, pay_output_index, &confirm_address, amount, Some(payer), request_hash, settle_ext).await;
         self.consume_reservation_if_settled(&resp, reservation_id.as_deref()).await;
         resp
     }
@@ -859,6 +987,8 @@ impl<B: ChainBackend> Facilitator<B> {
     }
 
     /// Confirm finality for a broadcast payment and record the outcome.
+    /// `ext_base` carries the scheme/profile-specific extension fields
+    /// (exactProfile, head lineage, ...) established at validation time.
     #[allow(clippy::too_many_arguments)]
     async fn finalize(
         &self,
@@ -870,6 +1000,7 @@ impl<B: ChainBackend> Facilitator<B> {
         amount: u64,
         payer: Option<String>,
         request_hash: Option<String>,
+        ext_base: KaspaSettleExt,
     ) -> SettlementResponse {
         let confirmed = self
             .backend
@@ -883,7 +1014,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 payment_output_index: Some(pay_output_index),
                 finality: Some("accepted".to_string()),
                 request_hash,
-                ..Default::default()
+                ..ext_base
             };
             SettlementResponse::ok(&net, chain_txid, amount, payer, ext)
         } else {
@@ -1136,6 +1267,8 @@ mod tests {
                 extensions: None,
             },
             payment_requirements: req,
+            request_hash: None,
+            resource: None,
         }
     }
 
@@ -1466,6 +1599,8 @@ mod tests {
                 extensions: None,
             },
             payment_requirements: requirements,
+            request_hash: None,
+            resource: None,
         };
         (req, payer_addr)
     }
@@ -1695,6 +1830,20 @@ mod tests {
         serde_json::to_string(&tx).unwrap()
     }
 
+    /// A structurally valid alpha.8 payer request authorization (version
+    /// const, 32-byte digest, 64-byte signature, unexpired). Cryptographic
+    /// digest/signature verification is blocked on upstream preimage vectors
+    /// (see validate()), so tests exercise the structural gate.
+    fn test_authorization() -> serde_json::Value {
+        serde_json::json!({
+            "version": AUTHORIZATION_VERSION,
+            "inputIndex": 1,
+            "expiresAt": "2099-01-01T00:00:00.000Z",
+            "digest": "ce".repeat(32),
+            "signature": "ab".repeat(64),
+        })
+    }
+
     /// requestHash binding is mandatory (Fix 2), so the default builder binds
     /// and supplies a fixed, matching hash. Tests specifically about the
     /// requestHash binding itself use `exact_request_rh` directly.
@@ -1715,10 +1864,13 @@ mod tests {
         let enc = exact_encoded_tx(merchant, borrow_txid, pay, cont);
         let mut payload = serde_json::json!({
             "type": "exact-transaction",
+            "profile": PROFILE_ADDITIVE,
             "payerAddress": payer,
             "transaction": enc,
             "transactionEncoding": crate::wire_v2::TX_ENCODING_SAFE_JSON,
-            "paymentOutputIndex": 0
+            "paymentOutputIndex": 0,
+            "challengeId": requirements.challenge_id().unwrap(),
+            "authorization": test_authorization(),
         });
         if let Some(rh) = payload_rh {
             payload["requestHash"] = serde_json::json!(rh);
@@ -1727,6 +1879,8 @@ mod tests {
             x402_version: X402_VERSION,
             payment_payload: PaymentPayload { x402_version: X402_VERSION, accepted: requirements.clone(), payload, extensions: None },
             payment_requirements: requirements,
+            request_hash: None,
+            resource: None,
         }
     }
 
@@ -1764,7 +1918,7 @@ mod tests {
             .with_utxo(&payer, &"ff".repeat(32), 0, 200_000_000);
         let fac = Facilitator::new(chain, tmp_store("exact_consume"), config());
         let req = exact_request(&fac, &merchant, &payer, &borrow_txid, 250, 100_003_000).await;
-        let rid = req.payment_requirements.reservation_id().unwrap().to_string();
+        let rid = req.payment_requirements.challenge_id().unwrap().to_string();
 
         assert!(!fac.reservations.lock().await.get(&rid).unwrap().consumed, "not consumed before settle");
         let s = fac.settle(&req).await;
@@ -1897,5 +2051,256 @@ mod tests {
         assert_eq!(n, e);
         assert_eq!(native_reject_code(scheme_native::NativeReject::FingerprintMissing), errors::INVALID_PAYLOAD);
         assert_eq!(kcc20_reject_code(scheme_kcc20::Kcc20Reject::FingerprintMissing), errors::INVALID_PAYLOAD);
+    }
+
+    // --- alpha.8 profile split: envelope-level gates on kaspa-exact-v2 ---
+
+    #[tokio::test]
+    async fn exact_settlement_ext_reports_profile_and_head_lineage() {
+        let merchant = addr(2);
+        let payer = addr(1);
+        let borrow_txid = "b1".repeat(32);
+        let (_rs, borrow_spk, borrow_addr) =
+            crate::reservation::borrow_covenant(&merchant, 100_000_000, 3000).unwrap();
+        let chain = MockChain::new(true)
+            .with_covenant_utxo(&borrow_addr, &hex::encode(&borrow_spk), &borrow_txid, 0, 100_000_000, &"00".repeat(32))
+            .with_utxo(&payer, &"ff".repeat(32), 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("exact_ext"), config());
+        let req = exact_request(&fac, &merchant, &payer, &borrow_txid, 250, 100_003_000).await;
+
+        let s = fac.settle(&req).await;
+        assert!(s.success, "settle: {:?}", s.error_reason);
+        let ext = s.extensions.as_ref().unwrap().kaspa.clone();
+        assert_eq!(ext.exact_profile.as_deref(), Some(PROFILE_ADDITIVE));
+        assert_eq!(ext.template_id.as_deref(), Some(TEMPLATE_KIP10_ADDITIVE));
+        assert_eq!(ext.head_outpoint, Some(Outpoint { txid: borrow_txid.clone(), index: 0 }));
+        assert_eq!(ext.head_version.as_deref(), Some("0"));
+        assert_eq!(ext.challenge_id.as_deref(), req.payment_requirements.challenge_id());
+        // The dropped alpha.7 fields are not serialized.
+        let v = serde_json::to_value(&s).unwrap();
+        assert!(v["extensions"]["kaspa"].get("borrowOutpoint").is_none());
+        assert!(v["extensions"]["kaspa"].get("reservationId").is_none());
+    }
+
+    #[tokio::test]
+    async fn exact_rejects_missing_or_bogus_authorization() {
+        let bt = "b2".repeat(32);
+        let (fac, merchant, payer) = exact_fac_with_borrow(&bt, "exact_auth_missing").await;
+        let mut req = exact_request(&fac, &merchant, &payer, &bt, 250, 100_003_000).await;
+
+        // Missing authorization: alpha.8 makes it a required payload field.
+        let mut p = req.payment_payload.payload.clone();
+        p.as_object_mut().unwrap().remove("authorization");
+        req.payment_payload.payload = p;
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+
+        // Wrong version const.
+        req.payment_payload.payload["authorization"] = test_authorization();
+        req.payment_payload.payload["authorization"]["version"] = serde_json::json!("kaspa-x402-exact-request-authorization-v0");
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+
+        // Expired authorization.
+        req.payment_payload.payload["authorization"] = test_authorization();
+        req.payment_payload.payload["authorization"]["expiresAt"] = serde_json::json!("2020-01-01T00:00:00.000Z");
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_rejects_payload_profile_or_challenge_mismatch() {
+        let bt = "b3".repeat(32);
+        let (fac, merchant, payer) = exact_fac_with_borrow(&bt, "exact_profile_mismatch").await;
+        // One reservation serves both tamper cases (a verify refusal does not
+        // consume it; a second reserve to the same merchant would be refused
+        // by the continuation-target uniqueness rule).
+        let good = exact_request(&fac, &merchant, &payer, &bt, 250, 100_003_000).await;
+
+        // Payload claims standard-native while the accepted offer is additive.
+        let mut req = good.clone();
+        req.payment_payload.payload["profile"] = serde_json::json!(PROFILE_STANDARD_NATIVE);
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+
+        // Payload echoes a DIFFERENT challengeId than the accepted offer's.
+        let mut req = good.clone();
+        req.payment_payload.payload["challengeId"] = serde_json::json!("ee".repeat(32));
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reserve_rejects_nonzero_payment_output_index() {
+        // alpha.8: additive offers carry paymentOutputIndex const 0.
+        let chain = MockChain::new(true);
+        let fac = Facilitator::new(chain, tmp_store("reserve_poi"), config());
+        let r = fac
+            .reserve(&addr(2), 250, &"cc".repeat(32), 0, 100_000_000, 3000, 1, "https://ex/r", Some(test_fp()))
+            .await;
+        assert!(r.is_err(), "nonzero paymentOutputIndex must be refused at the wire boundary");
+    }
+
+    // --- standard-native profile through the facilitator ---
+
+    fn std_native_requirements(pay_to: &str, amount: u64) -> PaymentRequirements {
+        PaymentRequirements {
+            scheme: SCHEME_EXACT.to_string(),
+            network: NETWORK_TESTNET10.to_string(),
+            amount: amount.to_string(),
+            asset: ASSET_KAS.to_string(),
+            pay_to: pay_to.to_string(),
+            max_timeout_seconds: 60,
+            extra: serde_json::json!({
+                "binding": BINDING_EXACT,
+                "profile": PROFILE_STANDARD_NATIVE,
+                "finality": "accepted",
+                "transactionEncoding": TX_ENCODING_SAFE_JSON,
+                "payToScriptPublicKey": format!("0000{}", spk_hex(pay_to)),
+            }),
+        }
+    }
+
+    /// Encoded standard-native transfer paying EXACTLY `pay` to `pay_to` at
+    /// output 0 (change to `from`), spending `in_txid:0`.
+    fn std_native_request(
+        from: &str,
+        pay_to: &str,
+        pay: u64,
+        in_txid: &str,
+        req_amount: u64,
+        server_rh: Option<&str>,
+        payload_rh: Option<&str>,
+    ) -> FacilitatorRequest {
+        let tx = serde_json::json!({
+            "version": 0,
+            "inputs": [{
+                "previousOutpoint": { "transactionId": in_txid, "index": 0 },
+                "signatureScript": "41".to_string() + &"cd".repeat(65),
+                "sequence": 0,
+                "sigOpCount": 1
+            }],
+            "outputs": [
+                { "value": pay, "scriptPublicKey": { "version": 0, "script": spk_hex(pay_to) } },
+                { "value": 1_000_000u64, "scriptPublicKey": { "version": 0, "script": spk_hex(from) } }
+            ],
+            "lockTime": 0,
+            "subnetworkId": "0000000000000000000000000000000000000000",
+            "payload": "",
+        });
+        let requirements = std_native_requirements(pay_to, req_amount);
+        let mut payload = serde_json::json!({
+            "type": "exact-transaction",
+            "profile": PROFILE_STANDARD_NATIVE,
+            "payerAddress": from,
+            "transaction": serde_json::to_string(&tx).unwrap(),
+            "transactionEncoding": TX_ENCODING_SAFE_JSON,
+            "paymentOutputIndex": 0,
+            "authorization": test_authorization(),
+        });
+        if let Some(rh) = payload_rh {
+            payload["requestHash"] = serde_json::json!(rh);
+        }
+        FacilitatorRequest {
+            x402_version: X402_VERSION,
+            payment_payload: PaymentPayload {
+                x402_version: X402_VERSION,
+                accepted: requirements.clone(),
+                payload,
+                extensions: None,
+            },
+            payment_requirements: requirements,
+            request_hash: server_rh.map(|s| s.to_string()),
+            resource: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn standard_native_verify_and_settle_happy() {
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "c1".repeat(32);
+        let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("std_happy"), config());
+        let h = test_fp();
+        let req = std_native_request(&from, &pay_to, 20_000_000, &in_txid, 20_000_000, Some(&h), Some(&h));
+
+        let v = fac.verify(&req).await;
+        assert!(v.is_valid, "verify: {:?}", v.invalid_reason);
+        assert_eq!(v.payer.as_deref(), Some(from.as_str()));
+
+        let s = fac.settle(&req).await;
+        assert!(s.success, "settle: {:?}", s.error_reason);
+        assert_eq!(s.amount.as_deref(), Some("20000000"));
+        let ext = s.extensions.as_ref().unwrap().kaspa.clone();
+        assert_eq!(ext.exact_profile.as_deref(), Some(PROFILE_STANDARD_NATIVE));
+        assert!(ext.head_id.is_none(), "standard-native carries no head lineage");
+        assert_eq!(fac.backend.submit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn standard_native_requires_server_request_hash() {
+        // facilitator-profile.md: requestHash is mandatory for exact and must
+        // come from the resource server, never inferred from the payload.
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "c2".repeat(32);
+        let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("std_no_server_rh"), config());
+        let h = test_fp();
+        let req = std_native_request(&from, &pay_to, 20_000_000, &in_txid, 20_000_000, None, Some(&h));
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn standard_native_rejects_request_hash_mismatch_and_inexact_amount() {
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "c3".repeat(32);
+        let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("std_rh_mismatch"), config());
+
+        // Server hash != payload hash -> the embedded value is contradicted.
+        let req = std_native_request(&from, &pay_to, 20_000_000, &in_txid, 20_000_000, Some(&"11".repeat(32)), Some(&"22".repeat(32)));
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+
+        // Overpayment: exact is an equality in alpha.8.
+        let h = test_fp();
+        let req = std_native_request(&from, &pay_to, 20_000_001, &in_txid, 20_000_000, Some(&h), Some(&h));
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYMENT_REQUIREMENTS));
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn standard_native_rejects_challenge_id_in_payload() {
+        // payment-payload.schema.json: challengeId is forbidden for the
+        // standard-native profile.
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "c4".repeat(32);
+        let chain = MockChain::new(true).with_utxo(&from, &in_txid, 0, 200_000_000);
+        let fac = Facilitator::new(chain, tmp_store("std_challenge"), config());
+        let h = test_fp();
+        let mut req = std_native_request(&from, &pay_to, 20_000_000, &in_txid, 20_000_000, Some(&h), Some(&h));
+        req.payment_payload.payload["challengeId"] = serde_json::json!("12".repeat(32));
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid);
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
     }
 }

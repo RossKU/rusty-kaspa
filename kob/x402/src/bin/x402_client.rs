@@ -743,13 +743,16 @@ mod kcc20 {
     }
 }
 
-/// KIP-10 additive "exact" (strict interop): build the additive exact-transaction
-/// from a `/reserve` PaymentRequirements and emit the v2 FacilitatorRequest.
+/// KIP-10 additive "exact" (strict interop, alpha.8 `additive` profile of
+/// `kaspa-exact-v2`): build the additive exact-transaction from a `/reserve`
+/// PaymentRequirements and emit the v2 FacilitatorRequest.
 mod exact {
     use super::*;
     use kob_core::contract::x402_borrow::build_x402_borrow_spend_sigscript;
     use kob_settle::build_p2sh;
-    use kob_x402::wire_v2::TX_ENCODING_SAFE_JSON;
+    use kob_x402::wire_v2::{
+        iso8601_from_unix_secs, AUTHORIZATION_VERSION, PROFILE_ADDITIVE, TX_ENCODING_SAFE_JSON,
+    };
 
     struct Args {
         node: String,
@@ -788,11 +791,13 @@ mod exact {
         let pay_to = req["payTo"].as_str().ok_or_else(|| anyhow::anyhow!("no payTo"))?.to_string();
         let amount: u64 = req["amount"].as_str().unwrap_or("0").parse()?;
         let extra = &req["extra"];
-        let borrow_txid = extra["borrowOutpoint"]["txid"].as_str().ok_or_else(|| anyhow::anyhow!("no borrowOutpoint"))?.to_string();
-        let borrow_index = extra["borrowOutpoint"]["index"].as_u64().unwrap_or(0) as u32;
-        let borrow_rs = hex::decode(extra["borrowRedeemScript"].as_str().ok_or_else(|| anyhow::anyhow!("no borrowRedeemScript"))?)?;
-        let borrow_amount: u64 = extra["borrowAmount"].as_str().unwrap_or("0").parse()?;
+        // alpha.8 additive field names (head/challenge vocabulary).
+        let borrow_txid = extra["expectedHeadOutpoint"]["txid"].as_str().ok_or_else(|| anyhow::anyhow!("no expectedHeadOutpoint"))?.to_string();
+        let borrow_index = extra["expectedHeadOutpoint"]["index"].as_u64().unwrap_or(0) as u32;
+        let borrow_rs = hex::decode(extra["headRedeemScript"].as_str().ok_or_else(|| anyhow::anyhow!("no headRedeemScript"))?)?;
+        let borrow_amount: u64 = extra["headAmount"].as_str().unwrap_or("0").parse()?;
         let threshold: u64 = extra["additiveThresholdSompi"].as_str().unwrap_or("0").parse()?;
+        let challenge_id = extra["challengeId"].as_str().ok_or_else(|| anyhow::anyhow!("no challengeId"))?.to_string();
 
         let wallet = WalletContext::load(Path::new(&a.wallet))?;
         let privkey = *wallet.privkey_bytes();
@@ -873,12 +878,38 @@ mod exact {
         let envelope = to_rpc_payload(&tx, &final_ss);
         let encoded = serde_json::to_string(&envelope)?;
 
+        // alpha.8 mandatory signed payer request authorization. The digest
+        // binds the encoded artifact + request hash and is Schnorr-signed by
+        // the P2PK funding key (input 1 — the head input cannot authorize).
+        // NOTE: the facilitator's structural checks (version/expiry/shapes)
+        // are what an interop peer can verify today; upstream's exact digest
+        // preimage layout has no published byte-level vectors yet.
+        let rh_for_digest = a.request_hash.clone().unwrap_or_default();
+        let mut digest_preimage = encoded.as_bytes().to_vec();
+        digest_preimage.extend_from_slice(rh_for_digest.as_bytes());
+        let digest = kob_settle::blake2b_256(&digest_preimage);
+        let auth_sig = kob_settle::signing::schnorr_sign(&digest, &privkey)?;
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let authorization = serde_json::json!({
+            "version": AUTHORIZATION_VERSION,
+            "inputIndex": 1,
+            "expiresAt": iso8601_from_unix_secs(now_secs + 3600),
+            "digest": hex::encode(digest),
+            "signature": hex::encode(auth_sig),
+        });
+
         let mut payload = serde_json::json!({
             "type": "exact-transaction",
+            "profile": PROFILE_ADDITIVE,
             "payerAddress": wallet.address,
             "transaction": encoded,
             "transactionEncoding": TX_ENCODING_SAFE_JSON,
-            "paymentOutputIndex": 0
+            "paymentOutputIndex": 0,
+            "challengeId": challenge_id,
+            "authorization": authorization
         });
         // Request-binding is mandatory: echo the requestHash the reservation
         // was bound to (the `wrong-request-hash` scenario perturbs it to prove

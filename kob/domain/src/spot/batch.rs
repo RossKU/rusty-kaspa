@@ -51,6 +51,19 @@ use kob_core::contract::spot::order::{
 };
 use kob_core::contract::spot::swap::{parse_swap_order_rs, build_swap_fill_sigscript, SWAP_RS_SIZE};
 use kob_core::contract::spot::bracket::{build_bracket_fill_sigscript, BRACKET_RS_SIZE};
+use kob_core::contract::spot::decay::{
+    build_decay_sell_fill_sigscript, build_decay_sell_ioc_fill_sigscript,
+    decay_effective_pnum, LOCK_TIME_THRESHOLD,
+};
+use kob_core::contract::spot::parse::{
+    parse_decay_buy_redeem_script, parse_decay_sell_redeem_script,
+    parse_oco_sell_redeem_script, parse_ratchet_oco_redeem_script,
+    parse_twap_sell_redeem_script,
+};
+use kob_core::contract::spot::ratchet::{
+    build_ratchet_oco_sl_fill_sigscript, build_ratchet_oco_tp_fill_sigscript,
+    RATCHET_OCO_RS_EXPECTED_LEN,
+};
 
 /// Order type (buy or sell) for batch matching.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +171,10 @@ pub enum OutputPurpose {
     /// Ring settle: matcher token skim, capped by the giver's F4 conservation
     /// cap. Sits at auth slots >= 1 of the giver input (after its delivery).
     MatcherSkim,
+    /// Ratchet advance: the spliced continuation UTXO — P2SH(new_rs), full
+    /// escrow, covenant binding to the ratchet input (R13f). The executor
+    /// must attach `CovenantBinding(ratchet_input_idx, token)`.
+    RatchetContinuation,
 }
 
 /// A planned output in the batch TX.
@@ -258,6 +275,36 @@ pub enum BatchError {
     /// Ring: a leg failed v18 swap-order validation (bad RS, owner SPK
     /// mismatch, etc.).
     RingInvalidLeg { outpoint: String, reason: &'static str },
+    /// A member's fill time-gate (`expiry > tx.lock_time`) cannot pass at the
+    /// lock_time this plan would carry — the order must settle in a tx with a
+    /// smaller L (or has effectively expired).
+    LockTimePastExpiry { outpoint: String, expiry: u64, lock_time: u64 },
+    /// A twap_sell cannot be full-filled in a sweep: its whole UTXO would
+    /// move in one event but the covenant caps per-event volume at `mpw`
+    /// (W2 applies to FULL fills too — the bypass pin, design §3.3).
+    TwapVolumeExceedsMpw { outpoint: String, amount: u64, mpw: u64 },
+    /// Decay lock-time solver: the batch only becomes feasible at
+    /// `earliest > now` (e.g. a decay_buy's bid has not risen enough yet).
+    /// Retry once the DAA score reaches `earliest`.
+    LockTimeTooEarly { earliest: u64, now: u64 },
+    /// Decay lock-time solver: NO tx lock_time satisfies every member's
+    /// effective-price floors + caps (+ expiry gates). `earliest` = smallest
+    /// L satisfying the lower-bound constraints (`u64::MAX` = never),
+    /// `latest` = largest L satisfying the upper-bound ones.
+    LockTimeWindowEmpty { earliest: u64, latest: u64 },
+    /// Ratchet G1: the order UTXO is younger than `rwin` — the `rwin CSV`
+    /// gate makes the advance unminable before `eligible_at_daa`.
+    RatchetWindowNotElapsed { eligible_at_daa: u64, tip_daa: u64 },
+    /// Ratchet G3: `(pnum_sl + rstep) * pden_tp < pnum_tp * pden_sl` fails —
+    /// the SL has trailed to just under TP and can never advance again.
+    RatchetTravelCapExhausted { outpoint: String, pnum_sl: u64, rstep: u64 },
+    /// No settle in the batch qualifies as the ratchet's print witness
+    /// (R10 volume >= mrv, R11 trigger at the attested pair, R12
+    /// settle-magnitude: the KAS leg must cover `vol * pnum_att / pden_att`
+    /// on the CEIL side — only divisible prints qualify).
+    RatchetNoQualifyingPrint { threshold_num: u64, threshold_den: u64, mrv: u64 },
+    /// The named order is not a ratchet_oco in a ratchetable state.
+    RatchetIneligible { outpoint: String, reason: &'static str },
 }
 
 impl std::fmt::Display for BatchError {
@@ -331,6 +378,34 @@ impl std::fmt::Display for BatchError {
             BatchError::RingInvalidLeg { outpoint, reason } => {
                 write!(f, "ring leg {} invalid: {}", outpoint, reason)
             }
+            BatchError::LockTimePastExpiry { outpoint, expiry, lock_time } => {
+                write!(f, "order {} expires at DAA {} but the tx would carry lock_time {} (fill gate needs expiry > L)", outpoint, expiry, lock_time)
+            }
+            BatchError::TwapVolumeExceedsMpw { outpoint, amount, mpw } => {
+                write!(f, "twap_sell {} holds {} tokens but its covenant caps every event at mpw={} (full-fill sweeps cannot split it)", outpoint, amount, mpw)
+            }
+            BatchError::LockTimeTooEarly { earliest, now } => {
+                write!(f, "batch is lock-time infeasible now (DAA {}); earliest feasible lock_time is {}", now, earliest)
+            }
+            BatchError::LockTimeWindowEmpty { earliest, latest } => {
+                if *earliest == u64::MAX {
+                    write!(f, "no tx lock_time makes this decay batch feasible (floor unreachable at every schedule point; upper bound {})", latest)
+                } else {
+                    write!(f, "decay lock-time window is empty: floors need L >= {} but caps/floors allow only L <= {}", earliest, latest)
+                }
+            }
+            BatchError::RatchetWindowNotElapsed { eligible_at_daa, tip_daa } => {
+                write!(f, "ratchet rwin not elapsed: eligible at DAA {} (tip {})", eligible_at_daa, tip_daa)
+            }
+            BatchError::RatchetTravelCapExhausted { outpoint, pnum_sl, rstep } => {
+                write!(f, "ratchet {} travel cap exhausted: pnum_sl {} + rstep {} would reach the TP ceiling (G3)", outpoint, pnum_sl, rstep)
+            }
+            BatchError::RatchetNoQualifyingPrint { threshold_num, threshold_den, mrv } => {
+                write!(f, "no settle in the batch qualifies as a ratchet print (need attested price >= {}/{}, volume >= {}, and a ceil-side-exact KAS leg)", threshold_num, threshold_den, mrv)
+            }
+            BatchError::RatchetIneligible { outpoint, reason } => {
+                write!(f, "ratchet_oco {} ineligible: {}", outpoint, reason)
+            }
         }
     }
 }
@@ -344,6 +419,12 @@ pub struct BatchTxInput {
     pub index: u32,
     pub sigscript: Vec<u8>,
     pub sig_op_count: u8,
+    /// Input sequence the executor must set on the real tx input. Covenant
+    /// order inputs carry the 50-DAA exposure delay; twap_sell fill inputs
+    /// carry `max(50, twin)` (their `twin CSV` real-age gate, design §3.4);
+    /// a ratchet advance carries `rwin` (G1). Signature-path inputs
+    /// (wallet/receipt) carry 0.
+    pub sequence: u64,
 }
 
 /// A fully built batch transaction output.
@@ -437,6 +518,12 @@ pub struct BatchPlan {
     /// binds each such BuyerTokens output to the named sell input (per-input F4),
     /// instead of the single `token_input_map` tii. Empty = legacy behavior.
     pub output_auth_input: std::collections::HashMap<usize, u16>,
+    /// Tx lock_time this plan was priced at (time-contracts family). 0 =
+    /// Finalized (legacy plans; decay schedules clamp to their start price).
+    /// The executor MUST set exactly this lock_time on the built tx: every
+    /// decay attestation in the plan is `f(lock_time)` and the covenant D3
+    /// check rejects any other L.
+    pub lock_time: u64,
 }
 
 /// Receipt input for bracket fill (v16).
@@ -492,13 +579,26 @@ impl BatchPlan {
             // OCO term that is the EXECUTING branch's pair (the scanner books
             // each OCO path as its own order carrying that branch's price),
             // which is what the OCO v18 body verifies and what unlocked OCO
-            // sweep eligibility on both branches.
+            // sweep eligibility on both branches. Time-contract variants
+            // (RS-length dispatch): a ratchet_oco branch attests its RAW
+            // branch pair (no-gcd freeze rule); a decay_sell attests the RAW
+            // effective pair `f(self.lock_time)` (D3 rejects anything else);
+            // a twap_sell uses the plain v18 shape (its state price IS the
+            // executing price).
+            let variant = classify_sell(sell);
+            let is_ratchet = sell.redeem_script.len() == RATCHET_OCO_RS_EXPECTED_LEN;
             let ss = if let Some(oco_path) = sell.oco_path {
-                match oco_path {
-                    kob_core::OcoPath::TakeProfit => build_oco_sell_tp_fill_sigscript(
+                match (oco_path, is_ratchet) {
+                    (kob_core::OcoPath::TakeProfit, false) => build_oco_sell_tp_fill_sigscript(
                         koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
                     ),
-                    kob_core::OcoPath::StopLoss => build_oco_sell_sl_fill_sigscript(
+                    (kob_core::OcoPath::StopLoss, false) => build_oco_sell_sl_fill_sigscript(
+                        koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
+                    ),
+                    (kob_core::OcoPath::TakeProfit, true) => build_ratchet_oco_tp_fill_sigscript(
+                        koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
+                    ),
+                    (kob_core::OcoPath::StopLoss, true) => build_ratchet_oco_sl_fill_sigscript(
                         koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
                     ),
                 }
@@ -511,19 +611,38 @@ impl BatchPlan {
                 // never compose it — see
                 // `BatchError::SellResidualUnsupported`.
                 let fta = self.sell_fill_amounts.get(i).copied().unwrap_or(sell.amount);
-                build_sell_ioc_fill_sigscript(
-                    koi as u16, sell.price_num, sell.price_den, fta, &sell.redeem_script,
-                )
+                match variant {
+                    SellVariant::Decay { dslope, t0, t_end, pnum, pden } => {
+                        build_decay_sell_ioc_fill_sigscript(
+                            koi as u16,
+                            decay_effective_pnum(pnum, dslope, t0, t_end, self.lock_time),
+                            pden, fta, &sell.redeem_script,
+                        )
+                    }
+                    _ => build_sell_ioc_fill_sigscript(
+                        koi as u16, sell.price_num, sell.price_den, fta, &sell.redeem_script,
+                    ),
+                }
             } else {
-                build_sell_fill_sigscript(
-                    koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
-                )
+                match variant {
+                    SellVariant::Decay { dslope, t0, t_end, pnum, pden } => {
+                        build_decay_sell_fill_sigscript(
+                            koi as u16,
+                            decay_effective_pnum(pnum, dslope, t0, t_end, self.lock_time),
+                            pden, &sell.redeem_script,
+                        )
+                    }
+                    _ => build_sell_fill_sigscript(
+                        koi as u16, sell.price_num, sell.price_den, &sell.redeem_script,
+                    ),
+                }
             };
             inputs.push(BatchTxInput {
                 tx_id: sell.outpoint.0.clone(),
                 index: sell.outpoint.1,
                 sigscript: ss,
                 sig_op_count: 0,
+                sequence: sell_input_sequence(sell),
             });
         }
 
@@ -572,6 +691,7 @@ impl BatchPlan {
                 // live N=32 run used). Bracket entries keep 0 (unchanged
                 // small body).
                 sig_op_count: if is_bracket { 0 } else { 1 },
+                sequence: 50,
             });
         }
 
@@ -584,6 +704,7 @@ impl BatchPlan {
                 index: receipt.outpoint.1,
                 sigscript: Vec::new(), // Needs receipt signing externally (sig_op_count=1)
                 sig_op_count: 1,
+                sequence: 0,
             });
         }
 
@@ -594,6 +715,7 @@ impl BatchPlan {
                 index,
                 sigscript: Vec::new(), // Needs P2PK signing externally
                 sig_op_count: 1,
+                sequence: 0,
             });
         }
 
@@ -751,6 +873,9 @@ impl BatchPlan {
         // Version 1 required when outputs have covenant binding
         let has_covenant = self.outputs.iter().any(|o| o.purpose == OutputPurpose::BuyerTokens);
         let mut tx = Transaction::new(if has_covenant { 1 } else { 0 });
+        // Decay plans price at this L (D3 attestation) — the executor must
+        // keep it. 0 for legacy plans (Finalized).
+        tx.lock_time = self.lock_time;
 
         // Sell inputs
         for (sell, _idx) in &self.sells {
@@ -758,7 +883,7 @@ impl BatchPlan {
             tx.inputs.push(TxInput {
                 prev_tx_id: sell.outpoint.0.clone(),
                 prev_index: sell.outpoint.1,
-                sequence: 50,
+                sequence: sell_input_sequence(sell),
                 sig_op_count: 0,
                 script_version: p2sh.version(),
                 script_bytes: p2sh.script().to_vec(),
@@ -1036,6 +1161,180 @@ fn parse_buy_mmfee_bps(rs: &[u8]) -> Option<u64> {
     Some(u64::from_le_bytes(rs[162..170].try_into().ok()?))
 }
 
+/// `mmfee_bps` of any buy-side contract the planners settle against: the
+/// plain v18 buy or a decay_buy (RS-length dispatch via the parse arm).
+pub(crate) fn buy_mmfee_bps_any(rs: &[u8]) -> Option<u64> {
+    parse_buy_mmfee_bps(rs)
+        .or_else(|| parse_decay_buy_redeem_script(rs).map(|p| p.order._max_matcher_fee))
+}
+
+// ── Time-contracts family (kob/TIME_CONTRACTS_DESIGN.md, Stage B) ──
+
+/// Time-contract classification of a sell-side order (RS-length dispatch,
+/// design §5). `Plain` covers the v18 sell AND the plain v18 OCO (whose
+/// branch pair rides in `price_num/price_den` via `oco_path`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SellVariant {
+    Plain,
+    /// twap_sell: fill inputs must carry `sequence >= twin` (real-age CSV
+    /// gate); per-event volume — the WHOLE UTXO in a full-fill sweep — must
+    /// be <= mpw (W2 gates full fills too, the bypass pin).
+    Twap { twin: u64, mpw: u64 },
+    /// decay_sell: the executing price is `f(L) = (pnum - dslope*(clamp(L) -
+    /// t0), pden)` of the tx lock_time; the pair is RAW (no gcd).
+    Decay { dslope: u64, t0: u64, t_end: u64, pnum: u64, pden: u64 },
+    /// ratchet_oco: TP/SL branch fills attest their RAW branch pairs.
+    RatchetOco,
+}
+
+/// Classify a sell by its redeemScript (parse arms are authoritative for the
+/// schedule fields — caller-supplied `BatchOrder` prices are NOT trusted for
+/// decay math). Unparseable time-length RSs fall back to `Plain` and die in
+/// the version checks.
+pub(crate) fn classify_sell(sell: &BatchOrder) -> SellVariant {
+    let rs = &sell.redeem_script;
+    if let Some(p) = parse_twap_sell_redeem_script(rs) {
+        return SellVariant::Twap { twin: p.twin, mpw: p.mpw };
+    }
+    if let Some(p) = parse_decay_sell_redeem_script(rs) {
+        return SellVariant::Decay {
+            dslope: p.dslope,
+            t0: p.t0,
+            t_end: p.t_end,
+            pnum: p.order.price_num,
+            pden: p.order.price_den,
+        };
+    }
+    if rs.len() == RATCHET_OCO_RS_EXPECTED_LEN {
+        return SellVariant::RatchetOco;
+    }
+    SellVariant::Plain
+}
+
+/// The price pair a sell EXECUTES at when the tx carries `lock_time`: decay
+/// sells price at f(L) (raw pair from the parsed RS); everything else at the
+/// order's own pair.
+pub(crate) fn effective_sell_pair(sell: &BatchOrder, lock_time: u64) -> (u64, u64) {
+    match classify_sell(sell) {
+        SellVariant::Decay { dslope, t0, t_end, pnum, pden } => {
+            (decay_effective_pnum(pnum, dslope, t0, t_end, lock_time), pden)
+        }
+        _ => (sell.price_num, sell.price_den),
+    }
+}
+
+fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a
+}
+
+/// The pair the sell's fill sigscript will ATTEST at [3..11)/[12..20) —
+/// exactly what a v18 buy's PASS 2 and a ratchet's R8 read. Plain v18 sells,
+/// twap sells and plain OCO branches attest the gcd-normalized pair (their
+/// builders normalize); decay sells attest the RAW effective pair f(L);
+/// ratchet_oco branches attest the RAW branch pair (no-gcd freeze rule).
+pub(crate) fn attested_sell_pair(sell: &BatchOrder, lock_time: u64) -> (u64, u64) {
+    match classify_sell(sell) {
+        SellVariant::Decay { dslope, t0, t_end, pnum, pden } => {
+            (decay_effective_pnum(pnum, dslope, t0, t_end, lock_time), pden)
+        }
+        SellVariant::RatchetOco => (sell.price_num, sell.price_den),
+        SellVariant::Plain | SellVariant::Twap { .. } => {
+            let g = gcd_u64(sell.price_num, sell.price_den);
+            if g > 0 {
+                (sell.price_num / g, sell.price_den / g)
+            } else {
+                (sell.price_num, sell.price_den)
+            }
+        }
+    }
+}
+
+/// Input sequence a sell's fill input must carry: `max(50, twin)` for
+/// twap_sell (twin CSV real-age gate, design §3.4), the 50-DAA exposure
+/// delay otherwise.
+pub(crate) fn sell_input_sequence(sell: &BatchOrder) -> u64 {
+    match classify_sell(sell) {
+        SellVariant::Twap { twin, .. } => twin.max(50),
+        _ => 50,
+    }
+}
+
+/// Expiry DAA of any spot order RS the planners handle (None = GTC).
+pub(crate) fn order_expiry_daa(rs: &[u8]) -> Option<u64> {
+    if let Some(p) = kob_core::contract::spot::parse::parse_redeem_script(rs) {
+        return p.expiry_daa;
+    }
+    if let Some(p) = parse_oco_sell_redeem_script(rs) {
+        return p.expiry_daa;
+    }
+    if let Some(p) = parse_ratchet_oco_redeem_script(rs) {
+        return p.oco.expiry_daa;
+    }
+    None
+}
+
+/// Buy-side lock-time gate: the fill time-gate demands `expiry > L` for
+/// expiry-carrying members, and D1 demands `L < LOCK_TIME_THRESHOLD`.
+fn validate_buy_lock_time(buy: &BatchOrder, lock_time: u64) -> Result<(), BatchError> {
+    if lock_time >= LOCK_TIME_THRESHOLD {
+        return Err(BatchError::LockTimeWindowEmpty {
+            earliest: 0,
+            latest: LOCK_TIME_THRESHOLD - 1,
+        });
+    }
+    if lock_time > 0 {
+        if let Some(e) = order_expiry_daa(&buy.redeem_script) {
+            if lock_time >= e {
+                return Err(BatchError::LockTimePastExpiry {
+                    outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+                    expiry: e,
+                    lock_time,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Explicit-batch time-member validation (GTC sweep): oversized twap
+/// full-fills and expiry-dead members are hard errors here (the greedy
+/// planners SKIP such sells instead).
+fn validate_time_members(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    lock_time: u64,
+) -> Result<(), BatchError> {
+    validate_buy_lock_time(buy, lock_time)?;
+    for s in sells {
+        if let SellVariant::Twap { mpw, .. } = classify_sell(s) {
+            if s.amount > mpw {
+                return Err(BatchError::TwapVolumeExceedsMpw {
+                    outpoint: format!("{}:{}", s.outpoint.0, s.outpoint.1),
+                    amount: s.amount,
+                    mpw,
+                });
+            }
+        }
+        if lock_time > 0 {
+            if let Some(e) = order_expiry_daa(&s.redeem_script) {
+                if lock_time >= e {
+                    return Err(BatchError::LockTimePastExpiry {
+                        outpoint: format!("{}:{}", s.outpoint.0, s.outpoint.1),
+                        expiry: e,
+                        lock_time,
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Contract-order fair value of a full-filled sell term, exactly as the v18
 /// buy's PASS 2 computes it: `floor(tokens / pden) * pnum` (read from the
 /// canonical attestation, which equals the sell's own state pair).
@@ -1148,8 +1447,58 @@ pub fn plan_batch_match(
     matcher_spk_version: u16,
     fee_bps: Option<u16>,
 ) -> Result<BatchPlan, BatchError> {
+    plan_batch_match_at(sells, buys, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, 0)
+}
+
+/// `plan_batch_match` at an explicit tx lock_time (time-contracts Stage B):
+/// decay_sell members are priced at their RAW effective pair `f(lock_time)`
+/// (attested by `build_tx`, enforced twice on-chain — D3 + the buy's PASS 2),
+/// twap_sell members are admitted with `sequence = max(50, twin)` and must
+/// full-fill within `mpw`, ratchet_oco TP/SL branches ride at their raw
+/// branch pairs. `lock_time = 0` = the legacy Finalized shape (decay
+/// schedules clamp to their start price). Mixed batches per CP-1..3.
+pub fn plan_batch_match_at(
+    sells: &[BatchOrder],
+    buys: &[BatchOrder],
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+    lock_time: u64,
+) -> Result<BatchPlan, BatchError> {
     validate_sweep(sells, buys)?;
     let buy = &buys[0];
+    validate_time_members(sells, buy, lock_time)?;
+    // Aggregate GTC limit-price floor pre-check value (planner-conservative
+    // mul-then-div order, >= the contract's div-then-mul floor).
+    let floor_tokens = buy.utxo_value as u128 * buy.price_num as u128 / buy.price_den as u128;
+    let mmfee_bps = parse_buy_mmfee_bps(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+    plan_gtc_sweep_core(
+        sells, buy, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, lock_time,
+        floor_tokens, mmfee_bps,
+    )
+}
+
+/// Shared GTC N:1 sweep core: `floor_tokens` (the buy's aggregate token
+/// floor) and `mmfee_bps` are supplied by the wrapper (plain buy vs
+/// decay_buy — the latter's floor consumes `pnum_eff(L)`).
+#[allow(clippy::too_many_arguments)]
+fn plan_gtc_sweep_core(
+    buy_sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+    lock_time: u64,
+    floor_tokens: u128,
+    mmfee_bps: u64,
+) -> Result<BatchPlan, BatchError> {
+    let sells = buy_sells;
     let n = sells.len();
 
     let token_input_map = build_token_input_map(
@@ -1167,7 +1516,9 @@ pub fn plan_batch_match(
     let mut seller_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
     let mut sell_output_idx: Vec<usize> = Vec::with_capacity(n);
     for (i, sell) in sells.iter().enumerate() {
-        let expected_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+        // Time variants execute at their effective pair (decay: f(L)).
+        let (eff_pnum, eff_pden) = effective_sell_pair(sell, lock_time);
+        let expected_kas_128 = sell.amount as u128 * eff_pnum as u128 / eff_pden as u128;
         if expected_kas_128 > u64::MAX as u128 {
             return Err(BatchError::Overflow { index: i, side: "sell", detail: "expected_kas" });
         }
@@ -1179,7 +1530,7 @@ pub fn plan_batch_match(
             return Err(BatchError::MinFillViolation { index: i, fill_kas: expected_kas, min_fill: sell.min_fill });
         }
         total_seller_kas += expected_kas;
-        fair_sum += fair_kas(sell.amount, sell.price_num, sell.price_den);
+        fair_sum += fair_kas(sell.amount, eff_pnum, eff_pden);
         let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
         if let Some(&existing) = seller_group_idx.get(&key) {
             outputs[existing].value += expected_kas;
@@ -1217,23 +1568,18 @@ pub fn plan_batch_match(
     }
 
     // Aggregate GTC limit-price floor (contract enforces on-chain; reject
-    // early so the buy covenant never aborts a submitted tx).
-    let expected_tokens = buy.utxo_value as u128 * buy.price_num as u128 / buy.price_den as u128;
-    if (total_buyer_tokens as u128) < expected_tokens {
+    // early so the buy covenant never aborts a submitted tx). The wrapper
+    // supplies the floor: plain buy = static pair, decay_buy = pnum_eff(L).
+    if (total_buyer_tokens as u128) < floor_tokens {
         return Err(BatchError::MinFillViolation {
             index: n,
             fill_kas: total_buyer_tokens,
-            min_fill: expected_tokens.min(u64::MAX as u128) as u64,
+            min_fill: floor_tokens.min(u64::MAX as u128) as u64,
         });
     }
 
     // Aggregate surplus-cap feasibility, contract integer order:
     // kas_in - fair_sum <= kas_in/10000 * mmfee_bps.
-    let mmfee_bps = parse_buy_mmfee_bps(&buy.redeem_script)
-        .ok_or_else(|| BatchError::UnsupportedVersion {
-            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
-            version: buy.version,
-        })?;
     let cap = (buy.utxo_value as u128 / 10000) * mmfee_bps as u128;
     let surplus_onchain = (buy.utxo_value as u128).saturating_sub(fair_sum);
     if surplus_onchain > cap {
@@ -1293,6 +1639,7 @@ pub fn plan_batch_match(
         bracket_oco_output: None,
         buy_sweep_sells: vec![sell_indices],
         output_auth_input,
+        lock_time,
     })
 }
 
@@ -1316,6 +1663,47 @@ pub fn plan_ioc_match(
     matcher_spk_version: u16,
     fee_bps: Option<u16>,
 ) -> Result<BatchPlan, BatchError> {
+    plan_ioc_match_at(sells, buy, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, 0)
+}
+
+/// `plan_ioc_match` at an explicit tx lock_time: the greedy sweep admits the
+/// time-sell variants (decay priced at f(L), twap with `sequence = twin` —
+/// SKIPPING those whose whole UTXO exceeds mpw or whose expiry gate cannot
+/// pass at L; the ratchet TP/SL branches at their raw pairs).
+pub fn plan_ioc_match_at(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+    lock_time: u64,
+) -> Result<BatchPlan, BatchError> {
+    // The mmfee parse doubles as the plain-v18-buy RS check.
+    let mmfee_bps = parse_buy_mmfee_bps(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+    plan_ioc_sweep_core(
+        sells, buy, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, lock_time, mmfee_bps,
+    )
+}
+
+/// Shared IOC N:1 sweep core (`mmfee_bps` supplied by the wrapper: plain buy
+/// vs decay_buy; the IOC aggregate floor is the buy's own `min_fill` on both
+/// — L-independent by construction).
+#[allow(clippy::too_many_arguments)]
+fn plan_ioc_sweep_core(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+    lock_time: u64,
+    mmfee_bps: u64,
+) -> Result<BatchPlan, BatchError> {
     if sells.is_empty() {
         return Err(BatchError::NoSellOrders);
     }
@@ -1328,6 +1716,7 @@ pub fn plan_ioc_match(
             version: buy.version,
         });
     }
+    validate_buy_lock_time(buy, lock_time)?;
 
     // Greedy affordability sweep: full-fill v18 sells only (a v18 buy is
     // structurally unable to consume a partial/IOC sell — its delivery is the
@@ -1358,7 +1747,23 @@ pub fn plan_ioc_match(
         if filled.len() + 1 > bm.min(min_cap) {
             continue; // its (or a member's) batch_max would be exceeded
         }
-        let sell_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+        // Time-variant admission (greedy = skip, not error): a twap_sell
+        // whose whole UTXO exceeds mpw cannot full-fill; an expiry-dead
+        // member cannot pass its fill time-gate at this L.
+        if let SellVariant::Twap { mpw, .. } = classify_sell(sell) {
+            if sell.amount > mpw {
+                continue;
+            }
+        }
+        if lock_time > 0 {
+            if let Some(e) = order_expiry_daa(&sell.redeem_script) {
+                if lock_time >= e {
+                    continue;
+                }
+            }
+        }
+        let (eff_pnum, eff_pden) = effective_sell_pair(sell, lock_time);
+        let sell_kas_128 = sell.amount as u128 * eff_pnum as u128 / eff_pden as u128;
         if sell_kas_128 > u64::MAX as u128 {
             continue;
         }
@@ -1397,14 +1802,12 @@ pub fn plan_ioc_match(
 
     // Surplus-cap feasibility (exact contract arithmetic): the cap reads the
     // full kas_in, so unswept `kas_remaining` counts against it.
-    let mmfee_bps = parse_buy_mmfee_bps(&buy.redeem_script)
-        .ok_or_else(|| BatchError::UnsupportedVersion {
-            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
-            version: buy.version,
-        })?;
     let fair_sum: u128 = filled
         .iter()
-        .map(|s| fair_kas(s.amount, s.price_num, s.price_den))
+        .map(|s| {
+            let (pn, pd) = effective_sell_pair(s, lock_time);
+            fair_kas(s.amount, pn, pd)
+        })
         .sum();
     let cap = (buy_kas as u128 / 10000) * mmfee_bps as u128;
     let surplus_onchain = (buy_kas as u128).saturating_sub(fair_sum);
@@ -1430,8 +1833,9 @@ pub fn plan_ioc_match(
     let mut seller_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
     let mut sell_output_idx: Vec<usize> = Vec::with_capacity(n);
     for sell in &filled {
-        let sell_kas = (sell.amount as u128 * sell.price_num as u128
-            / sell.price_den as u128) as u64;
+        let (eff_pnum, eff_pden) = effective_sell_pair(sell, lock_time);
+        let sell_kas = (sell.amount as u128 * eff_pnum as u128
+            / eff_pden as u128) as u64;
         total_seller_kas += sell_kas;
         let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
         if let Some(&existing) = seller_group_idx.get(&key) {
@@ -1529,6 +1933,7 @@ pub fn plan_ioc_match(
         bracket_oco_output: None,
         buy_sweep_sells: vec![sell_indices],
         output_auth_input,
+        lock_time,
     })
 }
 
@@ -1557,9 +1962,24 @@ pub fn plan_partial_match(
     matcher_spk_version: u16,
     fee_bps: Option<u16>,
 ) -> Result<BatchPlan, BatchError> {
+    plan_partial_match_at(sells, buy, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, 0)
+}
+
+/// `plan_partial_match` at an explicit tx lock_time — time-sell admission
+/// identical to `plan_ioc_match_at` (greedy skip semantics).
+pub fn plan_partial_match_at(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+    lock_time: u64,
+) -> Result<BatchPlan, BatchError> {
     if sells.is_empty() {
         return Err(BatchError::NoSellOrders);
     }
+    validate_buy_lock_time(buy, lock_time)?;
     if buy.order_type != OrderType::Buy {
         return Err(BatchError::NoBuyOrders);
     }
@@ -1597,7 +2017,21 @@ pub fn plan_partial_match(
         if filled.len() + 1 > bm.min(min_cap) {
             continue; // its (or a member's) batch_max would be exceeded
         }
-        let sell_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+        // Time-variant admission (greedy skip; see plan_ioc_match_at).
+        if let SellVariant::Twap { mpw, .. } = classify_sell(sell) {
+            if sell.amount > mpw {
+                continue;
+            }
+        }
+        if lock_time > 0 {
+            if let Some(e) = order_expiry_daa(&sell.redeem_script) {
+                if lock_time >= e {
+                    continue;
+                }
+            }
+        }
+        let (eff_pnum, eff_pden) = effective_sell_pair(sell, lock_time);
+        let sell_kas_128 = sell.amount as u128 * eff_pnum as u128 / eff_pden as u128;
         if sell_kas_128 > u64::MAX as u128 {
             continue;
         }
@@ -1637,7 +2071,10 @@ pub fn plan_partial_match(
     // Contract-order fair value and cap feasibility at zero surplus.
     let fair_sum: u128 = filled
         .iter()
-        .map(|s| fair_kas(s.amount, s.price_num, s.price_den))
+        .map(|s| {
+            let (pn, pd) = effective_sell_pair(s, lock_time);
+            fair_kas(s.amount, pn, pd)
+        })
         .sum();
     let gap = (base_spent as u128).saturating_sub(fair_sum); // integer-rounding gap >= 0
     let zero_allow = (base_spent as u128 / 10000) * mmfee_bps as u128;
@@ -1712,8 +2149,9 @@ pub fn plan_partial_match(
     let mut seller_group_idx: HashMap<(Vec<u8>, u16), usize> = HashMap::new();
     let mut sell_output_idx: Vec<usize> = Vec::with_capacity(n);
     for sell in &filled {
-        let sell_kas = (sell.amount as u128 * sell.price_num as u128
-            / sell.price_den as u128) as u64;
+        let (eff_pnum, eff_pden) = effective_sell_pair(sell, lock_time);
+        let sell_kas = (sell.amount as u128 * eff_pnum as u128
+            / eff_pden as u128) as u64;
         total_seller_kas += sell_kas;
         let key = (sell.counterparty_spk.clone(), sell.counterparty_spk_version);
         if let Some(&existing) = seller_group_idx.get(&key) {
@@ -1808,6 +2246,7 @@ pub fn plan_partial_match(
         bracket_oco_output: None,
         buy_sweep_sells: vec![sell_indices],
         output_auth_input,
+        lock_time,
     })
 }
 
@@ -2004,7 +2443,87 @@ pub fn plan_sell_ioc_match(
         bracket_oco_output: None,
         buy_sweep_sells: vec![vec![0u16]],
         output_auth_input,
+        // Sell-anchored flows do not admit time variants (Stage-B scope
+        // note); legacy Finalized shape.
+        lock_time: 0,
     })
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// decay_buy planners (time-contracts Stage B, design §2.7): siblings of
+// plan_batch_match / plan_ioc_match where the buy is a decay_buy — the
+// buy-side pnum_eff(L) drives the floor math. The decay_buy spends via the
+// UNCHANGED v18 buy sigscript builders (its sigscripts carry no prices), so
+// `build_tx` needs no new arm; only the plan math and lock_time change.
+// ═════════════════════════════════════════════════════════════════════════
+
+/// GTC N:1 sweep against a decay_buy (rising bid). Lock-time selection:
+/// `L = now_daa` (feasibility-maximal for the matcher — the bid only rises,
+/// i.e. demands FEWER tokens, as L grows; minable next block since
+/// acceptance > L), via the feasibility solver: if the batch only becomes
+/// feasible later, the typed `LockTimeTooEarly` names the earliest feasible
+/// L; if the sells' own floors/caps bound L from above, L is clamped there.
+/// The aggregate token floor is verified in the exact contract integer order
+/// `kas_in / pden * pnum_eff(L)` (buy body step E/H).
+pub fn plan_decay_buy_match(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    now_daa: u64,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    if buy.order_type != OrderType::Buy {
+        return Err(BatchError::NoBuyOrders);
+    }
+    let parsed = parse_decay_buy_redeem_script(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+    validate_sweep(sells, std::slice::from_ref(buy))?;
+    let win = super::time_planner::solve_batch_lock_time(sells, buy, now_daa)?;
+    let lock_time = win.chosen;
+    validate_time_members(sells, buy, lock_time)?;
+    let pnum_eff = decay_effective_pnum(
+        parsed.order.price_num, parsed.dslope, parsed.t0, parsed.t_end, lock_time,
+    );
+    let floor_tokens =
+        (buy.utxo_value as u128 / parsed.order.price_den as u128) * pnum_eff as u128;
+    plan_gtc_sweep_core(
+        sells, buy, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, lock_time,
+        floor_tokens, parsed.order._max_matcher_fee,
+    )
+}
+
+/// IOC N:1 sweep against a decay_buy. The decay_buy body relaxes the IOC
+/// aggregate floor to the buy's own `min_fill` (L-independent), so L is
+/// simply `now_daa` clamped under the D1 threshold and the buy's expiry;
+/// decay SELLS in the sweep are still priced at that L and the surplus cap
+/// is checked with the parsed decay mmfee.
+pub fn plan_decay_buy_ioc_match(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    now_daa: u64,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    let parsed = parse_decay_buy_redeem_script(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+    let mut lock_time = now_daa.min(LOCK_TIME_THRESHOLD - 1);
+    if let Some(e) = parsed.order.expiry_daa {
+        lock_time = lock_time.min(e.saturating_sub(1));
+    }
+    plan_ioc_sweep_core(
+        sells, buy, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, lock_time,
+        parsed.order._max_matcher_fee,
+    )
 }
 
 // ═════════════════════════════════════════════════════════════════════════
@@ -2079,6 +2598,7 @@ impl RingPlan {
                 index: leg.outpoint.1,
                 sigscript: ss,
                 sig_op_count: 0,
+                sequence: 50,
             });
         }
         if let Some((ref tx_id, index, _value)) = self.wallet_input {
@@ -2087,6 +2607,7 @@ impl RingPlan {
                 index,
                 sigscript: Vec::new(), // P2PK; signed externally
                 sig_op_count: 1,
+                sequence: 0,
             });
         }
         let outputs = self

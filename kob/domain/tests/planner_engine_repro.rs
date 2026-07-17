@@ -6,6 +6,15 @@
 //! bytecode itself is engine-proven adversarially in `kob-core`'s
 //! `tests/v18_spot.rs`; this file closes the remaining gap -- that the
 //! PLANNERS compose the honest tx shapes those tests assume.
+//!
+//! Time-contracts Stage B additions (kob/TIME_CONTRACTS_DESIGN.md):
+//! planner-built CP-1..CP-4 composition txs (unchanged v18 buy sweeps a
+//! decay_sell / twap_sell / ratchet_oco-TP mix; unchanged v18 sell settled
+//! by a decay_buy), a decay sweep priced at three lock_time points, a TWAP
+//! two-event pace with the pacing helper's sequences, and one combined
+//! settle+ratchet tx built by `plan_ratchet_advance` +
+//! `compose_settle_and_ratchet` -- all executed by the real engine using the
+//! plan-provided lock_time and per-input sequences.
 
 use kaspa_consensus_core::hashing::sighash::SigHashReusedValuesUnsync;
 use kaspa_consensus_core::mass::Gram;
@@ -20,8 +29,12 @@ use kaspa_txscript::engine_context::EngineCtx;
 use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_domain::batch::{
-    plan_batch_match, plan_ioc_match, plan_partial_match, plan_ring_match, BatchOrder,
-    BatchPlan, OrderType, OutputPurpose, RingLegOrder,
+    plan_batch_match, plan_batch_match_at, plan_decay_buy_match, plan_ioc_match,
+    plan_partial_match, plan_ring_match, BatchOrder, BatchPlan, OrderType, OutputPurpose,
+    RingLegOrder,
+};
+use kob_domain::time_planner::{
+    compose_settle_and_ratchet, plan_ratchet_advance, twap_fill_schedule, RatchetOrderRef,
 };
 
 const PUBKEY_HEX: &str = "b40c46552bc5fcf450d7026e8933b78b6f32b6812c9a94bcbf075cfcb4c249e0";
@@ -150,7 +163,14 @@ fn run_spot_plan(plan: &BatchPlan, wallet_value: u64) -> Vec<(usize, String)> {
             kob_core::parse_hash(&batch_input.tx_id).unwrap(),
             batch_input.index,
         );
-        inputs.push(TransactionInput::new(outpoint, batch_input.sigscript.clone(), 50, 0));
+        // Sequence comes from the plan: 50 exposure delay, or twin for
+        // twap_sell members (their real-age CSV gate).
+        inputs.push(TransactionInput::new(
+            outpoint,
+            batch_input.sigscript.clone(),
+            batch_input.sequence,
+            0,
+        ));
         entries.push(UtxoEntry {
             amount: order.utxo_value,
             script_public_key: kob_core::build_p2sh(&order.redeem_script),
@@ -165,7 +185,12 @@ fn run_spot_plan(plan: &BatchPlan, wallet_value: u64) -> Vec<(usize, String)> {
         kob_core::parse_hash(&buy_batch_input.tx_id).unwrap(),
         buy_batch_input.index,
     );
-    inputs.push(TransactionInput::new(buy_outpoint, buy_batch_input.sigscript.clone(), 50, 0));
+    inputs.push(TransactionInput::new(
+        buy_outpoint,
+        buy_batch_input.sigscript.clone(),
+        buy_batch_input.sequence,
+        0,
+    ));
     entries.push(UtxoEntry {
         amount: buy.utxo_value,
         script_public_key: kob_core::build_p2sh(&buy.redeem_script),
@@ -201,7 +226,8 @@ fn run_spot_plan(plan: &BatchPlan, wallet_value: u64) -> Vec<(usize, String)> {
         outputs.push(TransactionOutput::with_covenant(o.value, spk, covenant));
     }
 
-    let tx = Transaction::new(1, inputs, outputs, 50, Default::default(), 0, vec![]);
+    // The plan's own lock_time (decay members attested f(L) at exactly it).
+    let tx = Transaction::new(1, inputs, outputs, plan.lock_time, Default::default(), 0, vec![]);
     let covenant_count = plan.sells.len() + 1; // sells + buy
     exec_covenant_inputs(&tx, entries, covenant_count)
 }
@@ -470,4 +496,311 @@ fn ring_planner_3cycle_passes_real_engine() {
     ];
     let failures = run_ring_plan(&legs, 5_000_000);
     assert!(failures.is_empty(), "3-cycle ring planner tx must pass the real engine; failures: {failures:?}");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Time-contracts Stage B (kob/TIME_CONTRACTS_DESIGN.md): planner-built
+// CP-1..CP-4 txs, a decay sweep at three L points, a TWAP two-event pace,
+// and one combined settle+ratchet tx — all against the real engine.
+// ═════════════════════════════════════════════════════════════════════════
+
+/// twap_sell BatchOrder (state price = executing price; RS carries twin/mpw).
+fn make_twap_sell(id_byte: u8, amount: u64, twin: u64, mpw: u64, price: (u64, u64), token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
+    let rs = kob_core::contract::spot::twap::build_twap_sell_redeem_script(
+        twin, mpw, price.0, price.1, 1_000_000, owner, sspkh, &[0xDD; 32], 30, 0, 0,
+    ).unwrap();
+    let mut o = make_sell(id_byte, amount, price.0, price.1, token, owner, sspkh);
+    o.redeem_script = rs;
+    o
+}
+
+/// decay_sell BatchOrder on the standard schedule (pnum 2M -> 1M over DAA
+/// 1000..2000, pden 1M — raw pair; the planner re-parses the schedule).
+fn make_decay_sell(id_byte: u8, amount: u64, token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
+    let rs = kob_core::contract::spot::decay::build_decay_sell_redeem_script(
+        1000, 1000, 2000, 2_000_000, 1_000_000, 1_000_000, owner, sspkh, &[0xDD; 32], 30, 0, 0,
+    ).unwrap();
+    let mut o = make_sell(id_byte, amount, 2_000_000, 1_000_000, token, owner, sspkh);
+    o.redeem_script = rs;
+    o
+}
+
+/// ratchet_oco BatchOrder booked on its TP branch (raw branch pair).
+fn make_ratchet_tp_sell(id_byte: u8, amount: u64, token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
+    let rs = kob_core::contract::spot::ratchet::build_ratchet_oco_redeem_script(
+        1, 0, 60, 1_000_000, 5, 1, 1, 2, 1, 1, owner, sspkh, &[0xDD; 32], 30, 0, 0,
+    ).unwrap();
+    let mut o = make_sell(id_byte, amount, 5, 1, token, owner, sspkh);
+    o.redeem_script = rs;
+    o.oco_path = Some(kob_core::OcoPath::TakeProfit);
+    o.min_fill = 1;
+    o
+}
+
+/// decay_buy BatchOrder on the standard schedule (rising bid: token demand
+/// falls from 2M to 1M per 1M-sompi KAS unit over DAA 1000..2000).
+fn make_decay_buy(id_byte: u8, kas: u64, token: [u8; 32], owner: &[u8; 32], bspkh: &[u8; 32]) -> BatchOrder {
+    let rs = kob_core::contract::spot::decay::build_decay_buy_redeem_script(
+        1000, 1000, 2000, &token, 2_000_000, 1_000_000, 1, owner, bspkh, &[0xDD; 32], 10000, 0, 0,
+    ).unwrap();
+    let mut o = make_buy(id_byte, kas, 2_000_000, 1_000_000, 1, token, owner, bspkh, 10000);
+    o.redeem_script = rs;
+    o
+}
+
+/// CP-1 (planner-built): unchanged v18 buy sweeps a decay_sell + a plain v18
+/// sell in ONE tx planned by `plan_batch_match_at` — the buy's fair_sum
+/// consumes f(L) at the canonical offsets next to a static price; one tx =
+/// one L for every schedule in the sweep.
+#[test]
+fn cp1_planner_decay_plus_plain_sweep_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+
+    let sells = vec![
+        make_decay_sell(0x10, 10_000_000, token, &owner_hash, &spk_hash),
+        make_sell(0x11, 10_000_000, 99, 100, token, &owner_hash, &spk_hash),
+    ];
+    // kas_in = f(1500)·10M + 9.9M = 24.9M; buy 4/5: floor 19.92M <= 20M.
+    let buys = vec![make_buy(0x20, 24_900_000, 4, 5, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_batch_match_at(&sells, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000), 1500)
+        .expect("CP-1 mixed sweep must plan at L=1500");
+    assert_eq!(plan.lock_time, 1500);
+    // Same seller SPK => merged SellerKas output: f(1500)·10M + 9.9M.
+    assert_eq!(plan.outputs[0].value, 24_900_000, "decay leg pays f(1500) into the merged seat");
+    let tx = plan.build_tx().unwrap();
+    assert_eq!(&tx.inputs[0].sigscript[3..11], &1_500_000u64.to_le_bytes(), "RAW pnum_eff attested");
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "CP-1 planner tx must pass the real engine; failures: {failures:?}");
+}
+
+/// Decay sweep priced at three L points (start / mid / past-t_end floor):
+/// the planner computes pnum_eff per point, attests the RAW pair, and the
+/// real engine (decay D1-D4 + the unchanged v18 buy) accepts each tx.
+#[test]
+fn decay_sweep_three_lock_time_points_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+
+    // (L, expected seller KAS, buy price making the floor exactly bind).
+    for (l, kas, price) in [
+        (0u64, 20_000_000u64, (1u64, 2u64)), // clamp -> start price
+        (1500, 15_000_000, (2, 3)),          // mid-schedule
+        (2500, 10_000_000, (1, 1)),          // past t_end -> floor
+    ] {
+        let sells = vec![make_decay_sell(0x10, 10_000_000, token, &owner_hash, &spk_hash)];
+        let buys = vec![make_buy(0x20, kas, price.0, price.1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+        let plan = plan_batch_match_at(&sells, &buys, wallet.clone(), &p2pk_spk_bytes(&pubkey), 0, Some(2000), l)
+            .expect("decay sweep must plan at every schedule point");
+        assert_eq!(plan.outputs[0].value, kas, "seller KAS = f({l})");
+        let failures = run_spot_plan(&plan, 5_000_000);
+        assert!(failures.is_empty(), "decay sweep at L={l} must pass the real engine; failures: {failures:?}");
+    }
+}
+
+/// CP-2 (planner-built): unchanged v18 buy sweeps a twap_sell (+ plain
+/// sell), the twap input carrying sequence = twin from the plan.
+#[test]
+fn cp2_planner_twap_sweep_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+
+    let sells = vec![
+        make_twap_sell(0x10, 10_000_000, 100, 10_000_000, (1, 1), token, &owner_hash, &spk_hash),
+        make_sell(0x11, 10_000_000, 99, 100, token, &owner_hash, &spk_hash),
+    ];
+    let buys = vec![make_buy(0x20, 19_900_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_batch_match(&sells, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000))
+        .expect("CP-2 twap sweep must plan");
+    let tx = plan.build_tx().unwrap();
+    assert_eq!(tx.inputs[0].sequence, 100, "twap input sequence = twin");
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "CP-2 planner tx must pass the real engine; failures: {failures:?}");
+}
+
+/// TWAP two-event pace: the pacing helper splits the target volume into
+/// twin-spaced events; each event's tx (planned independently on the
+/// lineage's current UTXO) passes the real engine with sequence = twin.
+#[test]
+fn twap_two_event_pace_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+
+    let events = twap_fill_schedule(100, 10_000_000, 0, 20_000_000);
+    assert_eq!(events.len(), 2, "20M at mpw=10M paces into two events");
+    assert_eq!(events[0].earliest_daa, 100);
+    assert_eq!(events[1].earliest_daa, 200, "second event waits another twin");
+
+    for (k, ev) in events.iter().enumerate() {
+        // The lineage's current UTXO at this event (full fill of the paced
+        // volume; consensus enforces the real twin spacing via CSV).
+        let sells = vec![make_twap_sell(
+            0x10 + k as u8, ev.volume, 100, 10_000_000, (1, 1), token, &owner_hash, &spk_hash,
+        )];
+        let buys = vec![make_buy(0x20 + k as u8, ev.volume, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+        let plan = plan_batch_match(&sells, &buys, wallet.clone(), &p2pk_spk_bytes(&pubkey), 0, Some(2000))
+            .expect("paced twap event must plan");
+        let tx = plan.build_tx().unwrap();
+        assert_eq!(tx.inputs[0].sequence, ev.sequence, "event sequence = twin");
+        let failures = run_spot_plan(&plan, 5_000_000);
+        assert!(failures.is_empty(), "twap pace event {k} must pass the real engine; failures: {failures:?}");
+    }
+}
+
+/// CP-3 (planner-built): unchanged v18 buy sweeps a ratchet_oco on the TP
+/// branch (raw branch pair attested by the ratchet TP builder).
+#[test]
+fn cp3_planner_ratchet_tp_sweep_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+
+    let sells = vec![
+        make_ratchet_tp_sell(0x10, 5_000_000, token, &owner_hash, &spk_hash),
+        make_sell(0x11, 10_000_000, 99, 100, token, &owner_hash, &spk_hash),
+    ];
+    // kas_in = 25M + 9.9M = 34.9M; buy 3/7: floor 14.957M <= 15M.
+    let buys = vec![make_buy(0x20, 34_900_000, 3, 7, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_batch_match(&sells, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000))
+        .expect("CP-3 ratchet-TP sweep must plan");
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "CP-3 planner tx must pass the real engine; failures: {failures:?}");
+}
+
+/// CP-4 (planner-built): unchanged v18 sell settled by a decay_buy at the
+/// risen-bid floor, lock_time chosen by the feasibility solver (L = now).
+#[test]
+fn cp4_planner_decay_buy_settle_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+
+    // 10M KAS decay_buy at L=1500 demands 10 * 1.5M = 15M tokens.
+    let sells = vec![make_sell(0x10, 15_000_000, 1, 2, token, &owner_hash, &spk_hash)];
+    let buy = make_decay_buy(0x20, 10_000_000, token, &owner_hash, &spk_hash);
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_decay_buy_match(&sells, &buy, 1500, wallet, &p2pk_spk_bytes(&pubkey), 0, None)
+        .expect("CP-4 decay_buy settle must plan");
+    assert_eq!(plan.lock_time, 1500);
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "CP-4 planner tx must pass the real engine; failures: {failures:?}");
+}
+
+/// Combined settle+ratchet tx: `plan_batch_match` settles a 3/1 print,
+/// `plan_ratchet_advance` rides it (R10/R11/R12 verified against the plan's
+/// own outputs), `compose_settle_and_ratchet` merges them — and the real
+/// engine executes ALL covenant inputs including the permissionless ratchet
+/// branch with its spliced continuation.
+#[test]
+fn settle_plus_ratchet_combined_tx_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let token_hash = Hash::from_bytes(token);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = ScriptPublicKey::new(0, p2pk_spk_bytes(&pubkey).into());
+
+    // The settle: one 3/1 sell fully swept by a 30M buy (divisible print:
+    // 10M tokens x 3/1 = 30M KAS exactly).
+    let sells = vec![make_sell(0x10, 10_000_000, 3, 1, token, &owner_hash, &spk_hash)];
+    let buys = vec![make_buy(0x20, 30_000_000, 1, 3, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_batch_match(&sells, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000))
+        .expect("settle must plan");
+
+    // The ratchet_oco to advance: TP 5/1, SL 2/1, rstep 1, rgap 0, rwin 60,
+    // mrv 1M — the 3/1 print meets the trigger (3 >= 2+1+0) exactly.
+    let ratchet_rs = kob_core::contract::spot::ratchet::build_ratchet_oco_redeem_script(
+        1, 0, 60, 1_000_000, 5, 1, 1, 2, 1, 1, &owner_hash, &spk_hash, &[0xDD; 32], 30, 0, 0,
+    ).unwrap();
+    let oco = RatchetOrderRef {
+        outpoint: (hex::encode([0x40u8; 32]), 0),
+        redeem_script: ratchet_rs.clone(),
+        escrow: 5_000_000,
+        utxo_daa_score: 0,
+        token_cov_id: token,
+    };
+    let adv = plan_ratchet_advance(&oco, &plan, 100).expect("ratchet advance must plan");
+    assert_eq!(adv.sibling_input_idx, 0);
+    assert_eq!(adv.input_position, 2, "after the buy");
+    let composed = compose_settle_and_ratchet(&plan, &adv).expect("compose");
+
+    // Reconstruct the on-chain tx: [sell, buy, ratchet, wallet].
+    let mut inputs = Vec::new();
+    let mut entries = Vec::new();
+    for bi in &composed.inputs {
+        let outpoint = TransactionOutpoint::new(kob_core::parse_hash(&bi.tx_id).unwrap(), bi.index);
+        let ss = if bi.sigscript.is_empty() { vec![0x41; 66] } else { bi.sigscript.clone() };
+        inputs.push(TransactionInput::new(outpoint, ss, bi.sequence, bi.sig_op_count));
+    }
+    entries.push(UtxoEntry {
+        amount: 10_000_000,
+        script_public_key: kob_core::build_p2sh(&plan.sells[0].0.redeem_script),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: Some(token_hash),
+    });
+    entries.push(UtxoEntry {
+        amount: 30_000_000,
+        script_public_key: kob_core::build_p2sh(&plan.buys[0].0.redeem_script),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: None,
+    });
+    entries.push(UtxoEntry {
+        amount: 5_000_000,
+        script_public_key: kob_core::build_p2sh(&ratchet_rs),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: Some(token_hash),
+    });
+    entries.push(UtxoEntry {
+        amount: 5_000_000,
+        script_public_key: wallet_spk,
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: None,
+    });
+
+    let mut outputs = Vec::new();
+    for (i, o) in composed.outputs.iter().enumerate() {
+        let spk = ScriptPublicKey::new(o.spk_version, o.script_public_key.clone().into());
+        let covenant = match o.purpose {
+            OutputPurpose::BuyerTokens => plan
+                .output_auth_input
+                .get(&i)
+                .map(|&auth| CovenantBinding::new(auth, token_hash)),
+            // R13f: the continuation binds to the RATCHET input.
+            OutputPurpose::RatchetContinuation => {
+                Some(CovenantBinding::new(adv.input_position as u16, token_hash))
+            }
+            _ => None,
+        };
+        outputs.push(TransactionOutput::with_covenant(o.value, spk, covenant));
+    }
+
+    let tx = Transaction::new(1, inputs, outputs, plan.lock_time, Default::default(), 0, vec![]);
+    let failures = exec_covenant_inputs(&tx, entries, 3); // sell + buy + ratchet
+    assert!(failures.is_empty(), "settle+ratchet combined tx must pass the real engine; failures: {failures:?}");
+
+    // Scanner continuity: the continuation output IS P2SH(new_rs) with
+    // pnum_sl advanced one rstep.
+    let parsed = kob_core::contract::spot::parse::parse_ratchet_oco_redeem_script(&adv.new_rs)
+        .expect("continuation parses");
+    assert_eq!(parsed.oco.price_num_sl, 3, "SL advanced by rstep");
 }

@@ -41,7 +41,7 @@ pub mod prediction;
 // concern only — the public surface stays flat.
 pub use spot::{
     order_book, stop_book, dca_book, swap_book,
-    matching, routing, batch, ifd, trailing_stop,
+    matching, routing, batch, ifd, trailing_stop, time_planner,
 };
 pub use perp::{perp_book, perp_tracker, perp_executor};
 pub use lending::{lending_book, lending_tracker, lending_executor};

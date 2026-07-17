@@ -16,6 +16,8 @@ pub mod routing;
 #[allow(dead_code)]
 pub mod batch;
 #[allow(dead_code)]
+pub mod time_planner;
+#[allow(dead_code)]
 pub mod ifd;
 #[allow(dead_code)]
 pub mod trailing_stop;

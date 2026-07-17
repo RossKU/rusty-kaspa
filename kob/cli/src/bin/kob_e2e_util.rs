@@ -470,11 +470,89 @@ async fn main() -> anyhow::Result<()> {
             println!("TXID: {}", txid);
         }
 
+        // sweep-unit-kas <txid:idx> [<txid:idx> ...]
+        //
+        // Recover BINDING-LESS KAS parked at the wallet's token_unit P2SH
+        // (v18 covenant seats commit the token_unit SPK hash, so IOC buyer
+        // change / marked-order cancel refunds land there as plain KAS).
+        // Spends the listed unit-P2SH UTXOs via the token_unit owner-sig
+        // path into one wallet P2PK output. TX version 0, no covenant
+        // bindings -- if any listed UTXO actually carries a token covenant
+        // the node rejects the whole sweep (fail-closed, tokens are safe).
+        "sweep-unit-kas" => {
+            let wallet = WalletContext::load(&wallet_path)?;
+            let privkey = *wallet.privkey_bytes();
+            let unit_rs = kob_core::contract::build_token_unit_redeem_script(&wallet.pubkey);
+            let unit_p2sh = build_p2sh(&unit_rs);
+            let unit_addr = kaspa_address_encode("kaspatest", 8, &unit_p2sh.script()[2..34]);
+
+            let outpoints: Vec<(String, u32)> = args[2..]
+                .iter()
+                .map(|s| parse_outpoint(s))
+                .collect::<anyhow::Result<_>>()?;
+            if outpoints.is_empty() {
+                anyhow::bail!("sweep-unit-kas needs at least one <txid:idx>");
+            }
+
+            let rpc = NodeClient::connect(&node_url).await?;
+            let utxos = rpc.get_utxos_by_addresses(&[&unit_addr]).await?;
+
+            let mut tx = Transaction::new(0);
+            let mut total_in = 0u64;
+            for (txid, idx) in &outpoints {
+                let u = utxos
+                    .iter()
+                    .find(|u| u.outpoint.transaction_id == *txid && u.outpoint.index == *idx)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("unit UTXO {}:{} not found at {}", txid, idx, unit_addr)
+                    })?;
+                total_in += u.utxo_entry.amount;
+                tx.inputs.push(TxInput {
+                    prev_tx_id: txid.clone(),
+                    prev_index: *idx,
+                    sequence: 0,
+                    sig_op_count: 1,
+                    script_version: unit_p2sh.version,
+                    script_bytes: unit_p2sh.script().to_vec(),
+                    value: u.utxo_entry.amount,
+                });
+            }
+
+            let mut wallet_spk = Vec::with_capacity(34);
+            wallet_spk.push(0x20);
+            wallet_spk.extend_from_slice(&wallet.pubkey);
+            wallet_spk.push(0xac);
+            let est_fee = 50_000u64 * tx.inputs.len() as u64;
+            tx.outputs
+                .push(TxOutput::new(total_in - est_fee, 0, wallet_spk.clone(), None));
+
+            let sign_all = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
+                (0..tx.inputs.len())
+                    .map(|i| {
+                        let sh = compute_sighash(tx, i)?;
+                        let sig = signing::schnorr_sign(&privkey, &sh)?;
+                        Ok(kob_core::contract::build_token_unit_sigscript(&sig, &unit_rs))
+                    })
+                    .collect()
+            };
+            let sigs = sign_all(&tx)?;
+            let exact_fee = fee_with_floor(min_relay_fee(calc_mass_with_sigscripts(&tx, &sigs)));
+            tx.outputs[0].value = total_in - exact_fee;
+            let sigs = sign_all(&tx)?;
+            println!("sweeping {} unit UTXOs, total {} sompi, fee {} sompi", tx.inputs.len(), total_in, exact_fee);
+
+            let payload = to_rpc_payload(&tx, &sigs);
+            let txid = rpc.submit_transaction(payload).await?;
+            println!("SUCCESS! binding-less unit-P2SH KAS swept to wallet P2PK.");
+            println!("TXID: {}", txid);
+        }
+
         _ => {
             eprintln!("usage:");
             eprintln!("  kob-e2e-util oco-spk <tp_num> <tp_den> <tp_mfill> <sl_num> <sl_den> <sl_mfill> <mmfee_bps> <expiry>");
             eprintln!("  kob-e2e-util sell-partial <txid:idx> <rs_hex> <token_hex> <fta>");
             eprintln!("  kob-e2e-util expire <txid:idx> <rs_hex> <buy|sell> [token_hex]");
+            eprintln!("  kob-e2e-util sweep-unit-kas <txid:idx> [<txid:idx> ...]");
             eprintln!("env: NODE (ws url), WALLET (wallet.json path)");
             std::process::exit(2);
         }

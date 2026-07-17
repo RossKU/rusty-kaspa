@@ -695,15 +695,38 @@ async fn fill_bracket_inner(
     let token_hash = kob_core::compat::parse_hash(&token_cov_hex)
         .map_err(|e| anyhow::anyhow!("token covenant hash: {e:?}"))?;
 
+    // Trade-output SPK: the contract pins blake2b(output[1].spk) (buy entry;
+    // output[0] for sell) to the trade_spk_hash committed at rs[159..191).
+    // Post-D2 buy-entry deploys commit the owner's token_unit P2SH hash
+    // (KCC20 delivery re-wrap); pre-D2 brackets committed the raw P2PK.
+    // Resolve whichever preimage matches, or fail loudly BEFORE submitting.
+    let committed_trade_hash: [u8; 32] = redeem_script[159..191].try_into().unwrap();
+    let (trade_spk_version, trade_spk): (u16, Vec<u8>) =
+        if kob_core::compute_spk_hash(wallet_spk_version, &wallet_spk) == committed_trade_hash {
+            (wallet_spk_version, wallet_spk.clone())
+        } else if kob_core::contract::compute_token_unit_spk_hash(&pubkey) == committed_trade_hash {
+            (token_unit_p2sh.version, token_unit_p2sh.script().to_vec())
+        } else {
+            anyhow::bail!(
+                "Bracket trade_spk_hash matches neither this wallet's P2PK nor its token_unit P2SH."
+            );
+        };
+
     // Outputs.
     // [0] seller/matcher KAS (buy entry: the matcher's KAS proceeds; sell
     //     entry: blake2b(spk) must equal trade_spk_hash -> this wallet).
-    tx.outputs.push(TxOutput::new(seller_kas, wallet_spk_version, wallet_spk.clone(), None));
+    tx.outputs.push(TxOutput::new(
+        seller_kas,
+        if is_buy_entry { wallet_spk_version } else { trade_spk_version },
+        if is_buy_entry { wallet_spk.clone() } else { trade_spk.clone() },
+        None,
+    ));
     if is_buy_entry {
-        // [1] token delivery -> trade SPK (this wallet, N5) + token covenant
-        //     authorized by the token input (index 3).
+        // [1] token delivery -> committed trade SPK (N5; post-D2 this is the
+        //     owner's token_unit P2SH) + token covenant authorized by the
+        //     token input (index 3).
         tx.outputs.push(TxOutput::new(
-            buyer_tokens, wallet_spk_version, wallet_spk.clone(),
+            buyer_tokens, trade_spk_version, trade_spk.clone(),
             Some(kob_core::tx::CovenantBinding::new(3, token_hash)),
         ));
         // [2] OCO spawn: byte-exact oco_spk, genuine tokens.

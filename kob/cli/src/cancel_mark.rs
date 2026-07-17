@@ -51,26 +51,43 @@ pub async fn run(
     version: u8,
     expiry_daa: u64,
     fee_utxo_override: Option<&str>,
-    max_matcher_fee: u64,
+    max_matcher_fee: Option<u64>,
 ) -> anyhow::Result<()> {
     let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
     let pubkey = wallet.pubkey;
     let privkey = *wallet.privkey_bytes();
     let owner_hash = blake2b_256(&pubkey);
+    // Cached deploy record for this outpoint (if any): source of the exact
+    // delivery-SPK hash and the deployed mmfee_bps.
+    let cached_order = {
+        let cache_path = crate::cancel_all::orders_cache_path(wallet_path);
+        crate::cancel_all::load_orders_cache(&cache_path)
+            .ok()
+            .and_then(|orders| orders.into_iter().find(|o| o.outpoint == outpoint_str))
+    };
+    // mmfee_bps for RS reconstruction: explicit flag > deploy cache. There is
+    // no usable default -- v18 embeds BPS (<= 10000) and the legacy sompi
+    // default (10_000_000) can never reconstruct a v18 RS.
+    let max_matcher_fee: u64 = match max_matcher_fee {
+        Some(v) => v,
+        None => cached_order.as_ref().map(|o| o.max_matcher_fee).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing --max-matcher-fee and outpoint {} not found in orders cache.\n\
+                 Pass the deployed mmfee_bps explicitly (v18 BPS, e.g. 2000).",
+                outpoint_str
+            )
+        })?,
+    };
     // Delivery-SPK commitment for RS reconstruction. Prefer the exact hash
     // recorded at deploy time in the orders cache (byte-exact for both pre-D2
     // raw-P2PK orders and post-D2 token_unit orders); otherwise derive it:
     // v18 buys commit the owner's token_unit P2SH hash (D2 delivery re-wrap),
     // everything else the raw P2PK hash.
-    let cached_spk_hash: Option<[u8; 32]> = {
-        let cache_path = crate::cancel_all::orders_cache_path(wallet_path);
-        crate::cancel_all::load_orders_cache(&cache_path)
-            .ok()
-            .and_then(|orders| orders.into_iter().find(|o| o.outpoint == outpoint_str))
-            .and_then(|o| hex::decode(&o.spk_hash).ok())
-            .and_then(|b| <[u8; 32]>::try_from(b).ok())
-    };
+    let cached_spk_hash: Option<[u8; 32]> = cached_order
+        .as_ref()
+        .and_then(|o| hex::decode(&o.spk_hash).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b).ok());
     let spk_hash: [u8; 32] = match cached_spk_hash {
         Some(h) => h,
         None => {

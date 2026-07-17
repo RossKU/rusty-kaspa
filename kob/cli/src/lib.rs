@@ -217,9 +217,10 @@ pub enum Commands {
         #[arg(long)]
         fee_utxo: Option<String>,
 
-        /// Max matcher fee (sompi) embedded in the redeemScript.
-        #[arg(long, default_value = "10000000")]
-        max_matcher_fee: u64,
+        /// Deployed mmfee_bps (v18 BPS, <= 10000) embedded in the
+        /// redeemScript. Resolved from the orders cache if omitted.
+        #[arg(long)]
+        max_matcher_fee: Option<u64>,
     },
 
     /// List active orders (query UTXOs at known P2SH addresses).

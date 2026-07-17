@@ -2990,7 +2990,11 @@ async fn expire_orders(
             }
         };
         let (wallet_spk_ver, wallet_spk_script) = fee_utxo.parse_spk();
-        let expire_fee = kob_core::mass::estimate_compute_mass(2, 2, rs.len()) + 500;
+        // Miner fee: estimate_compute_mass returns MASS; the node's minimum
+        // relay fee is mass*100 (min_relay_fee). +500 mass headroom covers
+        // the signed sigscripts the estimate cannot see.
+        let expire_fee =
+            kob_core::mass::min_relay_fee(kob_core::mass::estimate_compute_mass(2, 2, rs.len()) + 500);
         if fee_utxo.utxo_entry.amount <= expire_fee + MIN_UTXO_VALUE {
             warn!("[EXPIRE] Wallet fee UTXO too small, skipping cycle");
             return expired_count;

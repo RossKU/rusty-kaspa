@@ -1,5 +1,124 @@
 # KOB Live testnet-10 E2E — post-hardening full run
 
+## single-generation spot — Stage F final live E2E (2026-07-17)
+
+Full re-proof of the 15-form spot matrix on the RENAMED single-generation
+binaries (HEAD e5bfcd6 + this run's glue fixes). Stage E1 changed the
+buy/sell/OCO covenant BYTECODE (expire seats: buy state 145B→178B / RS
+1720B, sell 112B→145B / 515B, OCO 139B→172B / 397B; swap 260B and bracket
+372B unchanged), E2 deleted every pre-v18 generation and rewrote engine
+auto-expire, E3 dropped the `_v18` names — so the Stage-D TXIDs prove
+retired bytecode, and every form below was re-settled on the shipping
+bytecode. Node `ws://65.108.107.30:18210`, REST verification via
+`api-tn10.kaspa.org` (every settle/claim TXID re-checked
+`is_accepted:true`; the REST API exposes `covenant_id` /
+`covenant_authorizing_input` per output, which this run used for every
+binding assertion). Wallet `kaspatest:qz6qc3j…cfy7qrwa6v8lf`.
+
+Funding: start 5.01 KAS free → reclaimed ~32.9 KAS by `cancel-all` of the
+legacy v14/v16/v17 resting orders using a preserved pre-E2 binary (the
+shipping binary correctly refuses non-v18 generations); mid-run mined 4
+blocks with `kob-miner` (31s; tn10 coinbase maturity = 1000 DAA);
+recovered 2.47 KAS of binding-less unit-P2SH change with the new
+`sweep-unit-kas` helper (`ab5fd46b…`). All three fixture mint authorities
+were unspent and reused; 26 fresh mints; end state 14.47 KAS free + token
+holdings, orderbook left empty (all Stage-F orders settled, cancelled,
+expired, or reclaimed).
+
+| # | Form | Path | Result | TXID |
+|---|---|---|---|---|
+| 1 | mint fresh A/B/C token_units | chained `token mint` off the fixture authorities | **PASS** — 22×A (incl. 90M and 300M units), 2×B, 2×C | first A `2affa93c…`, last A `955f601c…`, B `b0168cf6…`/`7f8b255f…`, C `6859d4a0…`/`c34388258…` |
+| 2 | deploy every contract on the renamed bytecode | CLI deploys | **PASS** — buy RS 1720B, sell 515B, OCO 397B, swap 260B, bracket 372B, receipt genesis; all `is_accepted` | buys `99ca1541…`/`1967e5e4…` et al., sells `3d0535fa…` et al., OCOs `a31c1f1e…`/`9d1b34e0…`, swaps `fe7a1396…`/`13f4c880…`/`1b77c885…`/`3c71df78…`/`c7cfe05e…`, bracket `7fb44bfe…`, receipt `6bb2860d…` |
+| 3 | GTC N:M sweep (3 sells × 1 buy) | engine `GtcBuyMultiFill` (fresh-cursor LISTEN) | **SETTLED** (blue 508055941) — 5-in/4-out, 3 per-sell token_unit deliveries COV(A) + merged 89.1M SellerKas | **`1a0cfed2f67c0c21da15d129ef1098db9dde09990ad8b7c6f052f6b3ffebbcf3`** |
+| 4 | IOC N:M sweep (3 sells × 1 buy, min_fill 30M tokens) | `match-batch --ioc` (`KOB_FEE_FLOOR=900000`) | **SETTLED** (blue 508058030) — deliveries COV(A); buyer-change seat = bspkh = token_unit P2SH (D2 model; binding-less KAS, later swept) | **`86f1363b31b0d3376a36e4a074e5b92645ab3323156f648b2433510b4cee7c22`** |
+| 5 | buy partial Op2 ×2 chained + final fill | `match-batch --partial` ×2 → `--ioc` | **SETTLED ×3** — 90M buy: ev1 residual 60M @`f1e52ddb…:2`, ev2 residual 30M @`c4eaf42a…:2` (byte-exact self-SPK, no covenant), final IOC consumes it (blues 508058808 / 508059505 / 508059789) | **`f1e52ddb…`**, **`c4eaf42a…`**, **`93934899…`** |
+| 6 | sell partial (Fix-3), direct Stage-D shape | `kob-e2e-util sell-partial` (E1 state offsets) | **SETTLED ×2 chained** — 300M sell: fta 100M (residual 200M @`9eabee26…:1`, COV at auth slot 0), then fta 50M on the residual (150M @`d8bc05b1…:1`); residual then cancelled (`8b3a5001…`) proving it rests live | **`9eabee26…`** (blue 508066998), **`d8bc05b1…`** (blue 508067289) |
+| 7a | OCO swept in a 2-sell batch, TP branch | engine `GtcBuyMultiFill sells=2` (OCO TP 99/100 + plain, buy 59.4M @1/1) | **SETTLED** (blue 508068352) on the new 397B OCO | **`9cb0686ef51a0e1071dfcd67213c6dec43c2bd83c6c242870ad6be8b00bdca80`** |
+| 7b | OCO swept in a 2-sell batch, SL branch | engine (OCO TP 2/1 no-cross / SL 1/2 + plain @1/2, buy 30M @3/4 min_fill 22.5M — the TOKEN floor) | **SETTLED** (blue 508069141) — out[0] 30M = 2×15M @1/2 proves the SL pair executed on-chain | **`af85a538bb363c2aa2713c423fbe1b213a979f30fe2443e2113952a858121d5d`** |
+| 8 | cancel-mark → fill rejected on-chain → cancel | `cancel-mark` → `kob-e2e-util sell-partial` ×2 → `cancel --cpend 1` | **PASS** — mark `87f7991e…` (cpend=1, binding carried per D2); fill attempts REFUSED by the node ("script ran, but verification failed", F5 cpend) both with covenant (`ed131e92…`) and plain (`aedfebbe…`), REST confirms neither landed; cancel recovered the escrow as a bound token_unit | mark **`87f7991e…`**, cancel **`a71e2265…`** |
+| 9 | expire seats (E1 — the changed bytecode) | `kob-e2e-util expire` (2-input full-refund, lockTime = expiry) | **CLAIMED ×2, NEW SEATS REST-VERIFIED**: buy expire → out[0] 30M FULL refund on the owner's RAW P2PK (`20b40c…ac`, `covenant_id:null`) = **okspkh seat live**; sell expire → out[0] 30M token_unit P2SH with `covenant_id` = V18A and `authorizing_input:0` = **otspkh + Fix-3 binding live**. (On-chain early-claim probe not exercised this run — optional; the client-side DAA guard is in place.) | buy **`41cb9d6958cad13cd6050e18f6c5dd0f15bbe5977469ac26ad9b18e5a4412113`** (blue 508077585), sell **`f56e41f78b033251691ebeb5aa3b9731c5590a5caa9365918a1486c6b259aedf`** (blue 508077607) |
+| 10 | 2-cycle ring A↔B | `match-ring` (2 legs) | **SETTLED** (blue 508074921) — token↔token direct, all-or-nothing, deliveries COV(A)/COV(B) | **`2b2cdb551a96989ebeaa68074038caf1fdf03b45125b0dc025773efaedb4ee60`** |
+| 11 | 3-cycle triangle A→B→C→A | `match-ring` (3 legs) | **SETTLED** (blue 508075669) — 3×30M deliveries COV(A)/COV(B)/COV(C), no KAS in any order leg | **`8e51b36c02ad36772485a172477fe2ce3dec021e5ba0aee3f432c148306821cc`** |
+| 12 | IFD soft path | `deploy ifd` → engine fills the entry | **SETTLED** (blue 508078516) — delivery out[1] landed ON the done-leg sell P2SH (`aa201018b690…`) with COV(A); the engine immediately rediscovered it as a live sell @2/1 (`72436538…:1`, later cancelled `5e8c233a…`) | **`724365386c2cb80ac74cf1c42567b192dda2e063d053e4ddad55a41c6f017687`** |
+| 13 | bracket fill (receipt in[2], CSV 50, OCO spawn on the 397B layout) | `receipt create` → `bracket deploy`/`fill --token-utxo` → `kob-e2e-util oco-cancel` | **SETTLED** (blue 508089255) after the D2 trade-seat fill fix (below) — in[2] = receipt `6bb2860d…:0`, in[3] = matcher token; out[1] 30M delivery token_unit COV(A) ai=3, out[2] 30M OCO spawn at the exact pinned `oco_spk` COV(A) ai=3, out[3] token change; the spawned 397B OCO then cancelled (owner path) | deploy **`7fb44bfe…`**, fill **`b112129d2db1f46d212b5facd2ac73854e0d6e7d80607a8527c7e3674e084099`**, OCO cancel **`6f48b46e…`** |
+| 14 | delivery re-wrap spend | `token transfer` of the form-3 delivery `1a0cfed2…:1` (38B token_unit P2SH + binding) | **SETTLED** (blue 508081300) — out[0] is again a covenant-bound token_unit (COV(A) ai=0): recipient re-wrap live on the renamed code | **`c95e5707e852dd74714379670ad4297c54f86dbfee63a69b94b1d6534986d94c`** |
+| 15 | engine auto-expire (E2 rewrite, 2-input full-refund) | continuous engine `expire_orders` after the fee fix (below) | **CLAIMED autonomously** (blue 508093935) — in[0] expired GTD sell `cb85d850…:0` + in[1] engine wallet fee; out[0] 30M FULL refund token_unit COV(A) ai=0 (otspkh + Fix-3 binding); log `[EXPIRE] Reclaimed expired SELL … (full refund to the owner seat)` | **`b8389a199081e5ee8b670586847e031e557fe7064a8f90fa9d88eb84659c5a12`** |
+
+**Verdict: the full single-generation spot matrix is LIVE-CONFIRMED on the
+shipping (post-E1/E2/E3) bytecode — all 15 forms have `is_accepted:true`
+TXIDs, and both E1 expire-seat changes are REST-verified at the output
+level (okspkh raw-P2PK KAS refund; otspkh token_unit refund WITH
+CovenantBinding). No covenant defect found.** The two on-chain rejections
+hit during the run were both CLI-glue defects (fixed below), not contract
+defects — in both cases the covenant correctly refused a malformed spend.
+
+**Product-code defects found + fixed during the run** (glue, non-covenant;
+both re-run live to green; 2427-suite regression `cargo test -p kob-cli -p
+kob-engine` green):
+1. **Bracket fill vs D2 trade seat** (`bracket.rs fill_bracket_inner`): the
+   buy-entry fill still delivered out[1] to the wallet's RAW P2PK while
+   post-D2 `bracket deploy` commits `trade_spk_hash` = token_unit P2SH
+   hash — the covenant's N5 check rejected every fill of a post-D2 bracket
+   ("script ran, but verification failed"; attempts `70b4a8ca…`,
+   `ed557da2…`, `87360914…` never landed). Stage D's successful fill
+   `9a993dc1…` had used a PRE-D2 bracket, masking the mismatch. Fix: the
+   fill resolves the committed trade seat from `rs[159..191)` (raw P2PK or
+   token_unit P2SH) and fails loudly if neither preimage matches.
+2. **Engine auto-expire fee** (`executor.rs expire_orders`, the E2
+   rewrite): used `estimate_compute_mass()` (grams) AS the fee (sompi) —
+   the node rejected with "4259 fees … under required 265600". Fix:
+   `min_relay_fee(mass + 500)`. (A failed expire also drops the order from
+   the engine book until redeploy/restart-rescan — the owner can always
+   self-expire via the CLI; noted, not changed.)
+3. **`cancel-mark` default mmfee** was the legacy sompi constant
+   (10000000), which can never reconstruct a v18 RS (BPS ≤ 10000) — the
+   command was unusable without an explicit flag. Fix: `--max-matcher-fee`
+   is now optional and resolves from the orders cache, with a clear error
+   when neither is available.
+4. **New `kob-e2e-util sweep-unit-kas`**: recovers binding-less KAS parked
+   at the wallet's token_unit P2SH via the unit-RS owner-sig path (single
+   P2PK output; tx version 0, so a covenant-carrying UTXO fails the whole
+   sweep closed). Live: `ab5fd46b…` swept 246,887,072 sompi.
+
+**Operational notes (Stage F)**:
+- Binding-less KAS accumulates at the token_unit P2SH by design post-D2:
+  the v18 buy's change/refund seat (bspkh) IS the token_unit hash, so IOC
+  buyer change and cancel refunds of de-tokenized escrows land there as
+  plain KAS (`token balance` flags them; `sweep-unit-kas` recovers them).
+- `cancel-mark` + `cancel` preserve the token covenant end-to-end (mark
+  carries the binding onto the cpend=1 UTXO; cancel refunds a bound
+  token_unit — REST-verified). There is no de-tokenize path anymore.
+- `cancel` with explicit params (uncached outpoint) requires `--version 18`
+  (the no-cache default is an intentional invalid sentinel).
+- Op2 residuals are not auto-cached: add the residual outpoint to
+  orders.json (same params, new outpoint/value) before chaining
+  `match-batch --partial` onto it.
+- min_fill semantics at the deploy gate: sell-side = KAS proceeds floor
+  (30M tokens @99/100 needs `--min-fill ≤ 29700000`); buy-side = TOKEN
+  floor (the Stage-D pin holds on the renamed code).
+- `KOB_FEE_FLOOR` remains necessary on covenant-heavy shapes (batch ~9e5,
+  1720B-RS buy deploys/expires ~4.5e5; the IFD two-RS payload needed
+  6e5) — the node's byte-proportional transient floor exceeds compute-mass
+  fees there.
+- tn10 coinbase maturity is 1000 DAA; `kob-miner` remains the funding path
+  (4/4 blocks accepted in 31s this run).
+- Build env: sdcardfs does not reliably bump mtimes on /storage — ALWAYS
+  `touch` changed sources before `cargo build`, and verify the fix string
+  is present in the binary (`strings | grep`) before re-running live.
+
+**Final matrix statement**: implemented + live-proven on the shipping
+bytecode — N:M GTC and IOC sweeps, buy Op2 partial chains, sell Fix-3
+partial chains, OCO sweeps on BOTH branches, two-phase cancel with on-chain
+fill rejection, permissionless expiry with the E1 owner seats (buy → owner
+P2PK KAS, sell/OCO → owner token_unit with binding), token↔token 2-cycle
+and 3-cycle rings, IFD done-leg spawn, receipt-gated bracket with live OCO
+spawn, KCC20 token_unit delivery re-wrap, and engine-autonomous expiry.
+Documented limitations (unchanged, by design): multi-buy (item D) stays
+fail-closed by proof, ring legs are all-or-nothing (no ring partial), and
+trailing stops remain off-chain matcher constructs.
+
+---
+
 ## v18 delivery re-wrap (KCC20 token_units) — Stage D2 live run (2026-07-16)
 
 Fix: v18 fills previously delivered tokens to the buyer's **raw P2PK SPK**

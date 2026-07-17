@@ -1,7 +1,10 @@
 # V18 DESIGN FREEZE — single-generation spot, delete v14/v16/v17
 
-Status: frozen 2026-07-16. Stages A–E DONE (2026-07-17). Unreleased chain
-state → no migration.
+Status: frozen 2026-07-16. **ALL STAGES A–F DONE (2026-07-17)** — Stage F
+full live re-proof of the 15-form matrix on the renamed bytecode is
+recorded in `E2E_LIVE_RESULTS.md` (Stage F section: all forms
+`is_accepted:true`, both E1 expire seats REST-verified at the output
+level). Unreleased chain state → no migration.
 
 Stage E (deletion + rename) landed in three commits:
 - **E1** expire-seat covenant fix: buy state 145B→178B (owner KAS seat
@@ -15,7 +18,11 @@ Stage E (deletion + rename) landed in three commits:
   only place the number 18 lives. The `version` u8 fields still REPORT 18
   (engine/API consumers) via that const; on-chain dispatch is by RS length.
 
-Only Stage F (fresh live smoke on the renamed binary) remains.
+Stage F (2026-07-17) went beyond a smoke: the FULL 15-form matrix was
+re-settled live on the renamed binaries (the Stage-D TXIDs prove retired
+pre-E1 bytecode). Two CLI-glue defects were found and fixed en route
+(bracket fill vs the D2 trade seat; engine auto-expire fee units) — both
+covenant rejections were the contract working correctly.
 
 ## Goals
 1. One spot contract generation (v18) covering everything the matrix needs: N:M GTC/IOC sweep, buy partial-fill (old item C), OCO sweep-eligible (old OCO-SL blocker), token↔token ring settle incl. triangle (old item F, closes Fix-7 locally).

@@ -471,3 +471,68 @@ fn mixed_batch_caps_interplay() {
     assert_eq!(&tx.inputs[3].sigscript[3..11], &u64_le(5));
     assert_eq!(tx.inputs[3].sigscript[11], 0x08);
 }
+
+// ── Stage C: sell-anchored admission gates (Stage-B residuals 1+2) ──
+
+/// The anchor's fill time-gate is a HARD error at the plan's lock_time (the
+/// anchor cannot be greedily skipped like sweep members).
+#[test]
+fn sell_anchored_expiry_gate_typed() {
+    let sell = decay_sell(0x10, 10_000_000, 1_000_000, 1200);
+    let buys = vec![plain_buy(0x20, 15_000_000, 2, 3, 2000)];
+    let err = kob_domain::batch::plan_sell_ioc_match_at(
+        &sell, &buys, wallet(), &[0x20; 34], 0, None, 1500,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, BatchError::LockTimePastExpiry { expiry: 1200, lock_time: 1500, .. }),
+        "anchor past expiry must reject typed; got {err}"
+    );
+}
+
+/// The D1 domain guard rejects a unix-ms-type lock_time at plan time.
+#[test]
+fn sell_anchored_d1_threshold_guard() {
+    let sell = decay_sell(0x10, 10_000_000, 1_000_000, 0);
+    let buys = vec![plain_buy(0x20, 15_000_000, 2, 3, 2000)];
+    let err = kob_domain::batch::plan_sell_ioc_match_at(
+        &sell, &buys, wallet(), &[0x20; 34], 0, None, 500_000_000_000,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, BatchError::LockTimeWindowEmpty { .. }),
+        "unix-ms-type L must reject typed; got {err}"
+    );
+}
+
+/// Expiry-dead candidate buys are SKIPPED (greedy), not hard errors: the
+/// anchor settles against the next eligible buy.
+#[test]
+fn sell_anchored_skips_expired_buys() {
+    let sell = decay_sell(0x10, 10_000_000, 1_000_000, 0);
+    // First buy expires at 1400 (< L=1500) — skipped; second absorbs.
+    let rs_expired = build_buy_redeem_script(&TOKEN, 2, 3, 1_000_000, &OWNER, &SPKH, &SEAT, 2000, 0, 1400).unwrap();
+    let expired = order_from_rs(0x20, OrderType::Buy, rs_expired, 15_000_000, 2, 3, 1_000_000);
+    let live = plain_buy(0x21, 15_000_000, 2, 3, 2000);
+    let plan = kob_domain::batch::plan_sell_ioc_match_at(
+        &sell, &[expired, live], wallet(), &[0x20; 34], 0, None, 1500,
+    )
+    .expect("second buy must absorb");
+    assert_eq!(plan.buys[0].0.outpoint.0, hex::encode([0x21u8; 32]), "expired buy skipped");
+    assert_eq!(plan.lock_time, 1500);
+}
+
+/// The legacy entry point stays byte-stable: `plan_sell_ioc_match` ==
+/// `plan_sell_ioc_match_at(..., 0)` (decay anchors clamp to the start price).
+#[test]
+fn sell_anchored_legacy_delegates_at_zero() {
+    let sell = decay_sell(0x10, 10_000_000, 1_000_000, 0);
+    // At L=0 the clamp yields the start price 2M/1M -> seller KAS 20M.
+    let buys = vec![plain_buy(0x20, 20_000_000, 1, 2, 2000)];
+    let legacy = kob_domain::batch::plan_sell_ioc_match(
+        &sell, &buys, wallet(), &[0x20; 34], 0, None,
+    )
+    .expect("legacy path plans");
+    assert_eq!(legacy.lock_time, 0);
+    assert_eq!(legacy.outputs[0].value, 20_000_000, "start-price clamp at L=0");
+}

@@ -289,6 +289,11 @@ pub struct SpentTracker {
     pub failed: HashMap<String, Instant>,
     /// Cooldown duration for failed outpoints.
     pub cooldown_secs: u64,
+    /// C-b collision backoff: consecutive lost-race count per outpoint.
+    /// Each loss extends the failure cooldown exponentially (capped), so a
+    /// matcher that keeps losing the same sweep race backs off and re-plans
+    /// from the refreshed book instead of resubmitting the same tx shape.
+    pub race_lost: HashMap<String, u32>,
 }
 
 impl Default for SpentTracker {
@@ -298,6 +303,7 @@ impl Default for SpentTracker {
             pending_outputs: Vec::new(),
             failed: HashMap::new(),
             cooldown_secs: FAILED_OUTPOINT_COOLDOWN_SECS,
+            race_lost: HashMap::new(),
         }
     }
 }
@@ -330,6 +336,35 @@ impl SpentTracker {
                 submit_txid: String::new(),
             },
         );
+        // A successful spend ends any lost-race streak on this outpoint.
+        self.race_lost.remove(outpoint_key);
+    }
+
+    /// C-b collision backoff: record a LOST RACE on this outpoint (another
+    /// tx consumed it first — "already spent" / orphaned sweep). The n-th
+    /// consecutive loss holds the outpoint under failure cooldown for
+    /// `cooldown_secs * 2^(n-1)` (exponent capped at 5), implemented by
+    /// forward-dating the failure entry (`Instant::elapsed` saturates to
+    /// zero for future instants, so the standard `is_failed` check applies
+    /// unchanged). The caller must NOT resubmit the same plan — the next
+    /// scan cycle re-plans from the refreshed book once the backoff expires.
+    pub fn mark_race_lost(&mut self, outpoint_key: &str) {
+        let n = self
+            .race_lost
+            .entry(outpoint_key.to_string())
+            .and_modify(|c| *c = c.saturating_add(1))
+            .or_insert(1);
+        let mult = 1u64 << (*n - 1).min(5);
+        let extra = self.cooldown_secs.saturating_mul(mult.saturating_sub(1));
+        self.failed.insert(
+            outpoint_key.to_string(),
+            Instant::now() + std::time::Duration::from_secs(extra),
+        );
+    }
+
+    /// Consecutive lost-race count for an outpoint (0 = none).
+    pub fn race_lost_count(&self, outpoint_key: &str) -> u32 {
+        self.race_lost.get(outpoint_key).copied().unwrap_or(0)
     }
 
     /// Associate a set of recently-marked outpoints with their submit txid.
@@ -751,4 +786,31 @@ mod tests {
         let outputs = [(99_900_000u64, 1u64)];
         assert!(check_mass_presubmit(&inputs, &outputs, "TEST").is_some());
     }
+    // C-b collision backoff: consecutive lost races extend the cooldown
+    // exponentially; a successful spend clears the streak.
+    #[test]
+    fn race_lost_backoff_extends_and_clears() {
+        let mut t = SpentTracker::with_cooldown(30);
+        assert_eq!(t.race_lost_count("k"), 0);
+        t.mark_race_lost("k");
+        assert_eq!(t.race_lost_count("k"), 1);
+        assert!(t.is_failed("k"), "first loss = standard cooldown");
+        t.mark_race_lost("k");
+        t.mark_race_lost("k");
+        assert_eq!(t.race_lost_count("k"), 3);
+        // The 3rd loss forward-dates the entry by cooldown*(2^2 - 1) = 90s;
+        // Instant::elapsed saturates to zero on future instants, so the
+        // standard is_failed check holds without touching its call sites.
+        assert!(t.is_failed("k"));
+        // A successful settle ends the streak.
+        t.mark_spent("k");
+        assert_eq!(t.race_lost_count("k"), 0);
+        // Exponent cap: 40 consecutive losses must not overflow the shift.
+        for _ in 0..40 {
+            t.mark_race_lost("cap");
+        }
+        assert_eq!(t.race_lost_count("cap"), 40);
+        assert!(t.is_failed("cap"));
+    }
+
 }

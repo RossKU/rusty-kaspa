@@ -315,6 +315,9 @@ fn planned_output_plurality(out: &crate::matcher::batch::PlannedOutput) -> u64 {
             | OutputPurpose::SellRemainder
             | OutputPurpose::RingDelivery
             | OutputPurpose::MatcherSkim
+            // Ratchet continuation: token escrow under the successor P2SH,
+            // covenant-bound to the ratchet input (R13f).
+            | OutputPurpose::RatchetContinuation
     );
     let total = UTXO_CONST_STORAGE
         + out.script_public_key.len()
@@ -644,6 +647,95 @@ fn extract_bracket_meta(rs: &[u8]) -> Option<crate::matcher::batch::BracketMeta>
     })
 }
 
+/// C-b: miner-style weighted-random ordering (weight + 1 proportional
+/// sampling WITHOUT replacement, xorshift64 PRNG — no new deps). Competing
+/// matchers that all execute candidates in the same deterministic
+/// best-surplus order collide on the same UTXOs every cycle; sampling
+/// spreads them across the candidate set while still favoring profit
+/// (exactly how miners sample mempool txs by fee weight).
+pub(crate) fn weighted_shuffle_by<T>(
+    items: &mut Vec<T>,
+    mut seed: u64,
+    weight: impl Fn(&T) -> u64,
+) {
+    if items.len() < 2 {
+        return;
+    }
+    if seed == 0 {
+        seed = 0x9E37_79B9_7F4A_7C15;
+    }
+    let mut pool = std::mem::take(items);
+    let mut out = Vec::with_capacity(pool.len());
+    while !pool.is_empty() {
+        let total: u128 = pool.iter().map(|t| weight(t) as u128 + 1).sum();
+        // xorshift64
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        let mut pick = (seed as u128) % total;
+        let mut idx = pool.len() - 1;
+        for (i, t) in pool.iter().enumerate() {
+            let w = weight(t) as u128 + 1;
+            if pick < w {
+                idx = i;
+                break;
+            }
+            pick -= w;
+        }
+        out.push(pool.swap_remove(idx));
+    }
+    *items = out;
+}
+
+/// True when a submit error means the tx LOST A RACE for one of its inputs
+/// (another matcher's tx consumed it first, or our sweep went orphan) —
+/// the C-b collision case: back off exponentially and re-plan from the
+/// refreshed book; never resubmit the same plan.
+pub(crate) fn is_race_lost_error(err_str: &str) -> bool {
+    let e = err_str.to_ascii_lowercase();
+    e.contains("already spent")
+        || e.contains("double spend")
+        || e.contains("doublespend")
+        || e.contains("orphan")
+        || e.contains("already accepted")
+}
+
+/// Classify a settle-submit failure and mark the plan's order outpoints:
+///   - "sequence locks" (CSV not yet mature) — short transient cooldown;
+///   - lost race — exponential collision backoff (C-b, `mark_race_lost`);
+///   - anything else — the standard failure cooldown.
+fn mark_submit_failure(
+    err_str: &str,
+    tag: &str,
+    plan: &crate::matcher::batch::BatchPlan,
+    spent_tracker: &mut SpentTracker,
+) {
+    let is_transient = err_str.contains("sequence locks");
+    let is_race = !is_transient && is_race_lost_error(err_str);
+    if is_transient {
+        warn!("[{}] CSV not yet mature (transient): {}", tag, err_str);
+    } else if is_race {
+        warn!("[{}] Lost race — backing off, will re-plan: {}", tag, err_str);
+    } else {
+        error!("[{}] Submit failed: {}", tag, err_str);
+    }
+    let mut mark = |key: String| {
+        if is_transient {
+            spent_tracker.mark_transient(&key);
+        } else if is_race {
+            spent_tracker.mark_race_lost(&key);
+        } else {
+            spent_tracker.mark_failed(&key);
+        }
+    };
+    for (sell, _) in &plan.sells {
+        mark(format!("{}:{}", sell.outpoint.0, sell.outpoint.1));
+    }
+    for (buy, _) in &plan.buys {
+        mark(format!("{}:{}", buy.outpoint.0, buy.outpoint.1));
+    }
+}
+
 /// to sign the wallet input (P2PK, last input), then submits via RPC.
 ///
 /// The wallet input is the LAST input in the batch TX and needs `sigOpCount: 1`
@@ -691,9 +783,15 @@ pub async fn execute_batch_match(
     let has_wallet = plan.wallet_input.is_some();
 
     // We need to sign the wallet input. Build a kob_core::tx::Transaction for sighash.
-    // lock_time=50 required for OP_CSV(50) in covenant inputs.
+    //
+    // C-a (TIME_CONTRACTS_DESIGN §7 Stage-C addenda): the planner is the
+    // authority on the tx lock_time — every decay attestation in the plan is
+    // f(plan.lock_time) and the covenant D3 check rejects any other L.
+    // Legacy plans carry lock_time = 0 (Finalized shape) and keep the
+    // historical DAA-type 50 the v18 proofs ran with.
+    let tx_lock_time = if plan.lock_time > 0 { plan.lock_time } else { 50 };
     let mut sighash_tx = kob_core::tx::Transaction::new(1);
-    sighash_tx.lock_time = 50;
+    sighash_tx.lock_time = tx_lock_time;
     // IFD: set TX payload on sighash_tx so sighash computation includes it.
     // The payload is part of the sighash in Kaspa — adding it only at RPC
     // submission time would invalidate all pre-computed signatures.
@@ -707,13 +805,17 @@ pub async fn execute_batch_match(
     // For covenant inputs: use P2SH script from the order's p2sh
     // For the wallet input: use the wallet's SPK
 
-    // Add sell order inputs (CSV=50 for BuySell covenant)
-    for (sell, _input_idx) in &plan.sells {
+    // Add sell order inputs. C-a: the per-input sequence comes from the
+    // plan's build_tx() — the 50-DAA exposure delay for plain covenants,
+    // `max(50, twin)` for twap_sell fill inputs (their `twin CSV` real-age
+    // gate). Sequences are part of the sighash, so they must match the
+    // submitted RPC inputs exactly.
+    for (i, (sell, _input_idx)) in plan.sells.iter().enumerate() {
         let p2sh = kob_core::build_p2sh(&sell.redeem_script);
         sighash_tx.inputs.push(kob_core::tx::TxInput {
             prev_tx_id: sell.outpoint.0.clone(),
             prev_index: sell.outpoint.1,
-            sequence: 50,
+            sequence: batch_tx.inputs.get(i).map_or(50, |inp| inp.sequence),
             sig_op_count: 0,
             script_version: p2sh.version,
             script_bytes: p2sh.script().to_vec(),
@@ -721,13 +823,13 @@ pub async fn execute_batch_match(
         });
     }
 
-    // Add buy order inputs (CSV=50 for BuySell covenant)
-    for (buy, _input_idx) in &plan.buys {
+    // Add buy order inputs (planner sequence; 50 for every current buy kind)
+    for (j, (buy, _input_idx)) in plan.buys.iter().enumerate() {
         let p2sh = kob_core::build_p2sh(&buy.redeem_script);
         sighash_tx.inputs.push(kob_core::tx::TxInput {
             prev_tx_id: buy.outpoint.0.clone(),
             prev_index: buy.outpoint.1,
-            sequence: 50,
+            sequence: batch_tx.inputs.get(plan.sells.len() + j).map_or(50, |inp| inp.sequence),
             sig_op_count: 0,
             script_version: p2sh.version,
             script_bytes: p2sh.script().to_vec(),
@@ -834,7 +936,7 @@ pub async fn execute_batch_match(
             inp.index,
             &hex::encode(&inp.sigscript),
             inp.sig_op_count,
-            50, // OP_CSV(50) compliance
+            inp.sequence, // C-a: planner-authoritative (50 / twin / rwin)
         ));
     }
 
@@ -1082,7 +1184,7 @@ pub async fn execute_batch_match(
 
     // === DEBUG: Dump full TX structure before submit ===
     info!("=== BATCH TX DEBUG DUMP ===");
-    info!("  version=1, lockTime=50, inputs={}, outputs={}", rpc_inputs.len(), rpc_outputs.len());
+    info!("  version=1, lockTime={}, inputs={}, outputs={}", tx_lock_time, rpc_inputs.len(), rpc_outputs.len());
     for (i, inp) in rpc_inputs.iter().enumerate() {
         let sig_hex = inp["signatureScript"].as_str().unwrap_or("");
         let seq = inp["sequence"].as_u64().unwrap_or(0);
@@ -1120,64 +1222,29 @@ pub async fn execute_batch_match(
     }
     info!("=== END DEBUG DUMP ===");
 
-    // Submit via RPC (version=1 for covenant output bindings, lockTime=50 for OP_CSV)
+    // Submit via RPC (version=1 for covenant output bindings; lock_time is
+    // the planner-authoritative value carried on the sighash tx — C-a).
     let payload = match ifd_payload {
-        Some(ref hex) => deploy::build_submit_payload_with_tx_payload(1, rpc_inputs, rpc_outputs, hex, 50),
-        None => deploy::build_submit_payload_with_lock_time(1, rpc_inputs, rpc_outputs, 50),
+        Some(ref hex) => deploy::build_submit_payload_with_tx_payload(1, rpc_inputs, rpc_outputs, hex, tx_lock_time),
+        None => deploy::build_submit_payload_with_lock_time(1, rpc_inputs, rpc_outputs, tx_lock_time),
     };
     // Dump full payload JSON at debug level for manual replay
     if tracing::enabled!(tracing::Level::DEBUG) {
         info!("[BATCH] Full RPC payload (for manual replay):");
         info!("{}", serde_json::to_string_pretty(&payload).unwrap_or_default());
     }
-    let result = match rpc.submit_transaction(payload).await {
+    let result = match crate::chain::submitter::TxSubmitter::submit(rpc, payload, config.submit_lane).await {
         Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
-            let is_transient = err_str.contains("sequence locks");
-            if is_transient {
-                warn!("[BATCH] CSV not yet mature (transient): {}", err_str);
-            } else {
-                error!("[BATCH] Submit failed: {}", err_str);
-            }
-            let mark = |key: &str, tracker: &mut SpentTracker| {
-                if is_transient {
-                    tracker.mark_transient(key);
-                } else {
-                    tracker.mark_failed(key);
-                }
-            };
-            for (sell, _) in &plan.sells {
-                mark(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1), spent_tracker);
-            }
-            for (buy, _) in &plan.buys {
-                mark(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1), spent_tracker);
-            }
+            mark_submit_failure(&err_str, "BATCH", plan, spent_tracker);
             return None;
         }
     };
 
     if !result.ok {
         let err_str = result.error.unwrap_or_else(|| "Unknown error".to_string());
-        let is_transient = err_str.contains("sequence locks");
-        if is_transient {
-            warn!("[BATCH] CSV not yet mature (transient): {}", err_str);
-        } else {
-            error!("[BATCH] FAILED: {}", err_str);
-        }
-        let mark = |key: &str, tracker: &mut SpentTracker| {
-            if is_transient {
-                tracker.mark_transient(key);
-            } else {
-                tracker.mark_failed(key);
-            }
-        };
-        for (sell, _) in &plan.sells {
-            mark(&format!("{}:{}", sell.outpoint.0, sell.outpoint.1), spent_tracker);
-        }
-        for (buy, _) in &plan.buys {
-            mark(&format!("{}:{}", buy.outpoint.0, buy.outpoint.1), spent_tracker);
-        }
+        mark_submit_failure(&err_str, "BATCH", plan, spent_tracker);
         return None;
     }
 
@@ -1218,6 +1285,399 @@ pub async fn execute_batch_match(
         .sum();
 
     Some(BatchMatchResult {
+        tx_id,
+        sell_count: plan.sells.len(),
+        buy_count: plan.buys.len(),
+        total_seller_kas,
+        matcher_surplus: plan.matcher_surplus,
+    })
+}
+
+/// Outcome of `execute_oco_ratchet` — the caller's fallback decision needs
+/// to distinguish a failed SUBMISSION (outpoints already cooled down; do NOT
+/// immediately resubmit the plain settle on the same inputs) from a
+/// pre-submit composition failure (nothing touched the network; the plain
+/// settle is safe to execute this cycle).
+pub enum RatchetExecOutcome {
+    /// One tx settled the print AND advanced the ratchet.
+    Submitted(BatchMatchResult),
+    /// The composed tx was submitted and rejected (or transport failed);
+    /// the plan's outpoints are marked (transient/race/failed).
+    SubmitFailed,
+    /// Composition was not possible pre-submit (guards, fee absorption,
+    /// mass) — nothing was marked; fall back to the plain settle.
+    NotComposable,
+}
+
+/// Find a resting ratchet_oco on the plan's token that `plan_ratchet_advance`
+/// accepts against this settle plan (trigger R11, volume R10, divisible
+/// print R12, window G1, travel cap G3, state gates R2/R3). Returns the
+/// planner-ready reference; virtual :tp/:sl book entries of one UTXO are
+/// deduplicated by base outpoint, and plan members are excluded (a UTXO
+/// being settled cannot also ratchet in the same tx).
+fn find_ratchet_advance_candidate(
+    order_book: &OrderBook,
+    plan: &crate::matcher::batch::BatchPlan,
+    spent_tracker: &SpentTracker,
+    tip_daa: u64,
+) -> Option<kob_domain::time_planner::RatchetOrderRef> {
+    let (buy, _) = plan.buys.first()?;
+    let token_hex = hex::encode(buy.token_cov_id);
+    let pair = order_book.pair_books.get(&token_hex)?;
+    let member_keys: std::collections::HashSet<String> = plan
+        .sells
+        .iter()
+        .map(|(s, _)| format!("{}:{}", s.outpoint.0, s.outpoint.1))
+        .chain(std::iter::once(format!("{}:{}", buy.outpoint.0, buy.outpoint.1)))
+        .collect();
+    let mut seen_bases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for order in pair.asks.values() {
+        if !matches!(
+            order.time_meta,
+            Some(crate::matcher::order_book::TimeMeta::RatchetOco { .. })
+        ) {
+            continue;
+        }
+        let base = format!("{}:{}", order.tx_id, order.index);
+        if !seen_bases.insert(base.clone()) {
+            continue; // the partner virtual entry of a UTXO we already tried
+        }
+        if member_keys.contains(&base) {
+            continue;
+        }
+        if spent_tracker.is_spent(&base)
+            || spent_tracker.is_spent(&format!("{}:tp", base))
+            || spent_tracker.is_spent(&format!("{}:sl", base))
+        {
+            continue;
+        }
+        let Ok(rs) = hex::decode(&order.redeem_script_hex) else { continue };
+        let Ok(tok_bytes) = hex::decode(&order.token_cov_id) else { continue };
+        let Ok(token_cov_id) = <[u8; 32]>::try_from(tok_bytes.as_slice()) else { continue };
+        let candidate = kob_domain::time_planner::RatchetOrderRef {
+            outpoint: (order.tx_id.clone(), order.index),
+            redeem_script: rs,
+            escrow: order.value,
+            // discovered_daa approximates the UTXO creation score for the
+            // G1 pre-check; consensus enforces the real rwin CSV either way.
+            utxo_daa_score: order.discovered_daa,
+            token_cov_id,
+        };
+        if kob_domain::time_planner::plan_ratchet_advance(&candidate, plan, tip_daa).is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Execute a settle plan WITH a permissionless ratchet advance riding it
+/// (design §4.7): ONE tx contains the print (the settle) and the RATCHET
+/// branch spend, whose continuation output re-escrows the OCO under the
+/// successor P2SH (`pnum_sl += rstep`), covenant-bound to the ratchet input
+/// (R13f). The matcher pays the ratchet's extra mass out of its own fee
+/// output — ratcheting earns no protocol fee (§4.7 matcher-incentive note).
+#[allow(clippy::too_many_arguments)]
+pub async fn execute_oco_ratchet(
+    rpc: &RpcClient,
+    plan: &crate::matcher::batch::BatchPlan,
+    oco: &kob_domain::time_planner::RatchetOrderRef,
+    tip_daa: u64,
+    config: &AppConfig,
+    spent_tracker: &mut SpentTracker,
+    wallet_spk: (u16, &[u8]),
+) -> RatchetExecOutcome {
+    if let Err(e) = plan.validate() {
+        error!("[RATCHET] settle plan validation failed: {}", e);
+        return RatchetExecOutcome::NotComposable;
+    }
+    // The composed input layout assumes [sells.., buy, ratchet, wallet?] —
+    // a bracket receipt input would sit at the ratchet's position. v18 spot
+    // planners never set it; guard defensively.
+    if plan.bracket_receipt.is_some() {
+        info!("[RATCHET] bracket plans cannot compose a ratchet advance, skipping");
+        return RatchetExecOutcome::NotComposable;
+    }
+    let adv = match kob_domain::time_planner::plan_ratchet_advance(oco, plan, tip_daa) {
+        Ok(a) => a,
+        Err(e) => {
+            info!("[RATCHET] not advanceable: {}", e);
+            return RatchetExecOutcome::NotComposable;
+        }
+    };
+    let batch_tx = match kob_domain::time_planner::compose_settle_and_ratchet(plan, &adv) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("[RATCHET] compose failed: {}", e);
+            return RatchetExecOutcome::NotComposable;
+        }
+    };
+
+    let n = plan.sells.len();
+    let has_wallet = plan.wallet_input.is_some();
+    let wallet_input_idx = batch_tx.inputs.len().saturating_sub(1);
+    // C-a: planner-authoritative lock_time (legacy plans keep the historical
+    // DAA-type 50); per-input sequences ride in from the composed BatchTx
+    // (50 / twin for the settle members, rwin on the ratchet input — G1).
+    let tx_lock_time = if plan.lock_time > 0 { plan.lock_time } else { 50 };
+
+    let mut sighash_tx = kob_core::tx::Transaction::new(1);
+    sighash_tx.lock_time = tx_lock_time;
+
+    // Inputs: [sells.., buy, ratchet, wallet?] — the ratchet input sits at
+    // adv.input_position (= sells + 1) so the sells' sii indices are stable
+    // and the ratchet sigscript's named print witness stays valid.
+    for (i, inp) in batch_tx.inputs.iter().enumerate() {
+        let (script_version, script_bytes, value) = if i < n {
+            let (s, _) = &plan.sells[i];
+            let p2sh = kob_core::build_p2sh(&s.redeem_script);
+            (p2sh.version, p2sh.script().to_vec(), s.utxo_value)
+        } else if i == n {
+            let (b, _) = &plan.buys[0];
+            let p2sh = kob_core::build_p2sh(&b.redeem_script);
+            (p2sh.version, p2sh.script().to_vec(), b.utxo_value)
+        } else if i == adv.input_position {
+            let p2sh = kob_core::build_p2sh(&oco.redeem_script);
+            (p2sh.version, p2sh.script().to_vec(), oco.escrow)
+        } else {
+            let (v, s) = wallet_spk;
+            (v, s.to_vec(), plan.wallet_input.as_ref().map_or(0, |w| w.2))
+        };
+        sighash_tx.inputs.push(kob_core::tx::TxInput {
+            prev_tx_id: inp.tx_id.clone(),
+            prev_index: inp.index,
+            sequence: inp.sequence,
+            sig_op_count: inp.sig_op_count,
+            script_version,
+            script_bytes,
+            value,
+        });
+    }
+
+    // Outputs + covenant bindings: plan outputs first (BuyerTokens bound per
+    // output_auth_input), the continuation LAST (bound to the ratchet input).
+    let token_hex = hex::encode(oco.token_cov_id);
+    let mut rpc_outputs = Vec::new();
+    for (i, out) in batch_tx.outputs.iter().enumerate() {
+        let spk_hex = hex::encode(&out.script_public_key);
+        let binding: Option<(u16, String)> = match out.purpose {
+            OutputPurpose::BuyerTokens => plan.output_auth_input.get(&i).copied().and_then(
+                |auth| plan.buys.first().map(|(b, _)| (auth, hex::encode(b.token_cov_id))),
+            ),
+            OutputPurpose::SellRemainder => plan.sells.first().and_then(|(s, _)| {
+                let th = hex::encode(s.token_cov_id);
+                plan.token_input_map.get(&th).map(|&tii| (tii as u16, th))
+            }),
+            OutputPurpose::RatchetContinuation => {
+                Some((adv.input_position as u16, token_hex.clone()))
+            }
+            _ => None,
+        };
+        if let Some((auth_input, tok)) = binding {
+            rpc_outputs.push(deploy::build_rpc_output_with_covenant(
+                out.value, out.spk_version, &spk_hex, auth_input, &tok,
+            ));
+            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                out.value,
+                out.spk_version,
+                out.script_public_key.clone(),
+                Some(kob_core::tx::CovenantBinding::new(
+                    auth_input,
+                    kob_core::compat::parse_hash(&tok).unwrap(),
+                )),
+            ));
+        } else {
+            rpc_outputs.push(deploy::build_rpc_output(out.value, out.spk_version, &spk_hex));
+            sighash_tx.outputs.push(kob_core::tx::TxOutput::new(
+                out.value, out.spk_version, out.script_public_key.clone(), None,
+            ));
+        }
+    }
+
+    // Exact fee for the COMPOSED tx: the plan's estimate covers the settle
+    // only, not the ratchet input's two-RS sigscript nor the continuation
+    // output. Deficit comes out of the MatcherFee output; if it cannot
+    // absorb, skip the ratchet (the plain settle still stands).
+    let placeholder_wallet_ss = if has_wallet {
+        kob_core::contract::build_p2pk_sigscript(&[0u8; 64])
+    } else {
+        Vec::new()
+    };
+    let sigscripts: Vec<Vec<u8>> = batch_tx.inputs.iter().enumerate().map(|(i, inp)| {
+        if has_wallet && i == wallet_input_idx {
+            placeholder_wallet_ss.clone()
+        } else {
+            inp.sigscript.clone()
+        }
+    }).collect();
+    let exact_fee = kob_core::mass::min_relay_fee(
+        kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts),
+    );
+    if exact_fee > batch_tx.fee {
+        let deficit = exact_fee - batch_tx.fee;
+        let Some(mi) = plan
+            .outputs
+            .iter()
+            .position(|o| o.purpose == OutputPurpose::MatcherFee)
+        else {
+            info!("[RATCHET] no matcher-fee output to absorb ratchet mass (deficit {}), skipping advance", deficit);
+            return RatchetExecOutcome::NotComposable;
+        };
+        let cur = sighash_tx.outputs[mi].value;
+        if cur < deficit.saturating_add(kob_core::MIN_UTXO_VALUE) {
+            info!(
+                "[RATCHET] matcher-fee output {} cannot absorb ratchet mass deficit {}, skipping advance",
+                cur, deficit
+            );
+            return RatchetExecOutcome::NotComposable;
+        }
+        sighash_tx.outputs[mi].value = cur - deficit;
+        rpc_outputs[mi]["value"] = serde_json::json!(cur - deficit);
+        info!("[RATCHET] matcher fee absorbs ratchet mass: -{} sompi", deficit);
+    }
+
+    // Mass pre-check (storage + compute, real sigscripts + placeholder sig).
+    {
+        let mut in_cells: Vec<(u64, u64)> = plan.sells.iter().map(|(s, _)| (s.utxo_value, 1u64))
+            .chain(plan.buys.iter().map(|(b, _)| (b.utxo_value, 1u64)))
+            .collect();
+        in_cells.push((oco.escrow, 1u64));
+        if let Some((_, _, wv)) = &plan.wallet_input {
+            in_cells.push((*wv, 1u64));
+        }
+        let out_cells: Vec<(u64, u64)> = batch_tx.outputs.iter().enumerate().map(|(i, o)| {
+            let po = crate::matcher::batch::PlannedOutput {
+                value: sighash_tx.outputs[i].value,
+                script_public_key: o.script_public_key.clone(),
+                spk_version: o.spk_version,
+                purpose: o.purpose,
+            };
+            (po.value, planned_output_plurality(&po))
+        }).collect();
+        if check_mass_presubmit(&in_cells, &out_cells, "RATCHET").is_none() {
+            return RatchetExecOutcome::NotComposable;
+        }
+        let compute_mass = kob_core::mass::calc_mass_with_sigscripts(&sighash_tx, &sigscripts);
+        let storage_mass = kob_core::mass::compute_storage_mass_ex(&in_cells, &out_cells);
+        let effective = compute_mass.max(storage_mass);
+        info!(
+            "[RATCHET] Mass check: compute={}, storage={}, effective={}, limit={}",
+            compute_mass, storage_mass, effective, kob_core::MAX_TX_MASS
+        );
+        if effective > kob_core::MAX_TX_MASS {
+            return RatchetExecOutcome::NotComposable;
+        }
+    }
+
+    // Build RPC inputs (planner-authoritative sequences), sign the wallet.
+    let mut rpc_inputs = Vec::new();
+    for (i, inp) in batch_tx.inputs.iter().enumerate() {
+        if has_wallet && i == wallet_input_idx {
+            continue;
+        }
+        rpc_inputs.push(deploy::build_rpc_input_with_sequence(
+            &inp.tx_id,
+            inp.index,
+            &hex::encode(&inp.sigscript),
+            inp.sig_op_count,
+            inp.sequence,
+        ));
+    }
+    if has_wallet {
+        let mut privkey = config.private_key_bytes();
+        let sighash = match kob_core::compute_sighash(&sighash_tx, wallet_input_idx) {
+            Ok(h) => h,
+            Err(e) => {
+                privkey.zeroize();
+                error!("[RATCHET] sighash failed: {}", e);
+                return RatchetExecOutcome::NotComposable;
+            }
+        };
+        let sig = match kob_core::schnorr_sign(&sighash, &privkey) {
+            Ok(s) => s,
+            Err(e) => {
+                privkey.zeroize();
+                error!("[RATCHET] wallet signing failed: {}", e);
+                return RatchetExecOutcome::NotComposable;
+            }
+        };
+        privkey.zeroize();
+        let wallet_ss = kob_core::contract::build_p2pk_sigscript(&sig);
+        let wallet_inp = &batch_tx.inputs[wallet_input_idx];
+        rpc_inputs.push(deploy::build_rpc_input(
+            &wallet_inp.tx_id,
+            wallet_inp.index,
+            &hex::encode(&wallet_ss),
+            1,
+        ));
+    }
+
+    let cont_p2sh_hex = hex::encode(kob_core::build_p2sh(&adv.new_rs).script());
+    info!(
+        "[RATCHET] Composed settle+advance: {} sells, ratchet {}:{} -> continuation P2SH {}..",
+        n, &oco.outpoint.0[..oco.outpoint.0.len().min(8)], oco.outpoint.1,
+        &cont_p2sh_hex[..cont_p2sh_hex.len().min(16)],
+    );
+
+    let payload =
+        deploy::build_submit_payload_with_lock_time(1, rpc_inputs, rpc_outputs, tx_lock_time);
+    let oco_key = format!("{}:{}", oco.outpoint.0, oco.outpoint.1);
+    let submit_res = crate::chain::submitter::TxSubmitter::submit(rpc, payload, config.submit_lane).await;
+    let result = match submit_res {
+        Ok(r) => r,
+        Err(e) => {
+            let err_str = e.to_string();
+            mark_submit_failure(&err_str, "RATCHET", plan, spent_tracker);
+            if is_race_lost_error(&err_str) {
+                spent_tracker.mark_race_lost(&oco_key);
+            } else {
+                spent_tracker.mark_failed(&oco_key);
+            }
+            return RatchetExecOutcome::SubmitFailed;
+        }
+    };
+    if !result.ok {
+        let err_str = result.error.unwrap_or_else(|| "Unknown error".to_string());
+        mark_submit_failure(&err_str, "RATCHET", plan, spent_tracker);
+        if is_race_lost_error(&err_str) {
+            spent_tracker.mark_race_lost(&oco_key);
+        } else {
+            spent_tracker.mark_failed(&oco_key);
+        }
+        return RatchetExecOutcome::SubmitFailed;
+    }
+
+    let tx_id = result.tx_id.unwrap_or_default();
+    info!("[RATCHET] SUCCESS! TXID: {} (settle + SL advance in one tx)", tx_id);
+
+    let mut marked_keys: Vec<String> = Vec::new();
+    for (sell, _) in &plan.sells {
+        let key = format!("{}:{}", sell.outpoint.0, sell.outpoint.1);
+        spent_tracker.mark_spent(&key);
+        marked_keys.push(key);
+    }
+    for (buy, _) in &plan.buys {
+        let key = format!("{}:{}", buy.outpoint.0, buy.outpoint.1);
+        spent_tracker.mark_spent(&key);
+        marked_keys.push(key);
+    }
+    spent_tracker.mark_spent(&oco_key);
+    marked_keys.push(oco_key);
+    if let Some((ref wallet_tx_id, wallet_index, _)) = plan.wallet_input {
+        let key = format!("{}:{}", wallet_tx_id, wallet_index);
+        spent_tracker.mark_spent(&key);
+        marked_keys.push(key);
+    }
+    if !tx_id.is_empty() {
+        spent_tracker.mark_submitted(&tx_id, &marked_keys);
+    }
+
+    let total_seller_kas: u64 = plan
+        .outputs
+        .iter()
+        .filter(|o| o.purpose == OutputPurpose::SellerKas)
+        .map(|o| o.value)
+        .sum();
+    RatchetExecOutcome::Submitted(BatchMatchResult {
         tx_id,
         sell_count: plan.sells.len(),
         buy_count: plan.buys.len(),
@@ -1447,7 +1907,7 @@ pub async fn execute_ring_fill(
             if transient { tracker.mark_transient(k); } else { tracker.mark_failed(k); }
         }
     };
-    let result = match rpc.submit_transaction(payload).await {
+    let result = match crate::chain::submitter::TxSubmitter::submit(rpc, payload, config.submit_lane).await {
         Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
@@ -1822,6 +2282,12 @@ fn process_block_txs_all(
 
         // Phase 1: Remove spent orders from ALL books
 
+        // Ratchet-continuation tracking (design §4.7): BEFORE removal, check
+        // whether any spent ratchet_oco left its successor P2SH in this tx —
+        // the old book entry supplies the carried seats/token, so this must
+        // read the book pre-removal. Successors are inserted after removal.
+        let ratchet_continuations = BlockScanner::detect_ratchet_continuations(tx, order_book);
+
         // Spot book
         let spot_spent = BlockScanner::find_spent_orders(tx, order_book);
         for key in &spot_spent {
@@ -1848,6 +2314,49 @@ fn process_block_txs_all(
             }
             order_book.remove_order(key);
             counters.spot_removed += 1;
+        }
+
+        // Insert ratchet successors (a landed RATCHET spend created a
+        // successor P2SH UTXO — track it as the live order, generation +1).
+        for cont in &ratchet_continuations {
+            let (mut tp_order, mut sl_order) = BlockScanner::ratchet_oco_to_book_orders(
+                &cont.parsed, &tx.tx_id, cont.output_index, cont.value, None,
+                cont.ratchets_applied,
+            );
+            // Seats are byte-preserved across the splice; the continuation
+            // keeps the covenant binding — carry both from the predecessor.
+            tp_order.counterparty_spk = cont.counterparty_spk.clone();
+            sl_order.counterparty_spk = cont.counterparty_spk.clone();
+            tp_order.token_cov_id = cont.token_cov_id.clone();
+            sl_order.token_cov_id = cont.token_cov_id.clone();
+            tp_order.discovered_daa = current_daa;
+            sl_order.discovered_daa = current_daa;
+
+            let tp_key = tp_order.outpoint_key();
+            if order_book.contains_outpoint(&tp_key) {
+                continue; // dedup
+            }
+            info!(
+                "[SCANNER-ALL] Ratchet continuation: {} -> {}:{} (SL now {}/{}, k={})",
+                &cont.old_base_key[..cont.old_base_key.len().min(20)],
+                &tx.tx_id[..tx.tx_id.len().min(16)], cont.output_index,
+                cont.parsed.oco.price_num_sl, cont.parsed.oco.price_den_sl,
+                cont.ratchets_applied,
+            );
+            if let Some(ws) = ws_tx {
+                crate::matcher::api::emit_order_detected(
+                    ws, &tp_order.owner_hash, &tp_key,
+                    OrderSide::Sell, tp_order.price_num, tp_order.price_den,
+                    tp_order.value, &tp_order.token_cov_id,
+                );
+            }
+            if let Some(ref mut rc) = reorg_collector {
+                rc.orders_added.push(tp_order.clone());
+                rc.orders_added.push(sl_order.clone());
+            }
+            order_book.add_sell_order(tp_order);
+            order_book.add_sell_order(sl_order);
+            counters.spot_added += 2;
         }
 
         // Perp book
@@ -2252,6 +2761,68 @@ fn process_block_txs_all(
                 }
 
                 // Reorg tracking: snapshot OCO orders before they're moved
+                if let Some(ref mut rc) = reorg_collector {
+                    rc.orders_added.push(tp_order.clone());
+                    rc.orders_added.push(sl_order.clone());
+                }
+
+                order_book.add_sell_order(tp_order);
+                order_book.add_sell_order(sl_order);
+                counters.spot_added += 2;
+            }
+            ScanResult::RatchetOco(parsed, p2sh_idx, p2sh_value) => {
+                if parsed.oco.cpend != 0 {
+                    info!(
+                        "[SCANNER-ALL] Skipping ratchet_oco (cancel_pending=1): {}:{}",
+                        &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                    );
+                    continue;
+                }
+
+                let (mut tp_order, mut sl_order) = BlockScanner::ratchet_oco_to_book_orders(
+                    &parsed, &tx.tx_id, p2sh_idx, p2sh_value, Some(tx), 0,
+                );
+                tp_order.discovered_daa = current_daa;
+                sl_order.discovered_daa = current_daa;
+
+                let tp_key = tp_order.outpoint_key();
+                let sl_key = sl_order.outpoint_key();
+
+                if order_book.contains_outpoint(&tp_key) {
+                    continue; // dedup (both keys share the same UTXO)
+                }
+                if tp_order.token_cov_id == "0".repeat(64) {
+                    warn!(
+                        "[SCANNER-ALL] Skipping ratchet_oco with unknown token_cov_id: {}:{}",
+                        &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                    );
+                    continue;
+                }
+                if skip_if_no_counterparty_spk(&tp_order) {
+                    continue;
+                }
+
+                info!(
+                    "[SCANNER-ALL] Discovered ratchet_oco: {}:{} value={} TP={}/{} SL={}/{} rstep={} rwin={}",
+                    &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
+                    p2sh_value, parsed.oco.price_num_tp, parsed.oco.price_den_tp,
+                    parsed.oco.price_num_sl, parsed.oco.price_den_sl,
+                    parsed.rstep, parsed.rwin,
+                );
+
+                if let Some(ws) = ws_tx {
+                    crate::matcher::api::emit_order_detected(
+                        ws, &tp_order.owner_hash, &tp_key,
+                        OrderSide::Sell, tp_order.price_num, tp_order.price_den,
+                        tp_order.value, &tp_order.token_cov_id,
+                    );
+                    crate::matcher::api::emit_order_detected(
+                        ws, &sl_order.owner_hash, &sl_key,
+                        OrderSide::Sell, sl_order.price_num, sl_order.price_den,
+                        sl_order.value, &sl_order.token_cov_id,
+                    );
+                }
+
                 if let Some(ref mut rc) = reorg_collector {
                     rc.orders_added.push(tp_order.clone());
                     rc.orders_added.push(sl_order.clone());
@@ -3095,7 +3666,7 @@ async fn expire_orders(
             expiry_daa,
         );
 
-        match rpc.submit_transaction(payload).await {
+        match crate::chain::submitter::TxSubmitter::submit(rpc, payload, config.submit_lane).await {
             Ok(result) if result.ok => {
                 let tx_id = result.tx_id.unwrap_or_default();
                 info!(
@@ -3334,9 +3905,24 @@ async fn run_scan_cycle(
         }
     }
 
-    let opt_groups = matching::match_book_direct(
+    let mut opt_groups = matching::match_book_direct(
         order_book, allow_self_trade, Some(&spent_keys), current_daa,
     );
+
+    // C-b: competing-matcher friendliness — execute groups in a
+    // weighted-random order (weight = matcher surplus + 1) instead of the
+    // deterministic most-profitable-first order every other matcher would
+    // also pick. Groups are disjoint by construction, so reordering never
+    // changes which settles are valid, only which race each matcher enters
+    // first.
+    {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() ^ (d.subsec_nanos() as u64))
+            .unwrap_or(1)
+            ^ ((std::process::id() as u64) << 32);
+        weighted_shuffle_by(&mut opt_groups, seed, |g| g.total_surplus);
+    }
 
     if opt_groups.is_empty() {
         let stats = order_book.stats();
@@ -3458,43 +4044,63 @@ async fn run_scan_cycle(
             .max_by_key(|u| u.utxo_entry.amount)
             .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-        // Plan using the appropriate planner based on GroupKind
+        // Plan using the appropriate planner based on GroupKind.
+        //
+        // Time-contracts Stage C: plans are priced at `L = tip` (design §2.7
+        // lock-time policy — maximizes decay in the taker's favor; minable
+        // next block since acceptance > L) via the `_at` planner entry
+        // points, and a decay_buy anchor routes to its dedicated planners
+        // (the plain wrappers reject the 5895B RS by mmfee-parse).
+        let plan_lock_time = current_daa;
+        let buy_is_decay = buys.first().map_or(false, |b| {
+            b.redeem_script.len()
+                == kob_core::contract::spot::decay::DECAY_BUY_RS_EXPECTED_LEN
+        });
         let plan_result = match group.kind {
             matching::GroupKind::BuySweep => {
                 // 1 v18 buy (in buys[0]) sweeps N sells via the per-sell-
                 // output IOC planner (per-term OpAuthOutputIdx binding).
-                crate::matcher::batch::plan_ioc_match(
-                    &sells, &buys[0], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                )
+                if buy_is_decay {
+                    crate::matcher::batch::plan_decay_buy_ioc_match(
+                        &sells, &buys[0], plan_lock_time, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else {
+                    crate::matcher::batch::plan_ioc_match_at(
+                        &sells, &buys[0], wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                        plan_lock_time,
+                    )
+                }
             }
-            matching::GroupKind::SellSweep => {
+            matching::GroupKind::SellSweep | matching::GroupKind::PartialSell => {
                 // 1 v18 sell (in sells[0]) sweeps N buys via the full-
                 // absorption parity planner (v18 sweeps are structurally
-                // full-fill-only on the sell side — auth-slot-0 conflict).
-                crate::matcher::batch::plan_sell_ioc_match(
+                // full-fill-only on the sell side — auth-slot-0 conflict;
+                // a PartialSell group reduces to the same full-absorption
+                // selection or reports SellResidualUnsupported). Admits the
+                // time-sell anchors and decay_buy absorbers (Stage-B
+                // residuals 1+2).
+                crate::matcher::batch::plan_sell_ioc_match_at(
                     &sells[0], &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    plan_lock_time,
                 )
             }
             matching::GroupKind::PartialBuy => {
                 // 1:1 partial buy — the v18 Op2 path: the buy spends only
                 // part of its KAS and keeps a byte-exact self-SPK residual
                 // UTXO (item C).
-                crate::matcher::batch::plan_partial_match(
-                    &sells, &buys[0], wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                )
-            }
-            matching::GroupKind::PartialSell => {
-                // 1:1 partial sell: sell IOC sweeps 1 buy. A v18 partial sell
-                // cannot settle against a v18 buy in the same tx (auth-slot-0
-                // conflict) — plan_sell_ioc_match selects a fully-
-                // absorbing buy instead or reports SellResidualUnsupported.
-                {
-                    crate::matcher::batch::plan_sell_ioc_match(
-                        &sells[0], &buys, wallet_utxo,
+                if buy_is_decay {
+                    crate::matcher::batch::plan_decay_buy_partial_match(
+                        &sells, &buys[0], plan_lock_time, wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else {
+                    crate::matcher::batch::plan_partial_match_at(
+                        &sells, &buys[0], wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                        plan_lock_time,
                     )
                 }
             }
@@ -3506,10 +4112,18 @@ async fn run_scan_cycle(
                 // requires output[toi] >= exp_tok, which is satisfied because
                 // the sweep grouper only emits GTC multi-fill when total
                 // fill tokens >= expected_tokens.
-                crate::matcher::batch::plan_batch_match(
-                    &sells, &buys, wallet_utxo,
-                    &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
-                )
+                if buy_is_decay && buys.len() == 1 {
+                    crate::matcher::batch::plan_decay_buy_match(
+                        &sells, &buys[0], plan_lock_time, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                    )
+                } else {
+                    crate::matcher::batch::plan_batch_match_at(
+                        &sells, &buys, wallet_utxo,
+                        &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
+                        plan_lock_time,
+                    )
+                }
             }
             matching::GroupKind::CrossSwap => {
                 // Cross-swap groups are handled in Phase 3, not here.
@@ -3543,7 +4157,15 @@ async fn run_scan_cycle(
             }
             Err(ref e) if matches!(e,
                 crate::matcher::batch::BatchError::SellResidualUnsupported { .. }
-                | crate::matcher::batch::BatchError::CapInfeasible { .. }) => {
+                | crate::matcher::batch::BatchError::CapInfeasible { .. }
+                // Time-contracts (Stage C): lock-time / pacing gates are
+                // timing or pairing conditions, not order faults — the same
+                // group may become feasible at a later DAA (decay window,
+                // twap age) or with different counterparties. No cooldown.
+                | crate::matcher::batch::BatchError::LockTimePastExpiry { .. }
+                | crate::matcher::batch::BatchError::LockTimeTooEarly { .. }
+                | crate::matcher::batch::BatchError::LockTimeWindowEmpty { .. }
+                | crate::matcher::batch::BatchError::TwapVolumeExceedsMpw { .. }) => {
                 // Structural v18 pairing issues, not order faults: a v18
                 // partial sell can't compose with a v18 buy in one tx, and
                 // the surplus cap depends on WHICH counterparty is chosen.
@@ -3621,7 +4243,49 @@ async fn run_scan_cycle(
             (ctx, payload)
         };
 
-        match execute_batch_match(rpc, &mut plan, config, spent_tracker, ifd_payload, (wallet_spk_version, &wallet_spk_script)).await {
+        // Stage C §4.7: opportunistic ratchet composition — when a resting
+        // ratchet_oco on this token qualifies against this settle plan
+        // (trigger/volume/window/G3, checked by the planner), ride the SL
+        // advance in the SAME tx. Pre-submit composition failures fall back
+        // to the plain settle; a failed SUBMISSION does not (its outpoints
+        // are already cooling down — the next cycle re-plans). IFD groups
+        // skip composition (payload interplay stays out of scope).
+        let batch_result_opt = {
+            let ratchet_ref = if ifd_payload.is_none() {
+                find_ratchet_advance_candidate(order_book, &plan, spent_tracker, current_daa)
+            } else {
+                None
+            };
+            if let Some(oco_ref) = ratchet_ref {
+                match execute_oco_ratchet(
+                    rpc, &plan, &oco_ref, current_daa, config, spent_tracker,
+                    (wallet_spk_version, &wallet_spk_script),
+                ).await {
+                    RatchetExecOutcome::Submitted(r) => {
+                        // The ratchet UTXO's book entries are gone once the
+                        // spend lands; the scanner will insert the successor
+                        // (continuation tracking). Mark both virtual keys.
+                        let base = format!("{}:{}", oco_ref.outpoint.0, oco_ref.outpoint.1);
+                        spent_tracker.mark_spent(&format!("{}:tp", base));
+                        spent_tracker.mark_spent(&format!("{}:sl", base));
+                        Some(r)
+                    }
+                    RatchetExecOutcome::SubmitFailed => None,
+                    RatchetExecOutcome::NotComposable => {
+                        execute_batch_match(
+                            rpc, &mut plan, config, spent_tracker, ifd_payload,
+                            (wallet_spk_version, &wallet_spk_script),
+                        ).await
+                    }
+                }
+            } else {
+                execute_batch_match(
+                    rpc, &mut plan, config, spent_tracker, ifd_payload,
+                    (wallet_spk_version, &wallet_spk_script),
+                ).await
+            }
+        };
+        match batch_result_opt {
             Some(batch_result) => {
                 // IFD trigger
                 if let Some(ctx) = &ifd_ctx {
@@ -6561,7 +7225,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         });
 
         assert!(ob.contains_outpoint(&outpoint), "should contain outpoint after add");
@@ -6597,7 +7261,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
-            discovered_daa: 0,
+            discovered_daa: 0, time_meta: None,
         };
         assert!(skip_if_no_counterparty_spk(&make(None)),
             "None counterparty_spk must be skipped");
@@ -6651,7 +7315,7 @@ mod tests {
                 ifd_order_b_rs_hex: None,
                 oco_path: None,
                 oco_partner_key: None,
-                discovered_daa: 0,
+                discovered_daa: 0, time_meta: None,
             });
         }
 
@@ -7450,7 +8114,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
-            discovered_daa: 0,
+            discovered_daa: 0, time_meta: None,
         };
 
         // Add order to book and record provenance
@@ -7508,7 +8172,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
-            discovered_daa: 0,
+            discovered_daa: 0, time_meta: None,
         };
         ob.add_sell_order(order.clone());
         assert!(ob.contains_outpoint("tx_preexisting:0"));
@@ -7654,7 +8318,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
-            discovered_daa: 0,
+            discovered_daa: 0, time_meta: None,
         };
         ob.add_buy_order(order_a.clone());
 
@@ -7690,7 +8354,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
-            discovered_daa: 0,
+            discovered_daa: 0, time_meta: None,
         };
         ob.add_sell_order(order_b.clone());
 
@@ -7755,7 +8419,7 @@ mod tests {
             ifd_order_b_rs_hex: None,
             oco_path: None,
             oco_partner_key: None,
-            discovered_daa: 0,
+            discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -8238,4 +8902,56 @@ mod tests {
 
         let _ = std::fs::remove_file(&ckpt_path_str);
     }
+    // ═════════════════════════════════════════════════════════════════════
+    // C-b: weighted-random match selection
+    // ═════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn weighted_shuffle_preserves_elements_and_is_seed_deterministic() {
+        let orig: Vec<u64> = vec![10, 0, 500, 3, 42, 42, 7];
+        let mut a = orig.clone();
+        let mut b = orig.clone();
+        weighted_shuffle_by(&mut a, 0xDEAD_BEEF, |x| *x);
+        weighted_shuffle_by(&mut b, 0xDEAD_BEEF, |x| *x);
+        assert_eq!(a, b, "same seed => same order");
+        let mut sa = a.clone();
+        let mut so = orig.clone();
+        sa.sort_unstable();
+        so.sort_unstable();
+        assert_eq!(sa, so, "a permutation — nothing lost or invented");
+        // Different seed produces a (usually) different order — over this
+        // weight spread the top element differs across at least one of a
+        // few seeds; assert it is not constant to catch a broken PRNG.
+        let mut seen_orders = std::collections::HashSet::new();
+        for seed in [1u64, 2, 3, 4, 5, 6, 7, 8] {
+            let mut c = orig.clone();
+            weighted_shuffle_by(&mut c, seed, |x| *x);
+            seen_orders.insert(format!("{c:?}"));
+        }
+        assert!(seen_orders.len() > 1, "orders vary across seeds");
+    }
+
+    #[test]
+    fn weighted_shuffle_zero_weights_and_small_inputs() {
+        let mut empty: Vec<u64> = vec![];
+        weighted_shuffle_by(&mut empty, 7, |x| *x);
+        assert!(empty.is_empty());
+        let mut one = vec![9u64];
+        weighted_shuffle_by(&mut one, 7, |x| *x);
+        assert_eq!(one, vec![9]);
+        // All-zero weights degrade to a uniform shuffle (weight + 1).
+        let mut zeros = vec![0u64; 5];
+        weighted_shuffle_by(&mut zeros, 7, |x| *x);
+        assert_eq!(zeros.len(), 5);
+    }
+
+    #[test]
+    fn race_lost_error_classification() {
+        assert!(is_race_lost_error("input 3 already spent by tx abc"));
+        assert!(is_race_lost_error("transaction is an ORPHAN"));
+        assert!(is_race_lost_error("rejected: double spend detected"));
+        assert!(!is_race_lost_error("failed to satisfy sequence locks"));
+        assert!(!is_race_lost_error("script ran, but verification failed"));
+    }
+
 }

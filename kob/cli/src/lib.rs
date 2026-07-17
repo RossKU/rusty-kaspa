@@ -1354,6 +1354,189 @@ pub enum DeployCommands {
         #[arg(long)]
         fee_utxo: Option<String>,
     },
+
+    /// Deploy a TWAP sell order (twap_sell): rate-limited execution on the
+    /// consensus CSV clock — at most --max-per-window tokens per fill event,
+    /// consecutive events >= --window real DAA apart (TIME_CONTRACTS §3).
+    TwapSell {
+        /// Token covenant ID (hex, 64 chars) or alias.
+        #[arg(long)]
+        token: String,
+        /// Price numerator (KAS per token, rational).
+        #[arg(long)]
+        price_num: u64,
+        /// Price denominator.
+        #[arg(long)]
+        price_den: u64,
+        /// Minimum fill (sompi KAS per event).
+        #[arg(long)]
+        min_fill: u64,
+        /// Amount of tokens to lock (sompi value).
+        #[arg(long)]
+        amount: u64,
+        /// Rate window in DAA (>= 50; consensus CSV clock).
+        #[arg(long)]
+        window: u64,
+        /// Max tokens moved per fill event (sompi).
+        #[arg(long)]
+        max_per_window: u64,
+        /// GTD expiry DAA score (0 = GTC).
+        #[arg(long, default_value = "0")]
+        expiry: u64,
+        /// Max matcher fee in basis points.
+        #[arg(long, default_value = "30")]
+        mmfee_bps: u64,
+        /// Owner batch cap (1..=255).
+        #[arg(long)]
+        batch_max: Option<u8>,
+        /// Token UTXO outpoint (txid:index) for covenant binding.
+        #[arg(long)]
+        token_utxo: Option<String>,
+        /// Fee UTXO outpoint (txid:index) override.
+        #[arg(long)]
+        fee_utxo: Option<String>,
+    },
+
+    /// Deploy a Dutch (decaying-ask) sell order (decay_sell): the ask falls
+    /// --slope pnum-units per DAA from --t0 until --until, enforced against
+    /// the tx lock_time by consensus (TIME_CONTRACTS §2).
+    DecaySell {
+        /// Token covenant ID (hex, 64 chars) or alias.
+        #[arg(long)]
+        token: String,
+        /// START price numerator (KAS per token; stored RAW, no gcd).
+        #[arg(long)]
+        price_num: u64,
+        /// Price denominator.
+        #[arg(long)]
+        price_den: u64,
+        /// Minimum fill (sompi KAS).
+        #[arg(long)]
+        min_fill: u64,
+        /// Amount of tokens to lock (sompi value).
+        #[arg(long)]
+        amount: u64,
+        /// Decay slope: pnum-units per DAA (>= 1).
+        #[arg(long)]
+        slope: u64,
+        /// Schedule start DAA score.
+        #[arg(long)]
+        t0: u64,
+        /// Schedule end DAA score (floor reached; must satisfy
+        /// slope*(until-t0) <= price_num-1).
+        #[arg(long)]
+        until: u64,
+        /// GTD expiry DAA score (0 = GTC).
+        #[arg(long, default_value = "0")]
+        expiry: u64,
+        /// Max matcher fee in basis points.
+        #[arg(long, default_value = "30")]
+        mmfee_bps: u64,
+        /// Owner batch cap (1..=255).
+        #[arg(long)]
+        batch_max: Option<u8>,
+        /// Token UTXO outpoint (txid:index) for covenant binding.
+        #[arg(long)]
+        token_utxo: Option<String>,
+        /// Fee UTXO outpoint (txid:index) override.
+        #[arg(long)]
+        fee_utxo: Option<String>,
+    },
+
+    /// Deploy a rising-bid buy order (decay_buy): the bid RISES with time —
+    /// the token demand numerator falls --slope units per DAA from --t0
+    /// until --until (TIME_CONTRACTS §2, buy side).
+    DecayBuy {
+        /// Token covenant ID (hex, 64 chars) or alias.
+        #[arg(long)]
+        token: String,
+        /// START price numerator (tokens per KAS demand; stored RAW).
+        #[arg(long)]
+        price_num: u64,
+        /// Price denominator.
+        #[arg(long)]
+        price_den: u64,
+        /// Minimum fill (sompi tokens).
+        #[arg(long)]
+        min_fill: u64,
+        /// KAS to escrow (sompi).
+        #[arg(long)]
+        amount: u64,
+        /// Decay slope: pnum-units per DAA (>= 1).
+        #[arg(long)]
+        slope: u64,
+        /// Schedule start DAA score.
+        #[arg(long)]
+        t0: u64,
+        /// Schedule end DAA score.
+        #[arg(long)]
+        until: u64,
+        /// GTD expiry DAA score (0 = GTC).
+        #[arg(long, default_value = "0")]
+        expiry: u64,
+        /// Max matcher fee in basis points.
+        #[arg(long, default_value = "30")]
+        mmfee_bps: u64,
+        /// Owner batch cap (1..=BUY_ORDER_MAX_N).
+        #[arg(long)]
+        n_max: Option<u8>,
+    },
+
+    /// Deploy a ratchet OCO sell (ratchet_oco): a v18 OCO whose SL anyone
+    /// may tighten by --step per --window DAA when a same-token settle
+    /// prints >= (SL + step + gap)/pden_sl at >= --min-vol volume
+    /// (TIME_CONTRACTS §4; guards G1-G4 mandatory, prints-not-market
+    /// disclosure applies).
+    RatchetOco {
+        /// Token covenant ID (hex, 64 chars) or alias.
+        #[arg(long)]
+        token: String,
+        /// Take-profit price numerator.
+        #[arg(long)]
+        tp_price_num: u64,
+        /// Take-profit price denominator.
+        #[arg(long)]
+        tp_price_den: u64,
+        /// Take-profit minimum fill (sompi).
+        #[arg(long)]
+        tp_min_fill: u64,
+        /// Stop-loss price numerator (the ratchet advances this).
+        #[arg(long)]
+        sl_price_num: u64,
+        /// Stop-loss price denominator.
+        #[arg(long)]
+        sl_price_den: u64,
+        /// Stop-loss minimum fill (sompi).
+        #[arg(long)]
+        sl_min_fill: u64,
+        /// Amount of tokens to lock (sompi value).
+        #[arg(long)]
+        amount: u64,
+        /// Ratchet step: pnum_sl increment per advance (>= 1).
+        #[arg(long)]
+        step: u64,
+        /// Trailing gap: required print premium over the POST-ratchet stop.
+        #[arg(long)]
+        gap: u64,
+        /// Ratchet rate window in DAA (>= 50; consensus CSV clock).
+        #[arg(long)]
+        window: u64,
+        /// Minimum print volume (sompi tokens) a sibling settle must move.
+        #[arg(long)]
+        min_vol: u64,
+        /// GTD expiry DAA score (0 = GTC).
+        #[arg(long, default_value = "0")]
+        expiry: u64,
+        /// Max matcher fee in basis points.
+        #[arg(long, default_value = "30")]
+        max_matcher_fee: u64,
+        /// Token UTXO outpoint (txid:index) for covenant binding.
+        #[arg(long)]
+        token_utxo: Option<String>,
+        /// Fee UTXO outpoint (txid:index) override.
+        #[arg(long)]
+        fee_utxo: Option<String>,
+    },
 }
 
 /// Subcommands for `lending`.
@@ -1870,6 +2053,7 @@ pub async fn dispatch(
                     max_matcher_fee,
                     mmfee_bps,
                     n_max,
+                    None, // plain v18 buy (decay_buy has its own subcommand)
                 )
                 .await?;
                 if tif_policy != tif::TimeInForce::Gtc {
@@ -2010,6 +2194,7 @@ pub async fn dispatch(
                     batch_max,
                     token_utxo.as_deref(),
                     fee_utxo.as_deref(),
+                    deploy::SellTimeVariant::Plain,
                 )
                 .await?;
                 if tif_policy != tif::TimeInForce::Gtc {
@@ -2216,6 +2401,176 @@ pub async fn dispatch(
                     max_matcher_fee,
                     token_utxo.as_deref(),
                     fee_utxo.as_deref(),
+                    None, // plain v18 OCO (ratchet_oco has its own subcommand)
+                )
+                .await?;
+            }
+            DeployCommands::TwapSell {
+                token,
+                price_num,
+                price_den,
+                min_fill,
+                amount,
+                window,
+                max_per_window,
+                expiry,
+                mmfee_bps,
+                batch_max,
+                token_utxo,
+                fee_utxo,
+            } => {
+                deploy::validate_amount_not_dust(amount, "--amount")?;
+                let token = token::resolve_token(&token, None)?;
+                let expiry_opt = if expiry == 0 { None } else { Some(expiry) };
+                deploy::deploy_sell(
+                    wallet_path,
+                    node,
+                    network,
+                    Some(&token),
+                    price_num,
+                    price_den,
+                    min_fill,
+                    amount,
+                    18,
+                    fee,
+                    false, // post_only: TWAP paces via consensus, not policy
+                    expiry_opt,
+                    deploy::DEFAULT_MAX_MATCHER_FEE,
+                    Some(mmfee_bps),
+                    batch_max,
+                    token_utxo.as_deref(),
+                    fee_utxo.as_deref(),
+                    deploy::SellTimeVariant::Twap { twin: window, mpw: max_per_window },
+                )
+                .await?;
+            }
+            DeployCommands::DecaySell {
+                token,
+                price_num,
+                price_den,
+                min_fill,
+                amount,
+                slope,
+                t0,
+                until,
+                expiry,
+                mmfee_bps,
+                batch_max,
+                token_utxo,
+                fee_utxo,
+            } => {
+                deploy::validate_amount_not_dust(amount, "--amount")?;
+                let token = token::resolve_token(&token, None)?;
+                let expiry_opt = if expiry == 0 { None } else { Some(expiry) };
+                deploy::deploy_sell(
+                    wallet_path,
+                    node,
+                    network,
+                    Some(&token),
+                    price_num,
+                    price_den,
+                    min_fill,
+                    amount,
+                    18,
+                    fee,
+                    false,
+                    expiry_opt,
+                    deploy::DEFAULT_MAX_MATCHER_FEE,
+                    Some(mmfee_bps),
+                    batch_max,
+                    token_utxo.as_deref(),
+                    fee_utxo.as_deref(),
+                    deploy::SellTimeVariant::Decay { dslope: slope, t0, t_end: until },
+                )
+                .await?;
+            }
+            DeployCommands::DecayBuy {
+                token,
+                price_num,
+                price_den,
+                min_fill,
+                amount,
+                slope,
+                t0,
+                until,
+                expiry,
+                mmfee_bps,
+                n_max,
+            } => {
+                deploy::validate_amount_not_dust(amount, "--amount")?;
+                let token = token::resolve_token(&token, None)?;
+                let expiry_opt = if expiry == 0 { None } else { Some(expiry) };
+                deploy::deploy_buy(
+                    wallet_path,
+                    node,
+                    network,
+                    &token,
+                    price_num,
+                    price_den,
+                    min_fill,
+                    amount,
+                    18,
+                    fee,
+                    false,
+                    expiry_opt,
+                    deploy::DEFAULT_MAX_MATCHER_FEE,
+                    Some(mmfee_bps),
+                    n_max,
+                    Some((slope, t0, until)),
+                )
+                .await?;
+            }
+            DeployCommands::RatchetOco {
+                token,
+                tp_price_num,
+                tp_price_den,
+                tp_min_fill,
+                sl_price_num,
+                sl_price_den,
+                sl_min_fill,
+                amount,
+                step,
+                gap,
+                window,
+                min_vol,
+                expiry,
+                max_matcher_fee,
+                token_utxo,
+                fee_utxo,
+            } => {
+                deploy::validate_amount_not_dust(amount, "--amount")?;
+                let token = token::resolve_token(&token, None)?;
+                if tp_price_num == 0 || tp_price_den == 0 {
+                    anyhow::bail!("TP price must be > 0");
+                }
+                if sl_price_num == 0 || sl_price_den == 0 {
+                    anyhow::bail!("SL price must be > 0");
+                }
+                if tp_min_fill == 0 || sl_min_fill == 0 {
+                    anyhow::bail!("min_fill must be > 0");
+                }
+                if amount == 0 {
+                    anyhow::bail!("amount must be > 0");
+                }
+                let expiry_opt = if expiry == 0 { None } else { Some(expiry) };
+                deploy::deploy_oco_sell(
+                    wallet_path,
+                    node,
+                    network,
+                    &token,
+                    tp_price_num,
+                    tp_price_den,
+                    tp_min_fill,
+                    sl_price_num,
+                    sl_price_den,
+                    sl_min_fill,
+                    amount,
+                    fee,
+                    expiry_opt,
+                    max_matcher_fee,
+                    token_utxo.as_deref(),
+                    fee_utxo.as_deref(),
+                    Some((step, gap, window, min_vol)),
                 )
                 .await?;
             }

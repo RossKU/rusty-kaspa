@@ -1,10 +1,17 @@
 //! L1 block scanner for permissionless order discovery.
 
-use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide, TimeMeta};
 
 
 // Parse types and functions imported from kob-core.
 pub use kob_core::contract::spot::parse::{ParsedOrder, ParsedOcoSell, parse_redeem_script, parse_oco_sell_redeem_script};
+pub use kob_core::contract::spot::parse::{
+    ParsedRatchetOco, parse_decay_buy_redeem_script, parse_decay_sell_redeem_script,
+    parse_ratchet_oco_redeem_script, parse_twap_sell_redeem_script,
+};
+pub use kob_core::contract::spot::ratchet::{
+    derive_ratchet_continuation_rs, RATCHET_OCO_RS_EXPECTED_LEN,
+};
 pub use kob_core::contract::perp::parse::{ParsedPerpOrder, PerpDeploySide, PERP_DEPLOY_V1_RS_SIZE, PERP_DEPLOY_V1_STATE_SIZE, parse_perp_deploy_rs};
 pub use kob_core::contract::lending::parse::{ParsedLendingOrder, LendingOrderType, parse_lending_rs, LOAN_OFFER_RS_SIZE, BORROW_REQUEST_RS_SIZE};
 pub use kob_core::contract::prediction::parse::{ParsedPredictionItem, PredictionItemType, parse_prediction_rs};
@@ -48,6 +55,10 @@ pub enum ScanResult {
     Spot(ParsedOrder, u32, u64),
     /// OCO sell: two virtual spot sell orders from a single UTXO (TP + SL paths).
     OcoSell(ParsedOcoSell, u32, u64),
+    /// ratchet_oco: OCO sell with the permissionless trailing-SL ratchet
+    /// branch (time-contracts family, 760B RS). Books as two virtual sell
+    /// orders like the plain OCO, carrying `TimeMeta::RatchetOco`.
+    RatchetOco(ParsedRatchetOco, u32, u64),
     /// Perp deploy order detected.
     Perp(ParsedPerpOrder, u32, u64),
     /// Lending order detected.
@@ -59,6 +70,60 @@ pub enum ScanResult {
     /// Swap order detected (swap_order, 243B RS).
     /// v18 swap order detected (swap v18, 260B RS — ring-eligible legs).
     Swap(ParsedSwapOrder, u32, u64),
+}
+
+/// A ratchet continuation detected in a spending TX (design §4.7): the
+/// landed RATCHET spend's successor P2SH UTXO, to be tracked as the live
+/// order (with the predecessor's seats/token carried over).
+#[derive(Debug, Clone)]
+pub struct RatchetContinuation {
+    /// The spent predecessor's base outpoint key (`txid:index`).
+    pub old_base_key: String,
+    /// Parsed successor RS (pnum_sl already advanced by rstep).
+    pub parsed: ParsedRatchetOco,
+    /// Continuation output index in the spending TX.
+    pub output_index: u32,
+    /// Continuation output value (full escrow, R13f).
+    pub value: u64,
+    /// Successor generation (predecessor's count + 1).
+    pub ratchets_applied: u64,
+    /// Seller SPK carried from the predecessor (seats are byte-preserved
+    /// across the splice — sspkh unchanged).
+    pub counterparty_spk: Option<String>,
+    /// Token covenant id carried from the predecessor (the continuation
+    /// keeps the binding, R13f).
+    pub token_cov_id: String,
+}
+
+/// Time-contract classification of a redeemScript (RS-length dispatch via
+/// the core parse arms). None for every non-time-contract RS.
+pub fn time_meta_from_rs(rs: &[u8]) -> Option<TimeMeta> {
+    if let Some(p) = parse_twap_sell_redeem_script(rs) {
+        return Some(TimeMeta::TwapSell { twin: p.twin, mpw: p.mpw });
+    }
+    if let Some(p) = parse_decay_sell_redeem_script(rs) {
+        return Some(TimeMeta::DecaySell { dslope: p.dslope, t0: p.t0, t_end: p.t_end });
+    }
+    if let Some(p) = parse_decay_buy_redeem_script(rs) {
+        return Some(TimeMeta::DecayBuy { dslope: p.dslope, t0: p.t0, t_end: p.t_end });
+    }
+    if let Some(p) = parse_ratchet_oco_redeem_script(rs) {
+        // ratchets_applied is genealogical (not recoverable from the RS
+        // alone) — 0 here; the continuation tracker sets the real count.
+        return Some(TimeMeta::RatchetOco {
+            rstep: p.rstep,
+            rgap: p.rgap,
+            rwin: p.rwin,
+            mrv: p.mrv,
+            ratchets_applied: 0,
+        });
+    }
+    None
+}
+
+/// `time_meta_from_rs` over a hex-encoded RS (persistence reload path).
+pub fn time_meta_from_rs_hex(rs_hex: &str) -> Option<TimeMeta> {
+    hex::decode(rs_hex).ok().and_then(|rs| time_meta_from_rs(&rs))
 }
 
 /// Scanner for detecting KOB deploy transactions and spent orders.
@@ -194,6 +259,28 @@ impl BlockScanner {
             if rs_hash == *p2sh_hash {
                 if let Some(parsed) = parse_oco_sell_redeem_script(&v2.rs_data) {
                     return Some((parsed, p2sh_idx, p2sh_out.value));
+                }
+            }
+        }
+        None
+    }
+
+    /// Scan for a ratchet_oco deploy (time-contracts family).
+    ///
+    /// Same KOB:2: payload format as regular spot; the RS is 760B and parses
+    /// through the dedicated ratchet arm.
+    fn scan_ratchet_oco(&self, tx: &TransactionData) -> Option<(ParsedRatchetOco, u32, u64)> {
+        let v2 = kob_core::contract::parse_order_payload(&tx.payload)?;
+        if v2.rs_data.len() != RATCHET_OCO_RS_EXPECTED_LEN {
+            return None;
+        }
+        let rs_hash = kob_core::blake2b_256(&v2.rs_data);
+        for (idx, out) in tx.outputs.iter().enumerate() {
+            if let Some(hash) = parse_p2sh_script(&out.script, out.script_version) {
+                if rs_hash == hash {
+                    if let Some(parsed) = parse_ratchet_oco_redeem_script(&v2.rs_data) {
+                        return Some((parsed, idx as u32, out.value));
+                    }
                 }
             }
         }
@@ -355,9 +442,12 @@ impl BlockScanner {
             // All v18 spot orders (buy AND sell — v18 is BPS-uniform) store
             // max_matcher_fee as BPS (basis points of trade value). Convert
             // to absolute sompi so the matching engine can use it uniformly:
-            // mmfee_sompi = value * bps / 10000.
+            // mmfee_sompi = value * bps / 10000. The time-contract siblings
+            // (twap_sell / decay_sell / decay_buy) carry the same v18
+            // BPS-uniform field.
             max_matcher_fee: if parsed.redeem_script.len() == kob_core::contract::spot::order::BUY_ORDER_RS_EXPECTED_LEN
                 || parsed.redeem_script.len() == kob_core::contract::spot::order::SELL_ORDER_RS_EXPECTED_LEN
+                || time_meta_from_rs(&parsed.redeem_script).is_some()
             {
                 value.saturating_mul(parsed._max_matcher_fee) / 10000
             } else {
@@ -368,6 +458,10 @@ impl BlockScanner {
             oco_partner_key: None,
             // Caller sets discovered_daa after construction when DAA context is available.
             discovered_daa: 0,
+            // Time-contracts classification (twap/decay); the RS parse arms
+            // are authoritative. Ratchet orders never come through this path
+            // (they book via `ratchet_oco_to_book_orders`).
+            time_meta: time_meta_from_rs(&parsed.redeem_script),
         }
     }
 
@@ -439,12 +533,93 @@ impl BlockScanner {
                 oco_partner_key: Some(partner.to_string()),
                 // Caller sets discovered_daa after construction.
                 discovered_daa: 0,
+                time_meta: None,
             }
         };
 
         let tp_order = make_order(kob_core::OcoPath::TakeProfit, &sl_key);
         let sl_order = make_order(kob_core::OcoPath::StopLoss, &tp_key);
         (tp_order, sl_order)
+    }
+
+    /// Convert a `ParsedRatchetOco` into two virtual BookOrders (TP + SL),
+    /// exactly like the plain OCO, carrying `TimeMeta::RatchetOco`.
+    ///
+    /// `ratchets_applied` = the continuation generation (0 for a fresh
+    /// deploy; predecessor's k+1 when following a landed RATCHET spend).
+    pub fn ratchet_oco_to_book_orders(
+        parsed: &ParsedRatchetOco,
+        tx_id: &str,
+        output_index: u32,
+        value: u64,
+        tx: Option<&TransactionData>,
+        ratchets_applied: u64,
+    ) -> (BookOrder, BookOrder) {
+        let (mut tp_order, mut sl_order) =
+            Self::oco_sell_to_book_orders(&parsed.oco, tx_id, output_index, value, tx);
+        // v18 BPS-uniform mmfee: the OCO helper's RS-length test only knows
+        // the plain OCO size, so re-apply the BPS conversion for the 760B RS.
+        let mm = value.saturating_mul(parsed.oco._max_matcher_fee) / 10000;
+        tp_order.max_matcher_fee = mm;
+        sl_order.max_matcher_fee = mm;
+        let meta = TimeMeta::RatchetOco {
+            rstep: parsed.rstep,
+            rgap: parsed.rgap,
+            rwin: parsed.rwin,
+            mrv: parsed.mrv,
+            ratchets_applied,
+        };
+        tp_order.time_meta = Some(meta.clone());
+        sl_order.time_meta = Some(meta);
+        (tp_order, sl_order)
+    }
+
+    /// Detect ratchet continuations in a spending TX (design §4.7 scanner
+    /// tracking): for every input that spends a booked ratchet_oco, derive
+    /// the successor RS (`pnum_sl += rstep`) and look for the continuation
+    /// output `P2SH(new_rs)` in the SAME tx. A hit means a RATCHET-branch
+    /// spend landed — the successor P2SH is the live order now. Detection is
+    /// by output SPK (no sigscript inspection needed): only the ratchet
+    /// branch produces that exact continuation SPK, and even a false
+    /// positive names a UTXO that genuinely exists under the successor RS.
+    ///
+    /// Call BEFORE removing spent orders (the old book entry supplies the
+    /// carried seats/token). Returns one entry per spent ratchet UTXO.
+    pub fn detect_ratchet_continuations(
+        tx: &TransactionData,
+        book: &OrderBook,
+    ) -> Vec<RatchetContinuation> {
+        let mut found = Vec::new();
+        for input in &tx.inputs {
+            let base = format!("{}:{}", input.prev_tx_id, input.prev_index);
+            let old = book
+                .get_order(&format!("{}:tp", base))
+                .or_else(|| book.get_order(&format!("{}:sl", base)));
+            let Some(old) = old else { continue };
+            let Some(TimeMeta::RatchetOco { ratchets_applied, .. }) = &old.time_meta else {
+                continue;
+            };
+            let Ok(old_rs) = hex::decode(&old.redeem_script_hex) else { continue };
+            let Ok(new_rs) = derive_ratchet_continuation_rs(&old_rs) else { continue };
+            let p2sh = kob_core::build_p2sh(&new_rs);
+            for (oi, out) in tx.outputs.iter().enumerate() {
+                if out.script_version == p2sh.version && out.script == p2sh.script() {
+                    if let Some(parsed) = parse_ratchet_oco_redeem_script(&new_rs) {
+                        found.push(RatchetContinuation {
+                            old_base_key: base.clone(),
+                            parsed,
+                            output_index: oi as u32,
+                            value: out.value,
+                            ratchets_applied: ratchets_applied.saturating_add(1),
+                            counterparty_spk: old.counterparty_spk.clone(),
+                            token_cov_id: old.token_cov_id.clone(),
+                        });
+                    }
+                    break;
+                }
+            }
+        }
+        found
     }
 
     // Unified multi-product scanner
@@ -457,6 +632,12 @@ impl BlockScanner {
         // 0. Try OCO sell (single-UTXO, KOB:2: payload with 333B RS)
         if let Some((oco, idx, val)) = self.scan_oco_sell(tx) {
             return Some(ScanResult::OcoSell(oco, idx, val));
+        }
+
+        // 0b. Try ratchet_oco (time-contracts family, 760B RS — disjoint
+        // length, order does not matter; kept beside its OCO sibling).
+        if let Some((r, idx, val)) = self.scan_ratchet_oco(tx) {
+            return Some(ScanResult::RatchetOco(r, idx, val));
         }
 
         // 1. Try Spot (existing path)
@@ -898,7 +1079,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         let buy_key = buy.outpoint_key();
         ob.add_buy_order(buy);
@@ -925,7 +1106,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         let sell_key = sell.outpoint_key();
         ob.add_sell_order(sell);
@@ -972,7 +1153,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         ob.add_buy_order(buy);
         assert_eq!(ob.stats().total_bids, 1);
@@ -1218,7 +1399,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         ob.add_buy_order(gtc_order);
 
@@ -1241,7 +1422,7 @@ mod tests {
             post_only: false,
             expiry_daa: Some(1000),
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         ob.add_buy_order(gtd_order);
 
@@ -1264,7 +1445,7 @@ mod tests {
             post_only: false,
             expiry_daa: Some(2000),
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         ob.add_sell_order(gtd_sell);
 
@@ -2041,5 +2222,173 @@ mod tests {
             ob.remove_order(key);
         }
         assert_eq!(ob.stats().total_bids, 0, "order should be removed after cancel");
+    }
+    // ═════════════════════════════════════════════════════════════════════
+    // Time-contracts Stage C: classification arms + ratchet continuation
+    // ═════════════════════════════════════════════════════════════════════
+
+    fn time_deploy_tx(rs: &[u8], value: u64, cov: Option<[u8; 32]>) -> TransactionData {
+        let hash = kob_core::blake2b_256(rs);
+        TransactionData {
+            tx_id: "9".repeat(64),
+            _version: if cov.is_some() { 1 } else { 0 },
+            inputs: vec![],
+            outputs: vec![TxOutputData {
+                value,
+                script_version: 0,
+                script: make_p2sh_script(&hash),
+                covenant_id: cov,
+            }],
+            payload: make_payload_v2(rs, false),
+        }
+    }
+
+    #[test]
+    fn scan_twap_sell_classifies_with_meta_and_bps_mmfee() {
+        let rs = kob_core::contract::spot::twap::build_twap_sell_redeem_script(
+            100, 5_000_000, 3, 2, 1_000_000, &[0xA1; 32], &[0xB1; 32], &[0xC1; 32], 30, 0, 0,
+        )
+        .unwrap();
+        let tx = time_deploy_tx(&rs, 10_000_000, Some([0x77; 32]));
+        let scanner = BlockScanner::new();
+        let (parsed, idx, val) = scanner.scan_tx(&tx).expect("twap_sell RS must classify as spot");
+        assert_eq!((idx, val), (0, 10_000_000));
+        let order = BlockScanner::to_book_order_with_tx(&parsed, &tx.tx_id, idx, val, None, Some(&tx));
+        assert_eq!(order.time_meta, Some(TimeMeta::TwapSell { twin: 100, mpw: 5_000_000 }));
+        assert_eq!(order.csv_maturity(), 100, "twap CSV maturity = twin");
+        // v18 BPS-uniform mmfee: 10M * 30 / 10000 = 30_000 sompi.
+        assert_eq!(order.max_matcher_fee, 30_000);
+    }
+
+    #[test]
+    fn scan_decay_sell_classifies_with_meta_and_effective_price() {
+        let rs = kob_core::contract::spot::decay::build_decay_sell_redeem_script(
+            1000, 1000, 2000, 2_000_000, 1_000_000, 1_000_000,
+            &[0xA1; 32], &[0xB1; 32], &[0xC1; 32], 30, 0, 0,
+        )
+        .unwrap();
+        let tx = time_deploy_tx(&rs, 10_000_000, Some([0x77; 32]));
+        let scanner = BlockScanner::new();
+        let (parsed, idx, val) = scanner.scan_tx(&tx).expect("decay_sell RS must classify as spot");
+        let order = BlockScanner::to_book_order_with_tx(&parsed, &tx.tx_id, idx, val, None, Some(&tx));
+        assert_eq!(order.time_meta, Some(TimeMeta::DecaySell { dslope: 1000, t0: 1000, t_end: 2000 }));
+        assert_eq!(order.effective_price(0), (2_000_000, 1_000_000), "clamp -> start price");
+        assert_eq!(order.effective_price(1500), (1_500_000, 1_000_000), "mid-schedule");
+        assert_eq!(order.effective_price(9999), (1_000_000, 1_000_000), "past t_end -> floor");
+        assert_eq!(order.max_matcher_fee, 30_000, "decay mmfee is BPS-converted");
+    }
+
+    #[test]
+    fn scan_decay_buy_classifies_with_meta() {
+        let token = [0x77u8; 32];
+        let rs = kob_core::contract::spot::decay::build_decay_buy_redeem_script(
+            1000, 1000, 2000, &token, 2_000_000, 1_000_000, 1,
+            &[0xA1; 32], &[0xB1; 32], &[0xC1; 32], 100, 0, 0,
+        )
+        .unwrap();
+        let tx = time_deploy_tx(&rs, 10_000_000, None);
+        let scanner = BlockScanner::new();
+        let (parsed, idx, val) = scanner.scan_tx(&tx).expect("decay_buy RS must classify as spot");
+        assert_eq!(parsed.order_type, OrderSide::Buy);
+        let order = BlockScanner::to_book_order_with_tx(&parsed, &tx.tx_id, idx, val, None, Some(&tx));
+        assert_eq!(order.time_meta, Some(TimeMeta::DecayBuy { dslope: 1000, t0: 1000, t_end: 2000 }));
+        assert_eq!(order.max_matcher_fee, 100_000, "10M * 100bps / 10000");
+    }
+
+    #[test]
+    fn scan_ratchet_oco_books_two_virtual_orders_with_meta() {
+        let rs = kob_core::contract::spot::ratchet::build_ratchet_oco_redeem_script(
+            1, 0, 60, 1_000_000, 5, 1, 1, 2, 1, 1,
+            &[0xA1; 32], &[0xB1; 32], &[0xC1; 32], 30, 0, 0,
+        )
+        .unwrap();
+        assert_eq!(rs.len(), RATCHET_OCO_RS_EXPECTED_LEN);
+        let tx = time_deploy_tx(&rs, 5_000_000, Some([0x77; 32]));
+        let scanner = BlockScanner::new();
+        let hit = scanner.scan_tx_all(&tx).expect("ratchet_oco must classify");
+        let ScanResult::RatchetOco(parsed, idx, val) = hit else {
+            panic!("expected RatchetOco, got another arm");
+        };
+        assert_eq!((idx, val), (0, 5_000_000));
+        let (tp, sl) = BlockScanner::ratchet_oco_to_book_orders(&parsed, &tx.tx_id, idx, val, Some(&tx), 0);
+        assert_eq!(tp.oco_path, Some(kob_core::OcoPath::TakeProfit));
+        assert_eq!(sl.oco_path, Some(kob_core::OcoPath::StopLoss));
+        assert_eq!((tp.price_num, tp.price_den), (5, 1), "TP branch pair");
+        assert_eq!((sl.price_num, sl.price_den), (2, 1), "SL branch pair");
+        let expect_meta = Some(TimeMeta::RatchetOco {
+            rstep: 1, rgap: 0, rwin: 60, mrv: 1_000_000, ratchets_applied: 0,
+        });
+        assert_eq!(tp.time_meta, expect_meta);
+        assert_eq!(sl.time_meta, expect_meta);
+        assert_eq!(tp.max_matcher_fee, 15_000, "5M * 30bps / 10000 (BPS-uniform)");
+        assert_eq!(tp.token_cov_id, hex::encode([0x77u8; 32]), "tcid from output binding");
+    }
+
+    #[test]
+    fn ratchet_continuation_detected_from_spending_tx() {
+        // Book a ratchet_oco, then feed a spending tx whose outputs include
+        // P2SH(new_rs) — the tracker must name the successor with k+1 and
+        // carry the predecessor's seats/token.
+        let rs = kob_core::contract::spot::ratchet::build_ratchet_oco_redeem_script(
+            1, 0, 60, 1_000_000, 5, 1, 1, 2, 1, 1,
+            &[0xA1; 32], &[0xB1; 32], &[0xC1; 32], 30, 0, 0,
+        )
+        .unwrap();
+        let deploy_tx = time_deploy_tx(&rs, 5_000_000, Some([0x77; 32]));
+        let scanner = BlockScanner::new();
+        let ScanResult::RatchetOco(parsed, idx, val) = scanner.scan_tx_all(&deploy_tx).unwrap() else {
+            panic!("expected RatchetOco");
+        };
+        let (mut tp, mut sl) =
+            BlockScanner::ratchet_oco_to_book_orders(&parsed, &deploy_tx.tx_id, idx, val, Some(&deploy_tx), 0);
+        tp.counterparty_spk = Some("20aa".to_string());
+        sl.counterparty_spk = Some("20aa".to_string());
+        let mut ob = OrderBook::new();
+        ob.add_sell_order(tp);
+        ob.add_sell_order(sl);
+
+        let new_rs = derive_ratchet_continuation_rs(&rs).unwrap();
+        let cont_p2sh = kob_core::build_p2sh(&new_rs);
+        let spend_tx = TransactionData {
+            tx_id: "8".repeat(64),
+            _version: 1,
+            inputs: vec![TxInputData {
+                prev_tx_id: deploy_tx.tx_id.clone(),
+                prev_index: 0,
+                _sig_script: vec![],
+            }],
+            outputs: vec![TxOutputData {
+                value: 5_000_000,
+                script_version: cont_p2sh.version,
+                script: cont_p2sh.script().to_vec(),
+                covenant_id: Some([0x77; 32]),
+            }],
+            payload: vec![],
+        };
+        let conts = BlockScanner::detect_ratchet_continuations(&spend_tx, &ob);
+        assert_eq!(conts.len(), 1, "one continuation per spent ratchet UTXO");
+        let c = &conts[0];
+        assert_eq!(c.old_base_key, format!("{}:0", deploy_tx.tx_id));
+        assert_eq!(c.output_index, 0);
+        assert_eq!(c.value, 5_000_000);
+        assert_eq!(c.ratchets_applied, 1, "generation advances by one");
+        assert_eq!(c.parsed.oco.price_num_sl, 3, "SL advanced by rstep");
+        assert_eq!(c.counterparty_spk.as_deref(), Some("20aa"), "seats carried");
+
+        // A spend WITHOUT the continuation output (e.g. TP fill) is not a
+        // continuation.
+        let fill_tx = TransactionData {
+            tx_id: "7".repeat(64),
+            _version: 1,
+            inputs: spend_tx.inputs.clone(),
+            outputs: vec![TxOutputData {
+                value: 25_000_000,
+                script_version: 0,
+                script: vec![0x20; 34],
+                covenant_id: None,
+            }],
+            payload: vec![],
+        };
+        assert!(BlockScanner::detect_ratchet_continuations(&fill_tx, &ob).is_empty());
     }
 }

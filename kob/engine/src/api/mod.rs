@@ -805,6 +805,55 @@ struct OrderResponse {
     min_fill: u64,
     #[serde(rename = "postOnly")]
     post_only: bool,
+    /// Time-contract kind (`twap_sell` / `decay_sell` / `decay_buy` /
+    /// `ratchet_oco`); omitted for plain orders.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<&'static str>,
+    /// Effective price at the current sink DAA (design §2.7 surfacing):
+    /// decay orders show `pnum_eff(now)/pden`, twap the state price, a
+    /// ratchet_oco branch its CURRENT branch pair. Omitted for plain orders.
+    #[serde(rename = "effectivePrice", skip_serializing_if = "Option::is_none")]
+    effective_price: Option<String>,
+    /// twap_sell pace state: earliest DAA at which the next fill event is
+    /// consensus-admissible (`discovered_daa + twin`); ratchet_oco: earliest
+    /// DAA the next RATCHET advance is admissible (`discovered_daa + rwin`).
+    #[serde(rename = "nextEligibleDaa", skip_serializing_if = "Option::is_none")]
+    next_eligible_daa: Option<u64>,
+    /// ratchet_oco: continuation generation (SL advances applied so far).
+    #[serde(rename = "ratchetsApplied", skip_serializing_if = "Option::is_none")]
+    ratchets_applied: Option<u64>,
+}
+
+/// Time-contract response fields for a book order at `now_daa`
+/// (kind, effective price, pace, ratchet generation).
+fn time_fields_for(
+    order: &crate::matcher::order_book::BookOrder,
+    now_daa: u64,
+) -> (Option<&'static str>, Option<String>, Option<u64>, Option<u64>) {
+    use crate::matcher::order_book::TimeMeta;
+    match &order.time_meta {
+        None => (None, None, None, None),
+        Some(meta) => {
+            let (en, ed) = order.effective_price(now_daa);
+            let eff = Some(price_str(en, ed));
+            match meta {
+                TimeMeta::TwapSell { twin, .. } => (
+                    Some("twap_sell"),
+                    eff,
+                    Some(order.discovered_daa.saturating_add(*twin)),
+                    None,
+                ),
+                TimeMeta::DecaySell { .. } => (Some("decay_sell"), eff, None, None),
+                TimeMeta::DecayBuy { .. } => (Some("decay_buy"), eff, None, None),
+                TimeMeta::RatchetOco { rwin, ratchets_applied, .. } => (
+                    Some("ratchet_oco"),
+                    eff,
+                    Some(order.discovered_daa.saturating_add(*rwin)),
+                    Some(*ratchets_applied),
+                ),
+            }
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1231,12 +1280,17 @@ async fn handle_order(
     Query(params): Query<OrderQuery>,
 ) -> Result<Json<OrderResponse>, (StatusCode, Json<ErrorResponse>)> {
     let s = state.read().await;
+    // `now` for effective-price surfacing: the node sink DAA (falls back to
+    // the scan cursor; 0 clamps decay schedules to their start price).
+    let now_daa = if s.sync.sink_daa > 0 { s.sync.sink_daa } else { s.sync.cursor_daa };
     let ob = s.order_book.lock().await;
     if let Some((pair, order)) = ob.get_order_by_txid(&params.txid) {
         let side = match order.side {
             crate::matcher::order_book::OrderSide::Buy => "buy",
             crate::matcher::order_book::OrderSide::Sell => "sell",
         };
+        let (kind, effective_price, next_eligible_daa, ratchets_applied) =
+            time_fields_for(order, now_daa);
         return Ok(Json(OrderResponse {
             txid: order.tx_id.clone(),
             pair: pair.to_string(),
@@ -1245,6 +1299,10 @@ async fn handle_order(
             value: order.value,
             min_fill: order.min_fill,
             post_only: order.post_only,
+            kind,
+            effective_price,
+            next_eligible_daa,
+            ratchets_applied,
         }));
     }
     Err(json_error(StatusCode::NOT_FOUND, "order not found"))
@@ -2724,7 +2782,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -2747,7 +2805,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 

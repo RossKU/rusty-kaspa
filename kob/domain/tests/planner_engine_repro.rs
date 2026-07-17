@@ -29,9 +29,9 @@ use kaspa_txscript::engine_context::EngineCtx;
 use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_domain::batch::{
-    plan_batch_match, plan_batch_match_at, plan_decay_buy_match, plan_ioc_match,
-    plan_partial_match, plan_ring_match, BatchOrder, BatchPlan, OrderType, OutputPurpose,
-    RingLegOrder,
+    plan_batch_match, plan_batch_match_at, plan_decay_buy_match, plan_decay_buy_partial_match,
+    plan_ioc_match, plan_partial_match, plan_ring_match, plan_sell_ioc_match_at, BatchOrder,
+    BatchPlan, OrderType, OutputPurpose, RingLegOrder,
 };
 use kob_domain::time_planner::{
     compose_settle_and_ratchet, plan_ratchet_advance, twap_fill_schedule, RatchetOrderRef,
@@ -803,4 +803,216 @@ fn settle_plus_ratchet_combined_tx_real_engine() {
     let parsed = kob_core::contract::spot::parse::parse_ratchet_oco_redeem_script(&adv.new_rs)
         .expect("continuation parses");
     assert_eq!(parsed.oco.price_num_sl, 3, "SL advanced by rstep");
+}
+
+// ═════════════════════════════════════════════════════════════════════════
+// Stage C — sell-anchored time-variant admission (Stage-B residuals 1+2)
+// and the decay_buy Op2 partial planner (residual 3)
+// ═════════════════════════════════════════════════════════════════════════
+
+/// Residual 1: a decay_sell ANCHOR in the sell-anchored flow is priced at
+/// f(L) of the plan's lock_time, the RAW effective pair is attested, and the
+/// real engine (decay D1–D4 + the unchanged v18 buy) accepts the tx.
+#[test]
+fn sell_anchored_decay_settle_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+
+    // Anchor: 10M tokens on the standard schedule -> f(1500) = 1.5M/1M.
+    let sell = make_decay_sell(0x10, 10_000_000, token, &owner_hash, &spk_hash);
+    // Absorber: 15M KAS at 2/3 -> demand 10M tokens exactly (GTC Op1 path);
+    // kas_in == fair(f(1500)) so the surplus cap binds at zero.
+    let buys = vec![make_buy(0x20, 15_000_000, 2, 3, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_sell_ioc_match_at(&sell, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000), 1500)
+        .expect("sell-anchored decay settle must plan at L=1500");
+    assert_eq!(plan.lock_time, 1500);
+    assert_eq!(plan.outputs[0].value, 15_000_000, "seller KAS = 10M x f(1500)");
+    let tx = plan.build_tx().unwrap();
+    assert_eq!(&tx.inputs[0].sigscript[3..11], &1_500_000u64.to_le_bytes(), "RAW pnum_eff attested");
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "sell-anchored decay tx must pass the real engine; failures: {failures:?}");
+}
+
+/// Residual 1: a twap_sell anchor is admitted (sequence = twin on its input)
+/// and the whole-UTXO volume is gated by mpw with the typed error (the
+/// anchor cannot be greedily skipped).
+#[test]
+fn sell_anchored_twap_settle_and_mpw_gate() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+
+    // Admitted: 10M tokens <= mpw 10M; buy absorbs exactly at 1/1.
+    let sell = make_twap_sell(0x10, 10_000_000, 100, 10_000_000, (1, 1), token, &owner_hash, &spk_hash);
+    let buys = vec![make_buy(0x20, 10_000_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let plan = plan_sell_ioc_match_at(&sell, &buys, wallet.clone(), &p2pk_spk_bytes(&pubkey), 0, Some(2000), 0)
+        .expect("twap anchor within mpw must plan");
+    let tx = plan.build_tx().unwrap();
+    assert_eq!(tx.inputs[0].sequence, 100, "twap anchor input carries sequence = twin");
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "sell-anchored twap tx must pass the real engine; failures: {failures:?}");
+
+    // Gated: 20M tokens > mpw 10M -> typed rejection (W2 gates full fills).
+    let oversized = make_twap_sell(0x11, 20_000_000, 100, 10_000_000, (1, 1), token, &owner_hash, &spk_hash);
+    let big_buys = vec![make_buy(0x21, 20_000_000, 1, 1, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let err = plan_sell_ioc_match_at(&oversized, &big_buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000), 0)
+        .unwrap_err();
+    assert!(
+        matches!(err, kob_domain::batch::BatchError::TwapVolumeExceedsMpw { mpw: 10_000_000, .. }),
+        "oversized twap anchor must reject typed; got {err}"
+    );
+}
+
+/// Residual 1 (buy side): a decay_buy ABSORBER in the sell-anchored flow —
+/// its token demand is evaluated at the risen bid pnum_eff(L) and the
+/// unchanged v18 sell settles against the decay_buy body on the real engine.
+#[test]
+fn sell_anchored_decay_buy_absorber_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+
+    // Anchor: plain 15M-token sell at 1/2 (seller KAS 7.5M). Absorber: 10M
+    // KAS decay_buy whose demand at L=1500 is (10M/1M)*1.5M = 15M exactly.
+    let sell = make_sell(0x10, 15_000_000, 1, 2, token, &owner_hash, &spk_hash);
+    let buys = vec![make_decay_buy(0x20, 10_000_000, token, &owner_hash, &spk_hash)];
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_sell_ioc_match_at(&sell, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, None, 1500)
+        .expect("decay_buy absorber must plan at L=1500");
+    assert_eq!(plan.lock_time, 1500);
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "sell-anchored decay_buy tx must pass the real engine; failures: {failures:?}");
+}
+
+/// Residual 2: sell-INITIATED ratchet composition — a sell-anchored settle
+/// plan is a valid print witness for `plan_ratchet_advance`, and
+/// `compose_settle_and_ratchet` produces one tx (settle + SL advance) that
+/// passes the real engine including the permissionless ratchet branch.
+#[test]
+fn sell_anchored_settle_plus_ratchet_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let token_hash = Hash::from_bytes(token);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+    let wallet_spk = ScriptPublicKey::new(0, p2pk_spk_bytes(&pubkey).into());
+
+    // Sell-anchored settle: 10M tokens at 3/1 fully absorbed by a 30M buy
+    // (divisible print; the anchor is the print witness at input 0).
+    let sell = make_sell(0x10, 10_000_000, 3, 1, token, &owner_hash, &spk_hash);
+    let buys = vec![make_buy(0x20, 30_000_000, 1, 3, 1_000_000, token, &owner_hash, &spk_hash, 2000)];
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_sell_ioc_match_at(&sell, &buys, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(2000), 0)
+        .expect("sell-anchored settle must plan");
+
+    let ratchet_rs = kob_core::contract::spot::ratchet::build_ratchet_oco_redeem_script(
+        1, 0, 60, 1_000_000, 5, 1, 1, 2, 1, 1, &owner_hash, &spk_hash, &[0xDD; 32], 30, 0, 0,
+    ).unwrap();
+    let oco = RatchetOrderRef {
+        outpoint: (hex::encode([0x40u8; 32]), 0),
+        redeem_script: ratchet_rs.clone(),
+        escrow: 5_000_000,
+        utxo_daa_score: 0,
+        token_cov_id: token,
+    };
+    let adv = plan_ratchet_advance(&oco, &plan, 100).expect("ratchet must ride the sell-anchored settle");
+    assert_eq!(adv.sibling_input_idx, 0, "the anchor at input 0 is the print witness");
+    assert_eq!(adv.input_position, 2, "after the buy at input 1");
+    let composed = compose_settle_and_ratchet(&plan, &adv).expect("compose");
+
+    let mut inputs = Vec::new();
+    let mut entries = Vec::new();
+    for bi in &composed.inputs {
+        let outpoint = TransactionOutpoint::new(kob_core::parse_hash(&bi.tx_id).unwrap(), bi.index);
+        let ss = if bi.sigscript.is_empty() { vec![0x41; 66] } else { bi.sigscript.clone() };
+        inputs.push(TransactionInput::new(outpoint, ss, bi.sequence, bi.sig_op_count));
+    }
+    entries.push(UtxoEntry {
+        amount: 10_000_000,
+        script_public_key: kob_core::build_p2sh(&plan.sells[0].0.redeem_script),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: Some(token_hash),
+    });
+    entries.push(UtxoEntry {
+        amount: 30_000_000,
+        script_public_key: kob_core::build_p2sh(&plan.buys[0].0.redeem_script),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: None,
+    });
+    entries.push(UtxoEntry {
+        amount: 5_000_000,
+        script_public_key: kob_core::build_p2sh(&ratchet_rs),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: Some(token_hash),
+    });
+    entries.push(UtxoEntry {
+        amount: 5_000_000,
+        script_public_key: wallet_spk,
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: None,
+    });
+
+    let mut outputs = Vec::new();
+    for (i, o) in composed.outputs.iter().enumerate() {
+        let spk = ScriptPublicKey::new(o.spk_version, o.script_public_key.clone().into());
+        let covenant = match o.purpose {
+            OutputPurpose::BuyerTokens => plan
+                .output_auth_input
+                .get(&i)
+                .map(|&auth| CovenantBinding::new(auth, token_hash)),
+            OutputPurpose::RatchetContinuation => {
+                Some(CovenantBinding::new(adv.input_position as u16, token_hash))
+            }
+            _ => None,
+        };
+        outputs.push(TransactionOutput::with_covenant(o.value, spk, covenant));
+    }
+
+    let tx = Transaction::new(1, inputs, outputs, plan.lock_time, Default::default(), 0, vec![]);
+    let failures = exec_covenant_inputs(&tx, entries, 3); // sell + buy + ratchet
+    assert!(failures.is_empty(), "sell-anchored settle+ratchet tx must pass the real engine; failures: {failures:?}");
+    let parsed = kob_core::contract::spot::parse::parse_ratchet_oco_redeem_script(&adv.new_rs)
+        .expect("continuation parses");
+    assert_eq!(parsed.oco.price_num_sl, 3, "SL advanced by rstep");
+}
+
+/// Residual 3: the decay_buy Op2 PARTIAL planner mirrors the v18 partial
+/// shape — the buy spends part of its KAS at the RISEN bid floor and keeps a
+/// byte-exact self-SPK residual, and the tx passes the real engine through
+/// the decay_buy Op2 branch.
+#[test]
+fn decay_buy_partial_settle_real_engine() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let token = arr32(TOKEN_HEX);
+    let owner_hash = kob_core::blake2b_256(&pubkey);
+    let spk_hash = kob_core::compute_p2pk_spk_hash(&pubkey);
+
+    // 30M-KAS decay_buy partially filled by one 10M-token sell at 1/2
+    // (5M KAS spent base). At L=1500 the spent-based floor consumes
+    // pnum_eff = 1.5M per 1M-sompi KAS unit.
+    let sells = vec![make_sell(0x10, 10_000_000, 1, 2, token, &owner_hash, &spk_hash)];
+    let buy = make_decay_buy(0x20, 30_000_000, token, &owner_hash, &spk_hash);
+    let wallet = Some((hex::encode([0x30u8; 32]), 0u32, 5_000_000u64));
+    let plan = plan_decay_buy_partial_match(&sells, &buy, 1500, wallet, &p2pk_spk_bytes(&pubkey), 0, Some(0))
+        .expect("decay_buy partial must plan at L=1500");
+    assert_eq!(plan.lock_time, 1500);
+    let (spent, residual_idx, _) = *plan.buy_partial_fills.get(&0).expect("Op2 partial entry");
+    assert!(spent >= 5_000_000, "spent covers the sell leg");
+    let residual = plan.outputs[residual_idx as usize].value;
+    assert_eq!(plan.outputs[residual_idx as usize].purpose, OutputPurpose::BuyResidual);
+    assert_eq!(spent + residual, 30_000_000, "spent + residual = kas_in");
+    // Spent-based floor at the risen bid: floor(spent/1M)*1.5M <= 10M tokens.
+    assert!((spent as u128 / 1_000_000) * 1_500_000 <= 10_000_000);
+    let failures = run_spot_plan(&plan, 5_000_000);
+    assert!(failures.is_empty(), "decay_buy Op2 partial tx must pass the real engine; failures: {failures:?}");
 }

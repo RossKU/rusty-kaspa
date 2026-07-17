@@ -193,6 +193,62 @@ pub struct BookOrder {
     /// Defaults to 0 for backward compatibility with pre-FIFO persisted orders.
     #[serde(default)]
     pub discovered_daa: u64,
+    /// Time-contract classification (kob/TIME_CONTRACTS_DESIGN.md). None for
+    /// the plain v18 spot kinds; Some(..) for the four additive time kinds.
+    /// The scanner populates this from the RS parse arms; the book price
+    /// fields carry the START price (decay) / state price (twap) / branch
+    /// pair (ratchet) — effective-price surfacing reads this metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_meta: Option<TimeMeta>,
+}
+
+/// Time-contract metadata carried on a book entry (design §2.7/§3.5/§4.7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TimeMeta {
+    /// twap_sell: rate limiter fields. Fill inputs must carry
+    /// `sequence = max(50, twin)`; per-event volume <= mpw.
+    TwapSell { twin: u64, mpw: u64 },
+    /// decay_sell: falling-ask schedule; the book pair is the START price,
+    /// the executing price is `pnum_eff(L) = pnum - dslope*(clamp(L)-t0)`.
+    DecaySell { dslope: u64, t0: u64, t_end: u64 },
+    /// decay_buy: rising bid; same schedule formula on the buy pair.
+    DecayBuy { dslope: u64, t0: u64, t_end: u64 },
+    /// ratchet_oco: trailing-SL ratchet fields. `ratchets_applied` counts the
+    /// continuation generation (0 = deploy UTXO; the scanner increments it
+    /// when it follows a landed RATCHET spend to the successor P2SH).
+    RatchetOco { rstep: u64, rgap: u64, rwin: u64, mrv: u64, ratchets_applied: u64 },
+}
+
+impl BookOrder {
+    /// The consensus real-age (CSV) maturity this order's fill input needs:
+    /// `max(50, twin)` for a twap_sell (its `twin CSV` gate), the plain
+    /// 50-DAA exposure delay otherwise. `discovered_daa` approximates the
+    /// UTXO creation score for the planner-side gate; consensus is the
+    /// authority either way (a premature tx is rejected, not mis-priced).
+    pub fn csv_maturity(&self) -> u64 {
+        match &self.time_meta {
+            Some(TimeMeta::TwapSell { twin, .. }) => (*twin).max(50),
+            Some(TimeMeta::RatchetOco { .. }) => 50,
+            _ => 50,
+        }
+    }
+
+    /// The price pair this order would EXECUTE at in a tx carrying
+    /// `lock_time = now_daa` (design §2.7 effective-price surfacing): decay
+    /// kinds evaluate their schedule at `now_daa`; every other kind returns
+    /// the book pair unchanged (twap state price / ratchet branch pair).
+    pub fn effective_price(&self, now_daa: u64) -> (u64, u64) {
+        match &self.time_meta {
+            Some(TimeMeta::DecaySell { dslope, t0, t_end })
+            | Some(TimeMeta::DecayBuy { dslope, t0, t_end }) => (
+                kob_core::contract::spot::decay::decay_effective_pnum(
+                    self.price_num, *dslope, *t0, *t_end, now_daa,
+                ),
+                self.price_den,
+            ),
+            _ => (self.price_num, self.price_den),
+        }
+    }
 }
 
 fn default_max_matcher_fee() -> u64 {
@@ -1025,7 +1081,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -1211,7 +1267,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         ob.add_buy_order(buy);
         let buy_key = format!("{}:1", "b".repeat(64));
@@ -1318,7 +1374,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -1516,7 +1572,7 @@ mod tests {
             post_only,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -1539,7 +1595,7 @@ mod tests {
             post_only,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -1756,7 +1812,7 @@ mod tests {
             post_only: false,
             expiry_daa: expiry,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 

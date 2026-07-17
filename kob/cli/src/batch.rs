@@ -387,6 +387,7 @@ async fn execute_operation(
                 deploy::DEFAULT_MAX_MATCHER_FEE, // ignored for v18 (bps below)
                 Some(deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
                 None, // n_max: default owner batch cap (MAX_N)
+                None, // plain v18 buy
             )
             .await?;
             // deploy_buy prints the TXID; we return None since we don't capture it
@@ -419,6 +420,7 @@ async fn execute_operation(
                 None,  // batch_max: default owner batch cap (255)
                 None,  // token_utxo: not supported in batch mode
                 None,  // fee_utxo: not supported in batch mode
+                deploy::SellTimeVariant::Plain,
             )
             .await?;
             Ok(None)

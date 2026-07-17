@@ -320,6 +320,9 @@ pub async fn deploy_buy(
     max_matcher_fee: u64,
     mmfee_bps: Option<u64>,
     n_max: Option<u8>,
+    // decay_buy (rising bid): Some((dslope, t0, t_end)) deploys the
+    // time-contract sibling — same deploy tx shape, only the RS differs.
+    decay: Option<(u64, u64, u64)>,
 ) -> anyhow::Result<String> {
     // v18 (unified spot generation, V18_DESIGN.md) is the SOLE version new
     // buy deploys may target: N:M GTC/IOC sweep + Op2 partial fill + OCO
@@ -411,19 +414,42 @@ pub async fn deploy_buy(
     // Owner batch cap (LIMITS re-freeze): default = MAX_N unless the caller
     // narrows the blast radius with --n-max.
     let n_cap = n_max.unwrap_or(contract::spot::order::BUY_ORDER_MAX_N as u8);
-    let redeem_script = contract::spot::order::build_buy_redeem_script_with_caps(
-        n_cap,
-        &token_cov_id,
-        price_num,
-        price_den,
-        min_fill,
-        &owner_hash,
-        &buyer_spk_hash,
-        &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
-        bps,
-        0, // cancel_pending = 0 (active order)
-        expiry_daa.unwrap_or(0),
-    )?;
+    let redeem_script = match decay {
+        None => contract::spot::order::build_buy_redeem_script_with_caps(
+            n_cap,
+            &token_cov_id,
+            price_num,
+            price_den,
+            min_fill,
+            &owner_hash,
+            &buyer_spk_hash,
+            &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
+            bps,
+            0, // cancel_pending = 0 (active order)
+            expiry_daa.unwrap_or(0),
+        )?,
+        Some((dslope, t0, t_end)) => {
+            let floor = kob_core::contract::spot::decay::decay_effective_pnum(
+                price_num, dslope, t0, t_end, t_end,
+            );
+            println!("decay_buy (rising bid): pnum {} -> {} (dslope {} / DAA, t0 {} .. t_end {})",
+                price_num, floor, dslope, t0, t_end);
+            contract::spot::decay::build_decay_buy_redeem_script_with_caps(
+                n_cap,
+                dslope, t0, t_end,
+                &token_cov_id,
+                price_num,
+                price_den,
+                min_fill,
+                &owner_hash,
+                &buyer_spk_hash,
+                &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
+                bps,
+                0,
+                expiry_daa.unwrap_or(0),
+            )?
+        }
+    };
 
     let p2sh = build_p2sh(&redeem_script);
 
@@ -710,6 +736,21 @@ pub use kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS;
 
 /// Deploy a sell order (lock tokens, request KAS at a given price).
 #[allow(clippy::too_many_arguments)]
+/// Time-contract deploy variant for sell-side spot deploys
+/// (kob/TIME_CONTRACTS_DESIGN.md — additive siblings of the v18 sell; the
+/// deploy tx shape is identical, only the RS builder differs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SellTimeVariant {
+    Plain,
+    /// twap_sell: consensus-clock rate limiter — `twin` DAA window (CSV),
+    /// `mpw` max tokens per fill event.
+    Twap { twin: u64, mpw: u64 },
+    /// decay_sell: Dutch schedule — the ask falls `dslope` pnum-units per
+    /// DAA from `t0` to `t_end` (price pair stored RAW, freeze rule §2.6).
+    Decay { dslope: u64, t0: u64, t_end: u64 },
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn deploy_sell(
     wallet_path: &Path,
     node_url: &str,
@@ -728,6 +769,7 @@ pub async fn deploy_sell(
     batch_max: Option<u8>,
     token_utxo_str: Option<&str>,
     fee_utxo_str: Option<&str>,
+    variant: SellTimeVariant,
 ) -> anyhow::Result<String> {
     // v18 (unified spot) is the SOLE version new sell deploys may target:
     // canonical price attestation on all fill-family branches + Fix-3
@@ -818,19 +860,64 @@ pub async fn deploy_sell(
     let sell_bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
     // Owner batch cap (LIMITS re-freeze): default = 255 unless the caller
     // narrows the blast radius with --batch-max.
-    let redeem_script = contract::spot::order::build_sell_redeem_script_with_caps(
-        batch_max.unwrap_or(255),
-        price_num, price_den, min_fill, &owner_hash, &seller_spk_hash,
-        &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
-        sell_bps,
-        0, // cancel_pending
-        expiry_daa.unwrap_or(0),
-    )?;
+    let otspkh = contract::compute_token_unit_spk_hash(&pubkey); // E1 expire seat
+    let redeem_script = match variant {
+        SellTimeVariant::Plain => contract::spot::order::build_sell_redeem_script_with_caps(
+            batch_max.unwrap_or(255),
+            price_num, price_den, min_fill, &owner_hash, &seller_spk_hash,
+            &otspkh,
+            sell_bps,
+            0, // cancel_pending
+            expiry_daa.unwrap_or(0),
+        )?,
+        SellTimeVariant::Twap { twin, mpw } => {
+            contract::spot::twap::build_twap_sell_redeem_script_with_caps(
+                batch_max.unwrap_or(255),
+                twin, mpw,
+                price_num, price_den, min_fill, &owner_hash, &seller_spk_hash,
+                &otspkh,
+                sell_bps,
+                0,
+                expiry_daa.unwrap_or(0),
+            )?
+        }
+        SellTimeVariant::Decay { dslope, t0, t_end } => {
+            contract::spot::decay::build_decay_sell_redeem_script_with_caps(
+                batch_max.unwrap_or(255),
+                dslope, t0, t_end,
+                price_num, price_den, min_fill, &owner_hash, &seller_spk_hash,
+                &otspkh,
+                sell_bps,
+                0,
+                expiry_daa.unwrap_or(0),
+            )?
+        }
+    };
 
     let p2sh = build_p2sh(&redeem_script);
 
-    println!("Deploy Sell Order (v{})", version);
-    println!("=======================");
+    match variant {
+        SellTimeVariant::Plain => {
+            println!("Deploy Sell Order (v{})", version);
+            println!("=======================");
+        }
+        SellTimeVariant::Twap { twin, mpw } => {
+            println!("Deploy TWAP Sell Order (twap_sell, generation {})", version);
+            println!("================================================");
+            println!("Window:     {} DAA (consensus CSV clock)", twin);
+            println!("Max/event:  {} sompi tokens", mpw);
+        }
+        SellTimeVariant::Decay { dslope, t0, t_end } => {
+            let floor = kob_core::contract::spot::decay::decay_effective_pnum(
+                price_num, dslope, t0, t_end, t_end,
+            );
+            println!("Deploy Decay Sell Order (decay_sell, generation {})", version);
+            println!("==================================================");
+            println!("Schedule:   pnum {} -> {} (dslope {} / DAA, t0 {} .. t_end {})",
+                price_num, floor, dslope, t0, t_end);
+            println!("Floor:      {}/{} at t_end", floor, price_den);
+        }
+    }
     if let Some(token) = token_covenant_id {
         println!("Token:      {}", token);
     }
@@ -1324,6 +1411,10 @@ pub async fn deploy_oco_sell(
     max_matcher_fee: u64,
     token_utxo_str: Option<&str>,
     fee_utxo_str: Option<&str>,
+    // ratchet_oco: Some((rstep, rgap, rwin, mrv)) deploys the trailing-SL
+    // ratchet sibling (kob/TIME_CONTRACTS_DESIGN.md §4) — same deploy tx
+    // shape, only the RS differs.
+    ratchet: Option<(u64, u64, u64, u64)>,
 ) -> anyhow::Result<String> {
     let wallet = WalletContext::load(wallet_path)?;
 
@@ -1348,21 +1439,57 @@ pub async fn deploy_oco_sell(
     } else {
         DEFAULT_MAX_MATCHER_FEE_BPS
     };
-    let redeem_script = kob_core::contract::spot::oco::build_oco_sell_redeem_script(
-        tp_price_num, tp_price_den, tp_min_fill,
-        sl_price_num, sl_price_den, sl_min_fill,
-        &owner_hash, &seller_spk_hash,
-        &kob_core::contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
-        oco_bps,
-        0, // cancel_pending
-        expiry_daa.unwrap_or(0),
-    )?;
-    assert_eq!(redeem_script.len(), kob_core::contract::spot::oco::OCO_SELL_RS_SIZE);
+    let otspkh = kob_core::contract::compute_token_unit_spk_hash(&pubkey); // E1 expire seat
+    let redeem_script = match ratchet {
+        None => {
+            let rs = kob_core::contract::spot::oco::build_oco_sell_redeem_script(
+                tp_price_num, tp_price_den, tp_min_fill,
+                sl_price_num, sl_price_den, sl_min_fill,
+                &owner_hash, &seller_spk_hash,
+                &otspkh,
+                oco_bps,
+                0, // cancel_pending
+                expiry_daa.unwrap_or(0),
+            )?;
+            assert_eq!(rs.len(), kob_core::contract::spot::oco::OCO_SELL_RS_SIZE);
+            rs
+        }
+        Some((rstep, rgap, rwin, mrv)) => {
+            let rs = kob_core::contract::spot::ratchet::build_ratchet_oco_redeem_script(
+                rstep, rgap, rwin, mrv,
+                tp_price_num, tp_price_den, tp_min_fill,
+                sl_price_num, sl_price_den, sl_min_fill,
+                &owner_hash, &seller_spk_hash,
+                &otspkh,
+                oco_bps,
+                0, // cancel_pending
+                expiry_daa.unwrap_or(0),
+            )?;
+            assert_eq!(
+                rs.len(),
+                kob_core::contract::spot::ratchet::RATCHET_OCO_RS_EXPECTED_LEN
+            );
+            rs
+        }
+    };
 
     let p2sh = build_p2sh(&redeem_script);
 
-    println!("Deploy OCO Sell Order (single-UTXO, v18)");
-    println!("========================================");
+    match ratchet {
+        None => {
+            println!("Deploy OCO Sell Order (single-UTXO, v18)");
+            println!("========================================");
+        }
+        Some((rstep, rgap, rwin, mrv)) => {
+            println!("Deploy Ratchet OCO Sell Order (trailing-SL, generation 18)");
+            println!("==========================================================");
+            println!("Ratchet:      step {} / gap {} / window {} DAA / min print vol {}",
+                rstep, rgap, rwin, mrv);
+            println!("DISCLOSURE:   the ratchet schedule is declared over PRINTS");
+            println!("              (on-chain settles of this token), not a market price;");
+            println!("              anyone can be both sides of a print at fee cost (§4.5).");
+        }
+    }
     println!("Token:        {}", token_covenant_id);
     println!(
         "TP Price:     {}/{} ({:.6})",

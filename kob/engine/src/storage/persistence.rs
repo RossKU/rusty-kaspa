@@ -192,6 +192,7 @@ pub async fn load_order_book(
                 );
                 continue;
             }
+            let redeem_script_hex_tmp = order.redeem_script;
             ob.add_buy_order(BookOrder {
                 tx_id: order.tx_id,
                 index: order.index,
@@ -203,7 +204,7 @@ pub async fn load_order_book(
                 owner_hash: order.owner_hash,
                 spk_hash: order.spk_hash,
                 counterparty_spk: order.counterparty_spk,
-                redeem_script_hex: order.redeem_script,
+                redeem_script_hex: redeem_script_hex_tmp.clone(),
                 p2sh_script_hex: order.p2sh_script,
                 p2sh_version: order.p2sh_version,
                 side: OrderSide::Buy,
@@ -215,6 +216,9 @@ pub async fn load_order_book(
                 oco_path: order.oco_path,
                 oco_partner_key: order.oco_partner_key,
                 discovered_daa: order.discovered_daa,
+                // Rebuilt from the RS (authoritative); ratchets_applied
+                // resets to 0 on reload (genealogical, informational only).
+                time_meta: crate::chain::scanner::time_meta_from_rs_hex(&redeem_script_hex_tmp),
             });
             loaded += 1;
         }
@@ -227,6 +231,7 @@ pub async fn load_order_book(
                 );
                 continue;
             }
+            let redeem_script_hex_tmp = order.redeem_script;
             ob.add_sell_order(BookOrder {
                 tx_id: order.tx_id,
                 index: order.index,
@@ -238,7 +243,7 @@ pub async fn load_order_book(
                 owner_hash: order.owner_hash,
                 spk_hash: order.spk_hash,
                 counterparty_spk: order.counterparty_spk,
-                redeem_script_hex: order.redeem_script,
+                redeem_script_hex: redeem_script_hex_tmp.clone(),
                 p2sh_script_hex: order.p2sh_script,
                 p2sh_version: order.p2sh_version,
                 side: OrderSide::Sell,
@@ -250,6 +255,9 @@ pub async fn load_order_book(
                 oco_path: order.oco_path,
                 oco_partner_key: order.oco_partner_key,
                 discovered_daa: order.discovered_daa,
+                // Rebuilt from the RS (authoritative); ratchets_applied
+                // resets to 0 on reload (genealogical, informational only).
+                time_meta: crate::chain::scanner::time_meta_from_rs_hex(&redeem_script_hex_tmp),
             });
             loaded += 1;
         }

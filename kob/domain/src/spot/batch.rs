@@ -1976,6 +1976,69 @@ pub fn plan_partial_match_at(
     fee_bps: Option<u16>,
     lock_time: u64,
 ) -> Result<BatchPlan, BatchError> {
+    // The mmfee parse doubles as the plain-v18-buy RS check.
+    let mmfee_bps = parse_buy_mmfee_bps(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+    plan_partial_sweep_core(
+        sells, buy, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, lock_time,
+        buy.price_num, buy.price_den, mmfee_bps,
+    )
+}
+
+/// decay_buy Op2 PARTIAL planner (Stage-B residual 3): mirrors the v18
+/// partial shape with the buy-side floors at the RISEN bid `pnum_eff(L)` —
+/// the decay_buy Op2 branch computes `pnum_eff` at branch entry and uses it
+/// in the spent-based limit floor, exactly like its FILL/IOC siblings.
+/// Lock-time selection mirrors `plan_decay_buy_ioc_match`: `L = now_daa`
+/// clamped under the D1 threshold and the buy's expiry (a rising bid only
+/// RELAXES its token floor as L grows, so `now` is feasibility-maximal).
+/// The decay_buy spends through the unchanged v18 Op2 sigscript shape.
+pub fn plan_decay_buy_partial_match(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    now_daa: u64,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+) -> Result<BatchPlan, BatchError> {
+    let parsed = parse_decay_buy_redeem_script(&buy.redeem_script)
+        .ok_or_else(|| BatchError::UnsupportedVersion {
+            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
+            version: buy.version,
+        })?;
+    let mut lock_time = now_daa.min(LOCK_TIME_THRESHOLD - 1);
+    if let Some(e) = parsed.order.expiry_daa {
+        lock_time = lock_time.min(e.saturating_sub(1));
+    }
+    let pnum_eff = decay_effective_pnum(
+        parsed.order.price_num, parsed.dslope, parsed.t0, parsed.t_end, lock_time,
+    );
+    plan_partial_sweep_core(
+        sells, buy, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, lock_time,
+        pnum_eff, parsed.order.price_den, parsed.order._max_matcher_fee,
+    )
+}
+
+/// Shared Op2 PARTIAL sweep core: the buy's floor pair (`floor_pnum`,
+/// `floor_pden`) and `mmfee_bps` are supplied by the wrapper — plain buy =
+/// static state pair, decay_buy = (`pnum_eff(L)`, pden).
+#[allow(clippy::too_many_arguments)]
+fn plan_partial_sweep_core(
+    sells: &[BatchOrder],
+    buy: &BatchOrder,
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+    lock_time: u64,
+    floor_pnum: u64,
+    floor_pden: u64,
+    mmfee_bps: u64,
+) -> Result<BatchPlan, BatchError> {
     if sells.is_empty() {
         return Err(BatchError::NoSellOrders);
     }
@@ -1989,14 +2052,9 @@ pub fn plan_partial_match_at(
             version: buy.version,
         });
     }
-    if buy.price_den == 0 {
+    if floor_pden == 0 || floor_pnum == 0 {
         return Err(BatchError::ZeroPriceDenominator { index: 0, side: "buy" });
     }
-    let mmfee_bps = parse_buy_mmfee_bps(&buy.redeem_script)
-        .ok_or_else(|| BatchError::UnsupportedVersion {
-            outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
-            version: buy.version,
-        })?;
 
     // Greedy subset: full-fill v18 sells (plain/OCO) the buy can pay for
     // while still keeping a residual.
@@ -2096,9 +2154,11 @@ pub fn plan_partial_match_at(
         None => u128::MAX,
     };
     let mut surplus = (zero_allow - gap).min(policy_cap);
-    // Floor clamp: max spent with floor(spent/pden) <= floor(token_sum/pnum).
-    let max_spent_floor = (token_sum as u128 / buy.price_num as u128) * buy.price_den as u128
-        + buy.price_den as u128
+    // Floor clamp: max spent with floor(spent/pden) <= floor(token_sum/pnum)
+    // (the wrapper-supplied pair: static for the plain buy, pnum_eff(L) for
+    // a decay_buy).
+    let max_spent_floor = (token_sum as u128 / floor_pnum as u128) * floor_pden as u128
+        + floor_pden as u128
         - 1;
     let max_surplus_floor = max_spent_floor.saturating_sub(base_spent as u128);
     surplus = surplus.min(max_surplus_floor);
@@ -2120,7 +2180,7 @@ pub fn plan_partial_match_at(
             cap: ((spent_128 / 10000) * mmfee_bps as u128).min(u64::MAX as u128) as u64,
         });
     }
-    let floor_tokens = (spent_128 / buy.price_den as u128) * buy.price_num as u128;
+    let floor_tokens = (spent_128 / floor_pden as u128) * floor_pnum as u128;
     if (token_sum as u128) < floor_tokens {
         return Err(BatchError::MinFillViolation {
             index: n,
@@ -2273,6 +2333,35 @@ pub fn plan_sell_ioc_match(
     matcher_spk_version: u16,
     fee_bps: Option<u16>,
 ) -> Result<BatchPlan, BatchError> {
+    plan_sell_ioc_match_at(sell, buys, wallet_utxo, matcher_spk, matcher_spk_version, fee_bps, 0)
+}
+
+/// `plan_sell_ioc_match` at an explicit tx lock_time (Stage-B residuals 1+2):
+/// the sell-anchored flow admits the time variants —
+///   - a decay_sell ANCHOR is priced at its RAW effective pair `f(lock_time)`
+///     (build_tx emits the decayed attestation);
+///   - a twap_sell anchor moves its whole UTXO in one event, so `mpw` gates
+///     it here exactly like the full-fill sweeps (typed
+///     `TwapVolumeExceedsMpw` — the anchor cannot be greedily skipped);
+///   - ratchet_oco TP/SL branch anchors ride at their raw branch pairs
+///     (`oco_path` + RS-length dispatch in build_tx) — and the produced plan
+///     is a valid `settle` witness for `plan_ratchet_advance` /
+///     `compose_settle_and_ratchet` (sell-initiated ratchet composition);
+///   - a decay_buy ABSORBER's token demand is evaluated at its risen bid
+///     `pnum_eff(L)` in the exact contract order (kas/pden DIV, MUL), its
+///     surplus cap with the parsed decay mmfee.
+/// Fill time-gates: the anchor's expiry is a hard `LockTimePastExpiry`;
+/// expiry-dead candidate buys are skipped. `lock_time = 0` = the legacy
+/// Finalized shape (decay schedules clamp to their start price).
+pub fn plan_sell_ioc_match_at(
+    sell: &BatchOrder,
+    buys: &[BatchOrder],
+    wallet_utxo: Option<(String, u32, u64)>,
+    matcher_spk: &[u8],
+    matcher_spk_version: u16,
+    fee_bps: Option<u16>,
+    lock_time: u64,
+) -> Result<BatchPlan, BatchError> {
     if buys.is_empty() {
         return Err(BatchError::NoBuyOrders);
     }
@@ -2288,8 +2377,41 @@ pub fn plan_sell_ioc_match(
     if sell.price_den == 0 {
         return Err(BatchError::ZeroPriceDenominator { index: 0, side: "sell" });
     }
+    // D1 domain guard on the plan's lock_time.
+    if lock_time >= LOCK_TIME_THRESHOLD {
+        return Err(BatchError::LockTimeWindowEmpty {
+            earliest: 0,
+            latest: LOCK_TIME_THRESHOLD - 1,
+        });
+    }
+    // Anchor fill time-gate (hard error — the anchor cannot be skipped).
+    if lock_time > 0 {
+        if let Some(e) = order_expiry_daa(&sell.redeem_script) {
+            if lock_time >= e {
+                return Err(BatchError::LockTimePastExpiry {
+                    outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
+                    expiry: e,
+                    lock_time,
+                });
+            }
+        }
+    }
+    // twap anchor: the whole UTXO moves in one event — W2 gates full fills
+    // too (the bypass pin, design §3.3).
+    if let SellVariant::Twap { mpw, .. } = classify_sell(sell) {
+        if sell.amount > mpw {
+            return Err(BatchError::TwapVolumeExceedsMpw {
+                outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
+                amount: sell.amount,
+                mpw,
+            });
+        }
+    }
 
-    let seller_kas_128 = sell.amount as u128 * sell.price_num as u128 / sell.price_den as u128;
+    // The anchor executes at its effective pair (decay: f(L); ratchet
+    // branches / twap / plain: the order's own pair).
+    let (eff_pnum, eff_pden) = effective_sell_pair(sell, lock_time);
+    let seller_kas_128 = sell.amount as u128 * eff_pnum as u128 / eff_pden as u128;
     if seller_kas_128 > u64::MAX as u128 {
         return Err(BatchError::Overflow { index: 0, side: "sell", detail: "seller_kas" });
     }
@@ -2304,7 +2426,7 @@ pub fn plan_sell_ioc_match(
             min_fill: sell.min_fill,
         });
     }
-    let fair = fair_kas(sell.amount, sell.price_num, sell.price_den);
+    let fair = fair_kas(sell.amount, eff_pnum, eff_pden);
 
     // Select the first v18 buy that fully absorbs the sell.
     let mut selected: Option<(&BatchOrder, bool /* ioc */)> = None;
@@ -2318,7 +2440,27 @@ pub fn plan_sell_ioc_match(
         if buy.token_cov_id != sell.token_cov_id || buy.price_den == 0 {
             continue;
         }
-        let buy_expected = buy.utxo_value as u128 * buy.price_num as u128 / buy.price_den as u128;
+        // Fill time-gate for the absorbing buy at this L (greedy skip).
+        if lock_time > 0 {
+            if let Some(e) = order_expiry_daa(&buy.redeem_script) {
+                if lock_time >= e {
+                    continue;
+                }
+            }
+        }
+        // decay_buy absorber: token demand at the RISEN bid pnum_eff(L) in
+        // the exact contract order (kas/pden DIV, MUL); plain buys keep the
+        // planner-conservative mul-then-div order (>= the contract floor).
+        let buy_decay = parse_decay_buy_redeem_script(&buy.redeem_script);
+        let buy_expected = match &buy_decay {
+            Some(p) => {
+                let pe = decay_effective_pnum(
+                    p.order.price_num, p.dslope, p.t0, p.t_end, lock_time,
+                );
+                (buy.utxo_value as u128 / p.order.price_den as u128) * pe as u128
+            }
+            None => buy.utxo_value as u128 * buy.price_num as u128 / buy.price_den as u128,
+        };
         if buy_expected < sell.amount as u128 {
             // Would leave a sell residual — structurally unsupported in v18.
             saw_smaller = true;
@@ -2331,7 +2473,7 @@ pub fn plan_sell_ioc_match(
             continue; // IOC floor unreachable with this sell alone
         }
         // Exact contract cap: kas_in - fair <= kas_in/10000*mmfee_bps.
-        let Some(mmfee_bps) = parse_buy_mmfee_bps(&buy.redeem_script) else {
+        let Some(mmfee_bps) = buy_mmfee_bps_any(&buy.redeem_script) else {
             continue;
         };
         let cap = (buy.utxo_value as u128 / 10000) * mmfee_bps as u128;
@@ -2443,9 +2585,7 @@ pub fn plan_sell_ioc_match(
         bracket_oco_output: None,
         buy_sweep_sells: vec![vec![0u16]],
         output_auth_input,
-        // Sell-anchored flows do not admit time variants (Stage-B scope
-        // note); legacy Finalized shape.
-        lock_time: 0,
+        lock_time,
     })
 }
 

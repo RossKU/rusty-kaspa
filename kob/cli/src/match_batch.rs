@@ -290,6 +290,19 @@ pub async fn run(
     println!("Fee UTXO:       {}:{} ({} sompi)", wallet_utxo_info.0, wallet_utxo_info.1, wallet_utxo_info.2);
 
     // ---- Phase 1: Plan with estimated fee ----
+    //
+    // Time-contracts Stage C: plans are priced at `L = tip` (design §2.7
+    // lock-time policy) via the `_at` planners — decay members execute at
+    // f(tip), twap members carry their `twin` sequences, and the plan's
+    // lock_time/sequences flow into the tx via `to_transaction()`. A
+    // decay_buy anchor routes to its dedicated planners.
+    let tip_daa = rpc.get_daa_score().await.unwrap_or(0);
+    if tip_daa > 0 {
+        println!("Plan lock_time: {} (tip DAA)", tip_daa);
+    }
+    let buy_is_decay = |b: &BatchOrder| {
+        b.redeem_script.len() == kob_core::contract::spot::decay::DECAY_BUY_RS_EXPECTED_LEN
+    };
     let mut plan = if partial {
         // v18 Op2 partial (item C): ONE v18 buy spends part of its KAS
         // against the sells and keeps a byte-exact self-SPK residual UTXO.
@@ -300,37 +313,64 @@ pub async fn run(
             anyhow::bail!("--partial requires a v18 buy (Op2 partial fill); got v{}", buys[0].version);
         }
         println!("Partial (Op2): buy fills {} sell(s), residual continues", sells.len());
-        kob_engine::matcher::batch::plan_partial_match(
-            &sells,
-            &buys[0],
-            Some(wallet_utxo_info.clone()),
-            &matcher_spk,
-            0,
-            fee_bps,
-        )?
-    } else if ioc {
-        // Auto-detect IOC direction:
-        //   1 buy  + N sells → buy sweeps sells (plan_ioc_match)
-        //   N buys + 1 sell  → sell sweeps buys (plan_sell_ioc_match)
-        if buys.len() == 1 && sells.len() >= 1 {
-            println!("IOC direction: buy sweeps {} sells", sells.len());
-            kob_engine::matcher::batch::plan_ioc_match(
+        if buy_is_decay(&buys[0]) {
+            kob_engine::matcher::batch::plan_decay_buy_partial_match(
+                &sells,
+                &buys[0],
+                tip_daa,
+                Some(wallet_utxo_info.clone()),
+                &matcher_spk,
+                0,
+                fee_bps,
+            )?
+        } else {
+            kob_engine::matcher::batch::plan_partial_match_at(
                 &sells,
                 &buys[0],
                 Some(wallet_utxo_info.clone()),
                 &matcher_spk,
                 0,
                 fee_bps,
+                tip_daa,
             )?
+        }
+    } else if ioc {
+        // Auto-detect IOC direction:
+        //   1 buy  + N sells → buy sweeps sells (plan_ioc_match)
+        //   N buys + 1 sell  → sell sweeps buys (plan_sell_ioc_match)
+        if buys.len() == 1 && sells.len() >= 1 {
+            println!("IOC direction: buy sweeps {} sells", sells.len());
+            if buy_is_decay(&buys[0]) {
+                kob_engine::matcher::batch::plan_decay_buy_ioc_match(
+                    &sells,
+                    &buys[0],
+                    tip_daa,
+                    Some(wallet_utxo_info.clone()),
+                    &matcher_spk,
+                    0,
+                    fee_bps,
+                )?
+            } else {
+                kob_engine::matcher::batch::plan_ioc_match_at(
+                    &sells,
+                    &buys[0],
+                    Some(wallet_utxo_info.clone()),
+                    &matcher_spk,
+                    0,
+                    fee_bps,
+                    tip_daa,
+                )?
+            }
         } else if sells.len() == 1 && buys.len() >= 1 {
             println!("IOC direction: sell sweeps {} buys", buys.len());
-            kob_engine::matcher::batch::plan_sell_ioc_match(
+            kob_engine::matcher::batch::plan_sell_ioc_match_at(
                 &sells[0],
                 &buys,
                 Some(wallet_utxo_info.clone()),
                 &matcher_spk,
                 0,
                 fee_bps,
+                tip_daa,
             )?
         } else {
             anyhow::bail!(
@@ -338,14 +378,25 @@ pub async fn run(
                 buys.len(), sells.len()
             );
         }
+    } else if buys.len() == 1 && buy_is_decay(&buys[0]) {
+        kob_engine::matcher::batch::plan_decay_buy_match(
+            &sells,
+            &buys[0],
+            tip_daa,
+            Some(wallet_utxo_info.clone()),
+            &matcher_spk,
+            0,
+            fee_bps,
+        )?
     } else {
-        kob_engine::matcher::batch::plan_batch_match(
+        kob_engine::matcher::batch::plan_batch_match_at(
             &sells,
             &buys,
             Some(wallet_utxo_info.clone()),
             &matcher_spk,
             0,
             fee_bps,
+            tip_daa,
         )?
     };
     plan.validate()?;

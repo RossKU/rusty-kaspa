@@ -67,6 +67,7 @@ pub fn create_book_order(
         oco_path: None,
         oco_partner_key: None,
         discovered_daa: 0,
+        time_meta: crate::chain::scanner::time_meta_from_rs_hex(rs_hex),
     }
 }
 

@@ -437,7 +437,7 @@ fn find_sweep_groups(
                     && !claimed.contains(&key)
                     && b.price_num > 0
                     && b.price_den > 0
-                    && current_daa.saturating_sub(b.discovered_daa) >= CSV_MATURITY_DAA
+                    && current_daa.saturating_sub(b.discovered_daa) >= CSV_MATURITY_DAA.max(b.csv_maturity())
             })
             .collect();
 
@@ -451,7 +451,7 @@ fn find_sweep_groups(
                     && !claimed.contains(&key)
                     && s.price_num > 0
                     && s.price_den > 0
-                    && current_daa.saturating_sub(s.discovered_daa) >= CSV_MATURITY_DAA
+                    && current_daa.saturating_sub(s.discovered_daa) >= CSV_MATURITY_DAA.max(s.csv_maturity())
             })
             .collect();
 
@@ -909,7 +909,7 @@ pub fn match_book_direct(
                     && !used.contains(&key)
                     && s.price_num > 0
                     && s.price_den > 0
-                    && current_daa.saturating_sub(s.discovered_daa) >= CSV_MATURITY_DAA
+                    && current_daa.saturating_sub(s.discovered_daa) >= CSV_MATURITY_DAA.max(s.csv_maturity())
             })
             .collect();
 
@@ -923,7 +923,7 @@ pub fn match_book_direct(
                     && !used.contains(&key)
                     && b.price_num > 0
                     && b.price_den > 0
-                    && current_daa.saturating_sub(b.discovered_daa) >= CSV_MATURITY_DAA
+                    && current_daa.saturating_sub(b.discovered_daa) >= CSV_MATURITY_DAA.max(b.csv_maturity())
             })
             .collect();
 
@@ -1418,7 +1418,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -1441,7 +1441,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -1521,7 +1521,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -1553,7 +1553,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         }
     }
 
@@ -1621,7 +1621,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         let sell2 = BookOrder {
             tx_id: "c".repeat(64),
@@ -1641,7 +1641,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         // expected_tokens = 50M * 1 / 100M = 0 -> Case 1 won't trigger (0 <= 5M)
         // expected_kas = 5M * 1 / 100M = 0 -> Case 2 won't trigger (0 <= 50M)
@@ -1677,7 +1677,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         let sell = BookOrder {
             tx_id: "c".repeat(64),
@@ -1697,7 +1697,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             is_freezable: false,
-            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0,
+            max_matcher_fee: u64::MAX, ifd_order_b_rs_hex: None, oco_path: None, oco_partner_key: None, discovered_daa: 0, time_meta: None,
         };
         // expected_tokens = 5M * 1 / 1 = 5M
         // expected_kas = 500M * 1 / 100M = 5

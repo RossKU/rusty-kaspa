@@ -2173,11 +2173,11 @@ mod adversarial_tests {
         use crate::contract::spot::swap::build_swap_v18_body;
         let pins: &[(&str, Vec<u8>, &str)] = &[
             ("BUY_ORDER_V18", build_buy_v18_body(),
-             "a21222d90b10c6a38f139a183da6e24b3106a06d2a6b0773d340706142ebd2d4"),
+             "3f1320143a652e2e9894ffac1b52f33e469e791e9c8ca10aaa9557b9c541a82a"),
             ("SELL_ORDER_V18", build_sell_v18_body(),
-             "de71334d1adb9b12caeb8a533496d5a73b35a2dc77f89dcef4496202bb4d1082"),
+             "ae49a66f3858cf509917453bdfa8a2dd44b4fbeeca5be3e69fe0773dc3e2eb50"),
             ("OCO_SELL_V18", build_oco_sell_v18_body(),
-             "c2cd219b2c12832e6b1a057e9ad1c5bc96bf0afc82b15b1b7cb85ec9f3f382f5"),
+             "2a750d668ead305605b79dd9f574cd5832a5c7d010d510411cdc7eec0388a40c"),
             ("SWAP_ORDER_V18", build_swap_v18_body(),
              "47552d56319a3b8a523ae4d467192db1496347ff4243f1eae5b31e36729eb0b3"),
             ("BRACKET_V18", crate::contract::spot::bracket::build_bracket_v18_body(),
@@ -2215,9 +2215,10 @@ mod adversarial_tests {
         // expected bytes are literal.
         let (pnum, pden) = (12345678901u64, 987654321u64);
         let (pnum_sl, pden_sl) = (7u64, 3u64);
-        let sell_rs = build_sell_v18_redeem_script(pnum, pden, 1, &oh, &sh, 30, 0, 0).unwrap();
+        let ts = [0xCC; 32]; // owner token seat (otspkh)
+        let sell_rs = build_sell_v18_redeem_script(pnum, pden, 1, &oh, &sh, &ts, 30, 0, 0).unwrap();
         let oco_rs = build_oco_sell_v18_redeem_script(
-            pnum, pden, 1, pnum_sl, pden_sl, 1, &oh, &sh, 30, 0, 0,
+            pnum, pden, 1, pnum_sl, pden_sl, 1, &oh, &sh, &ts, 30, 0, 0,
         ).unwrap();
         let koi = 7u16;
         let cases: Vec<(&str, Vec<u8>, u64, u64)> = vec![
@@ -2252,7 +2253,9 @@ mod adversarial_tests {
         let tcid = [0x11; 32];
         let oh = [0x22; 32];
         let sh = [0x33; 32];
-        let buy = build_buy_v18_redeem_script(&tcid, 3, 2, 1_000_000, &oh, &sh, 30, 0, 555).unwrap();
+        let ks = [0x66; 32]; // owner KAS seat (okspkh)
+        let ts = [0x77; 32]; // owner token seat (otspkh)
+        let buy = build_buy_v18_redeem_script(&tcid, 3, 2, 1_000_000, &oh, &sh, &ks, 30, 0, 555).unwrap();
         assert_eq!(buy.len(), BUY_ORDER_V18_RS_EXPECTED_LEN);
         let p = parse_redeem_script(&buy).expect("v18 buy parses");
         assert_eq!(p.version, 18);
@@ -2260,8 +2263,9 @@ mod adversarial_tests {
         assert_eq!(p.price_num, 3);
         assert_eq!(p.price_den, 2);
         assert_eq!(p.expiry_daa, Some(555));
+        assert_eq!(p.owner_seat_hash, Some(ks), "v18 buy okspkh roundtrip");
 
-        let sell = build_sell_v18_redeem_script(5, 3, 2_000_000, &oh, &sh, 25, 0, 0).unwrap();
+        let sell = build_sell_v18_redeem_script(5, 3, 2_000_000, &oh, &sh, &ts, 25, 0, 0).unwrap();
         assert_eq!(sell.len(), SELL_ORDER_V18_RS_EXPECTED_LEN);
         let p = parse_redeem_script(&sell).expect("v18 sell parses");
         assert_eq!(p.version, 18);
@@ -2269,11 +2273,13 @@ mod adversarial_tests {
         assert_eq!(p.price_num, 5);
         assert_eq!(p.price_den, 3);
         assert_eq!(p._max_matcher_fee, 25);
+        assert_eq!(p.owner_seat_hash, Some(ts), "v18 sell otspkh roundtrip");
 
-        let oco = build_oco_sell_v18_redeem_script(5, 1, 500, 2, 1, 200, &oh, &sh, 30, 0, 0).unwrap();
+        let oco = build_oco_sell_v18_redeem_script(5, 1, 500, 2, 1, 200, &oh, &sh, &ts, 30, 0, 0).unwrap();
         let p = parse_oco_sell_redeem_script(&oco).expect("v18 OCO parses");
         assert_eq!(p.price_num_tp, 5);
         assert_eq!(p.price_num_sl, 2);
+        assert_eq!(p.owner_seat_hash, Some(ts), "v18 OCO otspkh roundtrip");
 
         let swap = build_swap_v18_redeem_script(&tcid, &[0x44; 32], 9_000, &oh, &sh, &[0x55; 32], 40).unwrap();
         assert_eq!(swap.len(), SWAP_V18_RS_SIZE);

@@ -2568,16 +2568,16 @@ pub fn plan_sell_ioc_match(
 // above are untouched and die with Stage E.
 // ═════════════════════════════════════════════════════════════════════════
 
-/// Parse `mmfee_bps` out of a v18 buy redeemScript (state offset [127..135)).
+/// Parse `mmfee_bps` out of a v18 buy redeemScript (state offset [160..168)).
 ///
-/// State layout (145B): `[0x20 tcid][0x08 pnum][0x08 pden][0x08 mfill]`
-/// `[0x20 ohash][0x20 bspkh][0x08 mmfee][cpend][0x08 expiry]` — mmfee bytes
-/// start after 1+32+1+8+1+8+1+8+1+32+1+32+1 = 127.
+/// State layout (178B): `[0x20 okspkh]` then `[0x20 tcid][0x08 pnum]`
+/// `[0x08 pden][0x08 mfill][0x20 ohash][0x20 bspkh][0x08 mmfee][cpend]`
+/// `[0x08 expiry]` — mmfee bytes start after 33 + 127 = 160.
 fn parse_v18_buy_mmfee_bps(rs: &[u8]) -> Option<u64> {
     if rs.len() != BUY_ORDER_V18_RS_EXPECTED_LEN {
         return None;
     }
-    Some(u64::from_le_bytes(rs[127..135].try_into().ok()?))
+    Some(u64::from_le_bytes(rs[160..168].try_into().ok()?))
 }
 
 /// Contract-order fair value of a full-filled sell term, exactly as the v18
@@ -4209,7 +4209,7 @@ mod tests {
         let owner = [0xBB; 32];
         let sspkh = [0xCC; 32];
         let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
-            price_num, price_den, 1_000_000, &owner, &sspkh, 30, 0, 0,
+            price_num, price_den, 1_000_000, &owner, &sspkh, &[0xDD; 32], 30, 0, 0,
         ).unwrap();
         BatchOrder {
             outpoint: (tx_id, 0),
@@ -4235,7 +4235,7 @@ mod tests {
         let owner = [0xBB; 32];
         let bspkh = [0xCC; 32];
         let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-            &token, price_num, price_den, 1_000_000, &owner, &bspkh, mmfee_bps, 0, 0,
+            &token, price_num, price_den, 1_000_000, &owner, &bspkh, &[0xDD; 32], mmfee_bps, 0, 0,
         ).unwrap();
         BatchOrder {
             outpoint: (tx_id, 0),
@@ -4270,7 +4270,7 @@ mod tests {
         let owner = [0xBB; 32];
         let sspkh = [0xCC; 32];
         let rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
-            tp.0, tp.1, 1, sl.0, sl.1, 1, &owner, &sspkh, 30, 0, 0,
+            tp.0, tp.1, 1, sl.0, sl.1, 1, &owner, &sspkh, &[0xDD; 32], 30, 0, 0,
         ).unwrap();
         let (pn, pd) = match path {
             kob_core::OcoPath::TakeProfit => tp,

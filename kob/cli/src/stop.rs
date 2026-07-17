@@ -421,6 +421,7 @@ async fn build_signed_buy_tx_json(
         min_fill,
         &owner_hash,
         &buyer_spk_hash,
+        &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
         crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         0, // GTC
@@ -535,6 +536,7 @@ async fn build_signed_sell_tx_json(
         min_fill,
         &owner_hash,
         &seller_spk_hash,
+        &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
         crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         0, // GTC

@@ -123,6 +123,7 @@ pub async fn run(
                 entry.min_fill,
                 &sell_owner,
                 &sell_spkh,
+                &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
                 entry.max_matcher_fee, // v18 caches store BPS
                 0, // cancel_pending
                 entry.expiry_daa,
@@ -214,6 +215,7 @@ pub async fn run(
                 entry.min_fill,
                 &buy_owner,
                 &buy_spkh,
+                &kob_core::compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
                 entry.max_matcher_fee, // v18 caches store BPS
                 0, // cancel_pending
                 entry.expiry_daa,

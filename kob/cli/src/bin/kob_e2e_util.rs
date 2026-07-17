@@ -74,7 +74,8 @@ async fn main() -> anyhow::Result<()> {
             let owner_hash = blake2b_256(&wallet.pubkey);
             let sspkh = compute_p2pk_spk_hash(&wallet.pubkey);
             let rs = oco::build_oco_sell_v18_redeem_script(
-                p[0], p[1], p[2], p[3], p[4], p[5], &owner_hash, &sspkh, p[6], 0, p[7],
+                p[0], p[1], p[2], p[3], p[4], p[5], &owner_hash, &sspkh,
+                &kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey), p[6], 0, p[7],
             )?;
             let p2sh = build_p2sh(&rs);
             let mut spk = Vec::with_capacity(37);
@@ -105,7 +106,8 @@ async fn main() -> anyhow::Result<()> {
                 kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey)
             };
             let rs = order::build_buy_v18_redeem_script(
-                &tcid, p[0], p[1], p[2], &owner_hash, &spkh, p[3], p[4] as u8, p[5],
+                &tcid, p[0], p[1], p[2], &owner_hash, &spkh,
+                &compute_p2pk_spk_hash(&wallet.pubkey), p[3], p[4] as u8, p[5],
             )?;
             let p2sh = build_p2sh(&rs);
             println!("RS: {}", hex::encode(&rs));
@@ -125,7 +127,8 @@ async fn main() -> anyhow::Result<()> {
             let owner_hash = blake2b_256(&wallet.pubkey);
             let spkh = compute_p2pk_spk_hash(&wallet.pubkey);
             let rs = order::build_sell_v18_redeem_script(
-                p[0], p[1], p[2], &owner_hash, &spkh, p[3], p[4] as u8, p[5],
+                p[0], p[1], p[2], &owner_hash, &spkh,
+                &kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey), p[3], p[4] as u8, p[5],
             )?;
             let p2sh = build_p2sh(&rs);
             println!("RS: {}", hex::encode(&rs));
@@ -219,10 +222,11 @@ async fn main() -> anyhow::Result<()> {
                 .map_err(|e| anyhow::anyhow!("token hash: {e:?}"))?;
             let fta: u64 = args[5].parse()?;
 
-            // Parse sell v18 state: pnum@1, pden@10, mfill@19 (8B LE each).
-            let pnum = u64le(&rs[1..9]);
-            let pden = u64le(&rs[10..18]);
-            let mfill = u64le(&rs[19..27]);
+            // Parse sell v18 state (E1: [0x20 otspkh] prefix, +33):
+            // pnum@34, pden@43, mfill@52 (8B LE each).
+            let pnum = u64le(&rs[34..42]);
+            let pden = u64le(&rs[43..51]);
+            let mfill = u64le(&rs[52..60]);
             let p2sh = build_p2sh(&rs);
             let sell_addr = kaspa_address_encode("kaspatest", 8, &p2sh.script()[2..34]);
 
@@ -338,11 +342,11 @@ async fn main() -> anyhow::Result<()> {
 
             let (expiry_daa, expire_ss) = match side {
                 "buy" => (
-                    u64le(&rs[137..145]),
+                    u64le(&rs[170..178]),
                     order::build_buy_v18_expire_sigscript(&rs),
                 ),
                 "sell" => (
-                    u64le(&rs[104..112]),
+                    u64le(&rs[137..145]),
                     order::build_sell_v18_expire_sigscript(&rs),
                 ),
                 _ => anyhow::bail!("side must be buy|sell"),
@@ -377,15 +381,13 @@ async fn main() -> anyhow::Result<()> {
             wallet_spk.extend_from_slice(&wallet.pubkey);
             wallet_spk.push(0xac);
 
-            // The expire branch forces blake2b(out[0].spk) == the spkh
-            // committed in state (bspkh at rs[94..126] for buys, sspkh at
-            // rs[61..93] for sells). Post-D2 v18 buys commit the token_unit
-            // P2SH hash, pre-D2 orders the raw P2PK -- pick whichever
-            // candidate matches, or fail loudly.
+            // E1 expire seats: the refund SPK-hash is the OWNER SEAT at
+            // rs[1..33] (buy okspkh = raw P2PK hash; sell otspkh =
+            // token_unit P2SH hash) -- pick whichever candidate matches,
+            // or fail loudly.
             let committed_spkh: [u8; 32] = {
-                let range = if side == "buy" { 94..126 } else { 61..93 };
                 let mut h = [0u8; 32];
-                h.copy_from_slice(&rs[range]);
+                h.copy_from_slice(&rs[1..33]);
                 h
             };
             let (refund_spk_version, refund_spk): (u16, Vec<u8>) =

@@ -1476,6 +1476,7 @@ pub async fn run(
         MIN_UTXO_VALUE,     // min_fill_sl
         &owner_hash,
         &seller_spk_hash,
+        &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
         crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         0, // expiry_daa (GTC)

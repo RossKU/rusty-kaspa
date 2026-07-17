@@ -408,18 +408,22 @@ use crate::contract::spot::order::{e_num, e_pick, e_roll, v17op};
 
 /// Build the v18 OCO sell body.
 ///
-/// Stack after state push (identical to v1, 11 items):
+/// Stack after state push (v1 layout preceded by the owner token seat
+/// `otspkh` = blake2b of the owner's token_unit P2SH SPK, 12 items):
 ///   expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4),
 ///   mfill_sl(5), pden_sl(6), pnum_sl(7),
-///   mfill_tp(8), pden_tp(9), pnum_tp(10)
-/// with the selector at depth 11 in every sigscript form.
+///   mfill_tp(8), pden_tp(9), pnum_tp(10), otspkh(11)
+/// with the selector at depth 12 in every sigscript form.
 ///
-/// Selectors: 0=CANCEL, 1=TP FILL, 2=SL FILL, 4=EXPIRE.
+/// Selectors: 0=CANCEL, 1=TP FILL, 2=SL FILL, 4=EXPIRE. The EXPIRE branch
+/// refunds the token escrow to `otspkh` as a covenant-bound token_unit via
+/// the Fix-3 per-input binding (auth[0] of self) — same form as the v18
+/// plain sell.
 pub fn build_oco_sell_v18_body() -> Vec<u8> {
     use v17op::*;
     let mut b: Vec<u8> = Vec::with_capacity(512);
 
-    e_roll(&mut b, 11);
+    e_roll(&mut b, 12);
     b.push(DUP);
     e_num(&mut b, 4);
     b.push(EQUAL);
@@ -429,27 +433,35 @@ pub fn build_oco_sell_v18_body() -> Vec<u8> {
         b.push(DUP);
         b.push(VERIFY); // expiry != 0
         b.push(CLTV);
+        // Fix-3 refund: auth[0] of self -> owner token seat, binding kept.
+        // stack: cpend(0), mmfee(1), sspkh(2), ohash(3), mfill_sl(4),
+        //        pden_sl(5), pnum_sl(6), mfill_tp(7), pden_tp(8),
+        //        pnum_tp(9), otspkh(10)
+        b.push(TXINPUTINDEX);
         b.push(OP0);
+        b.push(AUTHOUTPUTIDX); // r = auth_outputs[self][0]
+        b.push(DUP);
         b.push(TXOUTPUTSPK);
         b.push(BLAKE2B);
-        e_pick(&mut b, 3); // sspkh
+        e_pick(&mut b, 12); // otspkh (depth 10, +2 for r + hash)
         b.push(EQUAL);
-        b.push(VERIFY);
-        b.push(OP0);
-        b.push(TXOUTPUTAMOUNT);
+        b.push(VERIFY); // refund lands on the owner's token_unit P2SH
+        b.push(DUP);
+        b.push(OUTPUTCOVENANTID);
+        b.push(TXINPUTINDEX);
+        b.push(INPUTCOVENANTID);
+        b.push(EQUAL);
+        b.push(VERIFY); // refund carries THIS token's CovenantBinding
+        b.push(TXOUTPUTAMOUNT); // consumes r
         b.push(TXINPUTINDEX);
         b.push(TXINPUTAMOUNT);
         b.push(GTE);
-        b.push(VERIFY);
-        b.push(TXINPUTINDEX);
-        b.push(INPUTCOVENANTID);
-        b.push(COVOUTCOUNT);
-        b.push(OP1);
-        b.push(GTE);
-        b.push(VERIFY);
+        b.push(VERIFY); // full refund
+        // 11 items: cpend..otspkh
         for _ in 0..5 {
-            b.push(TWO_DROP); // 10 items
+            b.push(TWO_DROP);
         }
+        b.push(DROP);
     }
     b.push(ELSE);
     {
@@ -489,7 +501,7 @@ pub fn build_oco_sell_v18_body() -> Vec<u8> {
 ///
 /// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
 ///   ohash(4), mfill_sl(5), pden_sl(6), pnum_sl(7), mfill_tp(8), pden_tp(9),
-///   pnum_tp(10), pden_att(11), pnum_att(12), koi(13)
+///   pnum_tp(10), otspkh(11), pden_att(12), pnum_att(13), koi(14)
 fn emit_oco_v18_fill(b: &mut Vec<u8>, tp: bool) {
     use v17op::*;
     // time gate
@@ -510,16 +522,16 @@ fn emit_oco_v18_fill(b: &mut Vec<u8>, tp: bool) {
     b.push(OP0);
     b.push(EQUAL);
     b.push(VERIFY);
-    // base(12): mmfee(0), sspkh(1), ohash(2), mfill_sl(3), pden_sl(4),
-    //           pnum_sl(5), mfill_tp(6), pden_tp(7), pnum_tp(8), pden_att(9),
-    //           pnum_att(10), koi(11)
+    // base(13): mmfee(0), sspkh(1), ohash(2), mfill_sl(3), pden_sl(4),
+    //           pnum_sl(5), mfill_tp(6), pden_tp(7), pnum_tp(8), otspkh(9),
+    //           pden_att(10), pnum_att(11), koi(12)
     let (pnum_d, pden_d, mfill_d) = if tp { (8usize, 7usize, 6usize) } else { (5, 4, 3) };
     // ATTESTATION: attested pair == the EXECUTING branch's state pair
-    e_pick(b, 10); // pnum_att
+    e_pick(b, 11); // pnum_att
     e_pick(b, pnum_d + 1);
     b.push(EQUAL);
     b.push(VERIFY);
-    e_pick(b, 9); // pden_att
+    e_pick(b, 10); // pden_att
     e_pick(b, pden_d + 1);
     b.push(EQUAL);
     b.push(VERIFY);
@@ -535,13 +547,13 @@ fn emit_oco_v18_fill(b: &mut Vec<u8>, tp: bool) {
     b.push(GTE);
     b.push(VERIFY);
     // KAS output >= expected_kas
-    e_pick(b, 12); // koi (11 + 1)
+    e_pick(b, 13); // koi (12 + 1)
     b.push(TXOUTPUTAMOUNT);
     b.push(SWAP);
     b.push(GTE);
     b.push(VERIFY);
     // F2: seller SPK hash
-    e_pick(b, 11); // koi
+    e_pick(b, 12); // koi
     b.push(TXOUTPUTSPK);
     b.push(BLAKE2B);
     e_pick(b, 2); // sspkh (1 + 1)
@@ -562,10 +574,11 @@ fn emit_oco_v18_fill(b: &mut Vec<u8>, tp: bool) {
     b.push(TXINPUTAMOUNT);
     b.push(GTE);
     b.push(VERIFY);
-    // cleanup: 12 items
+    // cleanup: 13 items
     for _ in 0..6 {
         b.push(TWO_DROP);
     }
+    b.push(DROP);
 }
 
 /// v18 OCO cancel (selector 0) — owner signature.
@@ -574,33 +587,38 @@ fn emit_oco_v18_cancel(b: &mut Vec<u8>) {
     use v17op::*;
     // entry: expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4), mfill_sl(5),
     //        pden_sl(6), pnum_sl(7), mfill_tp(8), pden_tp(9), pnum_tp(10),
-    //        pk(11), sig(12)
+    //        otspkh(11), pk(12), sig(13)
     b.push(TWO_DROP); // expiry + cpend
-    e_pick(b, 9); // pk
+    e_pick(b, 10); // pk
     b.push(BLAKE2B);
     e_pick(b, 3); // ohash (2 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    e_roll(b, 10); // sig
-    e_roll(b, 10); // pk
+    e_roll(b, 11); // sig
+    e_roll(b, 11); // pk
     b.push(CHECKSIG);
     b.push(VERIFY);
-    // 9 items
-    for _ in 0..4 {
+    // 10 items
+    for _ in 0..5 {
         b.push(TWO_DROP);
     }
-    b.push(DROP);
 }
 
 /// Expected v18 OCO sell body length.
-pub const OCO_SELL_V18_BODY_EXPECTED_LEN: usize = 220;
+pub const OCO_SELL_V18_BODY_EXPECTED_LEN: usize = 225;
 
-/// v18 OCO sell redeemScript size (139B state + v18 body).
-pub const OCO_SELL_V18_RS_SIZE: usize = OCO_SELL_STATE_SIZE + OCO_SELL_V18_BODY_EXPECTED_LEN;
+/// v18 OCO sell state size: the v1 139B layout preceded by
+/// `[0x20][otspkh 32B]` (owner token seat).
+pub const OCO_SELL_V18_STATE_SIZE: usize = OCO_SELL_STATE_SIZE + 33;
 
-/// Build the v18 single-UTXO OCO sell redeemScript (139B state + v18 body).
+/// v18 OCO sell redeemScript size (172B state + v18 body).
+pub const OCO_SELL_V18_RS_SIZE: usize = OCO_SELL_V18_STATE_SIZE + OCO_SELL_V18_BODY_EXPECTED_LEN;
+
+/// Build the v18 single-UTXO OCO sell redeemScript (172B state + v18 body).
 ///
-/// State layout identical to v1. `max_matcher_fee` is BPS in v18 (uniform).
+/// State: `[0x20][otspkh 32B]` (owner token seat = blake2b of the owner's
+/// token_unit P2SH SPK; the EXPIRE refund endpoint, binding preserved) then
+/// the v1 139B layout. `max_matcher_fee` is BPS in v18 (uniform).
 pub fn build_oco_sell_v18_redeem_script(
     price_num_tp: u64,
     price_den_tp: u64,
@@ -610,6 +628,7 @@ pub fn build_oco_sell_v18_redeem_script(
     min_fill_sl: u64,
     owner_hash: &[u8; 32],
     seller_spk_hash: &[u8; 32],
+    owner_token_spk_hash: &[u8; 32],
     max_matcher_fee_bps: u64,
     cancel_pending: u8,
     expiry_daa: u64,
@@ -637,7 +656,9 @@ pub fn build_oco_sell_v18_redeem_script(
     let pden_sl = if g_sl > 0 { price_den_sl / g_sl } else { price_den_sl };
 
     let body = build_oco_sell_v18_body();
-    let mut rs = Vec::with_capacity(OCO_SELL_STATE_SIZE + body.len());
+    let mut rs = Vec::with_capacity(OCO_SELL_V18_STATE_SIZE + body.len());
+    rs.push(0x20);
+    rs.extend_from_slice(owner_token_spk_hash);
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(pnum_tp));
     rs.push(0x08);

@@ -80,11 +80,12 @@ pub fn build_buy_order_scripts(
     min_fill: u64,
     owner_hash: &[u8; 32],
     buyer_spk_hash: &[u8; 32],
+    owner_kas_spk_hash: &[u8; 32],
     max_matcher_fee_bps: u64,
 ) -> (String, String, u16) {
     let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
         token_cov_id, price_num, price_den, min_fill, owner_hash, buyer_spk_hash,
-        max_matcher_fee_bps, 0, 0,).unwrap();
+        owner_kas_spk_hash, max_matcher_fee_bps, 0, 0,).unwrap();
     let rs_hex = hex::encode(&rs);
     let spk = kob_core::build_p2sh(&rs);
     let p2sh_hex = hex::encode(&spk.script());
@@ -100,11 +101,12 @@ pub fn build_sell_order_scripts(
     min_fill: u64,
     owner_hash: &[u8; 32],
     seller_spk_hash: &[u8; 32],
+    owner_token_spk_hash: &[u8; 32],
     max_matcher_fee_bps: u64,
 ) -> (String, String, u16) {
     let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
-        price_num, price_den, min_fill, owner_hash, seller_spk_hash, max_matcher_fee_bps,
-        0, 0,).unwrap();
+        price_num, price_den, min_fill, owner_hash, seller_spk_hash, owner_token_spk_hash,
+        max_matcher_fee_bps, 0, 0,).unwrap();
     let rs_hex = hex::encode(&rs);
     let spk = kob_core::build_p2sh(&rs);
     let p2sh_hex = hex::encode(&spk.script());
@@ -272,9 +274,9 @@ async fn deploy_test_pair(
         _ => { error!("Invalid covenant ID hex"); return None; }
     };
     let (buy_rs_hex, buy_p2sh_hex, buy_p2sh_ver) =
-        build_buy_order_scripts(&cov_id_bytes, price_num, price_den, min_fill, &owner_hash, &buyer_spk_hash, kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS);
+        build_buy_order_scripts(&cov_id_bytes, price_num, price_den, min_fill, &owner_hash, &buyer_spk_hash, &seller_spk_hash, kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS);
     let (sell_rs_hex, sell_p2sh_hex, sell_p2sh_ver) =
-        build_sell_order_scripts(price_num, price_den, min_fill, &owner_hash, &seller_spk_hash, kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS);
+        build_sell_order_scripts(price_num, price_den, min_fill, &owner_hash, &seller_spk_hash, &buyer_spk_hash, kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS);
 
     // Find a wallet UTXO for the buy order + fee
     let wallet_utxo = utxos.iter().find(|u| u.utxo_entry.amount >= kas_needed);

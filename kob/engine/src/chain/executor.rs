@@ -8674,7 +8674,7 @@ mod tests {
     fn book_order_to_batch_order_maps_v18_buy_to_version_18() {
         let token = [0xCD; 32];
         let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-            &token, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 30, 0, 0,
+            &token, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
         assert_eq!(rs.len(), BUY_ORDER_V18_RS_EXPECTED_LEN);
         let bo = v18_book_order(OrderSide::Buy, rs, 15_000_000);
@@ -8686,7 +8686,7 @@ mod tests {
     #[test]
     fn book_order_to_batch_order_maps_v18_sell_and_oco_to_version_18() {
         let sell_rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
-            1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 30, 0, 0,
+            1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
         assert_eq!(sell_rs.len(), SELL_ORDER_V18_RS_EXPECTED_LEN);
         let bo = v18_book_order(OrderSide::Sell, sell_rs, 30_000_000);
@@ -8694,7 +8694,7 @@ mod tests {
         assert_eq!(batch.version, 18);
 
         let oco_rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
-            2, 1, 1_000_000, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 30, 0, 0,
+            2, 1, 1_000_000, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
         assert_eq!(oco_rs.len(), OCO_SELL_V18_RS_SIZE);
         let mut bo = v18_book_order(OrderSide::Sell, oco_rs, 30_000_000);
@@ -8743,10 +8743,10 @@ mod tests {
         // book_order_to_batch_order is sufficient for the v18 planner).
         let token = [0xCD; 32];
         let buy_rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-            &token, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 2000, 0, 0,
+            &token, 1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 2000, 0, 0,
         ).unwrap();
         let sell_rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
-            1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], 30, 0, 0,
+            1, 2, 1_000_000, &[0xEE; 32], &[0xFF; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
         let buy = book_order_to_batch_order(
             &v18_book_order(OrderSide::Buy, buy_rs, 16_000_000), "TEST",

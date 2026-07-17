@@ -1881,23 +1881,26 @@ pub const BUY_ORDER_V18_MAX_N: usize = BUY_ORDER_V17_MAX_N;
 
 /// Build the v18 buy body (deterministic given `BUY_ORDER_V18_MAX_N`).
 ///
-/// State (145B) and stack layout identical to v17:
+/// State (178B): the v17 145B layout preceded by the owner KAS seat
+/// (`okspkh` = blake2b of the owner's raw P2PK SPK, the EXPIRE refund
+/// endpoint — `bspkh` is the token_unit delivery seat post-D2 and must not
+/// receive plain KAS). Stack after the state pushes:
 ///   expiry(0), cpend(1), mmfee_bps(2), bspkh(3), ohash(4), mfill(5),
-///   pden(6), pnum(7), tcid(8), <sigscript items at depth 9+>
-/// with the selector at depth 9 in every sigscript form.
+///   pden(6), pnum(7), tcid(8), okspkh(9), <sigscript items at depth 10+>
+/// with the selector at depth 10 in every sigscript form.
 ///
-/// Selector dispatch: 0=CANCEL, 1=FILL, 2=PARTIAL-FILL (new), 3=CANCEL-MARK,
+/// Selector dispatch: 0=CANCEL, 1=FILL, 2=PARTIAL-FILL, 3=CANCEL-MARK,
 /// 4=EXPIRE, 5=IOC.
 pub fn build_buy_v18_body() -> Vec<u8> {
     use v17op::*;
     const MAX_N: usize = BUY_ORDER_V18_MAX_N;
     let mut b: Vec<u8> = Vec::with_capacity(2048);
 
-    // ===== DISPATCH: bring selector (depth 9) to top, branch on its value =====
-    e_num(&mut b, 9);
+    // ===== DISPATCH: bring selector (depth 10) to top, branch on its value =====
+    e_num(&mut b, 10);
     b.push(ROLL);
 
-    // selector == 4 -> EXPIRE (identical to v17)
+    // selector == 4 -> EXPIRE (refund to the owner KAS seat)
     b.push(DUP);
     e_num(&mut b, 4);
     b.push(NUMEQUAL);
@@ -1910,18 +1913,20 @@ pub fn build_buy_v18_body() -> Vec<u8> {
         b.push(OP0);
         b.push(TXOUTPUTSPK);
         b.push(BLAKE2B);
-        e_pick(&mut b, 3); // bspkh
+        e_pick(&mut b, 9); // okspkh (depth 8 + 1 for the hash)
         b.push(EQUAL);
-        b.push(VERIFY); // output[0] pays the buyer
+        b.push(VERIFY); // output[0] pays the OWNER KAS seat, not bspkh
         b.push(OP0);
         b.push(TXOUTPUTAMOUNT);
         b.push(TXINPUTINDEX);
         b.push(TXINPUTAMOUNT);
         b.push(GTE);
         b.push(VERIFY); // output[0].value >= input.value (full refund)
+        // 9 items: cpend..okspkh
         for _ in 0..4 {
             b.push(TWO_DROP);
         }
+        b.push(DROP);
     }
     b.push(ELSE);
     {
@@ -1931,7 +1936,7 @@ pub fn build_buy_v18_body() -> Vec<u8> {
         b.push(IF); // selector == 0 -> CANCEL
         {
             b.push(DROP);
-            emit_cancel_body(&mut b); // v17 cancel choreography, unchanged
+            emit_cancel_body_v18(&mut b);
         }
         b.push(ELSE);
         {
@@ -1941,7 +1946,7 @@ pub fn build_buy_v18_body() -> Vec<u8> {
             b.push(IF); // selector == 3 -> CANCEL-MARK
             {
                 b.push(DROP);
-                emit_cancel_body(&mut b);
+                emit_cancel_body_v18(&mut b);
             }
             b.push(ELSE);
             {
@@ -1970,6 +1975,26 @@ pub fn build_buy_v18_body() -> Vec<u8> {
     b
 }
 
+/// v18 CANCEL / CANCEL-MARK owner-signature spend (okspkh-aware layout).
+/// Entry (selector dropped): expiry(0), cpend(1), mmfee(2), bspkh(3),
+///   ohash(4), mfill(5), pden(6), pnum(7), tcid(8), okspkh(9), sig(10),
+///   pk(11)
+fn emit_cancel_body_v18(b: &mut Vec<u8>) {
+    use v17op::*;
+    e_pick(b, 11);
+    b.push(BLAKE2B); // blake2b(pk)
+    e_pick(b, 5); // ohash (depth 4 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    e_roll(b, 10); // sig -> top
+    e_roll(b, 11); // pk -> top
+    b.push(CHECKSIGVERIFY);
+    // 10 items: expiry..okspkh
+    for _ in 0..5 {
+        b.push(TWO_DROP);
+    }
+}
+
 /// v18 FILL (selector 1) / IOC FILL (selector 5): v17 `emit_fill_body`
 /// semantics carried unchanged, EXCEPT the counterparty price reads move to
 /// the canonical attestation offsets [3..11) / [12..20) (v17 read the price
@@ -1977,8 +2002,8 @@ pub fn build_buy_v18_body() -> Vec<u8> {
 /// sell sigscripts had).
 ///
 /// Entry (selector on top): selector(0), expiry(1), cpend(2), mmfee_bps(3),
-///   bspkh(4), ohash(5), mfill(6), pden(7), pnum(8), tcid(9), N(10),
-///   tii_MAX_N(11), tii_k(11 + MAX_N - k), tii_1(10 + MAX_N)
+///   bspkh(4), ohash(5), mfill(6), pden(7), pnum(8), tcid(9), okspkh(10),
+///   N(11), tii_MAX_N(12), tii_k(12 + MAX_N - k), tii_1(11 + MAX_N)
 fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
     use v17op::*;
 
@@ -1986,8 +2011,8 @@ fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
     e_num(b, 5);
     b.push(NUMEQUAL);
     // B0: ioc_flag(0), expiry(1), cpend(2), mmfee(3), bspkh(4), ohash(5),
-    //     mfill(6), pden(7), pnum(8), tcid(9), N(10), tii_MAX_N(11),
-    //     tii_k(11 + max_n - k)
+    //     mfill(6), pden(7), pnum(8), tcid(9), okspkh(10), N(11),
+    //     tii_MAX_N(12), tii_k(12 + max_n - k)
 
     // B) F5: cpend == 0.
     e_pick(b, 2);
@@ -2015,11 +2040,11 @@ fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
     // Distinctness: tii_k < tii_{k+1} for active adjacent pairs.
     for k in 1..max_n {
         e_num(b, (k + 1) as u16); // guard: (k+1) <= N
-        e_pick(b, 11); // N (depth 10 + 1)
+        e_pick(b, 12); // N (depth 11 + 1)
         b.push(LTE);
         b.push(IF);
         {
-            let d = 11 + max_n - k; // tii_k depth at B0
+            let d = 12 + max_n - k; // tii_k depth at B0
             e_pick(b, d); // tii_k
             e_pick(b, d); // tii_{k+1} (was d-1, +1 after the tii_k push)
             b.push(LT);
@@ -2046,22 +2071,23 @@ fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
         e_pick(b, 5); // mfill as floor
     }
     b.push(ENDIF);
-    // B1: floor_value(0), expiry(1), ... tcid(9), N(10), tii_MAX_N(11), ...
+    // B1: floor_value(0), expiry(1), ... tcid(9), okspkh(10), N(11),
+    //     tii_MAX_N(12), ...
 
     // F) token_sum = 0.
     b.push(OP0);
     // B2: token_sum(0), floor_value(1), expiry(2), cpend(3), mmfee(4),
-    //     bspkh(5), ohash(6), mfill(7), pden(8), pnum(9), tcid(10), N(11),
-    //     tii_MAX_N(12), tii_k(12 + max_n - k)
+    //     bspkh(5), ohash(6), mfill(7), pden(8), pnum(9), tcid(10),
+    //     okspkh(11), N(12), tii_MAX_N(13), tii_k(13 + max_n - k)
 
     // G) PASS 1: sum delivered tokens + per-term binding checks.
     for k in 1..=max_n {
         e_num(b, k as u16); // guard: k <= N
-        e_pick(b, 12); // N (depth 11 + 1)
+        e_pick(b, 13); // N (depth 12 + 1)
         b.push(LTE);
         b.push(IF);
         {
-            let tii = 12 + max_n - k; // tii_k depth at B2
+            let tii = 13 + max_n - k; // tii_k depth at B2
             e_pick(b, tii);
             b.push(OP0);
             b.push(AUTHOUTPUTIDX); // toi = auth_outputs[tii][0]
@@ -2087,23 +2113,24 @@ fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
     b.push(GTE); // pops [token_sum, floor_value] -> token_sum >= floor_value
     b.push(VERIFY);
     // B3: expiry(0), cpend(1), mmfee(2), bspkh(3), ohash(4), mfill(5),
-    //     pden(6), pnum(7), tcid(8), N(9), tii_MAX_N(10), tii_k(10 + max_n - k)
+    //     pden(6), pnum(7), tcid(8), okspkh(9), N(10), tii_MAX_N(11),
+    //     tii_k(11 + max_n - k)
 
     // I) fair_sum = 0.
     b.push(OP0);
     // B4: fair_sum(0), expiry(1), cpend(2), mmfee(3), bspkh(4), ohash(5),
-    //     mfill(6), pden(7), pnum(8), tcid(9), N(10), tii_MAX_N(11),
-    //     tii_k(11 + max_n - k)
+    //     mfill(6), pden(7), pnum(8), tcid(9), okspkh(10), N(11),
+    //     tii_MAX_N(12), tii_k(12 + max_n - k)
 
     // PASS 2: sum fair_kas at each sell's own ATTESTED price, read at the
     // canonical offsets: pnum = sigscript[3..11), pden = sigscript[12..20).
     for k in 1..=max_n {
         e_num(b, k as u16);
-        e_pick(b, 11); // N (depth 10 + 1)
+        e_pick(b, 12); // N (depth 11 + 1)
         b.push(LTE);
         b.push(IF);
         {
-            let tii = 11 + max_n - k; // tii_k depth at B4
+            let tii = 12 + max_n - k; // tii_k depth at B4
             e_pick(b, tii);
             b.push(OP0);
             b.push(AUTHOUTPUTIDX); // toi
@@ -2143,8 +2170,8 @@ fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
     b.push(MUL); // max_surplus(0), surplus(1)
     b.push(LTE); // pops [surplus, max_surplus] -> surplus <= max_surplus
     b.push(VERIFY);
-    // leftover: 9 state + N + max_n tii
-    let leftover = 10 + max_n;
+    // leftover: 10 state (incl. okspkh) + N + max_n tii
+    let leftover = 11 + max_n;
     for _ in 0..(leftover / 2) {
         b.push(TWO_DROP);
     }
@@ -2180,8 +2207,8 @@ fn emit_fill_body_v18(b: &mut Vec<u8>, max_n: usize) {
 ///   - F5 `cpend == 0` enforced (no partial on cancel-pending).
 ///
 /// Entry (selector dropped): expiry(0), cpend(1), mmfee(2), bspkh(3),
-///   ohash(4), mfill(5), pden(6), pnum(7), tcid(8), ri(9), N(10),
-///   tii_MAX_N(11), tii_k(11 + MAX_N - k), tii_1(10 + MAX_N)
+///   ohash(4), mfill(5), pden(6), pnum(7), tcid(8), okspkh(9), ri(10),
+///   N(11), tii_MAX_N(12), tii_k(12 + MAX_N - k), tii_1(11 + MAX_N)
 fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     use v17op::*;
 
@@ -2214,11 +2241,11 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     // N/tii depths at entry are identical to the fill path's B0.)
     for k in 1..max_n {
         e_num(b, (k + 1) as u16);
-        e_pick(b, 11); // N (depth 10 + 1)
+        e_pick(b, 12); // N (depth 11 + 1)
         b.push(LTE);
         b.push(IF);
         {
-            let d = 11 + max_n - k;
+            let d = 12 + max_n - k;
             e_pick(b, d);
             e_pick(b, d);
             b.push(LT);
@@ -2255,7 +2282,7 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     b.push(DROP); // drop own_spk
 
     // P6) residual continuation + spent = kas_in - residual.
-    e_pick(b, 9); // ri
+    e_pick(b, 10); // ri
     b.push(TXOUTPUTSPK);
     b.push(TXINPUTINDEX);
     b.push(TXINPUTSPK);
@@ -2263,7 +2290,7 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     b.push(VERIFY); // byte-exact self-SPK (same RS => same state)
     b.push(TXINPUTINDEX);
     b.push(TXINPUTAMOUNT); // kas_in
-    e_pick(b, 10); // ri (depth 9 + 1)
+    e_pick(b, 11); // ri (depth 10 + 1)
     b.push(TXOUTPUTAMOUNT); // residual(0), kas_in(1)
     b.push(DUP);
     b.push(OP1);
@@ -2275,8 +2302,8 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     b.push(GTE);
     b.push(VERIFY); // spent >= 0 (no negative arithmetic downstream)
     // B1: spent(0), expiry(1), cpend(2), mmfee(3), bspkh(4), ohash(5),
-    //     mfill(6), pden(7), pnum(8), tcid(9), ri(10), N(11), tii_MAX_N(12),
-    //     tii_k(12 + max_n - k)
+    //     mfill(6), pden(7), pnum(8), tcid(9), okspkh(10), ri(11), N(12),
+    //     tii_MAX_N(13), tii_k(13 + max_n - k)
 
     // P7) floor_value = spent / pden * pnum (v17 division order).
     b.push(DUP);
@@ -2285,23 +2312,23 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     e_pick(b, 9); // pnum (depth 8 + 1)
     b.push(MUL);
     // B2: floor(0), spent(1), expiry(2), cpend(3), mmfee(4), bspkh(5),
-    //     ohash(6), mfill(7), pden(8), pnum(9), tcid(10), ri(11), N(12),
-    //     tii_MAX_N(13)
+    //     ohash(6), mfill(7), pden(8), pnum(9), tcid(10), okspkh(11),
+    //     ri(12), N(13), tii_MAX_N(14)
 
     // P8) token_sum = 0.
     b.push(OP0);
     // B3: token_sum(0), floor(1), spent(2), expiry(3), cpend(4), mmfee(5),
-    //     bspkh(6), ohash(7), mfill(8), pden(9), pnum(10), tcid(11), ri(12),
-    //     N(13), tii_MAX_N(14), tii_k(14 + max_n - k)
+    //     bspkh(6), ohash(7), mfill(8), pden(9), pnum(10), tcid(11),
+    //     okspkh(12), ri(13), N(14), tii_MAX_N(15), tii_k(15 + max_n - k)
 
     // P9) PASS 1: sum delivered tokens + per-term binding checks.
     for k in 1..=max_n {
         e_num(b, k as u16);
-        e_pick(b, 14); // N (depth 13 + 1)
+        e_pick(b, 15); // N (depth 14 + 1)
         b.push(LTE);
         b.push(IF);
         {
-            let tii = 14 + max_n - k; // tii_k depth at B3
+            let tii = 15 + max_n - k; // tii_k depth at B3
             e_pick(b, tii);
             b.push(OP0);
             b.push(AUTHOUTPUTIDX); // toi = auth_outputs[tii][0]
@@ -2331,22 +2358,23 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     b.push(GTE);
     b.push(VERIFY); // token_sum >= floor
     // B4: spent(0), expiry(1), cpend(2), mmfee(3), bspkh(4), ohash(5),
-    //     mfill(6), pden(7), pnum(8), tcid(9), ri(10), N(11), tii_MAX_N(12)
+    //     mfill(6), pden(7), pnum(8), tcid(9), okspkh(10), ri(11), N(12),
+    //     tii_MAX_N(13)
 
     // P11) fair_sum = 0.
     b.push(OP0);
     // B5: fair_sum(0), spent(1), expiry(2), cpend(3), mmfee(4), bspkh(5),
-    //     ohash(6), mfill(7), pden(8), pnum(9), tcid(10), ri(11), N(12),
-    //     tii_MAX_N(13), tii_k(13 + max_n - k)
+    //     ohash(6), mfill(7), pden(8), pnum(9), tcid(10), okspkh(11),
+    //     ri(12), N(13), tii_MAX_N(14), tii_k(14 + max_n - k)
 
     // P12) PASS 2: fair_sum at each sell's attested price ([3..11)/[12..20)).
     for k in 1..=max_n {
         e_num(b, k as u16);
-        e_pick(b, 13); // N (depth 12 + 1)
+        e_pick(b, 14); // N (depth 13 + 1)
         b.push(LTE);
         b.push(IF);
         {
-            let tii = 13 + max_n - k; // tii_k depth at B5
+            let tii = 14 + max_n - k; // tii_k depth at B5
             e_pick(b, tii);
             b.push(OP0);
             b.push(AUTHOUTPUTIDX);
@@ -2383,8 +2411,8 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
     b.push(MUL); // max_surplus
     b.push(LTE);
     b.push(VERIFY); // surplus <= max_surplus
-    // leftover: spent + 9 state + ri + N + max_n tii = 12 + max_n
-    let leftover = 12 + max_n;
+    // leftover: spent + 10 state (incl. okspkh) + ri + N + max_n tii
+    let leftover = 13 + max_n;
     for _ in 0..(leftover / 2) {
         b.push(TWO_DROP);
     }
@@ -2394,14 +2422,24 @@ fn emit_partial_body_v18(b: &mut Vec<u8>, max_n: usize) {
 }
 
 /// Expected v18 buy body length (deterministic for `BUY_ORDER_V18_MAX_N`=8).
-pub const BUY_ORDER_V18_BODY_EXPECTED_LEN: usize = 1525;
+pub const BUY_ORDER_V18_BODY_EXPECTED_LEN: usize = 1542;
 
-/// Expected v18 buy redeemScript length (145B state + body).
-pub const BUY_ORDER_V18_RS_EXPECTED_LEN: usize = 145 + BUY_ORDER_V18_BODY_EXPECTED_LEN;
+/// v18 buy state size: the v17 145B layout preceded by `[0x20][okspkh 32B]`.
+pub const BUY_ORDER_V18_STATE_SIZE: usize = 178;
 
-/// Build the v18 buy_order redeemScript (145B state + v18 body).
+/// Expected v18 buy redeemScript length (178B state + body).
+pub const BUY_ORDER_V18_RS_EXPECTED_LEN: usize =
+    BUY_ORDER_V18_STATE_SIZE + BUY_ORDER_V18_BODY_EXPECTED_LEN;
+
+/// Build the v18 buy_order redeemScript (178B state + v18 body).
 ///
-/// State layout identical to v14/v16/v17 (145B). `max_matcher_fee_bps` is BPS.
+/// State (178B):
+///   `[0x20][okspkh 32B]` — owner KAS seat: blake2b of the owner's raw P2PK
+///   SPK; the EXPIRE branch refunds here (plain KAS must not land on the
+///   token_unit `bspkh` seat) — then the v17 145B layout unchanged:
+///   `[0x20][tcid][0x08][pnum][0x08][pden][0x08][mfill][0x20][ohash]`
+///   `[0x20][bspkh][0x08][mmfee_bps][cpend][0x08][expiry]`.
+/// `max_matcher_fee_bps` is BPS.
 pub fn build_buy_v18_redeem_script(
     token_covenant_id: &[u8; 32],
     price_num: u64,
@@ -2409,6 +2447,7 @@ pub fn build_buy_v18_redeem_script(
     min_fill: u64,
     owner_hash: &[u8; 32],
     buyer_spk_hash: &[u8; 32],
+    owner_kas_spk_hash: &[u8; 32],
     max_matcher_fee_bps: u64,
     cancel_pending: u8,
     expiry_daa: u64,
@@ -2432,7 +2471,9 @@ pub fn build_buy_v18_redeem_script(
     let price_num = if g > 0 { price_num / g } else { price_num };
     let price_den = if g > 0 { price_den / g } else { price_den };
     let body = build_buy_v18_body();
-    let mut rs = Vec::with_capacity(145 + body.len());
+    let mut rs = Vec::with_capacity(BUY_ORDER_V18_STATE_SIZE + body.len());
+    rs.push(0x20);
+    rs.extend_from_slice(owner_kas_spk_hash);
     rs.push(0x20);
     rs.extend_from_slice(token_covenant_id);
     rs.push(0x08);
@@ -2545,10 +2586,11 @@ pub fn build_buy_v18_cancel_sigscript(
 
 /// Build the v18 sell body.
 ///
-/// Stack after state push (identical to the v14 sell):
+/// Stack after state push (the v14 layout preceded by the owner token seat
+/// `otspkh` = blake2b of the owner's token_unit P2SH SPK):
 ///   expiry(0), cpend(1), mmfee(2), sspkh(3), ohash(4), mfill(5), pden(6),
-///   pnum(7), <sigscript items at depth 8+> with the selector at depth 8 in
-///   every sigscript form.
+///   pnum(7), otspkh(8), <sigscript items at depth 9+> with the selector at
+///   depth 9 in every sigscript form.
 ///
 /// Changes vs the v14 sell body:
 ///   - FILL / IOC / PARTIAL verify the sigscript-attested (pnum, pden)
@@ -2557,14 +2599,17 @@ pub fn build_buy_v18_cancel_sigscript(
 ///   - PARTIAL F4 upgraded from count-only (`OpCovOutCount >= 2`) to Fix-3:
 ///     this input's auth[0] must be a self-SPK residual worth
 ///     `>= token_in - fta` (same per-input binding the IOC path already had).
+///   - EXPIRE refunds the token escrow to `otspkh` as a covenant-bound
+///     token_unit via the Fix-3 per-input binding (auth[0] of self), instead
+///     of the v14 raw-P2PK `sspkh` refund that stripped the binding.
 ///   - mmfee is BPS uniformly (the v14 absolute-sompi semantics die with v14);
 ///     the sell body itself never reads mmfee — the cap lives on the buy side.
 pub fn build_sell_v18_body() -> Vec<u8> {
     use v17op::*;
     let mut b: Vec<u8> = Vec::with_capacity(512);
 
-    // ===== DISPATCH: selector (depth 8) to top =====
-    e_roll(&mut b, 8);
+    // ===== DISPATCH: selector (depth 9) to top =====
+    e_roll(&mut b, 9);
     b.push(DUP);
     e_num(&mut b, 4);
     b.push(EQUAL);
@@ -2574,28 +2619,34 @@ pub fn build_sell_v18_body() -> Vec<u8> {
         b.push(DUP);
         b.push(VERIFY); // expiry != 0 (GTC guard)
         b.push(CLTV);
+        // Fix-3 refund: this input's auth[0] must be a covenant-bound token
+        // output on the OWNER TOKEN SEAT worth the full escrow.
+        // stack: cpend(0), mmfee(1), sspkh(2), ohash(3), mfill(4), pden(5),
+        //        pnum(6), otspkh(7)
+        b.push(TXINPUTINDEX);
         b.push(OP0);
+        b.push(AUTHOUTPUTIDX); // r = auth_outputs[self][0]
+        b.push(DUP);
         b.push(TXOUTPUTSPK);
         b.push(BLAKE2B);
-        e_pick(&mut b, 3); // sspkh
+        e_pick(&mut b, 9); // otspkh (depth 7, +2 for r + hash)
         b.push(EQUAL);
-        b.push(VERIFY);
-        b.push(OP0);
-        b.push(TXOUTPUTAMOUNT);
+        b.push(VERIFY); // refund lands on the owner's token_unit P2SH
+        b.push(DUP);
+        b.push(OUTPUTCOVENANTID);
+        b.push(TXINPUTINDEX);
+        b.push(INPUTCOVENANTID);
+        b.push(EQUAL);
+        b.push(VERIFY); // refund carries THIS token's CovenantBinding
+        b.push(TXOUTPUTAMOUNT); // consumes r
         b.push(TXINPUTINDEX);
         b.push(TXINPUTAMOUNT);
         b.push(GTE);
         b.push(VERIFY); // full refund
-        b.push(TXINPUTINDEX);
-        b.push(INPUTCOVENANTID);
-        b.push(COVOUTCOUNT);
-        b.push(OP1);
-        b.push(GTE);
-        b.push(VERIFY); // token conservation
-        for _ in 0..3 {
+        // 8 items: cpend..otspkh
+        for _ in 0..4 {
             b.push(TWO_DROP);
         }
-        b.push(DROP);
     }
     b.push(ELSE);
     {
@@ -2653,7 +2704,8 @@ pub fn build_sell_v18_body() -> Vec<u8> {
 /// `[0x01,koi][0x08 pnum][0x08 pden][Op1][pushData(RS)]`.
 ///
 /// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
-///   ohash(4), mfill(5), pden(6), pnum(7), pden_att(8), pnum_att(9), koi(10)
+///   ohash(4), mfill(5), pden(6), pnum(7), otspkh(8), pden_att(9),
+///   pnum_att(10), koi(11)
 fn emit_sell_v18_fill(b: &mut Vec<u8>) {
     use v17op::*;
     // time gate
@@ -2674,14 +2726,14 @@ fn emit_sell_v18_fill(b: &mut Vec<u8>) {
     b.push(OP0);
     b.push(EQUAL);
     b.push(VERIFY);
-    // base(9): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
-    //          pden_att(6), pnum_att(7), koi(8)
+    // base(10): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
+    //           otspkh(6), pden_att(7), pnum_att(8), koi(9)
     // ATTESTATION: attested pair == state pair
-    e_pick(b, 7); // pnum_att
+    e_pick(b, 8); // pnum_att
     e_pick(b, 6); // pnum (5 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    e_pick(b, 6); // pden_att
+    e_pick(b, 7); // pden_att
     e_pick(b, 5); // pden (4 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
@@ -2697,13 +2749,13 @@ fn emit_sell_v18_fill(b: &mut Vec<u8>) {
     b.push(GTE);
     b.push(VERIFY);
     // KAS output >= expected_kas (PARAMETERIZED: koi)
-    e_pick(b, 9); // koi (8 + 1)
+    e_pick(b, 10); // koi (9 + 1)
     b.push(TXOUTPUTAMOUNT);
     b.push(SWAP);
     b.push(GTE);
     b.push(VERIFY);
     // F2: seller SPK hash
-    e_pick(b, 8); // koi
+    e_pick(b, 9); // koi
     b.push(TXOUTPUTSPK);
     b.push(BLAKE2B);
     e_pick(b, 2); // sspkh (1 + 1)
@@ -2724,19 +2776,18 @@ fn emit_sell_v18_fill(b: &mut Vec<u8>) {
     b.push(TXINPUTAMOUNT);
     b.push(GTE);
     b.push(VERIFY);
-    // cleanup: 9 items
-    for _ in 0..4 {
+    // cleanup: 10 items
+    for _ in 0..5 {
         b.push(TWO_DROP);
     }
-    b.push(DROP);
 }
 
 /// v18 sell IOC FILL (selector 5). Sigscript:
 /// `[0x01,koi][0x08 pnum][0x08 pden][0x08 fta][Op5][pushData(RS)]`.
 ///
 /// Entry (stale selector dropped): expiry(0), cpend(1), mmfee(2), sspkh(3),
-///   ohash(4), mfill(5), pden(6), pnum(7), fta(8), pden_att(9), pnum_att(10),
-///   koi(11)
+///   ohash(4), mfill(5), pden(6), pnum(7), otspkh(8), fta(9), pden_att(10),
+///   pnum_att(11), koi(12)
 fn emit_sell_v18_ioc(b: &mut Vec<u8>) {
     use v17op::*;
     b.push(DUP);
@@ -2754,89 +2805,8 @@ fn emit_sell_v18_ioc(b: &mut Vec<u8>) {
     b.push(OP0);
     b.push(EQUAL);
     b.push(VERIFY);
-    // base(10): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
-    //           fta(6), pden_att(7), pnum_att(8), koi(9)
-    // ATTESTATION
-    e_pick(b, 8); // pnum_att
-    e_pick(b, 6); // pnum (5 + 1)
-    b.push(EQUAL);
-    b.push(VERIFY);
-    e_pick(b, 7); // pden_att
-    e_pick(b, 5); // pden (4 + 1)
-    b.push(EQUAL);
-    b.push(VERIFY);
-    // fill_kas = fta * pnum / pden, >= mfill
-    e_pick(b, 6); // fta
-    e_pick(b, 6); // pnum (5 + 1)
-    b.push(MUL);
-    e_pick(b, 5); // pden (4 + 1)
-    b.push(DIV);
-    b.push(DUP);
-    e_pick(b, 5); // mfill (3 + 2)
-    b.push(GTE);
-    b.push(VERIFY);
-    // KAS output >= fill_kas
-    e_pick(b, 10); // koi (9 + 1)
-    b.push(TXOUTPUTAMOUNT);
-    b.push(SWAP);
-    b.push(GTE);
-    b.push(VERIFY);
-    // F2: seller SPK hash
-    e_pick(b, 9); // koi
-    b.push(TXOUTPUTSPK);
-    b.push(BLAKE2B);
-    e_pick(b, 2); // sspkh (1 + 1)
-    b.push(EQUAL);
-    b.push(VERIFY);
-    // F4: residual conservation — auth[0] is a self-SPK continuation worth
-    // >= token_in - fta (unchanged from the v14 IOC path).
-    b.push(TXINPUTINDEX);
-    b.push(OP0);
-    b.push(AUTHOUTPUTIDX);
-    b.push(DUP);
-    b.push(TXOUTPUTSPK);
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTSPK);
-    b.push(EQUAL);
-    b.push(VERIFY);
-    b.push(TXOUTPUTAMOUNT);
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTAMOUNT);
-    e_pick(b, 8); // fta (6 + 2)
-    b.push(SUB);
-    b.push(GTE);
-    b.push(VERIFY);
-    // cleanup: 10 items
-    for _ in 0..5 {
-        b.push(TWO_DROP);
-    }
-}
-
-/// v18 sell PARTIAL FILL (selector 2). Sigscript:
-/// `[0x01,koi][0x08 pnum][0x08 pden][0x08 fta][ri][Op2][pushData(RS)]`.
-///
-/// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
-///   ohash(4), mfill(5), pden(6), pnum(7), ri(8), fta(9), pden_att(10),
-///   pnum_att(11), koi(12)
-fn emit_sell_v18_partial(b: &mut Vec<u8>) {
-    use v17op::*;
-    b.push(DUP);
-    b.push(OP0);
-    b.push(NUMEQUAL);
-    b.push(NOTIF);
-    b.push(DUP);
-    b.push(TXLOCKTIME);
-    b.push(GT);
-    b.push(VERIFY);
-    b.push(ENDIF);
-    b.push(DROP);
-    e_num(b, 50);
-    b.push(CSV);
-    b.push(OP0);
-    b.push(EQUAL);
-    b.push(VERIFY);
     // base(11): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
-    //           ri(6), fta(7), pden_att(8), pnum_att(9), koi(10)
+    //           otspkh(6), fta(7), pden_att(8), pnum_att(9), koi(10)
     // ATTESTATION
     e_pick(b, 9); // pnum_att
     e_pick(b, 6); // pnum (5 + 1)
@@ -2846,69 +2816,31 @@ fn emit_sell_v18_partial(b: &mut Vec<u8>) {
     e_pick(b, 5); // pden (4 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    // fill_kas = fta * pnum / pden, >= mfill (keeps an fta copy on stack)
+    // fill_kas = fta * pnum / pden, >= mfill
     e_pick(b, 7); // fta
-    b.push(DUP);
-    e_pick(b, 7); // pnum (5 + 2)
-    b.push(MUL);
-    e_pick(b, 6); // pden (4 + 2)
-    b.push(DIV);
-    b.push(DUP);
-    e_pick(b, 6); // mfill (3 + 3)
-    b.push(GTE);
-    b.push(VERIFY);
-    // KAS output >= fill_kas
-    e_pick(b, 12); // koi (10 + 2)
-    b.push(TXOUTPUTAMOUNT);
-    b.push(SWAP);
-    b.push(GTE);
-    b.push(VERIFY);
-    // partial guard: token_in > fta
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTAMOUNT);
-    e_pick(b, 1); // fta copy
-    b.push(GT);
-    b.push(VERIFY);
-    // residual output SPK == own SPK (D&R continuation)
-    e_pick(b, 7); // ri (6 + 1)
-    b.push(TXOUTPUTSPK);
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTSPK);
-    b.push(EQUAL);
-    b.push(VERIFY);
-    // residual output value >= token_in - fta (consumes the fta copy)
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTAMOUNT);
-    e_roll(b, 1);
-    b.push(SUB);
-    e_pick(b, 7); // ri (6 + 1)
-    b.push(TXOUTPUTAMOUNT);
-    b.push(SWAP);
-    b.push(GTE);
-    b.push(VERIFY);
-    // residual-fill floor: (token_in - fta) * pnum / pden >= mfill
-    b.push(TXINPUTINDEX);
-    b.push(TXINPUTAMOUNT);
-    e_pick(b, 8); // fta (7 + 1)
-    b.push(SUB);
     e_pick(b, 6); // pnum (5 + 1)
     b.push(MUL);
     e_pick(b, 5); // pden (4 + 1)
     b.push(DIV);
-    e_pick(b, 4); // mfill (3 + 1)
+    b.push(DUP);
+    e_pick(b, 5); // mfill (3 + 2)
     b.push(GTE);
     b.push(VERIFY);
-    // F2: seller SPK hash on koi
+    // KAS output >= fill_kas
+    e_pick(b, 11); // koi (10 + 1)
+    b.push(TXOUTPUTAMOUNT);
+    b.push(SWAP);
+    b.push(GTE);
+    b.push(VERIFY);
+    // F2: seller SPK hash
     e_pick(b, 10); // koi
     b.push(TXOUTPUTSPK);
     b.push(BLAKE2B);
     e_pick(b, 2); // sspkh (1 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    // F4 (Fix-3, upgraded from count-only `OpCovOutCount >= 2`): this input's
-    // auth[0] must be a self-SPK residual token output worth >= token_in - fta.
-    // The old shared count let another same-token input's outputs satisfy the
-    // check; per-input binding closes that (same shape as the IOC F4).
+    // F4: residual conservation — auth[0] is a self-SPK continuation worth
+    // >= token_in - fta (unchanged from the v14 IOC path).
     b.push(TXINPUTINDEX);
     b.push(OP0);
     b.push(AUTHOUTPUTIDX);
@@ -2932,6 +2864,125 @@ fn emit_sell_v18_partial(b: &mut Vec<u8>) {
     b.push(DROP);
 }
 
+/// v18 sell PARTIAL FILL (selector 2). Sigscript:
+/// `[0x01,koi][0x08 pnum][0x08 pden][0x08 fta][ri][Op2][pushData(RS)]`.
+///
+/// Entry (selector consumed): expiry(0), cpend(1), mmfee(2), sspkh(3),
+///   ohash(4), mfill(5), pden(6), pnum(7), otspkh(8), ri(9), fta(10),
+///   pden_att(11), pnum_att(12), koi(13)
+fn emit_sell_v18_partial(b: &mut Vec<u8>) {
+    use v17op::*;
+    b.push(DUP);
+    b.push(OP0);
+    b.push(NUMEQUAL);
+    b.push(NOTIF);
+    b.push(DUP);
+    b.push(TXLOCKTIME);
+    b.push(GT);
+    b.push(VERIFY);
+    b.push(ENDIF);
+    b.push(DROP);
+    e_num(b, 50);
+    b.push(CSV);
+    b.push(OP0);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // base(12): mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
+    //           otspkh(6), ri(7), fta(8), pden_att(9), pnum_att(10), koi(11)
+    // ATTESTATION
+    e_pick(b, 10); // pnum_att
+    e_pick(b, 6); // pnum (5 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    e_pick(b, 9); // pden_att
+    e_pick(b, 5); // pden (4 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // fill_kas = fta * pnum / pden, >= mfill (keeps an fta copy on stack)
+    e_pick(b, 8); // fta
+    b.push(DUP);
+    e_pick(b, 7); // pnum (5 + 2)
+    b.push(MUL);
+    e_pick(b, 6); // pden (4 + 2)
+    b.push(DIV);
+    b.push(DUP);
+    e_pick(b, 6); // mfill (3 + 3)
+    b.push(GTE);
+    b.push(VERIFY);
+    // KAS output >= fill_kas
+    e_pick(b, 13); // koi (11 + 2)
+    b.push(TXOUTPUTAMOUNT);
+    b.push(SWAP);
+    b.push(GTE);
+    b.push(VERIFY);
+    // partial guard: token_in > fta
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_pick(b, 1); // fta copy
+    b.push(GT);
+    b.push(VERIFY);
+    // residual output SPK == own SPK (D&R continuation)
+    e_pick(b, 8); // ri (7 + 1)
+    b.push(TXOUTPUTSPK);
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTSPK);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // residual output value >= token_in - fta (consumes the fta copy)
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_roll(b, 1);
+    b.push(SUB);
+    e_pick(b, 8); // ri (7 + 1)
+    b.push(TXOUTPUTAMOUNT);
+    b.push(SWAP);
+    b.push(GTE);
+    b.push(VERIFY);
+    // residual-fill floor: (token_in - fta) * pnum / pden >= mfill
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_pick(b, 9); // fta (8 + 1)
+    b.push(SUB);
+    e_pick(b, 6); // pnum (5 + 1)
+    b.push(MUL);
+    e_pick(b, 5); // pden (4 + 1)
+    b.push(DIV);
+    e_pick(b, 4); // mfill (3 + 1)
+    b.push(GTE);
+    b.push(VERIFY);
+    // F2: seller SPK hash on koi
+    e_pick(b, 11); // koi
+    b.push(TXOUTPUTSPK);
+    b.push(BLAKE2B);
+    e_pick(b, 2); // sspkh (1 + 1)
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // F4 (Fix-3, upgraded from count-only `OpCovOutCount >= 2`): this input's
+    // auth[0] must be a self-SPK residual token output worth >= token_in - fta.
+    // The old shared count let another same-token input's outputs satisfy the
+    // check; per-input binding closes that (same shape as the IOC F4).
+    b.push(TXINPUTINDEX);
+    b.push(OP0);
+    b.push(AUTHOUTPUTIDX);
+    b.push(DUP);
+    b.push(TXOUTPUTSPK);
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTSPK);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    b.push(TXOUTPUTAMOUNT);
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    e_pick(b, 10); // fta (8 + 2)
+    b.push(SUB);
+    b.push(GTE);
+    b.push(VERIFY);
+    // cleanup: 12 items
+    for _ in 0..6 {
+        b.push(TWO_DROP);
+    }
+}
+
 /// v18 sell CANCEL (selector 0) / CANCEL-MARK (selector 3) — owner signature.
 /// Sigscript: `[sig][pk][Op0 or Op3][pushData(RS)]` (same shapes as v14).
 fn emit_sell_v18_cancel(b: &mut Vec<u8>, mark: bool) {
@@ -2945,37 +2996,47 @@ fn emit_sell_v18_cancel(b: &mut Vec<u8>, mark: bool) {
         b.push(TWO_DROP); // expiry + cpend
     }
     // stack: mmfee(0), sspkh(1), ohash(2), mfill(3), pden(4), pnum(5),
-    //        pk(6), sig(7)
-    e_pick(b, 6); // pk
+    //        otspkh(6), pk(7), sig(8)
+    e_pick(b, 7); // pk
     b.push(BLAKE2B);
     e_pick(b, 3); // ohash (2 + 1)
     b.push(EQUAL);
     b.push(VERIFY);
-    e_roll(b, 7); // sig
-    e_roll(b, 7); // pk
+    e_roll(b, 8); // sig
+    e_roll(b, 8); // pk
     b.push(CHECKSIG);
     b.push(VERIFY);
-    // 6 items
+    // 7 items
     for _ in 0..3 {
         b.push(TWO_DROP);
     }
+    b.push(DROP);
 }
 
 /// Expected v18 sell body length.
-pub const SELL_ORDER_V18_BODY_EXPECTED_LEN: usize = 365;
+pub const SELL_ORDER_V18_BODY_EXPECTED_LEN: usize = 370;
 
-/// Expected v18 sell redeemScript length (112B state + body).
-pub const SELL_ORDER_V18_RS_EXPECTED_LEN: usize = 112 + SELL_ORDER_V18_BODY_EXPECTED_LEN;
+/// v18 sell state size: the v14 112B layout preceded by `[0x20][otspkh 32B]`.
+pub const SELL_ORDER_V18_STATE_SIZE: usize = 145;
 
-/// Build the v18 sell_order redeemScript (112B state + v18 body).
+/// Expected v18 sell redeemScript length (145B state + body).
+pub const SELL_ORDER_V18_RS_EXPECTED_LEN: usize =
+    SELL_ORDER_V18_STATE_SIZE + SELL_ORDER_V18_BODY_EXPECTED_LEN;
+
+/// Build the v18 sell_order redeemScript (145B state + v18 body).
 ///
-/// State layout identical to v14 (112B). `max_matcher_fee_bps` is BPS.
+/// State (145B):
+///   `[0x20][otspkh 32B]` — owner token seat: blake2b of the owner's
+///   token_unit P2SH SPK (`compute_token_unit_spk_hash`); the EXPIRE branch
+///   refunds the token escrow here as a covenant-bound token_unit — then
+///   the v14 112B layout unchanged. `max_matcher_fee_bps` is BPS.
 pub fn build_sell_v18_redeem_script(
     price_num: u64,
     price_den: u64,
     min_fill: u64,
     owner_hash: &[u8; 32],
     seller_spk_hash: &[u8; 32],
+    owner_token_spk_hash: &[u8; 32],
     max_matcher_fee_bps: u64,
     cancel_pending: u8,
     expiry_daa: u64,
@@ -2999,7 +3060,9 @@ pub fn build_sell_v18_redeem_script(
     let price_num = if g > 0 { price_num / g } else { price_num };
     let price_den = if g > 0 { price_den / g } else { price_den };
     let body = build_sell_v18_body();
-    let mut rs = Vec::with_capacity(112 + body.len());
+    let mut rs = Vec::with_capacity(SELL_ORDER_V18_STATE_SIZE + body.len());
+    rs.push(0x20);
+    rs.extend_from_slice(owner_token_spk_hash);
     rs.push(0x08);
     rs.extend_from_slice(&u64_le(price_num));
     rs.push(0x08);

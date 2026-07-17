@@ -1293,6 +1293,7 @@ pub async fn run(
                                     cached.min_fill,
                                     &owner_hash,
                                     &spk_hash,
+                                    &kob_core::compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
                                     cached.max_matcher_fee, // bps for v18
                                     0,
                                     cached.expiry_daa,
@@ -1345,6 +1346,7 @@ pub async fn run(
                                     cached.min_fill,
                                     &owner_hash,
                                     &spk_hash,
+                                    &kob_core::contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
                                     cached.max_matcher_fee, // bps for v18
                                     0,
                                     cached.expiry_daa,

@@ -420,6 +420,7 @@ pub async fn deploy_buy(
             min_fill,
             &owner_hash,
             &buyer_spk_hash,
+            &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
             bps,
             0, // cancel_pending = 0 (active order)
             expiry_daa.unwrap_or(0),
@@ -856,6 +857,7 @@ pub async fn deploy_sell(
     let sell_bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
     let redeem_script = contract::spot::order::build_sell_v18_redeem_script(
         price_num, price_den, min_fill, &owner_hash, &seller_spk_hash,
+        &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
         sell_bps,
         0, // cancel_pending
         expiry_daa.unwrap_or(0),
@@ -1386,6 +1388,7 @@ pub async fn deploy_oco_sell(
         tp_price_num, tp_price_den, tp_min_fill,
         sl_price_num, sl_price_den, sl_min_fill,
         &owner_hash, &seller_spk_hash,
+        &kob_core::contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
         oco_bps,
         0, // cancel_pending
         expiry_daa.unwrap_or(0),

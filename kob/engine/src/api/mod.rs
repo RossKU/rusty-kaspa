@@ -1452,6 +1452,10 @@ struct SubmitIfdRequest {
     owner_hash: String,
     /// Owner SPK hash (hex, 64 chars) — for B's bspkh/sspkh.
     owner_spk_hash: String,
+    /// Owner pubkey (hex, 64 chars) — the E1 expire seats (buy `okspkh` =
+    /// raw P2PK SPK hash, sell `otspkh` = token_unit P2SH SPK hash) are
+    /// derived from it and baked into the v18 RS.
+    owner_pubkey: String,
     /// Maximum matcher fee (sompi) — PRE-v18 wire field, kept for request
     /// compatibility. v18 IFD builds B with the shared
     /// `DEFAULT_MAX_MATCHER_FEE_BPS` (P2SH must match the trigger-time RS).
@@ -1579,6 +1583,13 @@ async fn handle_submit_ifd(
         Ok(h) => h,
         Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
     };
+    let owner_pubkey = match parse_hex_32_api(&req.owner_pubkey) {
+        Ok(h) => h,
+        Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e }))),
+    };
+    // E1 expire seats, derived from the owner pubkey.
+    let okspkh = kob_core::compute_p2pk_spk_hash(&owner_pubkey);
+    let otspkh = kob_core::contract::compute_token_unit_spk_hash(&owner_pubkey);
 
     // Compute order B's scripts
     let b_params = crate::matcher::ifd::OrderBParams {
@@ -1595,10 +1606,15 @@ async fn handle_submit_ifd(
     // planners. The fee is the shared BPS constant (v18 builders reject the
     // legacy sompi-scale value); registration and trigger must agree on it
     // or the precomputed P2SH won't match the deployed order.
+    let b_seat = match req.order_b.side {
+        crate::matcher::ifd::IfdSide::Buy => okspkh,
+        crate::matcher::ifd::IfdSide::Sell => otspkh,
+    };
     let (b_rs, b_p2sh_hex, b_spk_hash_hex) = match crate::matcher::ifd::compute_order_b_scripts_v18(
         &b_params,
         &owner_hash,
         &owner_spk_hash,
+        &b_seat,
         crate::DEFAULT_MAX_MATCHER_FEE_BPS,
     ) {
         Ok(v) => v,
@@ -1652,7 +1668,7 @@ async fn handle_submit_ifd(
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh_bytes, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
+                &a_bspkh_bytes, &okspkh, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1665,7 +1681,7 @@ async fn handle_submit_ifd(
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh_bytes, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
+                &a_bspkh_bytes, &otspkh, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1749,6 +1765,19 @@ async fn handle_submit_ifo(
         &owner_spk_bytes[2..],
     );
 
+    // E1 expire seats, derived from the P2PK pubkey embedded in owner_spk
+    // (script = [0x20, pubkey32, 0xac] at bytes 2..36).
+    if owner_spk_bytes[2] != 0x20 || owner_spk_bytes[35] != 0xac {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "owner_spk is not a P2PK SPK" })),
+        );
+    }
+    let mut owner_pubkey = [0u8; 32];
+    owner_pubkey.copy_from_slice(&owner_spk_bytes[3..35]);
+    let okspkh = kob_core::compute_p2pk_spk_hash(&owner_pubkey);
+    let otspkh = kob_core::contract::compute_token_unit_spk_hash(&owner_pubkey);
+
     let oco_params = crate::matcher::ifd::IfoOcoParams {
         tp_side: req.tp_side,
         tp_price_num: req.tp_price_num,
@@ -1799,7 +1828,7 @@ async fn handle_submit_ifo(
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
+                &a_bspkh, &okspkh, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,
@@ -1812,7 +1841,7 @@ async fn handle_submit_ifo(
                 req.order_a.price_den,
                 req.order_a.min_fill,
                 &owner_hash,
-                &a_bspkh, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
+                &a_bspkh, &otspkh, crate::DEFAULT_MAX_MATCHER_FEE_BPS,
                 0,
                 req.order_a.expiry_daa,) {
                 Ok(v) => v,

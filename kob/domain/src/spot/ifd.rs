@@ -459,11 +459,17 @@ pub fn compute_oco_b_scripts(
 /// use ONE fixed value across registration and trigger, or the precomputed
 /// P2SH will not match the deployed order.
 ///
+/// `owner_seat_hash` is the E1 expire-refund seat, side-appropriate: for a
+/// BUY done-leg the owner KAS seat `okspkh` (blake2b of the owner's raw
+/// P2PK SPK); for a SELL done-leg the owner token seat `otspkh` (blake2b of
+/// the owner's token_unit P2SH SPK).
+///
 /// Returns (rs_bytes, p2sh_script_hex, spk_hash_hex).
 pub fn compute_order_b_scripts_v18(
     params: &OrderBParams,
     owner_hash: &[u8; 32],
     owner_spk_hash: &[u8; 32],
+    owner_seat_hash: &[u8; 32],
     max_matcher_fee_bps: u64,
 ) -> Result<(Vec<u8>, String, String), String> {
     let token_bytes = parse_hex_32(&params.token)?;
@@ -476,6 +482,7 @@ pub fn compute_order_b_scripts_v18(
             params.min_fill,
             owner_hash,
             owner_spk_hash,
+            owner_seat_hash,
             max_matcher_fee_bps,
             0, // cancel_pending
             params.expiry_daa,
@@ -487,6 +494,7 @@ pub fn compute_order_b_scripts_v18(
             params.min_fill,
             owner_hash,
             owner_spk_hash,
+            owner_seat_hash,
             max_matcher_fee_bps,
             0, // cancel_pending
             params.expiry_daa,
@@ -521,6 +529,15 @@ pub fn compute_oco_b_scripts_v18(
     // convention as the v1 helper.
     let seller_spk_hash = kob_core::p2sh::blake2b_256(owner_spk);
 
+    // E1 owner token seat (otspkh): derived from the P2PK pubkey embedded in
+    // owner_spk (script = [0x20, pubkey32, 0xac] at bytes 2..36).
+    if owner_spk[2] != 0x20 || owner_spk[35] != 0xac {
+        return Err("owner_spk is not a P2PK SPK (expected [ver 2B][0x20][pk 32B][0xac])".into());
+    }
+    let mut owner_pubkey = [0u8; 32];
+    owner_pubkey.copy_from_slice(&owner_spk[3..35]);
+    let otspkh = kob_core::contract::compute_token_unit_spk_hash(&owner_pubkey);
+
     let rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
         oco.tp_price_num,
         oco.tp_price_den,
@@ -530,6 +547,7 @@ pub fn compute_oco_b_scripts_v18(
         oco.sl_min_fill,
         owner_hash,
         &seller_spk_hash,
+        &otspkh,
         max_matcher_fee_bps,
         0, // cancel_pending
         0, // expiry_daa (GTC)
@@ -1091,7 +1109,7 @@ mod tests {
         let spk_hash = [0xcc; 32];
         let mut params = make_order_b_params(); // Sell
         let (rs, p2sh_hex, spk_hash_hex) =
-            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, 30).unwrap();
+            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, &[0xEE; 32], 30).unwrap();
         assert_eq!(
             rs.len(),
             kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN,
@@ -1102,7 +1120,7 @@ mod tests {
 
         params.side = IfdSide::Buy;
         let (rs, p2sh_hex, _) =
-            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, 30).unwrap();
+            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, &[0xEE; 32], 30).unwrap();
         assert_eq!(
             rs.len(),
             kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN,
@@ -1113,7 +1131,7 @@ mod tests {
         // v18 mmfee is BPS: the v14 sompi default (10_000_000) must be
         // rejected by the underlying builder, not silently embedded.
         assert!(
-            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE).is_err(),
+            compute_order_b_scripts_v18(&params, &owner_hash, &spk_hash, &[0xEE; 32], crate::DEFAULT_MAX_MATCHER_FEE).is_err(),
             "sompi-scale mmfee must be rejected for v18 (bps only)"
         );
     }

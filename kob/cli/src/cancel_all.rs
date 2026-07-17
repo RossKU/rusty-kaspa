@@ -589,7 +589,7 @@ pub fn build_redeem_script_for_order(
             if order.version == 18 {
                 Ok(contract::spot::order::build_buy_v18_redeem_script(
                     &tcid, order.price_num, order.price_den, order.min_fill,
-                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+                    &owner_hash, &spk_hash, &compute_p2pk_spk_hash(pubkey), order.max_matcher_fee, 0, order.expiry_daa,)?)
             } else if order.version == 17 {
                 Ok(contract::build_buy_v17_redeem_script(
                     &tcid, order.price_num, order.price_den, order.min_fill,
@@ -608,7 +608,7 @@ pub fn build_redeem_script_for_order(
             if order.version == 18 {
                 Ok(contract::spot::order::build_sell_v18_redeem_script(
                     order.price_num, order.price_den, order.min_fill,
-                    &owner_hash, &spk_hash, order.max_matcher_fee, 0, order.expiry_daa,)?)
+                    &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(pubkey), order.max_matcher_fee, 0, order.expiry_daa,)?)
             } else {
                 Ok(contract::build_sell_redeem_script(
                     order.price_num, order.price_den, order.min_fill,

@@ -330,6 +330,7 @@ pub async fn run(
             buy_min_fill,
             &buy_owner_hash,
             &buy_spk_hash,
+            &kob_core::compute_p2pk_spk_hash(&buyer_pubkey), // okspkh (E1 expire seat)
             mmfee_bps.unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
             0,
             buy_expiry,
@@ -366,6 +367,7 @@ pub async fn run(
             sell_min_fill,
             &sell_owner_hash,
             &sell_spk_hash,
+            &contract::compute_token_unit_spk_hash(&seller_pubkey), // otspkh (E1 expire seat)
             mmfee_bps.unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
             0,
             sell_expiry,

@@ -210,6 +210,7 @@ pub async fn deploy_ifd(
         sell_min_fill,
         &owner_hash,
         &owner_spk_hash, // sell proceeds go back to owner's wallet
+        &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
         crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         sell_expiry_daa,
@@ -235,6 +236,7 @@ pub async fn deploy_ifd(
         buy_min_fill,
         &owner_hash,
         &buyer_spk_hash,
+        &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
         crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         0, // GTC for entry order
@@ -518,6 +520,7 @@ pub async fn deploy_ifo_trustless(
         sl_min_fill,
         &owner_hash,
         &owner_spk_hash, // sell proceeds go back to owner's wallet
+        &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
         oco_bps,
         0, // cancel_pending
         expiry_daa,
@@ -543,6 +546,7 @@ pub async fn deploy_ifo_trustless(
         buy_min_fill,
         &owner_hash,
         &buyer_spk_hash,
+        &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
         oco_bps,
         0, // cancel_pending
         0, // GTC for entry order
@@ -843,6 +847,7 @@ pub async fn deploy_ifo(
         buy_min_fill,
         &owner_hash,
         &buyer_spk_hash,
+        &compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
         crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
         0, // cancel_pending
         0, // GTC

@@ -67,7 +67,7 @@ fn exec_covenant_inputs(
 
 fn make_sell_v18(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
     let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
-        price_num, price_den, 1_000_000, owner, sspkh, 30, 0, 0,
+        price_num, price_den, 1_000_000, owner, sspkh, &[0xDD; 32], 30, 0, 0,
     ).unwrap();
     BatchOrder {
         outpoint: (hex::encode([id_byte; 32]), 0),
@@ -89,7 +89,7 @@ fn make_sell_v18(id_byte: u8, amount: u64, price_num: u64, price_den: u64, token
 
 fn make_oco_sell_v18(id_byte: u8, amount: u64, tp: (u64, u64), sl: (u64, u64), path: kob_core::OcoPath, token: [u8; 32], owner: &[u8; 32], sspkh: &[u8; 32]) -> BatchOrder {
     let rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
-        tp.0, tp.1, 1, sl.0, sl.1, 1, owner, sspkh, 30, 0, 0,
+        tp.0, tp.1, 1, sl.0, sl.1, 1, owner, sspkh, &[0xDD; 32], 30, 0, 0,
     ).unwrap();
     let (pn, pd) = match path {
         kob_core::OcoPath::TakeProfit => tp,
@@ -115,7 +115,7 @@ fn make_oco_sell_v18(id_byte: u8, amount: u64, tp: (u64, u64), sl: (u64, u64), p
 
 fn make_buy_v18(id_byte: u8, amount: u64, price_num: u64, price_den: u64, min_fill: u64, token: [u8; 32], owner: &[u8; 32], bspkh: &[u8; 32], mmfee_bps: u64) -> BatchOrder {
     let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-        &token, price_num, price_den, min_fill, owner, bspkh, mmfee_bps, 0, 0,
+        &token, price_num, price_den, min_fill, owner, bspkh, &[0xDD; 32], mmfee_bps, 0, 0,
     ).unwrap();
     BatchOrder {
         outpoint: (hex::encode([id_byte; 32]), 0),

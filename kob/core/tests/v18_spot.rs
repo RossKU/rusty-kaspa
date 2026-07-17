@@ -25,14 +25,15 @@ use kaspa_txscript::engine_context::EngineCtx;
 use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_core::contract::spot::oco::{
-    build_oco_sell_v18_redeem_script, build_oco_sell_v18_sl_fill_sigscript,
-    build_oco_sell_v18_tp_fill_sigscript,
+    build_oco_sell_v18_expire_sigscript, build_oco_sell_v18_redeem_script,
+    build_oco_sell_v18_sl_fill_sigscript, build_oco_sell_v18_tp_fill_sigscript,
 };
 use kob_core::contract::spot::order::{
     build_buy_v18_cancel_sigscript, build_buy_v18_expire_sigscript,
     build_buy_v18_fill_sigscript, build_buy_v18_partial_fill_sigscript,
-    build_buy_v18_redeem_script, build_sell_v18_fill_sigscript,
-    build_sell_v18_partial_fill_sigscript, build_sell_v18_redeem_script, BUY_ORDER_V18_MAX_N,
+    build_buy_v18_redeem_script, build_sell_v18_expire_sigscript,
+    build_sell_v18_fill_sigscript, build_sell_v18_partial_fill_sigscript,
+    build_sell_v18_redeem_script, BUY_ORDER_V18_MAX_N,
 };
 use kob_core::contract::spot::swap::{build_swap_v18_fill_sigscript, build_swap_v18_redeem_script};
 use kob_core::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
@@ -192,7 +193,8 @@ fn run18(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
     let mut entries = Vec::new();
     for (i, s) in scn.sells.iter().enumerate() {
         let rs = build_sell_v18_redeem_script(
-            s.price_num, s.price_den, 1, &owner_hash, &spk_hash, 30, 0, 0,
+            s.price_num, s.price_den, 1, &owner_hash, &spk_hash,
+        &spk_hash, 30, 0, 0,
         )
         .unwrap();
         let (att_pn, att_pd) = s.attested.unwrap_or((s.price_num, s.price_den));
@@ -213,6 +215,7 @@ fn run18(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
         scn.buy_price_den,
         scn.buy_mfill,
         &owner_hash,
+        &spk_hash,
         &spk_hash,
         scn.buy_mmfee_bps,
         scn.buy_cpend,
@@ -301,7 +304,8 @@ fn run18(scn: &Scn) -> (Vec<Result<(), String>>, usize) {
         let res_spk = if scn.forge_residual_spk {
             // A buy RS with a different state (price 3/1) — different P2SH.
             let other = build_buy_v18_redeem_script(
-                &tcid_arr, 3, 1, scn.buy_mfill, &owner_hash, &spk_hash, scn.buy_mmfee_bps, 0, 0,
+                &tcid_arr, 3, 1, scn.buy_mfill, &owner_hash, &spk_hash,
+        &spk_hash, scn.buy_mmfee_bps, 0, 0,
             )
             .unwrap();
             build_p2sh(&other)
@@ -373,10 +377,11 @@ fn v18_decoy_price_input_rejected() {
     let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
 
     let sell_rs =
-        build_sell_v18_redeem_script(99, 100, 1, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+        build_sell_v18_redeem_script(99, 100, 1, &owner_hash, &spk_hash, &spk_hash, 30, 0, 0).unwrap();
     let sell_ss = build_sell_v18_fill_sigscript(0, 99, 100, &sell_rs);
     let buy_rs = build_buy_v18_redeem_script(
-        &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 2000, 0, 0,
+        &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash,
+        &spk_hash, 2000, 0, 0,
     )
     .unwrap();
     // Decoy wallet input whose sigscript mimics the canonical attested prefix
@@ -721,7 +726,7 @@ fn run_sell_partial(
     let wallet_spk = p2pk_spk(&pubkey);
     let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
     let (pnum, pden) = (99u64, 100u64);
-    let rs = build_sell_v18_redeem_script(pnum, pden, 1, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+    let rs = build_sell_v18_redeem_script(pnum, pden, 1, &owner_hash, &spk_hash, &spk_hash, 30, 0, 0).unwrap();
     let ss = build_sell_v18_partial_fill_sigscript(0, pnum, pden, fta, 1, &rs);
     let inputs = vec![
         TransactionInput::new(op(0x10, 0), ss, 50, 0),
@@ -802,7 +807,8 @@ fn run_oco_sweep(sl_branch: bool, attest_wrong: bool) -> (Vec<Result<(), String>
     let (pn_tp, pd_tp, pn_sl, pd_sl) = (2u64, 1u64, 1u64, 2u64);
     let tokens = 10_000_000u64;
     let oco_rs = build_oco_sell_v18_redeem_script(
-        pn_tp, pd_tp, 1, pn_sl, pd_sl, 1, &owner_hash, &spk_hash, 30, 0, 0,
+        pn_tp, pd_tp, 1, pn_sl, pd_sl, 1, &owner_hash, &spk_hash,
+        &spk_hash, 30, 0, 0,
     )
     .unwrap();
     let branch_pair = if sl_branch { (pn_sl, pd_sl) } else { (pn_tp, pd_tp) };
@@ -824,6 +830,7 @@ fn run_oco_sweep(sl_branch: bool, attest_wrong: bool) -> (Vec<Result<(), String>
         branch_price.0,
         1_000_000,
         &owner_hash,
+        &spk_hash,
         &spk_hash,
         2000,
         0,
@@ -1078,7 +1085,8 @@ fn v18_buy_expire_refund_passes_and_early_expire_rejected() {
     let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
     for (lock_time, expect_ok) in [(2000u64, true), (500u64, false)] {
         let buy_rs = build_buy_v18_redeem_script(
-            &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 30, 0, 1000,
+            &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash,
+        &spk_hash, 30, 0, 1000,
         )
         .unwrap();
         let ss = build_buy_v18_expire_sigscript(&buy_rs);
@@ -1112,7 +1120,8 @@ fn v18_buy_cancel_reaches_checksig() {
     let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
     for mark in [false, true] {
         let buy_rs = build_buy_v18_redeem_script(
-            &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash, 30, 0, 0,
+            &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &spk_hash,
+        &spk_hash, 30, 0, 0,
         )
         .unwrap();
         let sig = [0x11u8; 64];
@@ -1202,7 +1211,8 @@ fn bracket_oco_leg(owner_hash: &[u8; 32], spk_hash: &[u8; 32]) -> (Vec<u8>, [u8;
     let oco_rs = build_oco_sell_v18_redeem_script(
         2, 1, 1, // TP 2/1
         1, 2, 1, // SL 1/2
-        owner_hash, spk_hash, 30, 0, 0,
+        owner_hash, spk_hash,
+        &spk_hash, 30, 0, 0,
     )
     .unwrap();
     assert_eq!(
@@ -1362,7 +1372,8 @@ fn run_bracket_sell(scn: &BracketSellScn) -> Result<(), String> {
 
     // Done-leg for a sell entry: a v18 buy (re-buy lower) funded with KAS.
     let buy_leg_rs = build_buy_v18_redeem_script(
-        &arr32(TOKEN_HEX), 1, 4, 1, &owner_hash, &spk_hash, 30, 0, 0,
+        &arr32(TOKEN_HEX), 1, 4, 1, &owner_hash, &spk_hash,
+        &spk_hash, 30, 0, 0,
     )
     .unwrap();
     let leg_p2sh = build_p2sh(&buy_leg_rs);
@@ -1680,7 +1691,7 @@ fn v18_sell_cancel_reaches_checksig() {
     let wallet_spk = p2pk_spk(&pubkey);
     let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
     let token = hash32(TOKEN_HEX);
-    let rs = build_sell_v18_redeem_script(99, 100, 1, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+    let rs = build_sell_v18_redeem_script(99, 100, 1, &owner_hash, &spk_hash, &spk_hash, 30, 0, 0).unwrap();
     let sig = [0x11u8; 64];
     let ss = build_sell_cancel_sigscript(&sig, &pubkey, &rs);
     let inputs = vec![TransactionInput::new(op(0x10, 0), ss, 0, 0)];
@@ -1704,4 +1715,155 @@ fn v18_sell_cancel_reaches_checksig() {
             || e.contains("Schnorr"),
         "v18 sell cancel must reach OpCheckSig, got: {e}"
     );
+}
+
+// ===========================================================================
+// E1 expire-seat fixes — buy EXPIRE refunds to the owner KAS seat (okspkh),
+// sell/OCO EXPIRE refunds the token escrow to the owner token seat (otspkh)
+// as a covenant-bound token_unit (Fix-3 per-input binding).
+// ===========================================================================
+
+/// A stand-in "token_unit P2SH" SPK, distinct from the wallet P2PK.
+fn token_unit_spk() -> ScriptPublicKey {
+    let mut s = Vec::with_capacity(35);
+    s.push(0xaa); // OpBlake2b
+    s.push(0x20);
+    s.extend_from_slice(&[0x77; 32]);
+    s.push(0x87); // OpEqual
+    ScriptPublicKey::new(0, s.into())
+}
+
+fn spk_hash_of(spk: &ScriptPublicKey) -> [u8; 32] {
+    kob_core::p2sh::compute_spk_hash(spk.version(), spk.script())
+}
+
+/// Buy expire: okspkh (wallet P2PK) != bspkh (token_unit delivery seat).
+/// A refund landing on the token_unit seat — the pre-E1 behavior that parked
+/// binding-less KAS at the shared token address — must FAIL; the owner KAS
+/// seat must PASS.
+#[test]
+fn v18_buy_expire_wrong_seat_rejected() {
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let wallet_spk = p2pk_spk(&pubkey);
+    let okspkh = compute_p2pk_spk_hash(&pubkey);
+    let tu_spk = token_unit_spk();
+    let bspkh = spk_hash_of(&tu_spk);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    for (refund_spk, expect_ok) in [(wallet_spk.clone(), true), (tu_spk.clone(), false)] {
+        let buy_rs = build_buy_v18_redeem_script(
+            &arr32(TOKEN_HEX), 1, 1, 1_000_000, &owner_hash, &bspkh, &okspkh, 30, 0, 1000,
+        )
+        .unwrap();
+        let ss = build_buy_v18_expire_sigscript(&buy_rs);
+        let inputs = vec![TransactionInput::new(op(0x20, 0), ss, 0, 0)];
+        let outputs = vec![TransactionOutput::with_covenant(30_000_000, refund_spk, None)];
+        let entries = vec![UtxoEntry {
+            amount: 30_000_000,
+            script_public_key: build_p2sh(&buy_rs),
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: None,
+        }];
+        let tx = Transaction::new(1, inputs, outputs, 2000, Default::default(), 0, vec![]);
+        let res = exec_inputs(&tx, entries, 0);
+        assert_eq!(
+            res[0].is_ok(),
+            expect_ok,
+            "buy expire refund seat (to_token_unit={}): {:?}",
+            !expect_ok,
+            res[0]
+        );
+    }
+}
+
+/// Sell/OCO expire harness. input[0] = the order UTXO (token covenant);
+/// output[0] = the refund, with knobs for its SPK, binding, and value.
+fn run_sell_expire(
+    oco: bool,
+    to_token_seat: bool,
+    bound: bool,
+    amount: u64,
+    lock_time: u64,
+) -> Result<(), String> {
+    let pubkey = arr32(PUBKEY_HEX);
+    let owner_hash = blake2b_256(&pubkey);
+    let sspkh = compute_p2pk_spk_hash(&pubkey); // KAS-proceeds seat (raw P2PK)
+    let wallet_spk = p2pk_spk(&pubkey);
+    let tu_spk = token_unit_spk();
+    let otspkh = spk_hash_of(&tu_spk); // owner token seat
+    let token = hash32(TOKEN_HEX);
+    let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
+    let (rs, ss) = if oco {
+        let rs = build_oco_sell_v18_redeem_script(
+            99, 100, 1, 1, 2, 1, &owner_hash, &sspkh, &otspkh, 30, 0, 1000,
+        )
+        .unwrap();
+        let ss = build_oco_sell_v18_expire_sigscript(&rs);
+        (rs, ss)
+    } else {
+        let rs = build_sell_v18_redeem_script(
+            99, 100, 1, &owner_hash, &sspkh, &otspkh, 30, 0, 1000,
+        )
+        .unwrap();
+        let ss = build_sell_v18_expire_sigscript(&rs);
+        (rs, ss)
+    };
+    let inputs = vec![TransactionInput::new(op(0x10, 0), ss, 0, 0)];
+    let refund_spk = if to_token_seat { tu_spk.clone() } else { wallet_spk.clone() };
+    let cov = if bound { Some(CovenantBinding::new(0, token)) } else { None };
+    let outputs = vec![TransactionOutput::with_covenant(amount, refund_spk, cov)];
+    let entries = vec![UtxoEntry {
+        amount: 30_000_000,
+        script_public_key: build_p2sh(&rs),
+        block_daa_score: 0,
+        is_coinbase: false,
+        covenant_id: Some(token),
+    }];
+    let tx = Transaction::new(1, inputs, outputs, lock_time, Default::default(), 0, vec![]);
+    exec_inputs(&tx, entries, 0).remove(0)
+}
+
+#[test]
+fn v18_sell_expire_token_seat_bound_passes() {
+    for oco in [false, true] {
+        let r = run_sell_expire(oco, true, true, 30_000_000, 2000);
+        assert!(r.is_ok(), "expire (oco={oco}) to bound token seat must pass: {r:?}");
+    }
+}
+
+#[test]
+fn v18_sell_expire_to_sspkh_wrong_seat_rejected() {
+    // Pre-E1 behavior: token refund to the raw-P2PK sspkh (binding target
+    // mismatch with otspkh) must fail even when covenant-bound.
+    for oco in [false, true] {
+        let r = run_sell_expire(oco, false, true, 30_000_000, 2000);
+        assert!(r.is_err(), "expire (oco={oco}) to the raw P2PK seat must fail");
+    }
+}
+
+#[test]
+fn v18_sell_expire_without_binding_rejected() {
+    // Binding stripped (token burned to plain KAS): auth[0] of the order
+    // input does not exist, the Fix-3 read must fail.
+    for oco in [false, true] {
+        let r = run_sell_expire(oco, true, false, 30_000_000, 2000);
+        assert!(r.is_err(), "expire (oco={oco}) without CovenantBinding must fail");
+    }
+}
+
+#[test]
+fn v18_sell_expire_short_refund_rejected() {
+    for oco in [false, true] {
+        let r = run_sell_expire(oco, true, true, 29_999_999, 2000);
+        assert!(r.is_err(), "expire (oco={oco}) with a short refund must fail");
+    }
+}
+
+#[test]
+fn v18_sell_expire_early_rejected() {
+    for oco in [false, true] {
+        let r = run_sell_expire(oco, true, true, 30_000_000, 500);
+        assert!(r.is_err(), "expire (oco={oco}) before expiry_daa must fail (CLTV)");
+    }
 }

@@ -3,11 +3,13 @@
 use crate::types::OrderSide;
 use crate::contract::spot::bracket::BRACKET_V18_RS_SIZE;
 use crate::contract::spot::oco::{
-    OCO_SELL_STATE_SIZE, OCO_SELL_RS_SIZE, OCO_SELL_V18_RS_SIZE, OcoPath,
+    OCO_SELL_STATE_SIZE, OCO_SELL_RS_SIZE, OCO_SELL_V18_RS_SIZE, OCO_SELL_V18_STATE_SIZE,
+    OcoPath,
 };
 use crate::contract::spot::order::{
     BUY_ORDER_V16_RS_EXPECTED_LEN, BUY_ORDER_V17_RS_EXPECTED_LEN,
-    BUY_ORDER_V18_RS_EXPECTED_LEN, SELL_ORDER_V18_RS_EXPECTED_LEN,
+    BUY_ORDER_V18_RS_EXPECTED_LEN, BUY_ORDER_V18_STATE_SIZE,
+    SELL_ORDER_V18_RS_EXPECTED_LEN, SELL_ORDER_V18_STATE_SIZE,
 };
 
 /// OpZkPrecompile opcode byte (0xa6).
@@ -50,6 +52,11 @@ pub struct ParsedOrder {
     pub requires_zk: bool,
     /// IFD: order B's redeemScript bytes (from IFD payload flag).
     pub ifd_order_b_rs: Option<Vec<u8>>,
+    /// v18 owner refund seat (None for pre-v18 generations):
+    /// buy = `okspkh` (blake2b of the owner's raw P2PK SPK, EXPIRE KAS
+    /// refund endpoint); sell = `otspkh` (blake2b of the owner's token_unit
+    /// P2SH SPK, EXPIRE token refund endpoint).
+    pub owner_seat_hash: Option<[u8; 32]>,
 }
 
 /// Buy state size: 145B.
@@ -88,6 +95,8 @@ pub struct ParsedOcoSell {
     pub cpend: u8,
     pub expiry_daa: Option<u64>,
     pub redeem_script: Vec<u8>,
+    /// v18 owner token seat `otspkh` (None for the v1 OCO).
+    pub owner_seat_hash: Option<[u8; 32]>,
 }
 
 /// Parse a redeemScript to extract order parameters.
@@ -117,14 +126,14 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
             None
         }
         BUY_ORDER_V18_RS_EXPECTED_LEN => {
-            // Buy v18 (unified spot: N:M sweep + Op2 partial): SAME 145B state
-            // layout and the same selector-dispatch signature as v17 (Op9
-            // OpRoll = 0x59 0x7a); the RS length is the version tag.
-            if rs[BUY_STATE_SIZE] == 0x59 && rs[BUY_STATE_SIZE + 1] == 0x7a {
-                return parse_buy_state(rs).map(|mut o| {
-                    o.version = 18;
-                    o
-                });
+            // Buy v18 (unified spot: N:M sweep + Op2 partial): the v17 145B
+            // state layout preceded by [0x20][okspkh 32B] (178B state), body
+            // dispatch signature Op10 OpRoll = 0x5a 0x7a; the RS length is
+            // the version tag.
+            if rs[BUY_ORDER_V18_STATE_SIZE] == 0x5a
+                && rs[BUY_ORDER_V18_STATE_SIZE + 1] == 0x7a
+            {
+                return parse_buy_state_v18(rs);
             }
             None
         }
@@ -136,14 +145,14 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
             None
         }
         SELL_ORDER_V18_RS_EXPECTED_LEN => {
-            // Sell v18 (canonical price attestation + Fix-3 partial F4): SAME
-            // 112B state layout and dispatch signature (Op8 OpRoll) as v14;
-            // the RS length is the version tag.
-            if rs[SELL_STATE_SIZE] == 0x58 && rs[SELL_STATE_SIZE + 1] == 0x7a {
-                return parse_sell_state(rs).map(|mut o| {
-                    o.version = 18;
-                    o
-                });
+            // Sell v18 (canonical price attestation + Fix-3 partial F4 +
+            // otspkh expire seat): the v14 112B layout preceded by
+            // [0x20][otspkh 32B] (145B state), body dispatch signature Op9
+            // OpRoll = 0x59 0x7a; the RS length is the version tag.
+            if rs[SELL_ORDER_V18_STATE_SIZE] == 0x59
+                && rs[SELL_ORDER_V18_STATE_SIZE + 1] == 0x7a
+            {
+                return parse_sell_state_v18(rs);
             }
             None
         }
@@ -176,24 +185,31 @@ pub fn parse_redeem_script(rs: &[u8]) -> Option<ParsedOrder> {
     }
 }
 
-/// Try to parse an OCO sell redeemScript (v1 or v18 — same 139B state layout;
-/// the RS length is the version tag, the dispatch signature is shared).
+/// Try to parse an OCO sell redeemScript (v1, or v18 = the v1 139B layout
+/// preceded by `[0x20][otspkh 32B]`; the RS length is the version tag).
 ///
 /// Returns `None` if the RS is not an OCO sell (wrong size or signature).
 pub fn parse_oco_sell_redeem_script(rs: &[u8]) -> Option<ParsedOcoSell> {
-    if rs.len() != OCO_SELL_RS_SIZE && rs.len() != OCO_SELL_V18_RS_SIZE {
-        return None;
+    if rs.len() == OCO_SELL_RS_SIZE {
+        // v1 body signature: 0x5b 0x7a (Op11 OpRoll) at offset 139
+        if rs[OCO_SELL_STATE_SIZE] != 0x5b || rs[OCO_SELL_STATE_SIZE + 1] != 0x7a {
+            return None;
+        }
+        return parse_oco_sell_state(rs, 0);
     }
-    // Body signature: 0x5b 0x7a (Op11 OpRoll) at offset 139
-    if rs[OCO_SELL_STATE_SIZE] != 0x5b || rs[OCO_SELL_STATE_SIZE + 1] != 0x7a {
-        return None;
+    if rs.len() == OCO_SELL_V18_RS_SIZE {
+        // v18 body signature: 0x5c 0x7a (Op12 OpRoll) at offset 172
+        if rs[OCO_SELL_V18_STATE_SIZE] != 0x5c || rs[OCO_SELL_V18_STATE_SIZE + 1] != 0x7a {
+            return None;
+        }
+        return parse_oco_sell_state(rs, 33);
     }
-    parse_oco_sell_state(rs)
+    None
 }
 
-/// Parse buy state (145B).
+/// Parse buy state (145B v14/v16/v17 layout at offset `base`).
 ///
-/// State layout:
+/// State layout (relative to `base`):
 ///   [0x20][tcid 32B]    = bytes 0..33
 ///   [0x08][pnum 8B]     = bytes 33..42
 ///   [0x08][pden 8B]     = bytes 42..51
@@ -204,38 +220,59 @@ pub fn parse_oco_sell_redeem_script(rs: &[u8]) -> Option<ParsedOcoSell> {
 ///   [cpend 1B]          = byte 135
 ///   [0x08][expiry 8B]   = bytes 136..145
 fn parse_buy_state(rs: &[u8]) -> Option<ParsedOrder> {
-    if rs.len() < BUY_STATE_SIZE {
+    parse_buy_state_at(rs, 0)
+}
+
+/// Parse a v18 buy state (178B): `[0x20][okspkh 32B]` + the 145B layout.
+fn parse_buy_state_v18(rs: &[u8]) -> Option<ParsedOrder> {
+    if rs.len() < BUY_ORDER_V18_STATE_SIZE {
         return None;
     }
+    if rs[0] != 0x20 {
+        return None;
+    }
+    let mut seat = [0u8; 32];
+    seat.copy_from_slice(&rs[1..33]);
+    let mut o = parse_buy_state_at(rs, 33)?;
+    o.version = 18;
+    o.owner_seat_hash = Some(seat);
+    Some(o)
+}
 
-    if rs[0] != 0x20 { return None; }
-    if rs[33] != 0x08 || rs[42] != 0x08 || rs[51] != 0x08 { return None; }
-    if rs[60] != 0x20 || rs[93] != 0x20 { return None; }
-    if rs[126] != 0x08 { return None; }
-    if rs[136] != 0x08 { return None; }
+fn parse_buy_state_at(rs: &[u8], base: usize) -> Option<ParsedOrder> {
+    if rs.len() < base + BUY_STATE_SIZE {
+        return None;
+    }
+    let s = &rs[base..];
+
+    if s[0] != 0x20 { return None; }
+    if s[33] != 0x08 || s[42] != 0x08 || s[51] != 0x08 { return None; }
+    if s[60] != 0x20 || s[93] != 0x20 { return None; }
+    if s[126] != 0x08 { return None; }
+    if s[136] != 0x08 { return None; }
 
     let mut tcid = [0u8; 32];
-    tcid.copy_from_slice(&rs[1..33]);
+    tcid.copy_from_slice(&s[1..33]);
 
-    let pnum = u64::from_le_bytes(rs[34..42].try_into().ok()?);
-    let pden = u64::from_le_bytes(rs[43..51].try_into().ok()?);
-    let mfill = u64::from_le_bytes(rs[52..60].try_into().ok()?);
+    let pnum = u64::from_le_bytes(s[34..42].try_into().ok()?);
+    let pden = u64::from_le_bytes(s[43..51].try_into().ok()?);
+    let mfill = u64::from_le_bytes(s[52..60].try_into().ok()?);
 
     let mut ohash = [0u8; 32];
-    ohash.copy_from_slice(&rs[61..93]);
+    ohash.copy_from_slice(&s[61..93]);
 
     let mut bspkh = [0u8; 32];
-    bspkh.copy_from_slice(&rs[94..126]);
+    bspkh.copy_from_slice(&s[94..126]);
 
-    let mmfee = u64::from_le_bytes(rs[127..135].try_into().ok()?);
+    let mmfee = u64::from_le_bytes(s[127..135].try_into().ok()?);
 
-    let cpend = match rs[135] {
+    let cpend = match s[135] {
         0x00 => 0,
         0x51 => 1,
         _ => return None,
     };
 
-    let expiry_daa = u64::from_le_bytes(rs[137..145].try_into().ok()?);
+    let expiry_daa = u64::from_le_bytes(s[137..145].try_into().ok()?);
 
     if pnum == 0 || pden == 0 || mfill == 0 {
         return None;
@@ -252,17 +289,18 @@ fn parse_buy_state(rs: &[u8]) -> Option<ParsedOrder> {
         spk_hash: bspkh,
         _max_matcher_fee: mmfee,
         cpend,
-        requires_zk: has_zk_opcode(rs, BUY_STATE_SIZE),
+        requires_zk: has_zk_opcode(rs, base + BUY_STATE_SIZE),
         redeem_script: rs.to_vec(),
         post_only: false,
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
         ifd_order_b_rs: None,
+        owner_seat_hash: None,
     })
 }
 
-/// Parse sell state (112B).
+/// Parse sell state (112B v14 layout at offset `base`).
 ///
-/// State layout:
+/// State layout (relative to `base`):
 ///   [0x08][pnum 8B]     = bytes 0..9
 ///   [0x08][pden 8B]     = bytes 9..18
 ///   [0x08][mfill 8B]    = bytes 18..27
@@ -272,34 +310,55 @@ fn parse_buy_state(rs: &[u8]) -> Option<ParsedOrder> {
 ///   [cpend 1B]          = byte 102
 ///   [0x08][expiry 8B]   = bytes 103..112
 fn parse_sell_state(rs: &[u8]) -> Option<ParsedOrder> {
-    if rs.len() < SELL_STATE_SIZE {
+    parse_sell_state_at(rs, 0)
+}
+
+/// Parse a v18 sell state (145B): `[0x20][otspkh 32B]` + the 112B layout.
+fn parse_sell_state_v18(rs: &[u8]) -> Option<ParsedOrder> {
+    if rs.len() < SELL_ORDER_V18_STATE_SIZE {
         return None;
     }
+    if rs[0] != 0x20 {
+        return None;
+    }
+    let mut seat = [0u8; 32];
+    seat.copy_from_slice(&rs[1..33]);
+    let mut o = parse_sell_state_at(rs, 33)?;
+    o.version = 18;
+    o.owner_seat_hash = Some(seat);
+    Some(o)
+}
 
-    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x08 { return None; }
-    if rs[27] != 0x20 || rs[60] != 0x20 { return None; }
-    if rs[93] != 0x08 { return None; }
-    if rs[103] != 0x08 { return None; }
+fn parse_sell_state_at(rs: &[u8], base: usize) -> Option<ParsedOrder> {
+    if rs.len() < base + SELL_STATE_SIZE {
+        return None;
+    }
+    let s = &rs[base..];
 
-    let pnum = u64::from_le_bytes(rs[1..9].try_into().ok()?);
-    let pden = u64::from_le_bytes(rs[10..18].try_into().ok()?);
-    let mfill = u64::from_le_bytes(rs[19..27].try_into().ok()?);
+    if s[0] != 0x08 || s[9] != 0x08 || s[18] != 0x08 { return None; }
+    if s[27] != 0x20 || s[60] != 0x20 { return None; }
+    if s[93] != 0x08 { return None; }
+    if s[103] != 0x08 { return None; }
+
+    let pnum = u64::from_le_bytes(s[1..9].try_into().ok()?);
+    let pden = u64::from_le_bytes(s[10..18].try_into().ok()?);
+    let mfill = u64::from_le_bytes(s[19..27].try_into().ok()?);
 
     let mut ohash = [0u8; 32];
-    ohash.copy_from_slice(&rs[28..60]);
+    ohash.copy_from_slice(&s[28..60]);
 
     let mut sspkh = [0u8; 32];
-    sspkh.copy_from_slice(&rs[61..93]);
+    sspkh.copy_from_slice(&s[61..93]);
 
-    let mmfee = u64::from_le_bytes(rs[94..102].try_into().ok()?);
+    let mmfee = u64::from_le_bytes(s[94..102].try_into().ok()?);
 
-    let cpend = match rs[102] {
+    let cpend = match s[102] {
         0x00 => 0,
         0x51 => 1,
         _ => return None,
     };
 
-    let expiry_daa = u64::from_le_bytes(rs[104..112].try_into().ok()?);
+    let expiry_daa = u64::from_le_bytes(s[104..112].try_into().ok()?);
 
     if pnum == 0 || pden == 0 || mfill == 0 {
         return None;
@@ -316,11 +375,12 @@ fn parse_sell_state(rs: &[u8]) -> Option<ParsedOrder> {
         spk_hash: sspkh,
         _max_matcher_fee: mmfee,
         cpend,
-        requires_zk: has_zk_opcode(rs, SELL_STATE_SIZE),
+        requires_zk: has_zk_opcode(rs, base + SELL_STATE_SIZE),
         redeem_script: rs.to_vec(),
         post_only: false,
         expiry_daa: if expiry_daa > 0 { Some(expiry_daa) } else { None },
         ifd_order_b_rs: None,
+        owner_seat_hash: None,
     })
 }
 
@@ -405,12 +465,14 @@ fn parse_bracket_state(rs: &[u8]) -> Option<ParsedOrder> {
         post_only: false,
         expiry_daa: None,
         ifd_order_b_rs: None,
+        owner_seat_hash: None,
     })
 }
 
-/// Parse OCO sell state (139B).
+/// Parse OCO sell state (139B v1 layout at offset `base`; v18 prefixes it
+/// with `[0x20][otspkh 32B]`, `base` = 33).
 ///
-/// State layout:
+/// State layout (relative to `base`):
 ///   [0x08][pnum_tp 8B]   = bytes 0..9
 ///   [0x08][pden_tp 8B]   = bytes 9..18
 ///   [0x08][mfill_tp 8B]  = bytes 18..27
@@ -422,39 +484,50 @@ fn parse_bracket_state(rs: &[u8]) -> Option<ParsedOrder> {
 ///   [0x08][mmfee 8B]     = bytes 120..129
 ///   [cpend 1B]           = byte 129
 ///   [0x08][expiry 8B]    = bytes 130..139
-fn parse_oco_sell_state(rs: &[u8]) -> Option<ParsedOcoSell> {
-    if rs.len() < OCO_SELL_STATE_SIZE {
+fn parse_oco_sell_state(rs: &[u8], base: usize) -> Option<ParsedOcoSell> {
+    if rs.len() < base + OCO_SELL_STATE_SIZE {
         return None;
     }
+    let seat: Option<[u8; 32]> = if base > 0 {
+        if rs[0] != 0x20 {
+            return None;
+        }
+        let mut a = [0u8; 32];
+        a.copy_from_slice(&rs[1..33]);
+        Some(a)
+    } else {
+        None
+    };
+    let s = &rs[base..];
     // Verify push-size markers
-    if rs[0] != 0x08 || rs[9] != 0x08 || rs[18] != 0x08 { return None; }
-    if rs[27] != 0x08 || rs[36] != 0x08 || rs[45] != 0x08 { return None; }
-    if rs[54] != 0x20 || rs[87] != 0x20 { return None; }
-    if rs[120] != 0x08 { return None; }
-    if rs[130] != 0x08 { return None; }
+    if s[0] != 0x08 || s[9] != 0x08 || s[18] != 0x08 { return None; }
+    if s[27] != 0x08 || s[36] != 0x08 || s[45] != 0x08 { return None; }
+    if s[54] != 0x20 || s[87] != 0x20 { return None; }
+    if s[120] != 0x08 { return None; }
+    if s[130] != 0x08 { return None; }
 
-    let pnum_tp = u64::from_le_bytes(rs[1..9].try_into().ok()?);
-    let pden_tp = u64::from_le_bytes(rs[10..18].try_into().ok()?);
-    let mfill_tp = u64::from_le_bytes(rs[19..27].try_into().ok()?);
-    let pnum_sl = u64::from_le_bytes(rs[28..36].try_into().ok()?);
-    let pden_sl = u64::from_le_bytes(rs[37..45].try_into().ok()?);
-    let mfill_sl = u64::from_le_bytes(rs[46..54].try_into().ok()?);
+    let pnum_tp = u64::from_le_bytes(s[1..9].try_into().ok()?);
+    let pden_tp = u64::from_le_bytes(s[10..18].try_into().ok()?);
+    let mfill_tp = u64::from_le_bytes(s[19..27].try_into().ok()?);
+    let pnum_sl = u64::from_le_bytes(s[28..36].try_into().ok()?);
+    let pden_sl = u64::from_le_bytes(s[37..45].try_into().ok()?);
+    let mfill_sl = u64::from_le_bytes(s[46..54].try_into().ok()?);
 
     let mut ohash = [0u8; 32];
-    ohash.copy_from_slice(&rs[55..87]);
+    ohash.copy_from_slice(&s[55..87]);
 
     let mut sspkh = [0u8; 32];
-    sspkh.copy_from_slice(&rs[88..120]);
+    sspkh.copy_from_slice(&s[88..120]);
 
-    let mmfee = u64::from_le_bytes(rs[121..129].try_into().ok()?);
+    let mmfee = u64::from_le_bytes(s[121..129].try_into().ok()?);
 
-    let cpend = match rs[129] {
+    let cpend = match s[129] {
         0x00 => 0,
         0x51 => 1,
         _ => return None,
     };
 
-    let expiry_daa_raw = u64::from_le_bytes(rs[131..139].try_into().ok()?);
+    let expiry_daa_raw = u64::from_le_bytes(s[131..139].try_into().ok()?);
 
     if pnum_tp == 0 || pden_tp == 0 || mfill_tp == 0 { return None; }
     if pnum_sl == 0 || pden_sl == 0 || mfill_sl == 0 { return None; }
@@ -472,6 +545,7 @@ fn parse_oco_sell_state(rs: &[u8]) -> Option<ParsedOcoSell> {
         cpend,
         expiry_daa: if expiry_daa_raw > 0 { Some(expiry_daa_raw) } else { None },
         redeem_script: rs.to_vec(),
+        owner_seat_hash: seat,
     })
 }
 
@@ -501,6 +575,7 @@ impl ParsedOcoSell {
             post_only: false,
             expiry_daa: self.expiry_daa,
             ifd_order_b_rs: None,
+            owner_seat_hash: self.owner_seat_hash,
         }
     }
 }

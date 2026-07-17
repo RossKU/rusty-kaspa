@@ -2129,6 +2129,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             ifd_order_b_rs: None,
+            owner_seat_hash: None,
         };
         let book_order = BlockScanner::to_book_order(&parsed, "a".repeat(64).as_str(), 0, 10_000, None);
         assert!(!book_order.is_freezable, "requires_zk=false should propagate as is_freezable=false");
@@ -2152,6 +2153,7 @@ mod tests {
             post_only: false,
             expiry_daa: None,
             ifd_order_b_rs: None,
+            owner_seat_hash: None,
         };
         let book_order = BlockScanner::to_book_order(&parsed, "b".repeat(64).as_str(), 1, 20_000, None);
         assert!(book_order.is_freezable, "requires_zk=true should propagate as is_freezable=true");

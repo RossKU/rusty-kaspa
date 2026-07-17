@@ -2038,7 +2038,7 @@ mod tests {
         let mut ob = OrderBook::new();
 
         let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], 2000, 0, 0,
+            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xDD; 32], 2000, 0, 0,
         ).unwrap();
         assert!(is_v18_buy(&rs), "helper must recognize the v18 buy RS");
         assert_eq!(max_sweep_sells_for_buy(&rs), BUY_ORDER_V18_MAX_N);
@@ -2075,7 +2075,7 @@ mod tests {
         let mut ob = OrderBook::new();
 
         let buy_rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], 2000, 0, 0,
+            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xDD; 32], 2000, 0, 0,
         ).unwrap();
         let mut buy = make_buy(2_000_000_000, 1, 1, token);
         buy.tx_id = format!("{:064x}", 3);
@@ -2089,7 +2089,7 @@ mod tests {
         ob.add_sell_order(sell_plain);
 
         let oco_rs = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
-            2, 1, 1_000_000, 1, 2, 1_000_000, &[0xBB; 32], &[0xCC; 32], 30, 0, 0,
+            2, 1, 1_000_000, 1, 2, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xDD; 32], 30, 0, 0,
         ).unwrap();
         assert!(is_v18_oco_sell(&oco_rs), "helper must recognize the v18 OCO RS");
         let mut sell_oco = make_sell(500_000_000, 1, 2, token);
@@ -2117,7 +2117,7 @@ mod tests {
         let mut ob = OrderBook::new();
 
         let buy_rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], 2000, 0, 0,
+            &[0x01; 32], 1, 1, 1_000_000, &[0xBB; 32], &[0xCC; 32], &[0xDD; 32], 2000, 0, 0,
         ).unwrap();
         let mut buy = make_buy(2_000_000_000, 1, 1, token);
         buy.tx_id = format!("{:064x}", 4);

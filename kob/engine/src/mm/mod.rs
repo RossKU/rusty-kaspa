@@ -1051,9 +1051,12 @@ async fn deploy_order(
         "buy" => contract::spot::order::build_buy_v18_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
             &owner_hash, &contract::compute_token_unit_spk_hash(&pubkey),
+            &spk_hash, // okspkh: EXPIRE refunds KAS to the owner's raw P2PK
             crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         "sell" => contract::spot::order::build_sell_v18_redeem_script(
-            price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
+            price_num, price_den, min_fill, &owner_hash, &spk_hash,
+            &contract::compute_token_unit_spk_hash(&pubkey), // otspkh: EXPIRE token refund seat
+            crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         _ => anyhow::bail!("Unknown order side '{}'. Use 'buy' or 'sell'.", side),
     };
 
@@ -1201,9 +1204,12 @@ async fn cancel_order(
         "buy" => contract::spot::order::build_buy_v18_redeem_script(
             &token_cov_id, price_num, price_den, min_fill,
             &owner_hash, &contract::compute_token_unit_spk_hash(&pubkey),
+            &spk_hash, // okspkh: EXPIRE refunds KAS to the owner's raw P2PK
             crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         "sell" => contract::spot::order::build_sell_v18_redeem_script(
-            price_num, price_den, min_fill, &owner_hash, &spk_hash, crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
+            price_num, price_den, min_fill, &owner_hash, &spk_hash,
+            &contract::compute_token_unit_spk_hash(&pubkey), // otspkh: EXPIRE token refund seat
+            crate::DEFAULT_MAX_MATCHER_FEE_BPS, 0, 0,)?,
         _ => anyhow::bail!("Unknown order side '{}'. Use 'buy' or 'sell'.", side),
     };
 

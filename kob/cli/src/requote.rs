@@ -225,7 +225,7 @@ pub async fn run(
             if old_version == 18 {
                 contract::spot::order::build_buy_v18_redeem_script(
                     &tcid, old_price_num, old_price_den, old_min_fill,
-                    &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
+                    &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
             } else if old_version == 17 {
                 contract::build_buy_v17_redeem_script(
                     &tcid, old_price_num, old_price_den, old_min_fill,
@@ -242,7 +242,7 @@ pub async fn run(
         }
         "sell" if old_version == 18 => {
             contract::spot::order::build_sell_v18_redeem_script(
-                old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, old_max_matcher_fee, 0, old_expiry,)?
+                old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
         }
         "sell" => {
             contract::build_sell_redeem_script(
@@ -478,10 +478,10 @@ pub async fn run(
     let new_redeem_script = match new_params.side.as_str() {
         "buy" if new_params.version == 18 => contract::spot::order::build_buy_v18_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
-            new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+            new_params.min_fill, &owner_hash, &new_spk_hash, &compute_p2pk_spk_hash(&pubkey), new_max_matcher_fee, 0, new_expiry,)?,
         "sell" if new_params.version == 18 => contract::spot::order::build_sell_v18_redeem_script(
             new_params.price_num, new_params.price_den, new_params.min_fill,
-            &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,
+            &owner_hash, &new_spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), new_max_matcher_fee, 0, new_expiry,)?,
         "buy" if new_params.version == 17 => contract::build_buy_v17_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
             new_params.min_fill, &owner_hash, &new_spk_hash, new_max_matcher_fee, 0, new_expiry,)?,

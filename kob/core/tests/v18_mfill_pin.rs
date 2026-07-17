@@ -100,17 +100,19 @@ fn run_case(buy_pn: u64, buy_pd: u64, buy_mfill: u64, buy_bps: u64, expect_buy_o
     let op = |b: u8, i: u32| TransactionOutpoint::new(Hash::from_bytes([b; 32]), i);
 
     let oco_rs = build_oco_sell_v18_redeem_script(
-        2, 1, 10_000_000, 1, 2, 10_000_000, &owner_hash, &spk_hash, 30, 0, 0,
+        2, 1, 10_000_000, 1, 2, 10_000_000, &owner_hash, &spk_hash,
+        &spk_hash, 30, 0, 0,
     )
     .unwrap();
     let plain_rs =
-        build_sell_v18_redeem_script(1, 2, 10_000_000, &owner_hash, &spk_hash, 30, 0, 0).unwrap();
+        build_sell_v18_redeem_script(1, 2, 10_000_000, &owner_hash, &spk_hash, &spk_hash, 30, 0, 0).unwrap();
     let buy_rs = build_buy_v18_redeem_script(
         &arr32(TOKEN_HEX),
         buy_pn,
         buy_pd,
         buy_mfill,
         &owner_hash,
+        &spk_hash,
         &spk_hash,
         buy_bps,
         0,

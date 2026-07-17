@@ -70,13 +70,13 @@ const SWAP_RS_SIZE: u64 = 243;
 // --- v18 (unified spot generation, V18_DESIGN.md) ---
 /// buy v18 redeemScript: 145B state + 1525B body = 1670B.
 #[allow(dead_code)] // Kept for fee estimation reference
-const BUY_V18_RS_SIZE: u64 = 1670;
+const BUY_V18_RS_SIZE: u64 = 1720;
 /// sell v18 redeemScript: 112B state + 365B body = 477B.
 #[allow(dead_code)] // Kept for fee estimation reference
-const SELL_V18_RS_SIZE: u64 = 477;
+const SELL_V18_RS_SIZE: u64 = 515;
 /// oco_sell v18 redeemScript: 139B state + 220B body = 359B.
 #[allow(dead_code)] // Kept for fee estimation reference
-const OCO_V18_RS_SIZE: u64 = 359;
+const OCO_V18_RS_SIZE: u64 = 397;
 /// swap v18 redeemScript: 183B state + 77B body = 260B.
 #[allow(dead_code)] // Kept for fee estimation reference
 const SWAP_V18_RS_SIZE: u64 = 260;
@@ -1456,17 +1456,17 @@ mod tests {
     fn v18_rs_size_constants() {
         let h32 = [0u8; 32];
         let buy = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-            &h32, 1, 2, 1000, &h32, &h32, 30, 0, 0,
+            &h32, 1, 2, 1000, &h32, &h32, &h32, 30, 0, 0,
         ).unwrap();
         assert_eq!(BUY_V18_RS_SIZE, buy.len() as u64, "BUY_V18_RS_SIZE mismatch: {}", buy.len());
 
         let sell = kob_core::contract::spot::order::build_sell_v18_redeem_script(
-            1, 2, 1000, &h32, &h32, 30, 0, 0,
+            1, 2, 1000, &h32, &h32, &h32, 30, 0, 0,
         ).unwrap();
         assert_eq!(SELL_V18_RS_SIZE, sell.len() as u64, "SELL_V18_RS_SIZE mismatch: {}", sell.len());
 
         let oco = kob_core::contract::spot::oco::build_oco_sell_v18_redeem_script(
-            2, 1, 1000, 1, 1, 1000, &h32, &h32, 30, 0, 0,
+            2, 1, 1000, 1, 1, 1000, &h32, &h32, &h32, 30, 0, 0,
         ).unwrap();
         assert_eq!(OCO_V18_RS_SIZE, oco.len() as u64, "OCO_V18_RS_SIZE mismatch: {}", oco.len());
 

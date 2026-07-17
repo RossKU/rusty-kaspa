@@ -897,7 +897,7 @@ mod tests {
     fn detect_buy_fill_v18() {
         let tcid = [0x42; 32];
         let rs = kob_core::contract::spot::order::build_buy_v18_redeem_script(
-            &tcid, 41, 152, 1_000_000, &[0u8; 32], &[0u8; 32], 30, 0, 0,
+            &tcid, 41, 152, 1_000_000, &[0u8; 32], &[0u8; 32], &[0u8; 32], 30, 0, 0,
         ).unwrap();
         assert_eq!(rs.len(), kob_core::contract::spot::order::BUY_ORDER_V18_RS_EXPECTED_LEN);
         let ss = make_fill_sigscript(&rs, &[&[0x01], &[0x02], &[0x00], &[0x03]]);
@@ -911,7 +911,7 @@ mod tests {
     #[test]
     fn detect_sell_fill_v18() {
         let rs = kob_core::contract::spot::order::build_sell_v18_redeem_script(
-            7, 9, 1_000_000, &[0u8; 32], &[0u8; 32], 30, 0, 0,
+            7, 9, 1_000_000, &[0u8; 32], &[0u8; 32], &[0u8; 32], 30, 0, 0,
         ).unwrap();
         assert_eq!(rs.len(), kob_core::contract::spot::order::SELL_ORDER_V18_RS_EXPECTED_LEN);
         let ss = make_fill_sigscript(&rs, &[&[0x00]]);

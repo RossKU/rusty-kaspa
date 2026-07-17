@@ -209,7 +209,7 @@ pub fn build_buy_body() -> Vec<u8> {
 /// Entry (selector dropped): expiry(0), cpend(1), mmfee(2), bspkh(3),
 ///   ohash(4), mfill(5), pden(6), pnum(7), tcid(8), okspkh(9), sig(10),
 ///   pk(11)
-fn emit_cancel_body(b: &mut Vec<u8>) {
+pub(crate) fn emit_cancel_body(b: &mut Vec<u8>) {
     use ops::*;
     e_pick(b, 11);
     b.push(BLAKE2B); // blake2b(pk)
@@ -234,7 +234,7 @@ fn emit_cancel_body(b: &mut Vec<u8>) {
 /// Entry (selector on top): selector(0), expiry(1), cpend(2), mmfee_bps(3),
 ///   bspkh(4), ohash(5), mfill(6), pden(7), pnum(8), tcid(9), okspkh(10),
 ///   N(11), tii_MAX_N(12), tii_k(12 + MAX_N - k), tii_1(11 + MAX_N)
-fn emit_fill_body(b: &mut Vec<u8>, max_n: usize) {
+pub(crate) fn emit_fill_body(b: &mut Vec<u8>, max_n: usize) {
     use ops::*;
 
     // A) ioc_flag = (selector == 5), replacing selector at depth 0.
@@ -439,7 +439,7 @@ fn emit_fill_body(b: &mut Vec<u8>, max_n: usize) {
 /// Entry (selector dropped): expiry(0), cpend(1), mmfee(2), bspkh(3),
 ///   ohash(4), mfill(5), pden(6), pnum(7), tcid(8), okspkh(9), ri(10),
 ///   N(11), tii_MAX_N(12), tii_k(12 + MAX_N - k), tii_1(11 + MAX_N)
-fn emit_partial_body(b: &mut Vec<u8>, max_n: usize) {
+pub(crate) fn emit_partial_body(b: &mut Vec<u8>, max_n: usize) {
     use ops::*;
 
     // P1) F5: cpend == 0.

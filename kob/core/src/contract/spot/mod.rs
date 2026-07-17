@@ -16,6 +16,11 @@ pub mod dca;
 pub mod swap;
 pub mod token_pair;
 
+/// EXPERIMENTAL — batch-limit measurement variants (kob/BATCH_LIMITS.md).
+/// Not shipping bytecode: nothing in the deploy/parse/settle paths uses this
+/// module. Deliberately NOT re-exported via `pub use` below.
+pub mod lab;
+
 pub use order::*;
 pub use parse::*;
 pub use receipt::*;

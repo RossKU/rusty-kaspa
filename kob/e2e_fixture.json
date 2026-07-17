@@ -6,7 +6,7 @@
       "ticker": "V18A",
       "token_covenant_id": "eab5c99a1f23b29629f5e5e6808ea386cae522d8b9d122a3f1378b189bb5a4b4",
       "token_genesis_txid": "f4e01942a37eb792ca71b520f1e69b22e85883bebcd96d4db908c64d8e15541f",
-      "mint_authority_outpoint": "955f601c89e11f94063c5838929e037318f9af083a53b1f64f1f2da74283c9e2:0"
+      "mint_authority_outpoint": "c5feddf637e939919dabfa51c556c283c1c9f24aabc4a6c32566665b6e8165ac:0"
     },
     {
       "ticker": "V18B",

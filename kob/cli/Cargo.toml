@@ -19,6 +19,12 @@ path = "src/bin/kob_miner.rs"
 name = "kob-e2e-util"
 path = "src/bin/kob_e2e_util.rs"
 
+# EXPERIMENTAL measurement bin (kob/BATCH_LIMITS.md) — deploys/settles
+# large-N lab covenants on testnet only; not part of the product surface.
+[[bin]]
+name = "kob-batch-lab"
+path = "src/bin/kob_batch_lab.rs"
+
 [dependencies]
 kob-core = { path = "../core" }
 kob-domain = { path = "../domain" }

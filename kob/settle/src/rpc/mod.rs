@@ -1262,6 +1262,120 @@ mod tests {
         assert_eq!(RpcClient::MAX_RECONNECT_BACKOFF_SECS, 60);
     }
 
+    /// R1: exercises `reconnect()`'s actual retry-then-giveup loop (not just
+    /// the config default) against a dead endpoint.
+    ///
+    /// The endpoint is a real TCP listener that accepts each connection and
+    /// immediately drops it without completing the WebSocket handshake — so
+    /// every attempt runs the exact same `connect_with_options()` code path
+    /// (real TCP connect + real `tokio_tungstenite::client_async` handshake)
+    /// a genuinely dead/hung kaspad would hit, rather than a connection-
+    /// refused stub. A shared counter on the accept side proves the loop
+    /// made exactly `max_reconnect_attempts` attempts before giving up.
+    ///
+    /// The `RpcClient` instance itself is hand-built (private-field
+    /// construction, only possible from this in-crate `#[cfg(test)]`
+    /// module — matching this file's existing test layout) instead of going
+    /// through a real initial handshake: `reconnect()` re-dials `self.url`
+    /// itself on every attempt via `connect_with_options`, so the code path
+    /// under test is exercised identically regardless of how the struct was
+    /// constructed.
+    #[tokio::test]
+    async fn reconnect_gives_up_after_max_attempts_against_dead_endpoint() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .expect("bind ephemeral listener");
+        let port = listener.local_addr().unwrap().port();
+
+        let accept_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accept_count_bg = accept_count.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(sock) => {
+                        let n = accept_count_bg.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                        // Close without reading/responding: the client's WS
+                        // handshake fails (reset or EOF) instead of hanging.
+                        drop(sock);
+                        // Bound the acceptor thread's lifetime — well past
+                        // the expected attempt count, but finite so the
+                        // thread (and listener) exit on their own rather
+                        // than blocking on accept() forever.
+                        if n >= 5 {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let url = format!("ws://127.0.0.1:{}", port);
+
+        // reconnect()'s backoff schedule (1s, 2s, 4s, ... capped at
+        // MAX_RECONNECT_BACKOFF_SECS) is hardcoded inside reconnect() itself,
+        // not driven by RetryConfig — only max_reconnect_attempts is
+        // configurable there. 2 attempts costs ~1s + 2s = 3s of backoff
+        // sleep, keeping this well under the ~30s budget.
+        let retry_config = RetryConfig {
+            max_retries: 3,
+            initial_backoff: std::time::Duration::from_millis(10),
+            backoff_multiplier: 2,
+            max_reconnect_attempts: 2,
+        };
+
+        let (write_tx, _write_rx) = mpsc::channel::<String>(1);
+        let (notif_tx, notif_rx) = mpsc::channel::<serde_json::Value>(1);
+        let mut client = RpcClient {
+            url: url.clone(),
+            next_id: AtomicU64::new(1),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            write_tx,
+            alive: Arc::new(AtomicBool::new(false)),
+            auth_token: None,
+            retry_config,
+            notification_rx: Arc::new(Mutex::new(Some(notif_rx))),
+            notification_tx: notif_tx,
+            spent_outpoints: Arc::new(Mutex::new(HashSet::new())),
+            subscribed_addresses: Arc::new(Mutex::new(HashSet::new())),
+            shutdown: Arc::new(AtomicBool::new(false)),
+            notification_dropped: Arc::new(AtomicBool::new(false)),
+            consecutive_timeouts: Arc::new(AtomicU32::new(0)),
+        };
+
+        let start = std::time::Instant::now();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(25), client.reconnect())
+            .await
+            .expect("reconnect() must not hang past the test's time budget");
+        let elapsed = start.elapsed();
+
+        match &result {
+            Err(e) => {
+                assert!(
+                    e.starts_with(RECONNECT_GIVEUP_PREFIX),
+                    "expected the giveup sentinel, got: {}",
+                    e
+                );
+                assert!(
+                    e.contains(&url),
+                    "giveup message should reference the dead endpoint: {}",
+                    e
+                );
+            }
+            Ok(()) => panic!("reconnect() unexpectedly succeeded against a dead endpoint"),
+        }
+
+        assert_eq!(
+            accept_count.load(AtomicOrdering::SeqCst),
+            2,
+            "reconnect() should have made exactly max_reconnect_attempts TCP connections"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "test exceeded its time budget: {:?}",
+            elapsed
+        );
+    }
+
     // M-2: Confirmation polling config tests
 
     #[test]

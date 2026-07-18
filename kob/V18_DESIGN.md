@@ -6,6 +6,33 @@ recorded in `E2E_LIVE_RESULTS.md` (Stage F section: all forms
 `is_accepted:true`, both E1 expire seats REST-verified at the output
 level). Unreleased chain state → no migration.
 
+**(Update 2026-07-17, later the same day): this banner is now STALE for 7
+of the 15 forms.** The LIMITS re-freeze (`317f163c` — MAX_N 8→32, owner
+n_max/batch_max caps, ring 3→8; see `kob/BATCH_LIMITS.md`,
+`kob/TIME_CONTRACTS_DESIGN.md` §0) changed the plain buy and plain sell
+covenant bytecode (RS 1720B→5655B, 515B→542B) — swap/bracket/OCO/DCA
+bytecode is byte-identical and unaffected. This VOIDS the prior Stage-F
+live proofs for every form whose fill/partial/cancel/expire path exercises
+the changed buy/sell bytecode. Cross-referencing which of the 15 forms
+Stage-G (`E2E_LIVE_RESULTS.md`, 2026-07-17/18) actually re-settled live on
+the post-317f163c bytecode:
+- **Re-proven** (bytecode unchanged, or explicitly re-settled in Stage-G):
+  #1 mint, #2 deploy (RS lengths 542/5655 confirmed live), #3 GTC N:M sweep
+  (re-proven via the plain buy+sell 1:1 re-proof + CP-1/CP-2 multi-sell
+  compositions + the live N=8/N=32 sweeps in `BATCH_LIMITS.md`), #7a/#7b OCO
+  TP/SL sweep (OCO bytecode unchanged), #10 2-cycle ring, #11 3-cycle
+  triangle (swap bytecode unchanged), #13 bracket fill (bracket bytecode
+  unchanged), #14 delivery re-wrap (token_unit, unaffected).
+- **OWED re-proof** (touch changed buy/sell bytecode, NOT re-settled in
+  Stage-G): #4 IOC N:M sweep, #5 buy partial Op2 chain, #6 sell partial
+  Fix-3, #8 cancel-mark→fill-reject→cancel, #9 expire seats (manual), #12
+  IFD soft path, #15 engine auto-expire — **7 forms**.
+
+See `kob/RELEASE_STATUS.md` for the current tracked-list of what's proven
+vs. owed. This breakdown is this file's own derivation cross-referencing
+commit `317f163c`'s stated scope against the Stage-F and Stage-G records;
+it is not copied verbatim from either source doc.
+
 Stage E (deletion + rename) landed in three commits:
 - **E1** expire-seat covenant fix: buy state 145B→178B (owner KAS seat
   `okspkh`, EXPIRE refunds there); sell 112B→145B and OCO 139B→172B (owner
@@ -68,7 +95,7 @@ State: current 174B + `mmfee_bps` 8B. All-or-nothing legs only (no ring partial 
 - F2 target floor `output[toi].value >= min_target`, F3 `blake2b(spk[toi]) == owner_spk_hash` — kept.
 - F5 replaced: `toi == OpAuthOutputIdx(giver_idx, 0)` where `giver_idx` is sigscript-supplied and authenticated by `OpInputCovenantId(giver_idx) == target_tcid` (sii-safe; replaces the colliding global `OpCovOutputIdx(target,0)` read).
 - F4 replaced (conservation cap): own source delivery = `OpTxInputIndex Op0 OpAuthOutputIdx` (slot 0), `value >= source_in - source_in/10000*mmfee_bps`. Receiver pins slot 0 by SPK/floor (its F5/F3/F2); giver pins slot-0 value; matcher skim is capped and can only sit at slots >= 1. Both ends of every edge are pinned ⇒ ring is safe with purely local checks; the ring spread beyond per-leg mmfee is unreachable.
-- Old KAS-bridged `execute_swap_fill` (swap+sell+v14 buy) dies with v14. Token↔KAS = normal spot; token↔token = 2-cycle; triangle = 3-cycle. `RING_MAX = 3` for now.
+- Old KAS-bridged `execute_swap_fill` (swap+sell+v14 buy) dies with v14. Token↔KAS = normal spot; token↔token = 2-cycle; triangle = 3-cycle. ~~`RING_MAX = 3` for now.~~ **(Update 2026-07-17: raised to `RING_MAX = 8`, `kob/domain/src/spot/batch.rs:2769`, commit `317f163c` — planner policy only, the swap covenant itself is VM-proven to ~128 legs; see `kob/BATCH_LIMITS.md`.)**
 - Planner `plan_ring_match` (2..=3 legs, all-or-nothing, per-leg floor + cap feasibility), executor `execute_ring_fill`, CLI wiring.
 
 ## Version model

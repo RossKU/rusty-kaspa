@@ -116,7 +116,7 @@ planner-bypass driver) — noted as the one covenant-level caps deferral.
 | RT-2 adversarial set | **LANDED LIVE (2026-07-18, commit `b2869107`)** — 21/21 tamper cases REJECTED, honest advance ACCEPTED ×2; see "RT-2 — LANDED LIVE (2026-07-18)" section at the end of this file | Stage-A `time_contracts.rs` L1–L11 (unit) + `ratchet_tamper_live.rs` (live) |
 | RT-3 owner cancel of continuation | **SETTLED LIVE** — owner recovers full escrow with the original key | **`956af539b2a428cd3f18477008b901c5aee0446e1eb5309a59ed489a5a499bdd`** (blue score 508892097) |
 | **CP-3** buy sweeps ratchet TP | **SETTLED LIVE** — v18 buy fully sweeps the TP branch | **`10ff461089cfa59ad08fa67999e20e9ac69d8d50a678144a45b5d972b00539c8`** (blue score 508874731) |
-| Competing matcher (item 5) | DEFERRED live (unit-proven) | Stage-C weighted-selection/race/backoff tests |
+| Competing matcher (item 5) | ~~DEFERRED live (unit-proven)~~ **SETTLED LIVE later the same day (2026-07-18)** | Stage-C weighted-selection/race/backoff tests; live race winner TXID `d6cd4cff4551197ae108898affab97b4f1650785012e5b1977bf11cdff59a9e9`, loser cleanly rejected as an orphan double-spend — see "Deferred-item closure + competing-matcher live race" section below |
 
 **RT-1 — RESOLVED this run (2026-07-18), two sequential engine-glue bugs fixed.**
 
@@ -1608,7 +1608,13 @@ Live run (node `ws://65.108.107.30:18210`, wallet `/tmp/kob_e2e/wallet.json`):
 **New anomalies found during the race (open unless noted):**
 1. Sell deploy merged leftover fee-UTXO change into the covenant output
    (intended 40,000,000 sompi, on-chain 42,799,223) while logging it as
-   "donated as fee" — deploy-side value placement bug.
+   "donated as fee" — deploy-side value placement bug. **Fixed (`6bae05c3`)**:
+   new `RemainderPlacement` (ExactFit/DonateToFee/Change/InsufficientFunds)
+   + pure `resolve_remainder_placement`; `deploy_buy`/`deploy_sell`/
+   `deploy_oco_sell` (covers twap/decay/ratchet variants) route both phases
+   through it, order output pinned to `--amount` unless funds are genuinely
+   insufficient. Owed a live re-smoke (not yet re-run on testnet-10 after
+   the fix).
 2. `match` (singular) had no working fee floor: its fee override param is
    a documented no-op and `KOB_FEE_FLOOR` was not wired in, so order
    shapes whose local mass estimate undershoots the node relay floor
@@ -1619,7 +1625,17 @@ Live run (node `ws://65.108.107.30:18210`, wallet `/tmp/kob_e2e/wallet.json`):
    so the floor provably reaches the submitted tx.
 3. Phase-1/Phase-2 fee inconsistency in both `match` and `match-batch`:
    the submitted tx carries the stale Phase-1 fee even when Phase 2
-   prints a "recovered" fee; currently masked by `KOB_FEE_FLOOR`.
+   prints a "recovered" fee; currently masked by `KOB_FEE_FLOOR`. **Fixed
+   (`83d8293a` + `8ce15f89`)**: the rebuild gate was `total_fee.saturating_sub(exact)`,
+   which saturates to 0 (skipping the rebuild) on the Phase-1-undershoot
+   case real for covenant-heavy shapes (flat ~100B/input sigscript estimate
+   vs. a 5,655B v18 redeemScript) — `83d8293a` fixes `match`/`match-batch`
+   with a direct-comparison gate (`phase1 != exact || floor binds`);
+   `8ce15f89` fixes the identical gate bug in the engine's unattended
+   `execute_batch_match` settle path (`execute_oco_ratchet` verified
+   already correct). A 4th copy of the same bug in kob-cli auto-match's
+   `submit_match` was fixed separately in `73d3e330`. Owed a live re-smoke
+   (not yet re-run on testnet-10 after the fix).
 4. **(Cross-referenced, not found during this race — found during the
    later RT-2 live-fire session, same day, commit `b2869107`; grouping
    here since this is the file's running open-issues tally.)** `deploy

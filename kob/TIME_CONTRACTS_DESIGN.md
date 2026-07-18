@@ -934,9 +934,14 @@ Build env: unchanged from V18_DESIGN §Build env (Termux cargo 1.94.1,
   "price" is an on-chain print, declared as such (§4.5).
 - **No generation bump; no change of any kind to v18 bytecode, state layouts,
   RS lengths, planners or proofs** — enforced by the Stage-A zero-diff pin.
-- **MAX_N = 8 unchanged** (`BUY_ORDER_MAX_N`); no new sweep slots; the mass
+- ~~**MAX_N = 8 unchanged** (`BUY_ORDER_MAX_N`); no new sweep slots; the mass
   budget argument is not revisited (concurrent batch-mass measurement
-  workstream owns that topic).
+  workstream owns that topic).~~ **(Update 2026-07-17, superseded by the
+  LIMITS re-freeze this file's own header already records: `317f163c`
+  landed `BUY_ORDER_MAX_N = 32` as the shipping value, live-proven TXID
+  `536047f3…` — see `kob/BATCH_LIMITS.md` and `kob/RELEASE_STATUS.md`. This
+  bullet is stale; the mass-budget non-revisit applied only up to that
+  commit, which landed the same day this NON-GOALS section was written.)**
 - **No combined decay+TWAP order initially** — a combined variant is added
   later ONLY on product demand; the attestation ABI makes it additive too
   (one more RS length, zero change to v18 or these four).

@@ -1,5 +1,13 @@
 # KOB E2E Playbook (TN12)
 
+> **SUPERSEDED — frozen at pre-v18 (v14/v15) generation.** These copy-paste
+> patterns predate the v18 unification (`V18_DESIGN.md`, deleted
+> v14/v16/v17 — commits `23eb1edc`/`e5bfcd6c`) and the TIME contracts /
+> LIMITS re-freeze that followed it. See `kob/RELEASE_STATUS.md` for the
+> current canary scope and live-proof status; do not copy-paste these
+> commands against current binaries without checking they still apply.
+> Kept as historical record, not regenerated.
+
 Copy-paste test patterns. Assumes wallet exists and is funded.
 
 > **2026-07-14 (post-Toccata / KCC20)**: token_unit RS changed 35B → 38B

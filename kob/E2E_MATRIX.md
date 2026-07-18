@@ -1,5 +1,13 @@
 # KOB SPOT E2E Verification Matrix
 
+> **SUPERSEDED — frozen at pre-v18 (v14/v15) generation.** This matrix's
+> patterns, RS sizes, and version gates (v14 default, v15 feature-gated)
+> predate the v18 unification (`V18_DESIGN.md`, deleted v14/v16/v17 —
+> commits `23eb1edc`/`e5bfcd6c`) and the TIME contracts / LIMITS re-freeze
+> that followed it. See `kob/RELEASE_STATUS.md` for the current canary
+> scope and live-proof status; do not use this file's matrix as current
+> truth. Kept as historical record, not regenerated.
+
 Production-readiness checklist for the SPOT suite. Every order type x match path x
 operational command must have a post-M1 TN12 E2E PASS before release. Each pattern
 row additionally enumerates behavior / edge-case sub-bullets that a production review

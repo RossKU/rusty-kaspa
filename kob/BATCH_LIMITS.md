@@ -1,13 +1,19 @@
 # BATCH LIMITS — measured mass ceilings across settle patterns
 
 Status: measurement campaign, 2026-07-17, on the shipping single-generation
-spot bytecode (HEAD b37c590). **Nothing here changes the shipping
-covenants — `BUY_ORDER_MAX_N = 8` stays.** All campaign code is clearly
+spot bytecode (HEAD b37c590). **(Update 2026-07-17, same day: this
+campaign's own N=32 measurement became the SHIPPING covenant.) Landed by
+commit `317f163c` — `BUY_ORDER_MAX_N = 32` is now shipping
+(`kob/core/src/contract/spot/order.rs:16`), not experimental; the
+"decision deferred, MAX_N=8 stays" conclusion at the bottom of this file is
+STALE, superseded the same day it was written — see the Conclusion section
+for the update note.** At measurement time all campaign code was clearly
 experimental: `core/src/contract/spot/lab.rs` (parameterized buy-body
-variants, `max_n = 8` pinned byte-identical to shipping),
-`core/tests/batch_limits_lab.rs` (the offline lab), and
-`cli/src/bin/kob-batch-lab` (live deploy/settle driver for the large-N
-variants, testnet only).
+variants; **the `max_n = 32` variant is now pinned byte-identical to
+shipping**, `lab_max_n_32_matches_shipping_bytes`), `core/tests/batch_limits_lab.rs`
+(the offline lab), and `cli/src/bin/kob-batch-lab` (live deploy/settle
+driver for the large-N variants, testnet only — the product CLI itself now
+natively supports N up to 32).
 
 ## Method
 
@@ -54,7 +60,14 @@ fee floor prices `max(compute, transient/2)`; storage has no fee but is a
 hard per-tx cap — and it turns out to be the *binding* constraint for real
 batch sizes (see the storage section).
 
-## Shipping covenant — GTC sweep N ∈ {1,2,4,8}
+## Shipping covenant — GTC sweep N ∈ {1,2,4,8} (HISTORICAL: pre-317f163c shape)
+
+**(Update 2026-07-17): this table measures the then-shipping 8-slot-max buy
+body (RS 1720B). `317f163c` replaced it with the 32-slot body (RS 5655B)
+the same day — the bytes below no longer match current shipping RS
+lengths/masses, though the linear compute-mass fit still holds as a model.
+Kept as measurement history; see "Live validation" below and
+`kob/RELEASE_STATUS.md` for current shipping numbers.**
 
 Distinct-seller shape (`N` seller-KAS + `N` delivery outputs + change),
 100M-sompi sells at 99/100, buy 1/1:
@@ -69,12 +82,23 @@ Distinct-seller shape (`N` seller-KAS + `N` delivery outputs + change),
 
 Linear fit (distinct sellers): **compute ≈ 3,413 + 1,451 per sell**. The
 live Stage-F point (6,563 @ N=3, merged shape) sits on the merged variant
-of the same model and is reproduced exactly by the lab. Every shipping
+of the same model and is reproduced exactly by the lab. ~~Every shipping
 sweep runs on budget-0 covenant inputs (≤ 9,999 free script units — N=8
-uses 5,907).
+uses 5,907).~~ **(Update 2026-07-17, FALSE against current shipping):**
+`317f163c` made the shipping buy body a fixed 32-slot unrolled covenant
+(RS 5655B) — buy fill inputs now declare `sig_op_count = 1` (10 budget
+units, 100,000 extra script units) **at every N**, because the covenant's
+static instruction count is dictated by the 32-slot body regardless of how
+many sells actually fill; budget-0 no longer holds for the shipping
+covenant at any N. See "Live validation" below (the live N=32 run declared
+`sig_op_count = 1`) and `kob/RELEASE_STATUS.md`.
 
-## Experimental covenants MAX_N ∈ {16,32,64} and the ceiling
+## MAX_N ∈ {16,32,64}: 32 is SHIPPING, 16/64 remain experimental
 
+**(Update 2026-07-17): the `max_n=32` variant below is BYTE-IDENTICAL to
+the shipping buy body since `317f163c` — `lab_max_n_32_matches_shipping_bytes`
+pins it. Only 16 and 64 remain purely experimental (`kob-batch-lab` only,
+product CLI refuses those RS lengths by design).**
 `lab::build_buy_body_lab(max_n)` — same emitters, more unrolled slots.
 RS grows ~**149–155 B per slot** (1,720 → 2,912 @16 → 5,392 @32 → 10,352
 @64). At N = MAX_N, 400M-sompi sells, distinct sellers:
@@ -112,7 +136,7 @@ per input (the live N=32 run declared 10 via `sig_op_count = 1`).
 | OCO-heavy sweep (8 OCO sells × 1 buy) | 8 | 6,957 | 14,077 | 27,828 | 266,708 | 1,407,700 | OCO RS 397B < sell 515B → cheaper than plain-sell sweep |
 | ring (shipping swap bytecode) | 2 | 1,078 | 3,158 | 4,312 | 61,170 | 315,800 | |
 | ring | 3 | 1,484 | 3,924 | 5,936 | 84,312 | 392,400 | |
-| ring | 4 | 1,890 | 4,690 | 7,560 | 104,148 | 469,000 | **passes the engine — `RING_MAX = 3` is planner policy, not covenant** |
+| ring | 4 | 1,890 | 4,690 | 7,560 | 104,148 | 469,000 | passes the engine; ~~`RING_MAX = 3` is planner policy, not covenant~~ **(Update: `317f163c` raised `RING_MAX` to 8, `kob/domain/src/spot/batch.rs:2769`)** |
 | ring | 5 | 2,296 | 5,456 | 9,184 | 121,337 | 545,600 | |
 | ring | 6 | 2,702 | 6,222 | 10,808 | 136,375 | 622,200 | |
 | ring @ legs_max | **128** | 52,456 | 99,896 | 209,824 | 16,789 | 10,491,200 | ~766 grams/leg; storage nearly cancels (full-value in = out) |
@@ -121,7 +145,10 @@ per input (the live N=32 run declared 10 via `sig_op_count = 1`).
 Answer to "can a ring exceed 3 legs?": yes — the swap covenant's checks are
 purely local (giver/receiver pin both ends of each edge), so 4-, 5-, 6-…
 up to ~128-leg chains fit under even the 100k compute cap and pass the
-engine on the SHIPPING bytecode. Only `plan_ring_match` caps at 3.
+engine on the SHIPPING bytecode. ~~Only `plan_ring_match` caps at 3.~~
+**(Update 2026-07-17): `plan_ring_match` now caps at `RING_MAX = 8`**
+(`317f163c`, `kob/domain/src/spot/batch.rs:2769`) — still a planner-policy
+cap, not a covenant limit (the covenant itself is VM-proven to 128 legs).
 
 ## Storage-mass edge (KIP-9): the real batch limiter
 
@@ -170,10 +197,14 @@ of `690fa2aa…` @ 99/100; deploys `803d57ce…`, `527ae253…`, `e1df9aab…`,
 > details). 12.2% of the conservative 100k cap, 2.4% of the tn10 block
 > compute limit.
 
-**(b) EXPERIMENTAL MAX_N=32 sweep — one transaction, 32 fills.** Clearly
-experimental: covenant built by `lab::build_buy_redeem_script_lab(32,…)`
+**(b) MAX_N=32 sweep — one transaction, 32 fills.** At measurement time
+this was EXPERIMENTAL: covenant built by `lab::build_buy_redeem_script_lab(32,…)`
 (RS **5,392B**), deployed and settled by `kob-batch-lab` (the product CLI
-refuses this RS length by design). 32 sells (100M units of V18A
+of the time refused this RS length by design). **(Update, same day):**
+this measurement is what `317f163c` promoted to shipping — RS 5,392B here
+vs. shipping 5,655B (the extra bytes are the `n_max`/`batch_max` owner-cap
+fields added in the same commit); the product CLI now natively builds this
+shape. 32 sells (100M units of V18A
 `eab5c99a…` @ 99/100) + one 32-KAS experimental buy
 (`ca232d1325e078921e80db7e9d54349b3d5b6a2004b923e25f0d83ef26be603f:0`),
 settled in ONE 44-in/34-out tx (32 sells + buy + fee + 10 storage-credit
@@ -195,7 +226,7 @@ verification failed"), which stalls `deploy sell`'s default unit selection
 
 ## Conclusion
 
-Shipping MAX_N=8 uses ~12–15% of even the conservative 100,000-gram
+~~Shipping MAX_N=8 uses ~12–15% of even the conservative 100,000-gram
 standard budget (live: 12,225 grams at N=8, 2.4% of the actual 500k tn10
 compute limit); the measured compute ceiling for one sweep is N≈60
 (distinct sellers) / N≈81 (merged) under the 100k cap, N=227 at the VM's
@@ -205,4 +236,20 @@ delivery already at N=8 and ~1.5 KAS at N=32, plus a computeBudget
 declaration (engine/executor change) beyond N≈15. Raising MAX_N would cost
 a covenant re-freeze (~155B of RS per slot), fee-model and budget plumbing,
 and buys little while order values sit near the storage floor — decision
-deferred; MAX_N=8 stays.
+deferred; MAX_N=8 stays.~~
+
+**(Update 2026-07-17, same day — the decision above was NOT deferred, it
+was made within hours of this campaign):** `317f163c` landed MAX_N=32 as
+the shipping covenant the same day this campaign ran (live-proven N=32
+settle `536047f3…`, node mass 53,337 = exactly the lab prediction, ~53% of
+the conservative 100k-gram budget). The measured ceilings above (N≈60/81
+compute-bound, N=227 VM-stack-bound) remain accurate as upper bounds beyond
+32 — they were simply not the number chosen; N=32 was picked as the
+live-proven, comfortably-under-budget point, not the maximum theoretically
+reachable one. The `computeBudget` declaration this file flagged as an
+"engine/executor change... beyond N≈15" is now unconditional at every N
+(`sig_op_count = 1` on every buy fill input, `317f163c`) since the 32-slot
+body's static size exceeds the 9,999-unit free allowance regardless of how
+many sells actually fill. `RING_MAX` was raised 3 → 8 in the same commit
+(`kob/domain/src/spot/batch.rs:2769`). Current shipping status:
+`kob/RELEASE_STATUS.md`.

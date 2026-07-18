@@ -21,11 +21,22 @@ kob/
 
 Built as workspace members of [rusty-kaspa](https://github.com/kaspanet/rusty-kaspa), directly referencing `kaspa-consensus-core`, `kaspa-hashes`, and `kaspa-addresses`. Synced with upstream master post-Toccata (mainnet activation 2026-06-30); crates.io kaspa crates (frozen at 0.15.0, pre-covenants) are NOT usable — the in-tree path deps are required.
 
+## Release status
+
+**See `kob/RELEASE_STATUS.md` for the current canary scope, what's live-proven
+vs. untested, and known open items.** That file is the single source of
+truth; this README's Products table below is refreshed alongside it but
+`RELEASE_STATUS.md` is authoritative on anything time-sensitive.
+
 ## Products
+
+_As of 2026-07-18 (HEAD `73d3e330`; see `kob/E2E_LIVE_RESULTS.md`'s latest
+Stage-G entries for the reference date)._
 
 | Product | Status |
 |---------|--------|
-| Spot (Buy/Sell/Partial/OCO) | v17 (N:M sweep, mmfee-bps) is the sole creatable buy contract; v14/v16 remain parse/cancel-serviced for pre-existing orders, TN12 verified |
+| Spot (Buy/Sell/Partial/OCO) | **v18 is the sole spot generation** (`pub const SPOT_GENERATION: u32 = 18`, `kob/core/src/contract/spot/mod.rs:8`); v14/v16/v17 were deleted (commits `23eb1edc`, `e5bfcd6c`) — pre-existing v14/v16 order UTXOs are now **unparseable and uncancellable** by current binaries: the parser (`kob/core/src/contract/spot/parse.rs:105-168`) dispatches purely by v18 RS-length constants, with no v14/v16 arm. `BUY_ORDER_MAX_N = 32` (`kob/core/src/contract/spot/order.rs:16`, landed by commit `317f163c`) is the shipping sweep ceiling, live-proven at N=32 (TXID `536047f3...`, see `kob/BATCH_LIMITS.md`). |
+| TIME contracts (`decay_sell` / `decay_buy` / `twap_sell` / `ratchet_oco`) | Additive sibling contracts alongside v18 (no generation bump, own RS-length parse arms) — design + verdicts in `kob/TIME_CONTRACTS_DESIGN.md`, live-proof status in `kob/RELEASE_STATUS.md` |
 | Token layer | KCC20 Standard State Header (draft spec conformant, see below) |
 | Perpetuals | Oracle-free bilateral P2P |
 | Lending | Offer/Borrow/Repay/Default/Liquidate |

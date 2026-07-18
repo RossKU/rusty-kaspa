@@ -505,6 +505,16 @@ stays independently auditable (useful both for CoinGecko's data-match rule,
 
 ### 7.6 v17 N:M sweep effect on trade-tape/volume accounting (P0, feeds §7.1/§4/§6)
 
+> **Stale premise (noted, not rewritten — this doc is design-only):** v17
+> was deleted the next day (commit `23eb1edc`, `V18_DESIGN.md` Stage E2).
+> v18 is now the sole spot generation (`SPOT_GENERATION=18`,
+> `kob/core/src/contract/spot/mod.rs:8`) with `BUY_ORDER_MAX_N=32`
+> (`kob/core/src/contract/spot/order.rs:16`, commit `317f163c`), not 8. The
+> per-leg trade-recording argument below (one `record_trade` per order-leg
+> sharing one `txid`, needing a `leg_index` disambiguator) still applies
+> unchanged to v18 sweeps — only the contract name and MAX_N are stale. See
+> `kob/RELEASE_STATUS.md` for current status.
+
 Grounded in `kob/NM_BUY_DESIGN.md` and `kob/E2E_LIVE_RESULTS.md`:
 - **v17 is live** and is now the sole creatable buy contract. A v17 buy
   sweep settles **1 buy against up to `MAX_N=8` sells in one transaction**,

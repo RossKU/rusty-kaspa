@@ -200,6 +200,22 @@ fn resolve_planner_fee_bps_cap(fee_bps: Option<u16>, buy_mmfee_bps: u64, sell_mm
     fee_bps.or_else(|| Some(buy_mmfee_bps.min(sell_mmfee_bps) as u16))
 }
 
+/// Decide whether an optional `KOB_FEE_FLOOR` (sompi, read from the
+/// environment) should raise the fee above `current_fee`, and to what value.
+///
+/// Mirrors the decision `match-batch` makes inline (`cli/src/match_batch.rs`)
+/// and what `BatchPlan::apply_fee_floor` re-checks internally: the floor
+/// binds only when it is STRICTLY GREATER than the fee already reached
+/// (Phase 2's exact compute fee) -- an unset env var, a floor at/below the
+/// current fee, or an explicit floor of `0` are all no-ops. Kept separate
+/// from `BatchPlan::apply_fee_floor` (which does the actual output-value
+/// surgery) so the "should we bump, and to what" decision is unit-testable
+/// without constructing a full `BatchPlan`.
+fn resolve_fee_floor_bump(current_fee: u64, floor: Option<u64>) -> Option<u64> {
+    let floor = floor?;
+    (floor > current_fee).then_some(floor)
+}
+
 /// Resolve the cached redeemScript bytes for one side of a match, if the
 /// cache entry has one and it passes the p2sh_hash sanity check.
 ///
@@ -250,7 +266,10 @@ pub async fn run(
     // Superseded by the canonical planner's own mass-based fee model
     // (`plan_batch_match` / `converge_fee_exact`, same as `match-batch`).
     // Kept for CLI signature/menu parity with the global `--fee-rate` flag
-    // that `dispatch()` threads through every subcommand.
+    // that `dispatch()` threads through every subcommand. This parameter is
+    // INERT -- it is never read below. The supported floor override is the
+    // `KOB_FEE_FLOOR` env var (sompi), honored the same way `match-batch`
+    // and the engine executor honor it (see the Phase 2 block below).
     _fee: u64,
     buy_expiry: u64,
     sell_expiry: u64,
@@ -642,8 +661,30 @@ pub async fn run(
     println!("  Exact compute fee: {} sompi", exact_fee);
     println!("  Fee delta:         {} sompi (recovered)", delta);
 
-    if delta > 0 {
+    // Optional fee floor override (sompi): the node's transient-mass floor
+    // (byte-proportional, e.g. a v18 buy's 5,655B redeemScript) can exceed
+    // the compute-mass fee estimate above -- KOB_FEE_FLOOR lets the operator
+    // force a higher floor. Identical mechanism to `match-batch` / the
+    // engine executor (`engine/src/chain/executor.rs`): the bump is absorbed
+    // from the matcher-side outputs via `BatchPlan::apply_fee_floor` (never
+    // seller/buyer). This MUST be decided and applied here, before the
+    // tx.outputs rebuild below, so the floor reaches the actually-submitted
+    // tx -- not just Phase 2's printed "recovered" number, which the stale
+    // Phase-1 tx would otherwise ship unchanged.
+    let fee_floor_env = std::env::var("KOB_FEE_FLOOR").ok().and_then(|v| v.parse::<u64>().ok());
+    let fee_floor_bump = resolve_fee_floor_bump(exact_fee, fee_floor_env);
+    if let Some(floor) = fee_floor_bump {
+        println!("  Fee floor override: {} sompi (KOB_FEE_FLOOR)", floor);
+    }
+
+    if delta > 0 || fee_floor_bump.is_some() {
         plan.apply_exact_fee(exact_fee);
+        if let Some(floor) = fee_floor_bump {
+            let bumped = plan.apply_fee_floor(floor);
+            if bumped > 0 {
+                println!("  Fee floor applied:  +{} sompi -> {} sompi total", bumped, plan.total_fee);
+            }
+        }
 
         tx.outputs.clear();
         for planned in &plan.outputs {
@@ -847,6 +888,37 @@ mod tests {
     #[test]
     fn planner_cap_equal_sides() {
         assert_eq!(super::resolve_planner_fee_bps_cap(None, 30, 30), Some(30));
+    }
+
+    // ---- resolve_fee_floor_bump ----
+
+    #[test]
+    fn fee_floor_binds_when_above_current_fee() {
+        // Live bug scenario: Phase 2's exact compute-mass fee (1_000) is well
+        // under the node's real transient-mass floor (1_600_000) on a
+        // covenant-heavy v18 shape -- KOB_FEE_FLOOR must bind.
+        assert_eq!(super::resolve_fee_floor_bump(1_000, Some(1_600_000)), Some(1_600_000));
+    }
+
+    #[test]
+    fn fee_floor_does_not_bind_at_or_below_current_fee() {
+        // Floor equal to the current fee: already satisfied, no bump.
+        assert_eq!(super::resolve_fee_floor_bump(1_600_000, Some(1_600_000)), None);
+        // Floor below the current fee: the converged fee already clears it.
+        assert_eq!(super::resolve_fee_floor_bump(2_000_000, Some(1_600_000)), None);
+    }
+
+    #[test]
+    fn fee_floor_zero_never_binds() {
+        // An explicit KOB_FEE_FLOOR=0 (or a zero current fee) must never
+        // raise the fee -- 0 can't be strictly greater than anything u64.
+        assert_eq!(super::resolve_fee_floor_bump(5_000, Some(0)), None);
+        assert_eq!(super::resolve_fee_floor_bump(0, Some(0)), None);
+    }
+
+    #[test]
+    fn fee_floor_unset_env_is_noop() {
+        assert_eq!(super::resolve_fee_floor_bump(5_000, None), None);
     }
 
     // ---- resolve_cached_rs ----

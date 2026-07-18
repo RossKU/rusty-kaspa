@@ -249,6 +249,15 @@ pub enum Commands {
     /// Cross-pair match: sell Token A, buy Token B via a bridging token UTXO.
     ///   --cross-pair --token-outpoint <TXID:IDX>
     ///   TX layout: sell[0] buy[1] token[2] fee[3]
+    ///
+    /// NOTE on fees: the global --fee-rate flag is INERT for this
+    /// subcommand -- the canonical planner derives its own mass-based fee
+    /// (Phase 1 estimate, then Phase 2 exact convergence) and never reads
+    /// --fee-rate. On covenant-heavy shapes (e.g. a v18 buy with a large
+    /// redeemScript), the node's real transient-mass fee floor can exceed
+    /// that compute-mass estimate; the supported override is the
+    /// KOB_FEE_FLOOR env var (sompi), honored identically to `match-batch`
+    /// and the engine executor.
     Match {
         /// Buy order outpoint (txid:index).
         #[arg(long)]

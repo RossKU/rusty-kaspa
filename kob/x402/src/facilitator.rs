@@ -64,6 +64,20 @@ pub trait ChainBackend: Send + Sync {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    /// The input outpoints (`"txid:index"`) that `txid` actually consumes, if
+    /// the node can still produce them (e.g. a still-pending mempool entry).
+    ///
+    /// `None` means "unknown" — the tx wasn't found (already left the mempool
+    /// because it confirmed a while ago, or was never seen) and MUST be
+    /// treated as "cannot verify", never as "consumes nothing". Used by
+    /// `discover_landed_payment` to confirm that a candidate UTXO was really
+    /// produced by spending THIS payment's own inputs, rather than trusting an
+    /// (output index, amount) coincidence against an unrelated transaction.
+    /// Default: unsupported (mock backends override it to model the check).
+    fn tx_input_outpoints<'a>(&'a self, _txid: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
+        Box::pin(async { None })
+    }
+
     /// Classify a submit/RPC error string as transient (a network/RPC hiccup
     /// that is safe to retry and is NOT a validity verdict on the tx) vs
     /// fatal. Default: treat everything as fatal — mock backends produce
@@ -149,6 +163,45 @@ impl ChainBackend for RpcClient {
                 }
             }
             Ok(out)
+        })
+    }
+
+    fn tx_input_outpoints<'a>(&'a self, txid: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
+        // `getMempoolEntry` only answers while the tx is still pending (or in
+        // the orphan pool) — that is exactly the window `discover_landed_payment`
+        // cares about (a submit error just occurred; a genuinely-landed
+        // payment is still fresh). A tx that already confirmed a while ago
+        // (e.g. an unrelated, older payment sitting at the same address)
+        // returns nothing here, and the caller must treat that as
+        // unverifiable rather than as a match.
+        Box::pin(async move {
+            let resp = self
+                .call(
+                    "getMempoolEntry",
+                    serde_json::json!({
+                        "transactionId": txid,
+                        "includeOrphanPool": true,
+                        "filterTransactionPool": false,
+                    }),
+                )
+                .await
+                .ok()?;
+            let entry = resp
+                .get("mempoolEntry")
+                .or_else(|| resp.get("entry"))
+                .filter(|e| !e.is_null())?;
+            let inputs = entry.get("transaction")?.get("inputs")?.as_array()?;
+            Some(
+                inputs
+                    .iter()
+                    .filter_map(|inp| {
+                        let prev = inp.get("previousOutpoint")?;
+                        let id = prev.get("transactionId").and_then(|v| v.as_str())?;
+                        let idx = prev.get("index").and_then(|v| v.as_u64())?;
+                        Some(format!("{}:{}", id, idx))
+                    })
+                    .collect(),
+            )
         })
     }
 }
@@ -768,7 +821,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 // it on chain: poll the confirm address for the expected
                 // output before declaring failure.
                 if let Some(landed) = self
-                    .discover_landed_payment(&confirm_address, pay_output_index, amount)
+                    .discover_landed_payment(&confirm_address, pay_output_index, amount, &input_outpoints)
                     .await
                 {
                     warn!(
@@ -972,18 +1025,56 @@ impl<B: ChainBackend> Facilitator<B> {
     /// hiccup that dropped the response). Scans `confirm_address` for an
     /// unspent output of the expected value at the expected index — the same
     /// evidence `finalize` trusts, discovered by address instead of by a
-    /// known txid. Returns the on-chain txid of the matching output.
+    /// known txid.
+    ///
+    /// (index, amount) alone is NOT sufficient: a merchant address that
+    /// reuses the same `(payTo, amount, payOutputIndex)` across payments (a
+    /// fixed-price item, say) can already have an old, unrelated UTXO sitting
+    /// there from a PRIOR, unrelated settlement. Blindly trusting it would
+    /// credit THIS payment using a stale txid nothing to do with it. So a
+    /// candidate is only accepted once it is verified to have been produced
+    /// by spending `input_outpoints` — the specific inputs THIS payment's
+    /// signed tx consumes (`Validated.input_outpoints`, known to the caller
+    /// before broadcast, independent of whether the broadcast round-trip
+    /// succeeded). Returns the on-chain txid of the matching, verified output.
     async fn discover_landed_payment(
         &self,
         confirm_address: &str,
         pay_output_index: u32,
         amount: u64,
+        input_outpoints: &[String],
     ) -> Option<String> {
         let utxos = self.backend.get_address_utxos(confirm_address).await.ok()?;
-        utxos
-            .into_iter()
-            .find(|u| u.outpoint.index == pay_output_index && u.utxo_entry.amount == amount)
-            .map(|u| u.outpoint.transaction_id)
+        for u in utxos {
+            if u.outpoint.index != pay_output_index || u.utxo_entry.amount != amount {
+                continue;
+            }
+            let txid = u.outpoint.transaction_id;
+            match self.backend.tx_input_outpoints(&txid).await {
+                Some(consumed) => {
+                    let consumed: std::collections::HashSet<&str> =
+                        consumed.iter().map(String::as_str).collect();
+                    if input_outpoints.iter().all(|op| consumed.contains(op.as_str())) {
+                        return Some(txid);
+                    }
+                    // Verified, but this tx does not spend our inputs: some
+                    // other (unrelated) tx happens to pay the same amount at
+                    // the same output index. Not a match — keep scanning.
+                }
+                None => {
+                    // Can't verify (tx already left the mempool — e.g. an old
+                    // confirmed payment — or the node doesn't support the
+                    // lookup). Refuse to guess: crediting a payment we can't
+                    // tie to OUR inputs is exactly the stale-UTXO bug this
+                    // check exists to prevent.
+                    warn!(
+                        confirm_address = %confirm_address, txid = %txid,
+                        "[x402] discover_landed_payment: candidate UTXO's inputs unverifiable; not crediting"
+                    );
+                }
+            }
+        }
+        None
     }
 
     /// Confirm finality for a broadcast payment and record the outcome.
@@ -1061,6 +1152,11 @@ mod tests {
         /// When set, `submit` returns this error string instead of a txid
         /// (models a node rejection or a post-submit RPC hiccup).
         submit_err: Option<String>,
+        /// Models `getMempoolEntry`: the input outpoints a given txid is
+        /// known (still pending, in this mock) to consume. A txid with no
+        /// entry here models "unverifiable" (already confirmed a while ago /
+        /// not found), matching production's `None`.
+        mempool_inputs: HashMap<String, Vec<String>>,
     }
 
     impl MockChain {
@@ -1072,12 +1168,21 @@ mod tests {
                 next_txid: StdMutex::new(1),
                 incoming: Vec::new(),
                 submit_err: None,
+                mempool_inputs: HashMap::new(),
             }
         }
         /// Make `submit` fail with `err` (classified transient/fatal by the
         /// real `RpcClient::is_transient_error`, as production would).
         fn with_submit_error(mut self, err: &str) -> Self {
             self.submit_err = Some(err.to_string());
+            self
+        }
+        /// Register `txid` as (still) verifiably consuming `inputs` — models
+        /// a live `getMempoolEntry` hit. A txid never registered here reports
+        /// `None` (unverifiable), just like an already-confirmed/old tx would
+        /// in production.
+        fn with_mempool_inputs(mut self, txid: &str, inputs: Vec<String>) -> Self {
+            self.mempool_inputs.insert(txid.to_string(), inputs);
             self
         }
         /// Seed a discovered incoming payment (mempool) + its confirmed UTXO at
@@ -1177,6 +1282,10 @@ mod tests {
         }
         fn is_transient(&self, err: &str) -> bool {
             RpcClient::is_transient_error(err)
+        }
+        fn tx_input_outpoints<'a>(&'a self, txid: &'a str) -> BoxFuture<'a, Option<Vec<String>>> {
+            let v = self.mempool_inputs.get(txid).cloned();
+            Box::pin(async move { v })
         }
     }
 
@@ -1424,6 +1533,9 @@ mod tests {
             .with_utxo(&from, &in_txid, 0, 200_000_000)
             // The payment output actually landed at pay_to, index 0, 100M.
             .with_utxo(&pay_to, &landed_txid, 0, 100_000_000)
+            // Verified: `landed_txid` really did consume this payment's own
+            // input (mempool entry still live) -- a genuine landed payment.
+            .with_mempool_inputs(&landed_txid, vec![format!("{}:0", in_txid)])
             .with_submit_error("connection reset by peer");
         let fac = Facilitator::new(chain, tmp_store("landed"), config());
         let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
@@ -1431,6 +1543,37 @@ mod tests {
         let s = fac.settle(&req).await;
         assert!(s.success, "submit errored but payment landed -> must recover: {:?}", s.error_reason);
         assert_eq!(s.transaction, landed_txid, "must report the discovered on-chain txid");
+    }
+
+    #[tokio::test]
+    async fn discover_landed_payment_rejects_stale_utxo_matched_by_amount_and_index_only() {
+        // Regression for the stale-UTXO bug: a merchant address that reuses a
+        // fixed (payTo, amount, payOutputIndex) across payments can already
+        // have an OLD, unrelated UTXO sitting there (from some prior,
+        // unrelated settlement) that happens to match (index, amount)
+        // exactly. When THIS payment's submit errors, discover_landed_payment
+        // must NOT credit that old UTXO's txid as if it were this payment's
+        // settlement -- it never verified that this payment's own inputs
+        // were the ones actually consumed.
+        let from = addr(1);
+        let pay_to = addr(2);
+        let in_txid = "ee".repeat(32);
+        let stale_txid = "ff".repeat(32);
+        let chain = MockChain::new(true)
+            .with_utxo(&from, &in_txid, 0, 200_000_000)
+            // A stale, unrelated UTXO at the exact (payTo, index, amount) this
+            // payment expects -- but with NO registered mempool inputs, i.e.
+            // unverifiable (as an old, already-confirmed tx would be).
+            .with_utxo(&pay_to, &stale_txid, 0, 100_000_000)
+            .with_submit_error("connection reset by peer");
+        let fac = Facilitator::new(chain, tmp_store("stale_utxo"), config());
+        let req = request(&from, &pay_to, 100_000_000, &in_txid, 0, Some(&test_fp()), 100_000_000);
+
+        let s = fac.settle(&req).await;
+        assert!(!s.success, "must not credit an unverified stale UTXO as this payment's settlement");
+        assert!(s.transaction.is_empty());
+        assert_ne!(s.transaction, stale_txid);
+        assert_eq!(s.error_reason.as_deref(), Some(errors::UNEXPECTED_SETTLE_ERROR));
     }
 
     #[tokio::test]

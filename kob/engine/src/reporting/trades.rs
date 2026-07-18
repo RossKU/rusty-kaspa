@@ -73,8 +73,9 @@ pub struct Trade {
     pub txid: String,
     /// P1 fix: disambiguates multiple trade records that share one
     /// settlement `txid` -- already true for cross-pair swaps (2 legs) and
-    /// v17 N:M buy sweeps (up to 9 legs in one TX). `(txid, leg_index)` is
-    /// the stable trade key everywhere (ledger + API); see `trade_id()`.
+    /// N:M buy sweeps (up to 33 legs in one TX, BUY_ORDER_MAX_N=32 sells + 1
+    /// buy). `(txid, leg_index)` is the stable trade key everywhere
+    /// (ledger + API); see `trade_id()`.
     /// Backward-compatible: absent in old JSON/JSONL rows deserializes as 0
     /// (correct for the pre-leg_index era, when every trade was 1 leg = 1 TX).
     #[serde(default)]
@@ -94,7 +95,7 @@ pub struct Trade {
 impl Trade {
     /// The stable, collision-free trade identifier: `(txid, leg_index)`.
     /// A plain `txid` is NOT sufficient once one settlement TX carries
-    /// multiple fills (v17 N:M sweeps, cross-pair swaps).
+    /// multiple fills (N:M sweeps, cross-pair swaps).
     pub fn trade_id(&self) -> String {
         format!("{}:{}", self.txid, self.leg_index)
     }

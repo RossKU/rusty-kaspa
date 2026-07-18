@@ -251,7 +251,7 @@ fn parse_scan_tx(json: &serde_json::Value) -> Option<ScanTx> {
     })
 }
 
-/// Scan a block's transactions for v14 fill TXs.
+/// Scan a block's transactions for v18 fill TXs.
 fn scan_block_for_fills(
     block_json: &serde_json::Value,
     token_filter: &str,
@@ -287,7 +287,7 @@ fn scan_block_for_fills(
             None => continue,
         };
 
-        // Check each input's sigscript for a v14 RS
+        // Check each input's sigscript for a v18 RS
         for input in &tx.inputs {
             if let Some((tcid, pnum, pden, side)) =
                 detect_fill_from_sigscript(&input.sig_script)
@@ -323,7 +323,7 @@ fn scan_block_for_fills(
 /// Scan recent blocks for fill TXs (one-shot, no subscription).
 ///
 /// Uses `getBlockDagInfo` to get the current tip, then fetches the last
-/// `block_count` blocks via `getBlock` and scans for v14 fills.
+/// `block_count` blocks via `getBlock` and scans for v18 fills.
 ///
 /// Returns fills matching the given token, most recent first.
 pub async fn scan_recent_fills(

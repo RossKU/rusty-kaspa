@@ -15,14 +15,15 @@
 //!   directly to reuse matching logic without pulling in chain dependencies.
 
 /// Default maximum matcher fee (in sompi) embedded in PRE-v18 deploy
-/// redeemScripts (v14 absolute-sompi semantics).
+/// redeemScripts (pre-v18 absolute-sompi semantics, superseded by the v18
+/// generation's basis-points scale).
 /// Must match `kob-cli`'s `DEFAULT_MAX_MATCHER_FEE` to avoid P2SH mismatch.
 ///
 /// NOT valid for v18 builders — they take basis points and reject > 10000.
 /// Use [`DEFAULT_MAX_MATCHER_FEE_BPS`] for every v18 call site.
 pub const DEFAULT_MAX_MATCHER_FEE: u64 = 10_000_000;
 
-/// Default maximum matcher fee in BASIS POINTS (v16/v17/v18 semantics;
+/// Default maximum matcher fee in BASIS POINTS (v18 semantics;
 /// 30 bps = 0.3% of trade value). The single shared constant for all v18
 /// builder call sites (engine API, MM quoting, CLI deploys) — the deployer
 /// and any later RS reconstruction (cancel/requote) must agree on this

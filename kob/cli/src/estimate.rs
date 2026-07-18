@@ -70,22 +70,37 @@ const BRACKET_RS_SIZE: u64 = 372;
 ///   = 66 + 33 + 1 + 3 + 260 = 363.
 const SWAP_CANCEL_SS_SIZE: u64 = 363;
 
-/// buy fill sigscript: MAX_N=32 tii pushes + N + selector + pushData(5655B
-/// RS) ~= 40 + 4 + 3 + 5655 = 5702 (worst-case slot encoding).
-const BUY_FILL_SS_SIZE: u64 = 5702;
+/// buy fill sigscript (`build_buy_fill_sigscript`): MAX_N=32 `push_index`
+/// tii pushes (each up to 3B: `push_index` maxes at `[0x02, lo, hi]` for any
+/// n >= 128) + one `push_index(N)` (N <= BUY_ORDER_MAX_N=32, so at most 2B:
+/// the `[0x01, n]` 17..=127 form) + selector(1B) + pushData(5655B RS, >255
+/// => 3B prefix) = 32*3 + 2 + 1 + 3 + 5655 = 96 + 2 + 1 + 5658 = 5757
+/// (worst-case slot encoding -- reachable in an N:M batch where a later
+/// buy leg's own sells sit past tx input position 127).
+const BUY_FILL_SS_SIZE: u64 = 5757;
 /// sell fill sigscript: canonical attested prefix (20B) + selector +
 /// pushData(542B RS) = 21 + 3 + 542 = 566.
 const SELL_FILL_SS_SIZE: u64 = 566;
 
-/// buy_v14 cancel sigscript: 1 + 66 + 33 + 3 + 396 = 499.
-const BUY_CANCEL_SS_SIZE: u64 = 499;
-/// sell_v14 cancel sigscript: 66 + 33 + 1 + 3 + 427 = 530.
-const SELL_CANCEL_SS_SIZE: u64 = 530;
+/// buy cancel sigscript (`build_buy_cancel_sigscript`): pushData(pubkey 32B)
+/// + pushData(sig+sighash 65B) + selector(1B) + pushData(5655B RS, >255 =>
+/// 3B prefix) = 33 + 66 + 1 + 3 + 5655 = 5758.
+const BUY_CANCEL_SS_SIZE: u64 = 5758;
+/// sell cancel sigscript (`build_sell_cancel_sigscript`): pushData(sig+
+/// sighash 65B) + pushData(pubkey 32B) + selector(1B) + pushData(542B RS,
+/// >255 => 3B prefix) = 66 + 33 + 1 + 3 + 542 = 645.
+const SELL_CANCEL_SS_SIZE: u64 = 645;
 
-/// buy_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 396 = 411.
-const BUY_PARTIAL_SS_SIZE: u64 = 411;
-/// sell_v14 partial fill sigscript: 1 + 1 + 9 + 1 + 3 + 427 = 442.
-const SELL_PARTIAL_SS_SIZE: u64 = 442;
+/// buy partial-fill sigscript (`build_buy_partial_fill_sigscript`): same
+/// MAX_N=32 tii-push + N + selector + RS layout as `BUY_FILL_SS_SIZE`, plus
+/// one more `push_index` for the residual output index `ri` (worst case 3B,
+/// same reasoning as the tii pushes above) = 5757 + 3 = 5760.
+const BUY_PARTIAL_SS_SIZE: u64 = 5760;
+/// sell partial-fill sigscript (`build_sell_partial_fill_sigscript`):
+/// `SELL_FILL_SS_SIZE` (canonical attested prefix + selector + RS) + fta
+/// (0x08 + 8B = 9B) + residual output index `ri` (~3B worst case) =
+/// 566 + 9 + 3 = 578.
+const SELL_PARTIAL_SS_SIZE: u64 = 578;
 
 /// P2PK wallet input sigscript: pushData(sig+sighash 65B) = 66B.
 const WALLET_INPUT_SS_SIZE: u64 = P2PK_SIGSCRIPT_SIZE;
@@ -97,8 +112,8 @@ pub enum EstimateCommand {
         /// Amount of KAS to lock (in sompi).
         #[arg(long)]
         amount: u64,
-        /// Contract version (only 14 supported).
-        #[arg(long, default_value = "18")]
+        /// Contract version (only v18 / SPOT_GENERATION is supported).
+        #[arg(long, default_value_t = kob_core::contract::spot::SPOT_GENERATION as u8)]
         version: u8,
     },
     /// Estimate fee for deploying a sell order.
@@ -106,8 +121,8 @@ pub enum EstimateCommand {
         /// Amount of tokens to lock (in sompi value).
         #[arg(long)]
         amount: u64,
-        /// Contract version (only 14 supported).
-        #[arg(long, default_value = "18")]
+        /// Contract version (only v18 / SPOT_GENERATION is supported).
+        #[arg(long, default_value_t = kob_core::contract::spot::SPOT_GENERATION as u8)]
         version: u8,
     },
     /// Estimate fee for matching a buy and sell order.
@@ -118,8 +133,8 @@ pub enum EstimateCommand {
         /// Sell order value in sompi.
         #[arg(long)]
         sell_value: u64,
-        /// Contract version (only 14 supported).
-        #[arg(long, default_value = "18")]
+        /// Contract version (only v18 / SPOT_GENERATION is supported).
+        #[arg(long, default_value_t = kob_core::contract::spot::SPOT_GENERATION as u8)]
         version: u8,
     },
     /// Estimate fee for a partial fill.
@@ -133,8 +148,8 @@ pub enum EstimateCommand {
         /// Total order value in sompi.
         #[arg(long)]
         order_value: u64,
-        /// Contract version (only 14 supported).
-        #[arg(long, default_value = "18")]
+        /// Contract version (only v18 / SPOT_GENERATION is supported).
+        #[arg(long, default_value_t = kob_core::contract::spot::SPOT_GENERATION as u8)]
         version: u8,
     },
     /// Estimate fee for cancelling an order.
@@ -145,8 +160,8 @@ pub enum EstimateCommand {
         /// Order UTXO value in sompi.
         #[arg(long)]
         order_value: u64,
-        /// Contract version (only 14 supported).
-        #[arg(long, default_value = "18")]
+        /// Contract version (only v18 / SPOT_GENERATION is supported).
+        #[arg(long, default_value_t = kob_core::contract::spot::SPOT_GENERATION as u8)]
         version: u8,
     },
     /// Estimate fee for consolidating multiple UTXOs into one.
@@ -861,7 +876,7 @@ pub fn run(cmd: &EstimateCommand) {
 }
 
 fn validate_version(version: u8) {
-    if version != 18 {
+    if version != kob_core::contract::spot::SPOT_GENERATION as u8 {
         error!("unsupported contract version {}. Only v18 is supported (pre-v18 removed in Stage E).", version);
         std::process::exit(1);
     }
@@ -1010,12 +1025,12 @@ mod tests {
         ];
         let tm = compute_transaction_mass(&inputs, &outputs);
         // Sell input: 44 + 3 + 566  = 613  (SELL_FILL_SS_SIZE; >252 so varint = 3)
-        // Buy input:  44 + 3 + 5702 = 5749 (BUY_FILL_SS_SIZE;  >252 so varint = 3)
+        // Buy input:  44 + 3 + 5757 = 5804 (BUY_FILL_SS_SIZE;  >252 so varint = 3)
         // Fee input:  44 + 1 + 66   = 111
         // SigOps: 1 * 1000 = 1000
         // Outputs: (11+34) + (11+35) + (11+34) = 45 + 46 + 45 = 136
-        // Total: 68 + 613 + 5749 + 111 + 1000 + 136 = 7677
-        assert_eq!(tm, 68 + 613 + 5749 + 111 + 1000 + 136);
+        // Total: 68 + 613 + 5804 + 111 + 1000 + 136 = 7732
+        assert_eq!(tm, 68 + 613 + 5804 + 111 + 1000 + 136);
     }
 
 
@@ -1341,5 +1356,86 @@ mod tests {
             0, &h32, 1, 2, &oco_spk, 1000, 100, 1000, &h32, &h32, &h32,
         ).unwrap();
         assert_eq!(BRACKET_RS_SIZE, bracket.len() as u64, "BRACKET_RS_SIZE mismatch: {}", bracket.len());
+    }
+
+    // --- cancel / partial-fill sigscript size constants pinned against the
+    // real builders (kob/core/src/contract/spot/{order.rs,receipt.rs}) ---
+
+    #[test]
+    fn cancel_ss_size_constants() {
+        let h32 = [0u8; 32];
+        let sig64 = [0u8; 64];
+
+        let buy_rs = kob_core::contract::spot::order::build_buy_redeem_script(
+            &h32, 1, 2, 1000, &h32, &h32, &h32, 30, 0, 0,
+        ).unwrap();
+        let buy_cancel_ss = kob_core::contract::spot::order::build_buy_cancel_sigscript(
+            &h32, &sig64, false, &buy_rs,
+        );
+        assert_eq!(
+            BUY_CANCEL_SS_SIZE, buy_cancel_ss.len() as u64,
+            "BUY_CANCEL_SS_SIZE mismatch: {}", buy_cancel_ss.len()
+        );
+
+        let sell_rs = kob_core::contract::spot::order::build_sell_redeem_script(
+            1, 2, 1000, &h32, &h32, &h32, 30, 0, 0,
+        ).unwrap();
+        let sell_cancel_ss = kob_core::contract::spot::receipt::build_sell_cancel_sigscript(
+            &sig64, &h32, &sell_rs,
+        );
+        assert_eq!(
+            SELL_CANCEL_SS_SIZE, sell_cancel_ss.len() as u64,
+            "SELL_CANCEL_SS_SIZE mismatch: {}", sell_cancel_ss.len()
+        );
+    }
+
+    #[test]
+    fn sell_partial_ss_size_constant() {
+        let h32 = [0u8; 32];
+        let sell_rs = kob_core::contract::spot::order::build_sell_redeem_script(
+            1, 2, 1000, &h32, &h32, &h32, 30, 0, 0,
+        ).unwrap();
+        // residual_output_idx >= 256 forces push_index's worst-case 3-byte
+        // encoding -- the branch SELL_PARTIAL_SS_SIZE's derivation assumes.
+        let ss = kob_core::contract::spot::order::build_sell_partial_fill_sigscript(
+            0, 1, 2, 500, 300, &sell_rs,
+        );
+        assert_eq!(
+            SELL_PARTIAL_SS_SIZE, ss.len() as u64,
+            "SELL_PARTIAL_SS_SIZE mismatch: {}", ss.len()
+        );
+    }
+
+    #[test]
+    fn buy_fill_and_partial_ss_size_worst_case() {
+        let h32 = [0u8; 32];
+        let buy_rs = kob_core::contract::spot::order::build_buy_redeem_script(
+            &h32, 1, 2, 1000, &h32, &h32, &h32, 30, 0, 0,
+        ).unwrap();
+        // Worst case: MAX_N=32 sell slots all filled with indices >= 128, so
+        // every `push_index` tii call hits its 3-byte branch. This is a real
+        // reachable shape in an N:M batch (a later buy leg's own sells can
+        // sit past tx input position 127), not just a theoretical bound.
+        let idx: Vec<u16> = (224..256).collect();
+        assert_eq!(idx.len(), 32);
+        let fill_ss = kob_core::contract::spot::order::build_buy_fill_sigscript(&idx, false, &buy_rs);
+        assert_eq!(
+            BUY_FILL_SS_SIZE, fill_ss.len() as u64,
+            "BUY_FILL_SS_SIZE mismatch: {}", fill_ss.len()
+        );
+
+        // Partial adds exactly one more push_index (residual_output_idx),
+        // also forced into its worst-case 3-byte branch.
+        let partial_ss = kob_core::contract::spot::order::build_buy_partial_fill_sigscript(
+            &idx, 300, &buy_rs,
+        );
+        assert_eq!(
+            BUY_PARTIAL_SS_SIZE, partial_ss.len() as u64,
+            "BUY_PARTIAL_SS_SIZE mismatch: {}", partial_ss.len()
+        );
+        assert_eq!(
+            partial_ss.len(), fill_ss.len() + 3,
+            "partial-fill must be exactly one worst-case push_index (3B) larger than fill"
+        );
     }
 }

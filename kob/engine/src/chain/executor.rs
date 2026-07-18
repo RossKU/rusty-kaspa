@@ -896,9 +896,9 @@ pub async fn execute_batch_match(
         // BuyerTokens and SellRemainder outputs need covenant bindings
         // (sell covenant F4 checks: covenant_output_value >= sell_input_value)
         if out.purpose == OutputPurpose::BuyerTokens {
-            // v17 N:M sweep: each BuyerTokens output is authorized by its OWN
+            // N:M sweep: each BuyerTokens output is authorized by its OWN
             // sell input (per-input F4), given by output_auth_input[i]. The
-            // token id is the (single) v17 buy's token. Legacy (v14/v16): the
+            // token id is the (single) buy's token. Non-sweep fills: the
             // merged output binds to the shared token_input_map tii.
             let per_output = plan.output_auth_input.get(&i).copied();
             let binding = if let Some(auth) = per_output {
@@ -1059,8 +1059,8 @@ pub async fn execute_batch_match(
                 let spk_hex = hex::encode(&out.script_public_key);
 
                 if out.purpose == OutputPurpose::BuyerTokens {
-                    // v17: per-output authorizing sell input (see the initial
-                    // build above); legacy: shared token_input_map tii.
+                    // N:M sweep: per-output authorizing sell input (see the
+                    // initial build above); non-sweep: shared token_input_map tii.
                     let per_output = plan.output_auth_input.get(&i).copied();
                     let binding = if let Some(auth) = per_output {
                         plan.buys.first().map(|(b, _)| (auth, hex::encode(b.token_cov_id)))
@@ -3366,8 +3366,9 @@ pub fn parse_block_notification(notification: &serde_json::Value) -> Vec<Transac
 /// Called after every successful match TX submission to keep the REST API
 /// `/trades` and `/klines` endpoints populated with live data.
 /// `leg_index` disambiguates multiple trade records that share one
-/// settlement `txid` (cross-pair swaps: 2 legs; v17 N:M buy sweeps: up to
-/// 9 legs in one TX). Callers recording several legs of the SAME txid must
+/// settlement `txid` (cross-pair swaps: 2 legs; N:M buy sweeps: up to
+/// 33 legs in one TX, BUY_ORDER_MAX_N=32 sells + 1 buy). Callers recording
+/// several legs of the SAME txid must
 /// pass a distinct, incrementing `leg_index` per leg -- `(txid, leg_index)`
 /// is the stable trade key everywhere (ledger + API).
 async fn record_trade(
@@ -4420,11 +4421,12 @@ async fn run_scan_cycle(
                 );
 
                 // Mark all sells as spent + emit events + record trades.
-                // P1 fix: a v17 N:M sweep settles ALL these legs under ONE
+                // P1 fix: an N:M sweep settles ALL these legs under ONE
                 // batch_result.tx_id, so every leg (sells AND buys) needs a
                 // distinct, incrementing leg_index sharing one counter --
                 // otherwise an N-sell sweep would collide on a single
-                // (txid) "trade id" across up to 9 legs.
+                // (txid) "trade id" across up to 33 legs (BUY_ORDER_MAX_N=32
+                // sells + 1 buy).
                 let mut unified_marked_keys: Vec<String> = Vec::new();
                 let mut trade_leg_index: u32 = 0;
                 for sell in &group.sells {
@@ -6583,7 +6585,7 @@ pub async fn run_continuous_with_ws(
             }
         }
 
-        // Expire v14 GTD/IOC/FOK orders (every cycle)
+        // Expire GTD/IOC/FOK orders (every cycle)
         // Runs every cycle (not every 10) so that IOC/FOK orders with short
         // expiry_daa (~current_daa + 10 blocks) are expired promptly. The
         // get_current_daa RPC call is lightweight (single getBlockDagInfo).

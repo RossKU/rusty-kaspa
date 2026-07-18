@@ -112,7 +112,7 @@ pub async fn run(
         Ok(tcid)
     };
 
-    if version != 18 {
+    if version != kob_core::contract::spot::SPOT_GENERATION as u8 {
         anyhow::bail!("Unsupported contract version {}. Only v18 is supported.", version);
     }
 
@@ -396,8 +396,4 @@ pub async fn run(
 
 #[cfg(test)]
 #[allow(deprecated)]
-mod tests {
-    use kob_core::contract;
-    use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
-
-}
+mod tests {}

@@ -37,6 +37,7 @@
 use std::collections::{HashMap, HashSet};
 
 use kob_core::MIN_UTXO_VALUE;
+use kob_core::contract::spot::SPOT_GENERATION;
 use kob_core::contract::spot::oco::{
     build_oco_sell_sl_fill_sigscript,
     build_oco_sell_tp_fill_sigscript,
@@ -80,7 +81,9 @@ pub struct BatchOrder {
     pub outpoint: (String, u32),
     /// Order type (buy or sell).
     pub order_type: OrderType,
-    /// Contract version (sell: 6/8, buy: 8/10/11).
+    /// Contract version. Only `SPOT_GENERATION` (18) is accepted by the
+    /// planners (`validate_sweep`, `BatchPlan::validate`); anything else is
+    /// rejected as `BatchError::UnsupportedVersion`.
     pub version: u8,
     /// Token covenant ID (32 bytes).
     pub token_cov_id: [u8; 32],
@@ -111,7 +114,7 @@ pub struct BatchOrder {
     /// and must use the TP (Op1) or SL (Op2) selector instead of the
     /// standard sell fill selector (Op1).
     pub oco_path: Option<kob_core::OcoPath>,
-    /// Bracket entry metadata (v16 only).
+    /// Bracket entry metadata (v18 bracket contract only).
     ///
     /// Contains the receipt and OCO data extracted from the bracket RS state.
     /// The batch matcher uses this to construct the bracket-specific TX layout:
@@ -120,7 +123,7 @@ pub struct BatchOrder {
     pub bracket_meta: Option<BracketMeta>,
 }
 
-/// Metadata extracted from a bracket entry redeemScript (v16).
+/// Metadata extracted from a bracket entry redeemScript (v18).
 ///
 /// The bracket contract enforces hardcoded index checks:
 ///   - input[2].covenant_id == receipt_cov_id
@@ -492,7 +495,7 @@ pub struct BatchPlan {
     pub buy_output_idx: Vec<usize>,
     /// Covenant output index for each buy (coi). Length = buys.len() if populated.
     pub buy_coi: Vec<u16>,
-    /// Bracket receipt input (v16 only).
+    /// Bracket receipt input (v18 bracket contract only).
     ///
     /// When a bracket buy order is in the batch, the bracket contract checks
     /// `input[2].covenant_id == receipt_cov_id` and `input[2].amount >= min_receipt_val`.
@@ -503,18 +506,18 @@ pub struct BatchPlan {
     /// a recipient signature). The executor must sign this input and build
     /// `build_receipt_consume_sigscript(sig, pk, receipt_rs)`.
     pub bracket_receipt: Option<BracketReceiptInput>,
-    /// Bracket OCO sell output (v16 only).
+    /// Bracket OCO sell output (v18 bracket contract only).
     ///
     /// When a bracket buy order is in the batch, the bracket contract checks
     /// `output[2].spk == oco_spk` and `output[2].value >= oco_min_val`.
     /// This output is inserted at index 2 in `build_tx()`.
     pub bracket_oco_output: Option<PlannedOutput>,
-    /// v17 N:M sweep: per-buy sorted list of the sell INPUT indices this buy
-    /// sweeps. When non-empty for a buy, `build_tx()` emits the v17 fill
-    /// sigscript (`build_buy_v17_fill_sigscript`) instead of the v14/v16 form.
-    /// Empty vec for a buy = legacy (non-v17) path.
+    /// N:M sweep: per-buy sorted list of the sell INPUT indices this buy
+    /// sweeps. When non-empty for a buy, `build_tx()` emits the sweep fill
+    /// sigscript (`build_buy_fill_sigscript`) instead of the single-sell form.
+    /// Empty vec for a buy = the single-sell (non-sweep) path.
     pub buy_sweep_sells: Vec<Vec<u16>>,
-    /// v17 N:M sweep: OUTPUT index -> authorizing sell input index. The executor
+    /// N:M sweep: OUTPUT index -> authorizing sell input index. The executor
     /// binds each such BuyerTokens output to the named sell input (per-input F4),
     /// instead of the single `token_input_map` tii. Empty = legacy behavior.
     pub output_auth_input: std::collections::HashMap<usize, u16>,
@@ -526,7 +529,7 @@ pub struct BatchPlan {
     pub lock_time: u64,
 }
 
-/// Receipt input for bracket fill (v16).
+/// Receipt input for bracket fill (v18).
 ///
 /// The bracket contract hardcodes `input[2]` as the receipt input.
 /// The receipt is a trade_receipt covenant UTXO that proves a prior trade
@@ -695,7 +698,7 @@ impl BatchPlan {
             });
         }
 
-        // === Build bracket receipt input (v16, index 2) ===
+        // === Build bracket receipt input (v18, index 2) ===
         // Must come BEFORE the wallet input so it lands at input[2].
         // The bracket contract hardcodes `Op2 OpTxInputAmount` / `Op2 OpInputCovenantId`.
         if let Some(ref receipt) = self.bracket_receipt {
@@ -729,7 +732,7 @@ impl BatchPlan {
             });
         }
 
-        // === Insert bracket OCO output at index 2 (v16) ===
+        // === Insert bracket OCO output at index 2 (v18) ===
         // The bracket contract hardcodes `Op2 OpTxOutputSpk` / `Op2 OpTxOutputAmount`
         // to check output[2]. Insert AFTER the first two outputs (seller KAS at 0,
         // buyer tokens at 1) so the OCO lands at index 2.
@@ -756,14 +759,12 @@ impl BatchPlan {
 
     /// Validate the plan: all contracts satisfied, fees covered, amounts balanced.
     pub fn validate(&self) -> Result<(), BatchError> {
-        // Check: order versions (v14 for buys/sells, v16 (F6-fix) or v17 (N:M
-        // sweep) for buy, or bracket entry). This mirrors plan_batch_match's
-        // own version check -- kept here too as a post-hoc sanity check on
-        // the built plan, so it must stay in sync with that check (it was
-        // missed when v17 landed, silently rejecting an otherwise-correctly
-        // planned v17 sweep at this late stage).
+        // Check: order versions (v18 only, `SPOT_GENERATION`). This mirrors
+        // `validate_sweep`'s own version check -- kept here too as a
+        // post-hoc sanity check on the built plan, so it must stay in sync
+        // with that check.
         for (sell, _) in &self.sells {
-            if sell.version != 14 && sell.version != 18 {
+            if sell.version != SPOT_GENERATION as u8 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
                     version: sell.version,
@@ -771,7 +772,7 @@ impl BatchPlan {
             }
         }
         for (buy, _) in &self.buys {
-            if buy.version != 14 && buy.version != 16 && buy.version != 17 && buy.version != 18 {
+            if buy.version != SPOT_GENERATION as u8 {
                 return Err(BatchError::UnsupportedVersion {
                     outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
                     version: buy.version,
@@ -1414,7 +1415,7 @@ fn validate_sweep(sells: &[BatchOrder], buys: &[BatchOrder]) -> Result<(), Batch
         return Err(BatchError::MultiBuyUnsupported { count: buys.len() });
     }
     let buy = &buys[0];
-    if buy.version != 18 {
+    if buy.version != SPOT_GENERATION as u8 {
         return Err(BatchError::UnsupportedVersion {
             outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
             version: buy.version,
@@ -1451,7 +1452,7 @@ fn validate_sweep(sells: &[BatchOrder], buys: &[BatchOrder]) -> Result<(), Batch
         }
     }
     for (i, s) in sells.iter().enumerate() {
-        if s.version != 18 {
+        if s.version != SPOT_GENERATION as u8 {
             return Err(BatchError::UnsupportedVersion {
                 outpoint: format!("{}:{}", s.outpoint.0, s.outpoint.1),
                 version: s.version,
@@ -1478,7 +1479,7 @@ fn validate_sweep(sells: &[BatchOrder], buys: &[BatchOrder]) -> Result<(), Batch
 /// (auth slot 0, per-input Fix-3), and the buy contract SUMS those outputs for
 /// its aggregate limit-price floor and surplus cap.
 ///
-/// v18 news vs the v17 sibling:
+/// Notable properties:
 ///   - OCO sells are sweep-eligible on BOTH branches (canonical branch
 ///     attestation; `build_tx` emits the TP/SL v18 sigscript with the
 ///     executing branch's price pair).
@@ -1720,9 +1721,9 @@ fn plan_gtc_sweep_core(
 /// `BUY_ORDER_MAX_N` fully-filled v18 sells (plain and/or OCO),
 /// immediately-or-cancel, with a buyer-change output for leftover KAS.
 ///
-/// Floor semantics mirror the v17 sibling: the contract relaxes the
-/// aggregate limit-price floor to the buy's own `min_fill` on the IOC
-/// selector, so the planner checks `total_tokens >= buy.min_fill`.
+/// The contract relaxes the aggregate limit-price floor to the buy's own
+/// `min_fill` on the IOC selector, so the planner checks
+/// `total_tokens >= buy.min_fill`.
 ///
 /// The contract's surplus cap reads the buy's FULL `kas_in` unconditionally
 /// (surplus = kas_in - fair_sum, independent of where the change lands), so
@@ -1783,7 +1784,7 @@ fn plan_ioc_sweep_core(
     if buy.order_type != OrderType::Buy {
         return Err(BatchError::NoBuyOrders);
     }
-    if buy.version != 18 {
+    if buy.version != SPOT_GENERATION as u8 {
         return Err(BatchError::UnsupportedVersion {
             outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
             version: buy.version,
@@ -1807,7 +1808,7 @@ fn plan_ioc_sweep_core(
         if filled.len() >= n_cap {
             break;
         }
-        if sell.version != 18 {
+        if sell.version != SPOT_GENERATION as u8 {
             continue;
         }
         if sell.token_cov_id != buy.token_cov_id {
@@ -2119,7 +2120,7 @@ fn plan_partial_sweep_core(
     if buy.order_type != OrderType::Buy {
         return Err(BatchError::NoBuyOrders);
     }
-    if buy.version != 18 {
+    if buy.version != SPOT_GENERATION as u8 {
         return Err(BatchError::UnsupportedVersion {
             outpoint: format!("{}:{}", buy.outpoint.0, buy.outpoint.1),
             version: buy.version,
@@ -2141,7 +2142,7 @@ fn plan_partial_sweep_core(
         if filled.len() >= n_cap {
             break;
         }
-        if sell.version != 18 || sell.token_cov_id != buy.token_cov_id || sell.price_den == 0 {
+        if sell.version != SPOT_GENERATION as u8 || sell.token_cov_id != buy.token_cov_id || sell.price_den == 0 {
             continue;
         }
         let bm = sell_batch_max(sell) as usize;
@@ -2405,7 +2406,7 @@ fn plan_partial_sweep_core(
 /// flow (`plan_sell_ioc_match` sibling), adapted to the v18 structural rule
 /// that sweeps are FULL-FILL-ONLY on the sell side:
 ///
-///   - The v14 shape "sell keeps a token residual, N buys fully consumed" is
+///   - A sell keeping a token residual while N buys are fully consumed is
 ///     NOT expressible in v18: the buy derives its delivery as the sell
 ///     input's auth slot 0 (buyer-SPK checked) while the sell's IOC/partial
 ///     F4 requires that same slot to be its self-SPK residual. See
@@ -2459,7 +2460,7 @@ pub fn plan_sell_ioc_match_at(
     if sell.order_type != OrderType::Sell {
         return Err(BatchError::NoSellOrders);
     }
-    if sell.version != 18 {
+    if sell.version != SPOT_GENERATION as u8 {
         return Err(BatchError::UnsupportedVersion {
             outpoint: format!("{}:{}", sell.outpoint.0, sell.outpoint.1),
             version: sell.version,
@@ -2525,7 +2526,7 @@ pub fn plan_sell_ioc_match_at(
     let mut saw_smaller = false;
     let mut cap_infeasible: Option<BatchError> = None;
     for buy in buys {
-        if buy.order_type != OrderType::Buy || buy.version != 18 {
+        if buy.order_type != OrderType::Buy || buy.version != SPOT_GENERATION as u8 {
             continue;
         }
         if buy.token_cov_id != sell.token_cov_id || buy.price_den == 0 {
@@ -3052,29 +3053,29 @@ mod tests {
     // v18 planner tests (Stage B)
     // ═════════════════════════════════════════════════════════════════════
 
-    /// Stage E gates: the generic planner entrypoints reject any pre-v18
-    /// generation outright (the legacy planners were deleted with Stage E).
+    /// The generic planner entrypoints reject any non-v18 order version
+    /// outright (the only supported generation is `SPOT_GENERATION` == 18).
     #[test]
-    fn test_pre_versions_rejected() {
+    fn test_non_v18_versions_rejected() {
         let token = [0x5B; 32];
-        for legacy_version in [14u8, 16, 17] {
+        for bad_version in [0u8, 99, 255] {
             let mut sell = make_sell(0x10, 30_000_000, 1, 1, token);
             let buy = make_buy(0x20, 30_000_000, 1, 1, token, 2000);
-            sell.version = legacy_version;
+            sell.version = bad_version;
             let r = plan_batch_match(&[sell.clone()], &[buy.clone()], None, &matcher_spk(), 0, None);
             assert!(
                 matches!(r, Err(BatchError::UnsupportedVersion { .. })),
-                "plan_batch_match must reject v{legacy_version}: {r:?}"
+                "plan_batch_match must reject v{bad_version}: {r:?}"
             );
             // plan_ioc_match skips non-v18 sells during sweep collection, so
-            // a legacy-only book yields an empty-sweep error rather than
+            // a non-v18-only book yields an empty-sweep error rather than
             // UnsupportedVersion — either way the plan MUST fail.
             let r = plan_ioc_match(&[sell.clone()], &buy, None, &matcher_spk(), 0, None);
-            assert!(r.is_err(), "plan_ioc_match must reject v{legacy_version}: {r:?}");
+            assert!(r.is_err(), "plan_ioc_match must reject v{bad_version}: {r:?}");
             let r = plan_sell_ioc_match(&sell, &[buy.clone()], None, &matcher_spk(), 0, None);
             assert!(
                 matches!(r, Err(BatchError::UnsupportedVersion { .. })),
-                "plan_sell_ioc_match must reject v{legacy_version}: {r:?}"
+                "plan_sell_ioc_match must reject v{bad_version}: {r:?}"
             );
         }
     }

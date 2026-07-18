@@ -376,9 +376,10 @@ impl IfdBook {
 /// Same contract as `compute_order_b_scripts`, but the done-leg RS is a v18
 /// buy/sell, so the emitted order is automatically sweep/batch-eligible under
 /// the v18 planners. `max_matcher_fee_bps` is REQUIRED and is basis points
-/// (v18 uniform; the v14 absolute-sompi `DEFAULT_MAX_MATCHER_FEE` is invalid
-/// for v18 builders, which reject bps > 10000). The caller (engine/CLI) must
-/// use ONE fixed value across registration and trigger, or the precomputed
+/// (v18 uniform; the pre-v18 absolute-sompi `DEFAULT_MAX_MATCHER_FEE` is
+/// invalid for v18 builders, which reject bps > 10000). The caller
+/// (engine/CLI) must use ONE fixed value across registration and trigger,
+/// or the precomputed
 /// P2SH will not match the deployed order.
 ///
 /// `owner_seat_hash` is the E1 expire-refund seat, side-appropriate: for a

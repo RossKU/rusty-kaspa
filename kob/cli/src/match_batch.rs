@@ -482,7 +482,7 @@ pub async fn run(
         if buys.len() != 1 {
             anyhow::bail!("--partial requires exactly 1 buy order (got {})", buys.len());
         }
-        if buys[0].version != 18 {
+        if buys[0].version != kob_core::contract::spot::SPOT_GENERATION as u8 {
             anyhow::bail!("--partial requires a v18 buy (Op2 partial fill); got v{}", buys[0].version);
         }
         println!("Partial (Op2): buy fills {} sell(s), residual continues", sells.len());
@@ -599,7 +599,7 @@ pub async fn run(
         use kob_engine::matcher::batch::OutputPurpose;
         match planned.purpose {
             OutputPurpose::BuyerTokens => {
-                // v17/v18 plans provide the per-output authorizing sell input
+                // v18 plans provide the per-output authorizing sell input
                 // in output_auth_input; legacy plans fall back to
                 // buy_seller_map. BuyResidual (v18 Op2) is deliberately NOT
                 // covenant-bound: it is plain KAS under the buy's P2SH.

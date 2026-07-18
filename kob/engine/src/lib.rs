@@ -625,7 +625,7 @@ fn build_mm_config(
         amount,
         interval_secs: interval_ms / 1000,
         dry_run: false,
-        version: 18,
+        version: kob_core::contract::spot::SPOT_GENERATION as u8,
         min_fill: mm_min_fill,
         requote_threshold_bps: 500,
         deploy_delay_secs: 2,

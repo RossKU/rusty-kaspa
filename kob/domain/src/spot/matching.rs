@@ -28,7 +28,7 @@ pub fn is_oco_sell_rs(rs: &[u8]) -> bool {
 }
 
 /// Sweep-collection cap for a buy anchor: the contract's compile-time term
-/// slot count for v17/v18 sweeps, the generic batch cap otherwise. Collecting
+/// slot count for v18 sweeps, the generic batch cap otherwise. Collecting
 /// beyond this would be rejected wholesale at plan time (or panic inside the
 /// sigscript builder), losing the whole group.
 pub fn max_sweep_sells_for_buy(rs: &[u8]) -> usize {
@@ -482,7 +482,7 @@ fn find_sweep_groups(
             // duplicate inputs (TP + SL share the same UTXO).
             let mut sweep_utxo_keys: HashSet<String> = HashSet::new();
 
-            // HIGH DoS #3: a v17/v18 buy's contract has exactly MAX_N term
+            // HIGH DoS #3: a v18 buy's contract has exactly MAX_N term
             // slots -- collecting more sells than that for such an anchor
             // would later panic (or, since batch.rs guards it, get rejected
             // wholesale) at plan time. Cap collection at the contract's own
@@ -502,13 +502,13 @@ fn find_sweep_groups(
                 }
                 // Pre-v18 OCO exclusion (RELEASE-BLOCKER #1, historical): the
                 // real multi-sell blocker was the OCO-SL fixed-offset
-                // price-read mismatch — a v16/v17 buy reads the swept sell's
-                // price at fixed sigscript offsets that land on the TP pair
-                // even when the SL branch executes. (The once-cited OCO F4
+                // price-read mismatch — a pre-v18 buy read the swept sell's
+                // price at fixed sigscript offsets that landed on the TP pair
+                // even when the SL branch executed. (The once-cited OCO F4
                 // shared-output drain was already closed by the per-input
-                // Fix-3 rewrite of OCO_SELL_BODY — see
-                // BatchError::OcoMultiSellSweepUnsupported in
-                // domain/src/spot/batch.rs for the full history.)
+                // Fix-3 rewrite of OCO_SELL_BODY. The pre-v18 generations and
+                // their dedicated guard error variant were removed wholesale
+                // once v18 became the only supported generation.)
                 //
                 // v18 solves the price read with the canonical branch
                 // attestation (pnum/pden at sigscript [3..11)/[12..20),

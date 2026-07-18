@@ -322,7 +322,7 @@ pub enum WsEvent {
         pair: String,
         txid: String,
         /// P1 fix: disambiguates multiple trade events sharing one txid
-        /// (cross-pair swaps, v17 N:M sweeps) -- `(txid, leg_index)` is the
+        /// (cross-pair swaps, N:M sweeps) -- `(txid, leg_index)` is the
         /// stable trade key everywhere (ledger + API + WS).
         #[serde(rename = "legIndex")]
         leg_index: u32,
@@ -751,7 +751,7 @@ struct DepthResponse {
 struct TradeResponse {
     txid: String,
     /// P1 fix: disambiguates multiple trade records that share one
-    /// settlement txid (cross-pair swaps, v17 N:M sweeps).
+    /// settlement txid (cross-pair swaps, N:M sweeps).
     /// `(txid, leg_index)` is the stable trade key.
     #[serde(rename = "legIndex")]
     leg_index: u32,

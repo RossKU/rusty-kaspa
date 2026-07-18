@@ -45,13 +45,13 @@ pub struct CachedOrder {
     /// Contract version (v18).
     #[serde(default = "default_version")]
     pub version: u8,
-    /// Expiry DAA score (v14 only, 0 = GTC).
+    /// Expiry DAA score (0 = GTC).
     #[serde(default)]
     pub expiry_daa: u64,
 }
 
 fn default_version() -> u8 {
-    18
+    kob_core::contract::spot::SPOT_GENERATION as u8
 }
 
 /// Result of a single cancel operation.
@@ -563,7 +563,7 @@ pub fn build_redeem_script_for_order(
     };
 
 
-    if order.version != 18 {
+    if order.version != kob_core::contract::spot::SPOT_GENERATION as u8 {
         anyhow::bail!("Unsupported contract version {}. Only v18 is supported.", order.version);
     }
 
@@ -728,7 +728,7 @@ mod tests {
             price_den: 1,
             min_fill: 100,
             value: 1000,
-            version: 14,
+            version: 18,
             expiry_daa: 0,
         });
         let result = build_redeem_script_for_order(&order, &pubkey);
@@ -746,7 +746,7 @@ mod tests {
             price_den: 1,
             min_fill: 100,
             value: 1000,
-            version: 14,
+            version: 18,
             expiry_daa: 0,
         });
         let result = build_redeem_script_for_order(&order, &pubkey);

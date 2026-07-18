@@ -46,7 +46,7 @@ CREATE INDEX IF NOT EXISTS idx_candles_1m_time ON candles_1m(pair_id, open_time)
 -- /api/v1/trades (deep history) and /api/v1/gecko/historical_trades need;
 -- the in-memory TradeLog stays the low-latency hot path for recent/WS data.
 -- P1 fix: leg_index disambiguates multiple trade rows sharing one txid
--- (cross-pair swaps, v17 N:M sweeps). (txid, leg_index) is the trade key.
+-- (cross-pair swaps, N:M sweeps). (txid, leg_index) is the trade key.
 CREATE TABLE IF NOT EXISTS trades (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     txid         TEXT    NOT NULL,

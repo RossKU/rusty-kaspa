@@ -78,7 +78,7 @@ impl MmConfig {
         if self.interval_secs == 0 {
             anyhow::bail!("interval must be > 0");
         }
-        if self.version != 18 {
+        if self.version != kob_core::contract::spot::SPOT_GENERATION as u8 {
             anyhow::bail!("version must be 18 (new quotes deploy as v18 only)");
         }
         if self.min_fill == 0 {
@@ -1040,7 +1040,7 @@ async fn deploy_order(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_bytes);
 
-    if version != 18 {
+    if version != kob_core::contract::spot::SPOT_GENERATION as u8 {
         anyhow::bail!("Unsupported contract version {}. New quotes deploy as v18 only.", version);
     }
     let redeem_script = match side {
@@ -1194,7 +1194,7 @@ async fn cancel_order(
 
     // Reconstruct the redeem script (v18 only — matches deploy_order above;
     // the P2SH only resolves when the SAME builder + fee constant are used)
-    if version != 18 {
+    if version != kob_core::contract::spot::SPOT_GENERATION as u8 {
         anyhow::bail!("Unsupported contract version {}. New quotes deploy as v18 only.", version);
     }
     let redeem_script = match side {

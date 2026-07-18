@@ -136,13 +136,14 @@ pub enum Commands {
         #[arg(long)]
         order_value: Option<u64>,
 
-        /// Contract version (14, 16, or 17). Must match the version used to
-        /// deploy the order. For v16/v17 buys, --max-matcher-fee is the bps
-        /// value embedded at deploy time, not raw sompi.
+        /// Contract version (v18 only). Must match the version used to
+        /// deploy the order; resolved from the orders cache if omitted.
+        /// --max-matcher-fee is the bps value embedded at deploy time, not
+        /// raw sompi.
         #[arg(long)]
         version: Option<u8>,
 
-        /// Expiry DAA score (required for v14 orders to reconstruct RS). 0 = GTC.
+        /// Expiry DAA score, needed to reconstruct the RS (0 = GTC).
         #[arg(long)]
         expiry: Option<u64>,
 
@@ -224,7 +225,7 @@ pub enum Commands {
         #[arg(long, default_value_t = 18)]
         version: u8,
 
-        /// Expiry DAA score (required for v14 orders to reconstruct RS). 0 = GTC.
+        /// Expiry DAA score, needed to reconstruct the RS (0 = GTC).
         #[arg(long, default_value = "0")]
         expiry: u64,
 
@@ -356,18 +357,17 @@ pub enum Commands {
         #[arg(long, default_value = "18")]
         version: u8,
 
-        /// Buy order expiry DAA score (for v14 RS reconstruction). 0 = GTC.
+        /// Buy order expiry DAA score, needed to reconstruct the RS. 0 = GTC.
         #[arg(long, default_value = "0")]
         buy_expiry: u64,
 
-        /// Sell order expiry DAA score (for v14 RS reconstruction). 0 = GTC.
+        /// Sell order expiry DAA score, needed to reconstruct the RS. 0 = GTC.
         #[arg(long, default_value = "0")]
         sell_expiry: u64,
 
-        /// Max matcher fee (sompi) embedded in the reconstructed v14 buy/sell
-        /// redeemScripts. Must match the value the orders were deployed
-        /// with, or the reconstructed P2SH won't match the on-chain order.
-        /// Ignored for the buy side when --version 16 (use --mmfee-bps).
+        /// INERT for v18 (BPS-uniform contracts use --mmfee-bps instead;
+        /// this sompi-scale field is never read). Kept for CLI signature
+        /// parity with older invocations.
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
 
@@ -696,8 +696,10 @@ pub enum Commands {
         #[arg(long)]
         new_amount: u64,
 
-        /// Contract version of the old order being cancelled (14, 16, or 17).
-        /// Resolved from orders cache if omitted (defaults to 14).
+        /// Contract version of the old order being cancelled (v18 only).
+        /// Resolved from orders cache if omitted; if there's no cache entry
+        /// either, resolution falls back to a deliberately-invalid sentinel
+        /// so the command fails loudly instead of guessing a version.
         #[arg(long)]
         old_version: Option<u8>,
 
@@ -710,7 +712,7 @@ pub enum Commands {
         #[arg(long)]
         old_expiry: Option<u64>,
 
-        /// New order expiry DAA score (for v14 RS construction). 0 = GTC.
+        /// New order expiry DAA score, needed to construct the RS. 0 = GTC.
         #[arg(long, default_value = "0")]
         new_expiry: u64,
 
@@ -867,7 +869,7 @@ pub enum Commands {
 
     /// Watch blocks for fill TXs (trustless price discovery).
     ///
-    /// Scans recent blocks for v14 fill transactions, displays price info,
+    /// Scans recent blocks for v18 fill transactions, displays price info,
     /// then subscribes to new blocks and prints fills as they appear.
     Watch {
         /// Token covenant ID to filter by (hex, 64 chars). Shows all fills if omitted.
@@ -1085,11 +1087,10 @@ pub enum DeployCommands {
         amount_kas: Option<String>,
 
         /// Contract version. Only v18 (unified spot: N:M sweep + Op2 partial
-        /// + OCO sweep) may be deployed for new orders; v14/v16/v17 are
-        /// rejected here and retained solely for managing pre-existing
-        /// on-chain orders via cancel/cancel-all/requote --old-version.
-        /// v18 uses --mmfee-bps (BPS) instead of --max-matcher-fee
-        /// (see V18_DESIGN.md).
+        /// + OCO sweep) may be deployed; pre-v18 generations were removed
+        /// in Stage E and any other value is a hard error. v18 uses
+        /// --mmfee-bps (BPS) instead of --max-matcher-fee (see
+        /// V18_DESIGN.md).
         #[arg(long, default_value = "18")]
         version: u8,
 
@@ -1112,9 +1113,8 @@ pub enum DeployCommands {
         #[arg(long)]
         matcher_url: Option<String>,
 
-        /// GTD expiry: DAA score after which the order is considered expired.
-        /// For v14, this is enforced on-chain via CLTV (0 = GTC, no expiry).
-        /// For older versions, matchers enforce expiry off-chain.
+        /// GTD expiry: DAA score after which the order is considered expired,
+        /// enforced on-chain via CLTV (0 = GTC, no expiry).
         #[arg(long)]
         expiry: Option<u64>,
 
@@ -1124,16 +1124,14 @@ pub enum DeployCommands {
         #[arg(long)]
         post_only: bool,
 
-        /// Maximum fee (in sompi) the matcher may extract per fill (v14).
-        /// The on-chain F6 check enforces `kas_in - out[0].value <= mmfee`.
-        /// mmfee=0 makes partial fills impossible. Default: 10_000_000 (0.1 KAS).
-        /// Ignored when --mmfee-bps is set (v17).
+        /// INERT for v18 (BPS-uniform; use --mmfee-bps instead). This
+        /// sompi-scale field is never read by the v18 deploy path. Kept for
+        /// CLI signature parity with older invocations.
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
 
-        /// Maximum matcher fee in basis points (v17/v18 contracts).
-        /// E.g., 30 = 0.30% of trade value. Range: 0..=10000.
-        /// When set, --max-matcher-fee is ignored. Default: 30.
+        /// Maximum matcher fee in basis points. E.g., 30 = 0.30% of trade
+        /// value. Range: 0..=10000. Default: 30.
         #[arg(long)]
         mmfee_bps: Option<u64>,
 
@@ -1181,9 +1179,9 @@ pub enum DeployCommands {
         #[arg(long, conflicts_with = "amount")]
         amount_kas: Option<String>,
 
-        /// Contract version. Only v18 (unified spot) may be deployed for new
-        /// orders; v14 is retained solely for managing pre-existing on-chain
-        /// orders via cancel/cancel-all/requote.
+        /// Contract version. Only v18 (unified spot) may be deployed;
+        /// pre-v18 generations were removed in Stage E and any other value
+        /// is a hard error.
         #[arg(long, default_value = "18")]
         version: u8,
 

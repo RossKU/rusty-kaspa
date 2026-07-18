@@ -57,13 +57,17 @@ pub struct DetectedOrder {
     /// for sell orders it identifies the token they hold.
     /// Empty string if unknown (legacy v6 orders without pair metadata).
     pub token_cov_id: String,
-    /// Contract version (14 or, for buy orders only, 16 -- the F6-fix
-    /// contract; see V16_STATUS.md). Sell orders are always 14.
+    /// Contract version -- always 18 (`kob_core::contract::spot::SPOT_GENERATION`,
+    /// the unified spot generation) for both sides. Pre-v18 generations were
+    /// removed in Stage E; `scan_for_orders` bails out with
+    /// `BatchError`/`anyhow::bail!` before a `DetectedOrder` is ever built
+    /// for anything else (see the "Unsupported cached order version" checks
+    /// below).
     pub version: u8,
-    /// Max matcher fee embedded in the redeemScript: absolute sompi for
-    /// v14, basis points for a v16 buy. Needed to reconstruct the exact
+    /// Max matcher fee embedded in the redeemScript, in basis points (v18
+    /// uses bps for both buy and sell). Needed to reconstruct the exact
     /// on-chain redeemScript bytes (must match what the order was deployed
-    /// with) and, for a v16 buy, to derive a safe default F6-cap `fee_bps`
+    /// with) and, for a buy order, to derive a safe default F6-cap `fee_bps`
     /// for the canonical planner (see `submit_match`).
     pub max_matcher_fee: u64,
 }
@@ -160,10 +164,10 @@ pub struct SubmitResult {
 /// canonical kob-domain planner (`plan_batch_match` + `converge_fee_exact` /
 /// `apply_exact_fee`) -- the same planner `match-batch` and `kob-cli match`
 /// (see `matching.rs`) use, instead of the hand-rolled fee/output math this
-/// function used before consolidation. This is what makes a v16 buy's F6
+/// function used before consolidation. This is what makes a buy's F6
 /// (matcher-fee-cap) check reliably pass: `fee_bps` defaults to the buy's
-/// own `max_matcher_fee` (bps) when it's a v16 order, so the built tx never
-/// asks for more matcher surplus than F6 allows.
+/// own `max_matcher_fee` (bps), so the built tx never asks for more matcher
+/// surplus than F6 allows.
 ///
 /// Self-trade model (unchanged from before consolidation): both outputs are
 /// sent to `wallet_spk` (this wallet's own P2PK SPK), not to a per-order
@@ -204,6 +208,62 @@ pub struct SubmitResult {
 /// floor binds on top.
 fn resolve_fee_rebuild_needed(phase1_est: u64, exact_fee: u64, floor_bound: bool) -> bool {
     phase1_est != exact_fee || floor_bound
+}
+
+/// Build the sell/buy `BatchOrder` pair for a crossing match from the
+/// detected on-chain orders plus the already-resolved counterparty SPKs.
+///
+/// Pulled out of `submit_match` as its own pure function so the sell-side
+/// `version` field has a regression test that actually calls the real
+/// construction code, instead of a hand-rolled `BatchOrder` literal next to
+/// it that happens to also say `version: 18`. Commit 73d3e330 fixed a live
+/// bug where this literal hardcoded `version: 14` on the sell side (dead:
+/// `validate_sweep` rejects any non-18 `sell.version`, so every
+/// `submit_match` call failed before a tx was ever built) -- see
+/// `build_match_batch_orders_sell_version_passes_through` below for the test
+/// that guards against that regression recurring.
+fn build_match_batch_orders(
+    sell: &DetectedOrder,
+    buy: &DetectedOrder,
+    token_cov_id: &[u8; 32],
+    buyer_spk: &[u8],
+    buyer_spk_version: u16,
+    wallet_spk: &[u8],
+    wallet_spk_version: u16,
+) -> (BatchOrder, BatchOrder) {
+    let buy_order = BatchOrder {
+        outpoint: (buy.txid.clone(), buy.index),
+        order_type: OrderType::Buy,
+        version: buy.version,
+        token_cov_id: *token_cov_id,
+        price_num: buy.price_num,
+        price_den: buy.price_den,
+        amount: buy.value,
+        redeem_script: buy.redeem_script.clone(),
+        utxo_value: buy.value,
+        counterparty_spk: buyer_spk.to_vec(),
+        counterparty_spk_version: buyer_spk_version,
+        min_fill: buy.min_fill,
+        oco_path: None,
+        bracket_meta: None,
+    };
+    let sell_order = BatchOrder {
+        outpoint: (sell.txid.clone(), sell.index),
+        order_type: OrderType::Sell,
+        version: sell.version,
+        token_cov_id: *token_cov_id,
+        price_num: sell.price_num,
+        price_den: sell.price_den,
+        amount: sell.value,
+        redeem_script: sell.redeem_script.clone(),
+        utxo_value: sell.value,
+        counterparty_spk: wallet_spk.to_vec(),
+        counterparty_spk_version: wallet_spk_version,
+        min_fill: sell.min_fill,
+        oco_path: None,
+        bracket_meta: None,
+    };
+    (sell_order, buy_order)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -255,38 +315,15 @@ pub async fn submit_match(
             );
         };
 
-    let buy_order = BatchOrder {
-        outpoint: (buy.txid.clone(), buy.index),
-        order_type: OrderType::Buy,
-        version: buy.version,
-        token_cov_id: tcid,
-        price_num: buy.price_num,
-        price_den: buy.price_den,
-        amount: buy.value,
-        redeem_script: buy.redeem_script.clone(),
-        utxo_value: buy.value,
-        counterparty_spk: buyer_spk,
-        counterparty_spk_version: buyer_spk_version,
-        min_fill: buy.min_fill,
-        oco_path: None,
-        bracket_meta: None,
-    };
-    let sell_order = BatchOrder {
-        outpoint: (sell.txid.clone(), sell.index),
-        order_type: OrderType::Sell,
-        version: sell.version,
-        token_cov_id: tcid,
-        price_num: sell.price_num,
-        price_den: sell.price_den,
-        amount: sell.value,
-        redeem_script: sell.redeem_script.clone(),
-        utxo_value: sell.value,
-        counterparty_spk: wallet_spk.clone(),
-        counterparty_spk_version: wallet_spk_version,
-        min_fill: sell.min_fill,
-        oco_path: None,
-        bracket_meta: None,
-    };
+    let (sell_order, buy_order) = build_match_batch_orders(
+        sell,
+        buy,
+        &tcid,
+        &buyer_spk,
+        buyer_spk_version,
+        &wallet_spk,
+        wallet_spk_version,
+    );
 
     // Cap correctness: default to the buy's own embedded mmfee cap so the
     // built tx never asks for more matcher surplus than the covenant allows.
@@ -617,7 +654,7 @@ pub async fn run(
                             if pair_bytes.len() != 32 { continue; }
                             let mut tcid = [0u8; 32];
                             tcid.copy_from_slice(&pair_bytes);
-                            if cached_version == 18 {
+                            if cached_version == kob_core::contract::spot::SPOT_GENERATION as u8 {
                                 kob_core::contract::spot::order::build_buy_redeem_script(
                                     &tcid,
                                     cached.price_num,
@@ -638,9 +675,9 @@ pub async fn run(
                             }
                         }
                         OrderSide::Sell => {
-                            // Sells: v18 (unified spot) or the single legacy
-                            // v14 layout.
-                            if cached_version == 18 {
+                            // Sells: v18 (unified spot) only -- pre-v18
+                            // generations were removed in Stage E.
+                            if cached_version == kob_core::contract::spot::SPOT_GENERATION as u8 {
                                 kob_core::contract::spot::order::build_sell_redeem_script(
                                     cached.price_num,
                                     cached.price_den,
@@ -674,7 +711,15 @@ pub async fn run(
                         p2sh_hash: hash.clone(),
                         redeem_script: rs,
                         token_cov_id: cached.pair_id.clone(),
-                        version: if side == OrderSide::Buy || cached_version == 18 { cached_version } else { 14 },
+                        // Both match arms above already `anyhow::bail!` on any
+                        // `cached_version` other than `SPOT_GENERATION` (18),
+                        // for both sides -- so by this point `cached_version`
+                        // is always 18 and can be passed through directly.
+                        // (Previously: `if side == OrderSide::Buy ||
+                        // cached_version == 18 { cached_version } else { 14 }`,
+                        // an unreachable-in-practice fallback to the removed
+                        // v14 generation.)
+                        version: cached_version,
                         max_matcher_fee: cached.max_matcher_fee,
                     });
 
@@ -742,7 +787,7 @@ pub async fn run(
                     match_count += 1;
                 } else if let Some(fee) = fee_utxo {
                     // fee_bps=None: submit_match derives the F6-safe default
-                    // from the buy's own max_matcher_fee when it's v16.
+                    // from the buy's own max_matcher_fee (v18 bps).
                     match submit_match(&rpc, &pair.buy, &pair.sell, &privkey, fee, None).await {
                         Ok(result) => {
                             println!("         MATCHED! TXID: {}", result.tx_id);
@@ -863,7 +908,7 @@ mod tests {
             p2sh_hash: "00".repeat(32),
             redeem_script: vec![0x51],
             token_cov_id: "00".repeat(32),
-            version: 14,
+            version: kob_core::contract::spot::SPOT_GENERATION as u8,
             max_matcher_fee: 10_000_000,
         }
     }
@@ -964,19 +1009,25 @@ mod tests {
     /// `BatchOrder` literal hardcoded at `version: 14` -- so EVERY
     /// `submit_match` call failed with `BatchError::UnsupportedVersion`
     /// before a tx was ever built, i.e. `kob-cli auto-match` live matching
-    /// was 100% dead. (Not caught earlier because this is exactly the test
-    /// that check would have failed.)
+    /// was 100% dead.
     ///
     /// This builds the same `BatchOrder` pair shape `submit_match` builds
     /// from a `DetectedOrder` pair -- real v18 redeem scripts via
     /// `build_buy_redeem_script`/`build_sell_redeem_script` (required:
     /// `plan_batch_match_at` parses `mmfee_bps` out of the buy redeemScript
     /// and rejects any script whose length isn't the exact v18 size) -- and
-    /// asserts `plan_batch_match`/`plan.validate()` SUCCEED. Reverting the
-    /// sell-side `version: sell.version` fix back to a hardcoded `14` makes
-    /// this fail with `BatchError::UnsupportedVersion` (sell v14 is rejected
-    /// by `validate_sweep`'s `s.version != 18` gate), which is exactly what
-    /// happened live.
+    /// asserts `plan_batch_match`/`plan.validate()` SUCCEED.
+    ///
+    /// NOTE (corrected): this test hand-rolls its own `BatchOrder` literals
+    /// below (both already written as `version: 18`) instead of calling
+    /// `submit_match`'s extracted `build_match_batch_orders`. It therefore
+    /// does NOT exercise, and would NOT catch a regression of, the sell-side
+    /// hardcode described above -- an earlier version of this comment
+    /// claimed reverting that fix "makes this fail", which was false (this
+    /// test's `BatchOrder`s bypass that code path entirely).
+    /// `build_match_batch_orders_sell_version_passes_through` below is the
+    /// test that calls the real construction function and fails if the sell
+    /// version is ever hardcoded again.
     #[test]
     fn detected_order_pair_builds_a_valid_plan() {
         let tcid = [0u8; 32];
@@ -1053,6 +1104,40 @@ mod tests {
             .find(|o| o.purpose == OutputPurpose::BuyerTokens)
             .unwrap();
         assert_eq!(buyer_out.value, 5_000_000);
+    }
+
+    /// Regression guard for the sell-side `version` hardcode fixed in commit
+    /// 73d3e330 (see the corrected NOTE on `detected_order_pair_builds_a_valid_plan`
+    /// above for why that test does NOT cover this). Calls the actual
+    /// function `submit_match` uses to build its `BatchOrder` pair
+    /// (`build_match_batch_orders`) with a `DetectedOrder` sell whose
+    /// `version` is the real v18 generation, and asserts the output
+    /// `BatchOrder`'s `version` passes through unchanged. If
+    /// `build_match_batch_orders` (or a future reinlining of it back into
+    /// `submit_match`) ever hardcodes the sell-side version to a literal
+    /// again, this assertion fails immediately -- unlike
+    /// `detected_order_pair_builds_a_valid_plan`, which never calls this
+    /// function at all.
+    #[test]
+    fn build_match_batch_orders_sell_version_passes_through() {
+        let sell = make_test_order(OrderSide::Sell, 2, 1, 5_000_000);
+        let buy = make_test_order(OrderSide::Buy, 1, 2, 10_000_000);
+        assert_eq!(sell.version, kob_core::contract::spot::SPOT_GENERATION as u8);
+
+        let tcid = [0u8; 32];
+        let buyer_spk = vec![0xCC; 34];
+        let wallet_spk = vec![0xCC; 34];
+
+        let (sell_order, buy_order) =
+            build_match_batch_orders(&sell, &buy, &tcid, &buyer_spk, 0, &wallet_spk, 0);
+
+        assert_eq!(
+            sell_order.version, sell.version,
+            "sell BatchOrder.version must pass through DetectedOrder.version \
+             unchanged -- hardcoding it (as commit 73d3e330 fixed) breaks \
+             every submit_match call via validate_sweep's s.version != 18 gate"
+        );
+        assert_eq!(buy_order.version, buy.version);
     }
 
     #[test]
@@ -1340,7 +1425,7 @@ mod tests {
             p2sh_hash: "00".repeat(32),
             redeem_script: vec![0x51],
             token_cov_id: token_cov_id.to_string(),
-            version: 14,
+            version: kob_core::contract::spot::SPOT_GENERATION as u8,
             max_matcher_fee: 10_000_000,
         }
     }

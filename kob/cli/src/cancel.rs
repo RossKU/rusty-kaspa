@@ -81,9 +81,9 @@ pub async fn run(
     // explicitly -- a documented, sanctioned usage pattern -- silently
     // skipped the cache entirely and left `version` to fall back to the
     // deliberately-invalid sentinel default (12), which then failed the
-    // "Only v14 and v16 are supported" check below even for a perfectly
-    // valid, still-open order. `needs_cache` is kept only to decide whether
-    // to print the "Loaded order parameters from cache" notice.
+    // "Only v18 is supported" check below even for a perfectly valid,
+    // still-open order. `needs_cache` is kept only to decide whether to
+    // print the "Loaded order parameters from cache" notice.
     let needs_cache = side.is_none()
         || price_num.is_none()
         || price_den.is_none()
@@ -150,16 +150,13 @@ pub async fn run(
 
     // Reconstruct the redeemScript. Pre-v18 generations were removed in
     // Stage E (unreleased chain state — nothing pre-v18 remains serviceable).
-    if version != 18 {
+    if version != kob_core::contract::spot::SPOT_GENERATION as u8 {
         anyhow::bail!("Unsupported contract version {}. Only v18 is supported.", version);
     }
     // Resolve max_matcher_fee: CLI override > cache > default.
-    // For v16/v17/v18 this is BPS (basis points); v18 caches store bps.
+    // v18 is BPS (basis points); v18 caches store bps.
     let max_matcher_fee = max_matcher_fee_override.unwrap_or_else(|| {
-        cached.as_ref().map_or(
-            if version >= 16 { crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS } else { crate::deploy::DEFAULT_MAX_MATCHER_FEE },
-            |c| c.max_matcher_fee,
-        )
+        cached.as_ref().map_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS, |c| c.max_matcher_fee)
     });
 
     // Delivery-SPK commitment for RS reconstruction. Prefer the exact hash the
@@ -174,7 +171,7 @@ pub async fn run(
     {
         Some(h) => h,
         None => {
-            if side == "buy" && version == 18 {
+            if side == "buy" {
                 contract::compute_token_unit_spk_hash(&pubkey)
             } else {
                 compute_p2pk_spk_hash(&pubkey)
@@ -496,8 +493,7 @@ pub fn kaspa_address_encode(prefix: &str, version: u8, payload: &[u8]) -> String
 #[allow(deprecated)]
 mod tests {
     use super::*;
-    use kob_core::contract;
-    use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
+    use kob_core::p2sh::build_p2sh;
 
     #[test]
     fn cancel_tx_output_value_correct() {

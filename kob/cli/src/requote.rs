@@ -99,15 +99,15 @@ pub async fn run(
             new_params.min_fill
         );
     }
-    // v18 is the sole creatable contract generation (mirrors deploy.rs's
-    // deploy gates); v14/v16/v17 remain valid only for reconstructing an
-    // EXISTING order via --old-version, not for this new deploy.
+    // v18 is the sole contract generation, both for the new deploy below and
+    // for reconstructing the EXISTING order via --old-version (pre-v18
+    // generations were removed in Stage E; see the `old_version` gate below).
     match new_params.side.as_str() {
-        "buy" if new_params.version != 18 => anyhow::bail!(
-            "Unsupported contract version {} for NEW buy deploy. Only v18 (unified spot) may be deployed; v14/v16/v17 are retained only for --old-version (managing an existing order).",
+        "buy" if new_params.version != kob_core::contract::spot::SPOT_GENERATION as u8 => anyhow::bail!(
+            "Unsupported contract version {} for NEW buy deploy. Only v18 (unified spot) may be deployed.",
             new_params.version
         ),
-        "sell" if new_params.version != 18 => anyhow::bail!(
+        "sell" if new_params.version != kob_core::contract::spot::SPOT_GENERATION as u8 => anyhow::bail!(
             "Unsupported contract version {} for NEW sell deploy. Only v18 (unified spot) may be deployed.",
             new_params.version
         ),
@@ -165,7 +165,11 @@ pub async fn run(
     let old_price_num = resolve_field!(old_price_num, price_num, "price-num");
     let old_price_den = resolve_field!(old_price_den, price_den, "price-den");
     let old_min_fill = resolve_field!(old_min_fill, min_fill, "min-fill");
-    let old_version = old_version.unwrap_or_else(|| cached.as_ref().map_or(14, |c| c.version));
+    // 12 is a deliberately-invalid sentinel (never a real contract version;
+    // mirrors `cancel.rs`'s identical fallback) so a missing --old-version
+    // with no cache entry fails loudly at the gate below instead of silently
+    // guessing a specific historical generation.
+    let old_version = old_version.unwrap_or_else(|| cached.as_ref().map_or(12, |c| c.version));
     let old_expiry = old_expiry.unwrap_or_else(|| cached.as_ref().map_or(0, |c| c.expiry_daa));
     let old_max_matcher_fee = old_max_matcher_fee.unwrap_or_else(|| {
         cached.as_ref().map_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE, |c| c.max_matcher_fee)
@@ -176,7 +180,7 @@ pub async fn run(
     };
     let old_token: Option<&str> = old_token_owned.as_deref();
 
-    if old_version != 18 {
+    if old_version != kob_core::contract::spot::SPOT_GENERATION as u8 {
         anyhow::bail!("Unsupported old contract version {}. Only v18 is supported.", old_version);
     }
 
@@ -199,8 +203,9 @@ pub async fn run(
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
     {
         Some(h) => h,
+        // old_version is guaranteed SPOT_GENERATION here (gated above).
         None => {
-            if old_side == "buy" && old_version == 18 {
+            if old_side == "buy" {
                 contract::compute_token_unit_spk_hash(&pubkey)
             } else {
                 compute_p2pk_spk_hash(&pubkey)
@@ -211,7 +216,8 @@ pub async fn run(
     // Delivery-SPK commitment for the NEW deploy leg: v18 buys commit the
     // owner's token_unit P2SH hash (fills deliver spendable KCC20
     // token_units); sells keep the raw P2PK hash (KAS proceeds).
-    let new_spk_hash: [u8; 32] = if new_params.side == "buy" && new_params.version == 18 {
+    // new_params.version is guaranteed SPOT_GENERATION here (gated above).
+    let new_spk_hash: [u8; 32] = if new_params.side == "buy" {
         contract::compute_token_unit_spk_hash(&pubkey)
     } else {
         compute_p2pk_spk_hash(&pubkey)
@@ -219,23 +225,17 @@ pub async fn run(
 
     // STEP 1: Build and submit cancel TX
 
+    // old_version is guaranteed SPOT_GENERATION here (gated above).
     let old_redeem_script = match old_side {
         "buy" => {
             let tcid = parse_old_token(old_token)?;
-            if old_version == 18 {
-                contract::spot::order::build_buy_redeem_script(
-                    &tcid, old_price_num, old_price_den, old_min_fill,
-                    &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
-            } else {
-                anyhow::bail!("Unsupported old version {} (pre-v18 removed in Stage E)", old_version);
-            }
-        }
-        "sell" if old_version == 18 => {
-            contract::spot::order::build_sell_redeem_script(
-                old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
+            contract::spot::order::build_buy_redeem_script(
+                &tcid, old_price_num, old_price_den, old_min_fill,
+                &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
         }
         "sell" => {
-            anyhow::bail!("Unsupported old version {} (pre-v18 removed in Stage E)", old_version);
+            contract::spot::order::build_sell_redeem_script(
+                old_price_num, old_price_den, old_min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), old_max_matcher_fee, 0, old_expiry,)?
         }
         other => anyhow::bail!("Unknown old side '{}'. Use 'buy' or 'sell'.", other),
     };
@@ -350,8 +350,9 @@ pub async fn run(
     // Sign cancel TX
     let sighash_0 = compute_sighash(&cancel_tx, 0)?;
     let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
+    // old_version is guaranteed SPOT_GENERATION here (gated above).
     let cancel_sigscript = match old_side {
-        "buy" if old_version == 18 => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
+        "buy" => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
         // v18 sell cancel keeps the [sig][pk][Op0][RS] shape.
         "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
         _ => unreachable!(),
@@ -374,7 +375,7 @@ pub async fn run(
         let sighash_0 = compute_sighash(&cancel_tx, 0)?;
         let sig_0 = signing::schnorr_sign(&privkey, &sighash_0)?;
         let cancel_sigscript = match old_side {
-            "buy" if old_version == 18 => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
+            "buy" => contract::spot::order::build_buy_cancel_sigscript(&pubkey, &sig_0, false, &old_redeem_script),
             "sell" => contract::build_sell_cancel_sigscript(&sig_0, &pubkey, &old_redeem_script),
             _ => unreachable!(),
         };
@@ -460,15 +461,14 @@ pub async fn run(
     let mut token_cov_id = [0u8; 32];
     token_cov_id.copy_from_slice(&token_cov_bytes);
 
+    // new_params.version is guaranteed SPOT_GENERATION here (gated above).
     let new_redeem_script = match new_params.side.as_str() {
-        "buy" if new_params.version == 18 => contract::spot::order::build_buy_redeem_script(
+        "buy" => contract::spot::order::build_buy_redeem_script(
             &token_cov_id, new_params.price_num, new_params.price_den,
             new_params.min_fill, &owner_hash, &new_spk_hash, &compute_p2pk_spk_hash(&pubkey), new_max_matcher_fee, 0, new_expiry,)?,
-        "sell" if new_params.version == 18 => contract::spot::order::build_sell_redeem_script(
+        "sell" => contract::spot::order::build_sell_redeem_script(
             new_params.price_num, new_params.price_den, new_params.min_fill,
             &owner_hash, &new_spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), new_max_matcher_fee, 0, new_expiry,)?,
-        "buy" | "sell" => anyhow::bail!(
-            "Unsupported new version {} (pre-v18 removed in Stage E)", new_params.version),
         other => anyhow::bail!("Unknown new side '{}'. Use 'buy' or 'sell'.", other),
     };
 
@@ -569,8 +569,6 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kob_core::contract;
-    use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
 
     #[test]
     fn new_order_params_validation_price_num_zero() {

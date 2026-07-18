@@ -6,7 +6,7 @@
 //! and the engine's executor use. This guarantees the base match tx is
 //! F6-correct: matcher surplus is capped via the planner's `fee_bps`
 //! mechanism instead of the matcher folding 100% of the price spread into
-//! its own change output, so a v16 buy order's on-chain
+//! its own change output, so a v18 buy order's on-chain
 //! `max_surplus = kas/10000*mmfee_bps` check is respected by construction
 //! (see `apply_bps_cap` in kob-domain's `spot/batch.rs`) rather than merely
 //! hoped for.
@@ -20,7 +20,7 @@
 //! Note: unlike the pre-consolidation implementation, this path does not
 //! emit a `trade_receipt` output -- neither does `match-batch` (the
 //! documented production match path; see `E2E_MATRIX.md`/`V16_STATUS.md`),
-//! and receipts are no longer part of the v16-era match flow. Use
+//! and receipts are no longer part of the match flow. Use
 //! `kob-cli receipt create` directly if a receipt is needed downstream.
 //!
 //! Standard Match TX layout (same token pair, no wallet-fee UTXO needed
@@ -33,12 +33,8 @@
 //!
 //!   output[0]: seller KAS     (>= expected_kas from sell contract)
 //!   output[1]: buyer tokens   (>= expected_tokens from buy contract)
-//!   output[2]: matcher fee    (optional; bps-capped when --fee-bps or a
-//!                              v16 buy's --mmfee-bps is in effect)
-//!
-//! Cross-Pair Match TX layout (--cross-pair, v8-v13 only) is unchanged and
-//! documented on `run_cross_pair` below -- it is NOT routed through the
-//! canonical planner; see that function's doc comment for why.
+//!   output[2]: matcher fee    (optional; bps-capped when --fee-bps or the
+//!                              buy's --mmfee-bps is in effect)
 
 use crate::node::NodeClient;
 use crate::order_cache::{self, OrderCache};
@@ -438,18 +434,17 @@ pub async fn run(
     // Resolve redeemScripts. Precedence per side (no CLI override flags
     // exist for `match`, singular): cached entry.redeem_script (recorded
     // verbatim at deploy time) > reconstruct from the price/hash arguments
-    // above. v13/v14 share a layout (build_buy_redeem_script); v16 is the
-    // F6-fix buy contract (mmfee_bps semantics, see V16_STATUS.md); v18 is
-    // the unified spot generation (BOTH sides v18, BPS-uniform, canonical
-    // price attestation — see V18_DESIGN.md).
-    if version != 18 {
+    // above. v18 is the unified spot generation (BOTH sides v18, BPS-uniform,
+    // canonical price attestation — see V18_DESIGN.md) and the only version
+    // this function accepts.
+    if version != kob_core::contract::spot::SPOT_GENERATION as u8 {
         anyhow::bail!("Unsupported contract version {}. Only v18 is supported (pre-v18 removed in Stage E).", version);
     }
-    let buy_version: u8 = 18;
+    let buy_version: u8 = kob_core::contract::spot::SPOT_GENERATION as u8;
     let buy_cached_rs = resolve_cached_rs(buy_cached_entry, &buy_op_str)?;
     let buy_rs = if let Some(bytes) = buy_cached_rs {
         bytes
-    } else if buy_version == 18 {
+    } else {
         eprintln!(
             "warning: buy order {} cache predates redeem-script storage; reconstructing from \
              the supplied price/hash arguments. This may diverge from the deployed script for \
@@ -468,13 +463,11 @@ pub async fn run(
             0,
             buy_expiry,
         )?
-    } else {
-        anyhow::bail!("Unsupported buy version {} (pre-v18 removed in Stage E)", buy_version);
     };
     let sell_cached_rs = resolve_cached_rs(sell_cached_entry, &sell_op_str)?;
     let sell_rs = if let Some(bytes) = sell_cached_rs {
         bytes
-    } else if version == 18 {
+    } else {
         eprintln!(
             "warning: sell order {} cache predates redeem-script storage; reconstructing from \
              the supplied price/hash arguments. This may diverge from the deployed script for \
@@ -492,8 +485,6 @@ pub async fn run(
             0,
             sell_expiry,
         )?
-    } else {
-        anyhow::bail!("Unsupported sell version {} (pre-v18 removed in Stage E)", version);
     };
 
     let buy_p2sh = build_p2sh(&buy_rs);
@@ -507,7 +498,7 @@ pub async fn run(
     println!("Buy Price:    {}/{}", buy_price_num, buy_price_den);
     println!("Sell Price:   {}/{}", sell_price_num, sell_price_den);
     println!("Buy RS:       {} bytes (v{})", buy_rs.len(), buy_version);
-    println!("Sell RS:      {} bytes (v{})", sell_rs.len(), if version == 18 { 18 } else { 14 });
+    println!("Sell RS:      {} bytes (v{})", sell_rs.len(), buy_version);
     println!("Matcher:      {}", wallet.address);
     println!();
 
@@ -572,7 +563,7 @@ pub async fn run(
     let sell_order = BatchOrder {
         outpoint: (sell_outpoint.transaction_id.clone(), sell_outpoint.index),
         order_type: OrderType::Sell,
-        version: if version == 18 { 18 } else { 14 },
+        version: buy_version,
         token_cov_id: tcid,
         price_num: sell_price_num,
         price_den: sell_price_den,
@@ -666,7 +657,7 @@ pub async fn run(
         }
     }
 
-    // Build sigscripts from plan (sell fill + buy fill; F6 for a v16 buy
+    // Build sigscripts from plan (sell fill + buy fill; F6 for the buy
     // reads its price data straight from the sell input's fixed-offset
     // sigscript -- exactly what build_tx() emits).
     let batch_tx = plan.build_tx()?;
@@ -865,8 +856,7 @@ pub async fn run(
 #[allow(deprecated)]
 mod tests {
     use kob_core::contract;
-    use kob_core::p2sh::{blake2b_256, compute_p2pk_spk_hash};
-    use kob_domain::batch::{plan_batch_match, BatchOrder, OrderType};
+    use kob_core::p2sh::blake2b_256;
 
     #[test]
     fn price_crossing_check() {

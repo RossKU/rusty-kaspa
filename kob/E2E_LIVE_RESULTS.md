@@ -1494,6 +1494,9 @@ prep" item above plus Stage-G's RT-1/CP-3/RT-3/RT-2.
   pushed to `kob-phase0` through commit `bc07c18f`.
 
 **DEFERRED (owner may resume any of these; none block the canary):**
+*(Update, later the same day: items 2 and 3 below are now CLOSED — see
+"Deferred-item closure + competing-matcher live race" at the end of this
+file. Only RT-2 remains deferred.)*
 - **RT-2** (8-case ratchet adversarial set) — already proven at the unit
   level against the real `kaspa-txscript` engine (`time_contracts.rs`
   L1–L4/L8/L10/L11 + rwin/travel-cap tests); a LIVE demonstration needs a
@@ -1529,3 +1532,75 @@ regression's place in the mass-model story; `kob/TIME_CONTRACTS_DESIGN.md`
 2026-07-18). Code: `kob/domain/tests/budget_limited_repro.rs`,
 `kob/settle/src/rpc/mod.rs`, `kob/engine/src/chain/executor.rs`,
 `kob/engine/src/storage/persistence.rs`.
+
+## Deferred-item closure + competing-matcher live race (2026-07-18, post-handoff)
+
+Same-day follow-up session: two of the three DEFERRED items in the handoff
+section above are closed. Only RT-2 remains deferred.
+
+**1. RPC reconnect giveup — closed at library level (commit `cae349d9`).**
+New test `reconnect_gives_up_after_max_attempts_against_dead_endpoint` in
+`settle/src/rpc/mod.rs`: a real `TcpListener` accepts and immediately drops
+each connection (never completing the WS handshake), driving the genuine
+`connect_with_options` path. Asserts the sentinel giveup prefix, the dead
+URL in the message, and exactly `max_reconnect_attempts` (2) real TCP
+accepts; ~3s runtime, kob-settle 220 tests + 6 doctests green.
+
+**2. Competing-matcher live race — demonstrated on testnet-10.**
+Unblocked by two fixes landed first:
+- `0cb8f3f7` — `match`: per-side mmfee BPS resolution (explicit flag >
+  orders.json `max_matcher_fee` > default 30), planner surplus cap =
+  min(sides) when `--fee-bps` absent, new `--dry-run`, stale pre-v18
+  help text removed. (The handoff's "forces --version 16" description was
+  dead documentation — pre-v18 was deleted in Stage E `23eb1edc`; the real
+  gap was single-flag mmfee applied to both sides.)
+- `4769e7b2` — match-batch false "not found on chain" root-caused: RS
+  reconstruction from decomposed cache fields silently diverges (owner
+  batch caps not cached — non-`_with_caps` builders hardcode the max; E1
+  expire-seat SPKH recomputed from the running wallet's key). Fix:
+  `OrderCacheEntry` gains optional `redeem_script` (hex) populated at
+  deploy from the exact on-chain bytes; per-side precedence
+  `--sell-rs`/`--buy-rs` override > cached RS (blake2b-verified against
+  stored `p2sh_hash`, loud error on corrupt cache) > reconstruct (warns);
+  the reconstruct fallback now queries the stored ground-truth `p2sh_hash`
+  address. kob-cli 490/490.
+
+Live run (node `ws://65.108.107.30:18210`, wallet `/tmp/kob_e2e/wallet.json`):
+- Fresh crossing pair deployed: sell `40327a85…3963:0` (97/100, mmfee
+  500 bps), buy `2bfc5cec…afc5:0` (1/1, 500 bps), both OPEN. `orders.json`
+  entries verified to contain `redeem_script` — deploy-side caching works
+  live.
+- `match --dry-run` end-to-end OK; auto-resolved "Fee cap: 500 bps" from
+  cache with no `--mmfee-bps` given.
+- Race: two concurrent `match-batch` submissions, both with
+  `KOB_FEE_FLOOR=1600000`. Winner
+  `d6cd4cff4551197ae108898affab97b4f1650785012e5b1977bf11cdff59a9e9`
+  accepted (blue score 508999021); settlement exact: seller received
+  41,515,246 sompi = 42,799,223 tokens × 97/100. Loser rejected verbatim:
+  "Rejected transaction 76206501…f795: … is an orphan where orphan is
+  disallowed" — clean double-spend rejection; loser txid absent on-chain;
+  both order UTXOs spent afterwards; no funds lost.
+
+**New anomalies found during the race (open unless noted):**
+1. Sell deploy merged leftover fee-UTXO change into the covenant output
+   (intended 40,000,000 sompi, on-chain 42,799,223) while logging it as
+   "donated as fee" — deploy-side value placement bug.
+2. `match` (singular) had no working fee floor: its fee override param is
+   a documented no-op and `KOB_FEE_FLOOR` was not wired in, so order
+   shapes whose local mass estimate undershoots the node relay floor
+   (observed: v18 buy with 5655-byte redeemScript) could never submit via
+   `match`. **Fixed same session (`ae83f451`)**: KOB_FEE_FLOOR wired into
+   `match` via the canonical `BatchPlan::apply_fee_floor`; the Phase-2
+   rebuild now also triggers when the floor binds (not only on delta>0),
+   so the floor provably reaches the submitted tx.
+3. Phase-1/Phase-2 fee inconsistency in both `match` and `match-batch`:
+   the submitted tx carries the stale Phase-1 fee even when Phase 2
+   prints a "recovered" fee; currently masked by `KOB_FEE_FLOOR`.
+
+Full logs: session scratchpad `competing_matcher_live_2026-07-18.md` and
+`/tmp/kob_e2e/race3_*.log`.
+
+**RT-2** remains deferred: unit-proven at the consensus level; a live
+demonstration still needs bespoke hand-rolled-sigscript tooling, judged
+out of proportion twice. Recommendation stands: skip unless the owner
+decides otherwise.

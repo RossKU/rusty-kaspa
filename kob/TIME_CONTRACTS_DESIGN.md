@@ -9,12 +9,14 @@ the addenda C-a/C-b/C-c) landed (`9ba03e8`). **Stage D (live E2E,
 recorded as "Stage-G" in `E2E_LIVE_RESULTS.md`) substantially landed
 2026-07-18: RT-1/CP-3/RT-3 all SETTLED LIVE on testnet-10** (script-units
 budget bug found + fixed + permanently regression-tested, see
-`kob/domain/tests/budget_limited_repro.rs`); **RT-2 (adversarial set) and
-the competing-matcher stretch goal remain DEFERRED** (unit-proven against
-the real engine already; live demonstration needs bespoke tooling not yet
-built — see `E2E_LIVE_RESULTS.md`'s "Canary readiness status" handoff
-section, updated 2026-07-18, for the full current picture and next-session
-resume point). Stage E (doc/final: E2E_MATRIX.md rows, README touch-ups,
+`kob/domain/tests/budget_limited_repro.rs`); **the competing-matcher race
+SETTLED LIVE later the same day** (winner `d6cd4cff…`, loser cleanly
+double-spend-rejected — see `E2E_LIVE_RESULTS.md`'s "Deferred-item
+closure" section); **only RT-2 (adversarial set) remains DEFERRED**
+(unit-proven against the real engine already; live demonstration needs
+bespoke hand-rolled-sigscript tooling not yet built — see
+`E2E_LIVE_RESULTS.md`'s "Canary readiness status" handoff section for the
+full picture). Stage E (doc/final: E2E_MATRIX.md rows, README touch-ups,
 this stamp) is still open beyond what this update covers.
 Base: v18 single-generation spot (see `V18_DESIGN.md`), HEAD `bc07c18f`
 (2026-07-18; was `b37c590` at design-freeze time).

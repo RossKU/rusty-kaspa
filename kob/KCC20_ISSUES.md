@@ -1,9 +1,17 @@
-# KCC-0020 実装課題抽出報告
+# KCC-0020 実装レポート: 課題提起と仕様改善提案
 
 KOB (kob-phase0) が KCC-0020 draft (`kcc-0020.md`) を準拠実装する過程
 (`kob/core/src/contract/kcc20/`) で実際に手を動かして突き当たった仕様上の
-課題を、kaspanet/kccs の仕様議論 (PR #2 = kcc-0020, PR #3 = kcc-0001,
-kas-smiths.org スレッド #8) に提出できる形にまとめたものである。
+課題を、それぞれに対する具体的な仕様改善案とセットで、kaspanet/kccs の
+仕様議論 (PR #2 = kcc-0020, PR #3 = kcc-0001, kas-smiths.org スレッド #8)
+に提出できる形にまとめたものである。
+
+KOB は kcc-0020 の疑似コードを実際に redeem script まで組み上げ、
+`kob/core/tests/kcc20_contracts.rs` の 15 本のエンジンテスト(実際の
+`TxScriptEngine` 上での honest-path / adversarial-path 双方)で動作を確認
+した実装であり、本報告の各提案の少なくない部分は「この案を実際にこう
+実装したら動いた」という実証を伴わせられる。抽象的な設計論に留まらず、
+その実証性を提案の裏付けとして前面に出すのが本報告の狙いである。
 
 対象読者: kaspanet/kccs メンテナ (Manyfest, IzioDev, michaelsutton ほか)。
 
@@ -45,7 +53,11 @@ TODO・テストの意図)に基づく。誇張や仕様への一方的な断定
   り、字面通りのエンコードが原理的に不可能である。KOB はこれを「successor
   の完全な redeem-script blob をまるごと引数として渡す」設計で代替した
   (`transfer.rs`)。これは kcc-0020 の宣言する型そのものからの必然的な逸
-  脱であり、他の実装者も同じ壁にぶつかるはずである。
+  脱であり、他の実装者も同じ壁にぶつかるはずである。第3節では、この壁を
+  一文追記だけで解消できる最小修正案(record 配列内の `int` leaf を、既に
+  state payload が使っている固定8byte符号絶対値形式で扱う)を提示し、あわ
+  せてこの修正が採用された場合は KOB の redeem-script-blob 方式そのものが
+  ベース transfer には不要になりうるという設計上の含意も示す。
 - **ISSUE-19**(cardinality 上限の仕様欠落): Kaspa Script にループがない
   以上、あらゆる実装は N-of-N 検証を固定境界に unroll せざるを得ないが、
   kcc-0020 にはこの境界を超えた consumed input / produced output をどう
@@ -53,7 +65,9 @@ TODO・テストの意図)に基づく。誇張や仕様への一方的な断定
   境界外に置かれた token 入力が保存則チェックを素通りし、額面のインフレ
   ーションを許してしまいうる。KOB は明示的な cardinality 上限チェックで
   これを防いでいるが、この防御自体が仕様に要求されていない、実装者依存
-  の任意対応になっている。
+  の任意対応になっている。第3節では、この上限を descriptor の必須フィー
+  ルド(`max_participants`)として宣言させ、超過時の reject を MUST 化す
+  る具体案を提示する。
 - **ISSUE-15**(sibling 固定オフセット読みの暗黙 shape 前提): leader が
   delegator (sibling) 入力の `amount`/`extended_state_digest` を
   `OpTxInputScriptSigSubstr` で固定バイトオフセットから読む設計
@@ -63,7 +77,29 @@ TODO・テストの意図)に基づく。誇張や仕様への一方的な断定
   も明文化しておらず、kcc-0020 自身が定義する KCC20 Borrowed Receive
   Extension v1(所有者の署名協力なしに successor を再利用する拡張)を実
   際に配線した瞬間に破綻する — borrowed 入力は定義上 owner 署名を持たな
-  いため、この一様 shape 前提が最初に崩れる具体例そのものである。
+  いため、この一様 shape 前提が最初に崩れる具体例そのものである。第3節
+  では、witness 駆動でオフセット計算を条件分岐させる実装可能な回避案(KOB
+  が Borrowed Receive 配線時に採用予定のもの)と、descriptor 側でより一般
+  的な自己記述 shape を宣言させる案を対比して提示する。
+
+本報告の19件の ISSUE(章3)と章4(x402 / descriptor)は、性質が一貫し
+ている: いずれも kcc-0020 が**既に宣言している** `State`/`transfer`/
+`transfer_delegator`/`Descriptor` を、Kaspa Script の制約(ループ無し・
+record 配列の固定幅制約など)の下で**文字通り実装可能にする**ための、実
+装者からのフィードバックである。base interface に新しい概念や新しいエ
+ントリポイントを追加してほしいという要求は一切含まれておらず、むしろ
+「著者が minimal であることを意図して書いた宣言を、実際に動くバイト列
+に落とすと何が足りないか」を報告するものである。
+
+これに対し章5(issuer-authority/compliance)だけは性質が異なる—**新しい
+任意機能の追加提案**である。kcc-0020 の著者 Manyfest 自身が kas-smiths.org
+スレッドで "a minimal specification interface that enables recognition,
+tracking, and interaction with token covenants, while remaining
+extendable" と述べている通り、KCC-0020 の base interface を意図的に
+minimal に保つという設計判断を KOB は尊重し、章5の提案は base
+`State`/`transfer` には一切手を入れない。あくまで Borrowed Receive と
+同じ「`kcc20_extensions` で宣言する optional extension」という、
+kcc-0020 が既に用意している拡張機構の上に乗る形の提案として提出する。
 
 ## 2. Severity 別 ISSUE 一覧表
 
@@ -151,13 +187,82 @@ kcc-0001 §5.3 (Integers): 「An `int` invocation argument uses
 
 **提案**
 
-- kcc-0001 側で「配列内の record が可変幅 leaf を持つ場合の許容エンコー
-  ド(要素ごとに独立した push 列に展開する、など)」を追加するか、
-- kcc-0020 側で `State` を正式に record として宣言した上で `amount` を
-  引数コンテキストでは固定8byte幅の `byte[8]` として再定義するか、
-- あるいは `next_states` 自体を「各要素をまるごと独立引数として渡す」設
-  計(ISSUE-11 で KOB が実際に採用した代替設計)に仕様側を寄せるか。
-いずれかの選択を PR #2/#3 の場で明示的に決定することを提案する。
+3つの選択肢があり、KOB は (A) を推奨する。
+
+**(A, 推奨) kcc-0001 §5.3 に一文追記し、record 配列内の `int` leaf だけ
+state-payload と同じ固定8byte形式を使わせる。**
+
+根拠: `Kcc20State` の4フィールドのうち `owner_identifier`(32B)・
+`identifier_type`(1B)・`extended_state_digest`(32B) は最初から固定幅で
+あり、§5.5/§5.6 の record-array 要件をすでに満たしている。衝突している
+のは `amount: int` 一つだけであり、しかも kcc-0001 自身が「`int` の
+STATE payload は固定8byte」という同じ問題への解答をすでに持っている
+(§5.3 後段)。この既存の固定幅表現を、record 配列の中に限って引数側にも
+流用するだけで、新しい型もエンコード方式も増やさずに矛盾が消える。
+
+before → after の文言案(kcc-0001 §5.3 末尾に追記):
+
+```text
+before:
+"An `int` invocation argument uses `PushMinimal` over its minimal
+ScriptNum representation. An `int` state payload uses an eight-byte
+little-endian signed-magnitude encoding."
+
+after (追記):
+"An `int` invocation argument uses `PushMinimal` over its minimal
+ScriptNum representation, EXCEPT when the `int` is a recursively-lowered
+leaf field of a record-array argument (§5.6): in that position it uses
+the eight-byte little-endian signed-magnitude STATE-payload encoding
+instead, so that its payload width is fixed and the enclosing array of
+records satisfies §5.5's positive-fixed-width requirement. A standalone
+`int` argument outside a record array is unaffected."
+```
+
+この一文だけで `State[]` は §5.5/§5.6 の下で正式にエンコード可能にな
+り、kcc-0020 の `transfer(State[] next_states, ...)` を字面通り実装でき
+るようになる(ISSUE-2 の `amount` 上限規定と合わせて解決するのが自然)。
+
+**副次的な設計上の含意(ISSUE-11 とも関連): この修正が採用されれば、
+KOB の redeem-script-blob 方式(ISSUE-11)はベース `transfer` には不要に
+なりうる。** kcc-0001 §8.5 の同一テンプレート継続では、`template.prefix`/
+`template.suffix` は covenant 自身のバイトコードに静的に埋め込まれた定数
+であり(そもそも変化しない)、`R_next = template.prefix || encode_state(next_state)
+|| template.suffix` は **`next_state` の4フィールドだけから covenant 自
+身が再構築できる** — successor の redeem script 全体を引数として運ぶ必
+要が最初からない。したがって `State[]` が正式にエンコード可能になれば、
+KOB が実際に採った「新しい redeem script をまるごと引数で渡し、
+`dr_suffix_check`/`dr_output_spk_check` で template を再認証する」という
+(比較的高コストな)設計は、**同一テンプレートの範囲では**もはや必要な
+機構ではなくなる。この場合の trade-off は次の通り:
+
+| | State[] 経由(修正後の正規ルート) | redeem-script-blob 方式(KOB 現行実装、ISSUE-11) |
+|---|---|---|
+| 引数サイズ | 4フィールド分(owner32+type1+amount8+digest32=73B)×successor数 | successor 全体(state 77B + suffix)×successor数、より大きい |
+| template 変更 | 不可(prefix/suffix は静的埋め込み) | 可能(§8.5「different-template continuation」の余地を残す) |
+| 実装コスト | covenant 側が自分の prefix/suffix リテラルから R_next を組み立て | `dr_input_spk_check`/`dr_suffix_check`/`dr_output_spk_check` 一式が必要(ISSUE-16 のスタック深度規約の罠を含む) |
+
+KOB としては、**kcc-0020 のベース `transfer`(テンプレートを変えない通常
+の transfer)は (A) の `State[]` 経由に寄せ、テンプレート移行を許す将来
+拡張(未定義)のためにのみ、ISSUE-11 の「まるごと blob を運ぶ」パターン
+を明示的な代替経路として仕様に残す**、という二段構えを推奨する。
+
+**(B) kcc-0020 側で `State` を正式に record として宣言し、`amount` を引
+数コンテキストでは `byte[8]` として再定義する。** (A) とほぼ同じ効果だ
+が、kcc-0001 ではなく kcc-0020 側の修正で完結する分、影響範囲は KCC20 に
+閉じる。ただし「`int` が引数コンテキストでは byte[8] になる」という
+kcc-0001 §5.3 の一般規則からの特例が kcc-0020 側にだけ存在することにな
+り、他の将来の KCC 仕様が同じ record-array-with-int-leaf パターンにぶつ
+かるたびに個別対応を繰り返すことになる。
+
+**(C) `next_states` 自体を「各要素をまるごと独立引数として渡す」設計
+(ISSUE-11 で KOB が実際に採用した代替設計)に仕様側を寄せる。** これは
+kcc-0001 に一切手を入れずに済む(`bytes` 型の独立引数を並べるだけで、
+既存の §5.1/§5.4 の範囲内)という利点があるが、テンプレート再認証のコス
+ト(前表参照)を常に払うことになり、`State[]` が本来持っていた「4フィー
+ルドだけを運べばよい」という軽量性を失う。
+
+KOB は (A) を PR #2/#3 の場で明示的に決定することを提案し、(B)/(C) は
+(A) が何らかの理由で採用不可能な場合のフォールバックとして併記する。
 
 ### ISSUE-2 — `amount` の範囲: `u64` vs KCC1 `int` の 2^63-1 上限(MEDIUM)
 
@@ -213,8 +318,9 @@ must avoid emitting "negative zero" or whether a decoder must reject it」
 と明記した上で、この汎用デコーダは両方の zero 表現を値 `0` として受理す
 る(`mod.rs:562-568` のテストで two byte-strings, one value を確認)。
 
-一方 `kob/core/src/contract/kcc20/state.rs:333-344`(`decode_uint_from_
-int_state_payload`)は `Kcc20State.amount` 専用の非負限定デコーダとして、
+一方 `kob/core/src/contract/kcc20/mod.rs:333-344`(`decode_uint_from_
+int_state_payload`、doc comment に「known to represent a non-negative
+quantity (e.g. `Kcc20State.amount`)」と明記)は非負限定デコーダとして、
 符号bitが立っている入力を——たとえ絶対値が0の "negative zero" であって
 も——一律に拒否する。`state.rs:251-260` のテスト
 `decode_rejects_negative_amount` がこれを確認している。これは
@@ -272,12 +378,44 @@ unambiguous — `owner_identifier` がそのまま32byte Schnorr公開鍵)のみ
 
 **提案**
 
-`identifier_type` ごとの検証規則(最低限 SCRIPT_HASH: どの入力/UTXO の
-script hash と照合するか、COVENANT_ID: `OpInputCovenantId` とどう突き合
-わせるか)を kcc-0020 本文に明記することを提案する。あわせて、
-Manyfestation の「動的 hint 化」提案が採用されるかどうかで `transfer`
-の引数シグネチャ自体が変わりうるため(ISSUE-5 とも関連)、この論点は
-`State[]` の record 定義(ISSUE-1)より先に決着させることを推奨する。
+`identifier_type` ごとの検証規則を kcc-0020 本文に明記することを提案す
+る。具体的には次の2種を最低限のベースラインとして提示する:
+
+- **`SCRIPT_HASH` (0x01)**: `owner_identifier` を「対象 covenant が受理
+  する locking script の Blake2b ハッシュ」と解釈し、検証は「消費される
+  入力自身の scriptPublicKey(kcc-0001 §7 の P2SH commitment)が
+  `owner_identifier` と一致すること」を確認する形にする — 言い換えれば、
+  この token state を動かす認可は「`owner_identifier` が指す任意の
+  script(単純な pubkey P2SH でも、任意の multisig/timelock covenant で
+  もよい)をその場で満たすこと」という既存 P2SH の意味論をそのまま流用
+  する。
+- **`COVENANT_ID` (0x02)**: `owner_identifier` を「所有権を持つ covenant
+  の `covenant_id`(KIP-20)」と解釈し、検証は `OpInputCovenantId` で読ん
+  だ消費入力自身の covenant_id が `owner_identifier` と一致することを確
+  認する形にする(= この token は特定の別 covenant の同一 covenant_id を
+  持つ入力からしか動かせない、という covenant 間所有権)。
+
+before → after の文言案(kcc-0020 "## State" 節末尾に追記):
+
+```text
+after (追記案):
+`transfer`/`transfer_delegator` performing an ownership check for a
+given `identifier_type` MUST verify:
+- IDENTIFIER_PUBKEY:      OpCheckSig(sig, owner_identifier) over the
+                          spending input;
+- IDENTIFIER_SCRIPT_HASH: the spent input's own P2SH commitment
+                          (kcc-0001 §7) equals owner_identifier;
+- IDENTIFIER_COVENANT_ID: the spent input's own covenant_id
+                          (KIP-20 OpInputCovenantId) equals
+                          owner_identifier.
+```
+
+あわせて、Manyfestation の「動的 hint 化」提案が採用されるかどうかで
+`transfer` の引数シグネチャ自体が変わりうるため(ISSUE-5 とも関連)、こ
+の論点は `State[]` の record 定義(ISSUE-1)より先に決着させることを推奨
+する。なお、この2種の検証規則は章5(issuer-authority/compliance)で提案
+する `COVENANT_ID` 経由の発行体判定モデルの前提にもなるため、両章で整合
+させて確定させることを勧める。
 
 ### ISSUE-5 — `signatures[]` と `witnesses[]` を分離する設計意図が不明瞭(LOW)
 
@@ -379,13 +517,49 @@ spec conformance」)。
 
 **提案**
 
-kcc-0020 に、少なくとも以下を含む descriptor のワイヤ形式(または
-シリアライズ形式選定の指針)を追加することを提案する:
-- `prefix`/`suffix` の長さプレフィックス方式、
-- `ExtendedStateLayout | none` の discriminant、
-- `ExtensionId` の正準エンコード(固定長タグか UTF-8 文字列か)、
-- 「公開」の実務的な既定経路(on-chain payload か、artifact ファイルか、
-  レジストリ URL か)。
+kcc-0020 の descriptor 自体の概念(kas-smiths.org スレッドで Manyfest 自
+身が導入した「token covenant を識別するための descriptor artifact」)は
+既に固まっているが、スレッド内でも Shawn がフィールドの具体的な表現方法
+(空の selector をどう表すか等)を問う質問を投げているように、**この構造
+を実際にどうバイト列へ落とすかは、著者自身もまだ明言していない**。KOB
+はこれを「未解決の対立点」ではなく「まだ埋まっていないマス目」と捉え、
+以下を具体的な一案として提示する — 唯一解として押し付けるのではなく、
+議論のたたき台として提出する。
+
+**具体案(illustrative wire format):**
+
+```text
+KCC20Descriptor (wire) :=
+    LE16(len(prefix))  || prefix
+    LE16(len(suffix))  || suffix
+    extended_state_layout_present: byte   (0x00 = none, 0x01 = present)
+    [ if present: ExtendedStateLayout wire ]
+    extension_count: byte
+    ExtensionId * extension_count
+
+ExtendedStateLayout (wire) :=
+    field_count: byte
+    ( field_name_len: byte || UTF8(field_name) || LE16(width) ) * field_count
+
+ExtensionId (wire) := Hash(UTF8(extension_name))[0:4]   -- kcc-0001 §6.1
+                        の dispatch_tag と全く同じ導出方法の転用(ISSUE-7)
+```
+
+設計判断の理由:
+- `prefix`/`suffix` は kcc-0001 の他の可変長バイト列(§5.2 の
+  `PushMinimal`/`PushExplicit` テーブル)と同じ長さプレフィックス発想を
+  流用し、新しい規則を増やさない。
+- `extended_state_layout_present` の discriminant は `ExtendedStateLayout
+  | none` という Optional 型を kcc-0001 が他のどこにも持たないため、
+  最小のバイト(1byte)で表現する。
+- `ExtensionId` を kcc-0001 §6.1 の `dispatch_tag`(`Hash(FunctionSignature)
+  [0:4]`)と同じ「名前文字列からの決定的固定長タグ」にすることで、
+  kcc-0020 に新しいエンコード規則を1つも追加せずに済む — 既存の
+  dispatch tag 計算コード(KOB では `dispatch.rs`)がそのまま流用できる。
+
+「公開」経路については、章4.4 で述べる通り、facilitator のような自動化
+ツールが検証可能な形(on-chain 参照)を推奨するが、この点は descriptor
+のバイト形式そのものとは独立に決定できる。
 
 章4(x402)で述べる通り、この欠落は理論上の整理不足に留まらず、外部発行
 トークンを受け入れる決済ユースケースの直接的なブロッカーになっている。
@@ -416,12 +590,17 @@ kcc-0020 の例示文字列をそのまま Rust の `&str` 定数として転記
 
 **提案**
 
-`ExtensionId` を kcc-0001 の dispatch tag と同様の「名前文字列から決定
-的に導出される固定長タグ」として正式に型定義するか(例:
-`Hash(UTF8(extension_name))[0:4]` のような既存パターンの転用)、あるい
-は UTF-8 文字列そのものを正準ワイヤ表現とする(その場合は長さプレフィッ
-クス方式も併せて規定)かを明確にすることを提案する。ISSUE-6 の descriptor
-ワイヤ形式全体と合わせて解決するのが自然である。
+ISSUE-6 で提示した descriptor ワイヤ形式案の一部として、`ExtensionId` を
+`Hash(UTF8(extension_name))[0:4]` — kcc-0001 §6.1 の `dispatch_tag` と全
+く同じ導出規則の転用 — として型定義することを提案する。この選択の利点
+は、kcc-0020 側に新しいエンコード規則を1つも追加せず、既に §6.1 で規範
+化・実装済み(`dispatch.rs`の`dispatch_tag()`関数がそのまま流用可能)の
+仕組みを再利用できる点にある。対案として UTF-8 文字列そのものを正準ワイ
+ヤ表現とする道(その場合は長さプレフィックス方式も併せて規定)も残るが、
+`kcc20_borrowed_receive_v1` のような可変長文字列をそのまま記録するより
+固定4byteタグの方が descriptor 全体のサイズ・パース単純性の両面で有利
+と考え、KOB は前者(固定タグ方式)を推奨する。いずれにせよ ISSUE-6 の
+descriptor ワイヤ形式全体と合わせて一体で解決するのが自然である。
 
 ### ISSUE-8 — 非正準 push を MUST-reject すべきかが未規定(MEDIUM、実測データあり)
 
@@ -578,12 +757,31 @@ ships」と明記している。
 
 **提案**
 
-ISSUE-1 の解決と対にして、`next_states` の正準表現を「各要素を独立した
-引数(successor プログラム全体、または最低限 amount/digest を固定幅
-byte 列としてパックしたもの)として渡す」設計に仕様側を合わせることを
-提案する。KOB のような「successor 全体を認証する」パターンは Kaspa
-Script にループがない制約下では自然な設計であり、既に他の KOB 機能
-(`dr` モジュール)で実績があるため、参考実装として提供可能である。
+ISSUE-1 の「提案」で述べた二段構えをここでも繰り返す: kcc-0020 に
+`State[]` の正式なエンコードが定義されれば(ISSUE-1 の (A))、**同一テン
+プレートの通常 transfer では本方式(redeem-script-blob をまるごと運ぶ)
+は不要になる** — covenant 自身が自分の `template.prefix`/`template.suffix`
+リテラルと `State[]` から復元した4フィールドだけで `R_next` を再構築で
+きるためである(kcc-0001 §8.5)。
+
+その上で、本方式は次の**限定用途において仕様の正式な代替経路として残す
+ことを提案する**: kcc-0020 が将来「successor が異なるテンプレートへ移
+行してよい」拡張(kcc-0001 §8.5 の "different-template continuation" 相
+当)を定義する場合、そのケースでは `State[]` の4フィールドだけでは
+`R_next` を再構築できない(テンプレート自体が可変なため)。このケースに
+限り、本方式のような「successor 全体(または最低限、新テンプレートの
+template hash — kcc-0001 §8.3 — と state)を引数として運び、
+`dr_input_spk_check`/`dr_suffix_check`/`dr_output_spk_check` 相当の三段
+検証で認証する」パターンを、kcc-0020 の正式な "template-migrating
+transfer" 経路として仕様化することを提案する。
+
+この三段検証パターンは KOB の実装で実際に動作しており、対応する
+adversarial テストが engine 上で意図通り reject することを確認済みであ
+る(`kob/core/tests/kcc20_contracts.rs`: `successor_wrong_template_rejected`
+— suffix 改竄を reject、`successor_output_spk_does_not_match_claimed_new_rs_rejected`
+— 出力とのミスマッチを reject)。したがって「KOB implemented this
+template-authentication pattern and it passes these adversarial engine
+tests」として、参考実装込みで提案できる。
 
 ### ISSUE-12 — `transfer_delegator()` の「引数ゼロ」が実装不能(MEDIUM)
 
@@ -663,6 +861,17 @@ transfer は、産出される全 successor state が同一の
 い)」という KOB の解釈を明文の規則として採用するか、あるいは
 サブグループ化を許容する場合の対応規則(例: witness 経由で consumed/
 produced のペアリングを明示する)を追加することを提案する。
+
+なお、この対応関係の明確化は michaelsutton が PR #2(2026-07-15、章5.2
+参照)で述べる「open ICC」「virtual state」— DEX のような外部 covenant
+がこの `extended_state_digest`(= KCC-0001 でいう Virtual Element)を頼
+りに、co-spend されるトークン covenant の state 遷移を"observe"できる、
+という composability モデル — と矛盾するものではなく、むしろその前提を
+補強する提案である。「どの consumed state がどの successor の digest と
+対応するか」が一意に定まらないままでは、observer 側が virtual state を
+正しく追跡できず、michaelsutton の描く co-spend 観測モデル自体が成立し
+ない。本 ISSUE は、そのモデルを実際に動かすために必要な対応規則の穴を
+埋める提案として位置づけられる。
 
 ### ISSUE-14 — 基本 `transfer` における `witnesses[]` の意味論が未定義(MEDIUM)
 
@@ -758,15 +967,59 @@ Receive)を実装しようとした瞬間にこの不変条件が破られる**�
 
 **提案**
 
-kcc-0001/kcc-0020 に、「delegator/witness ごとに異なる invocation
-shape が許容される場合、leader はその sibling の consumed state を
-固定オフセットではなく、宣言された Program ABI 経由で self-describing
-に decode しなければならない(MUST)」という規範を追加することを提案す
-る。少なくとも、Borrowed Receive のような「一様 shape が壊れる」拡張を
-定義する際は、その拡張の仕様自体に「leader が sibling の shape を安全
-に判別する方法」を明記することを求めたい。KOB 側でも、Borrowed Receive
-配線時にはこの固定オフセット方式を witness 駆動の self-describing 方
-式に置き換える予定である。
+before → after の MUST 条項案(kcc-0001 §7 末尾、または kcc-0020
+"## KCC20 Extensions" 冒頭に追記):
+
+```text
+after (追記案):
+"When an extension permits a consumed KCC20 state's invocation to take
+more than one possible byte shape for the same entrypoint (e.g. a
+witness-selected variant that omits an otherwise-present signature), a
+leader reading that sibling's fields via fixed byte offsets into its
+sigScript MUST first determine, from data the leader itself already
+authenticates, which shape applies to that specific sibling BEFORE
+computing those offsets. An extension defining such a variant MUST
+specify how a leader performs this determination; it MUST NOT be left
+implicit in "the shape most implementations happen to assume"."
+```
+
+2つの実装可能な選択肢を対比する。KOB は (a) を推奨する — 追加の仕様変
+更や wire 形式なしに、kcc-0020 が既に持っている `witnesses[]` 機構の範
+囲内で解決できるためである。
+
+**(a, 推奨) witness 駆動の条件付きオフセット切替え。** leader 自身の
+`transfer` 引数である `witnesses[i]`(kcc-0020 が既に宣言している
+フィールド、ISSUE-14 参照)を、leader がまず(自分自身が pushed した、
+自分の署名検証の対象内にあるデータとして)読み、`witnesses[i] ==
+BORROWED_RECEIVE` かどうかで sibling `i` のオフセット計算式を分岐させ
+る: 通常 delegator は現行の `sibling_field_offsets`(`push_data(sig[65B])
+|| OP_DATA_4 tag || PushMinimal(R)` 前提、
+`kob/core/src/contract/kcc20/transfer.rs:230-264`)をそのまま使い、
+borrowed 側は sig push が存在しない分だけ短い別オフセット式を使う。
+`DELEGATOR_SIG_PUSH_LEN` を witness 依存の可変値にするだけで済み、
+kcc-0001 のワイヤ形式自体には手を入れない。トレードオフ: 「同じ
+entrypoint の中で witness ごとに複数の固定 shape がある」前提が増える
+たびに、leader 側は分岐を1つずつ手で足す必要があり、拡張が増えるほど
+組み合わせ的に複雑化する。
+
+**(b, より一般的だがコスト大) 自己記述 shape ヘッダーを kcc-0001 §7 の
+envelope 自体に追加する。** dispatch tag と `PushMinimal(R)` は既に
+sigScript の**末尾から**固定オフセットにある(§7: tag は
+`PushMinimal(R)` の直前)ことを利用し、その並びに1byte の
+"shape id"(またはentrypoint内の witness-variant識別子)を追加で常設す
+る。これにより ISSUE-9(受動的観測者が dispatch tag を判別できない問題)
+とISSUE-15(leader が sibling の shape を判別できない問題)を同じ1つの
+追加フィールドで同時に解決できる。トレードオフ: 全 kcc-0001 準拠プログ
+ラム(KCC20 に限らない)が対象になるため影響範囲が大きく、既存実装への
+互換性コストも伴う。
+
+KOB は Borrowed Receive の配線時には (a) を採用する予定であり、この設計
+は現行の `sibling_digest_mismatch_rejected` テスト(固定オフセット読み
+取り自体が意図通り digest 不一致を検出することを確認済み、
+`kob/core/tests/kcc20_contracts.rs`)が確認しているオフセット計算の正し
+さの上に、witness 分岐を1段足すだけで拡張できる見込みである。(b) は
+ISSUE-9 と合わせて kcc-0001 側でより広く議論する価値があるため、別項目
+として PR の場に提起することを勧める。
 
 ### ISSUE-16 — dr 系ヘルパのスタック深度規約が未文書化(MEDIUM)
 
@@ -937,13 +1190,61 @@ conformant でありながら token の保存則を破れてしまう。ルー�
 
 **提案**
 
-kcc-0020 に「実装は consumed input / produced output の個数に何らかの
-上限 `MAX_N` を持たねばならず(MUST)、その上限を超える covenant 入力
-/出力が transfer 対象の shared covenant-id context に存在する場合、
-transfer 全体を reject しなければならない(MUST)」という規範を明記す
-ることを提案する。あわせて `MAX_N` の値自体は実装依存(script size /
-mass 制約に応じて選択)でよいことを明示すれば、実装間の互換性要求と
-実装の柔軟性の両方を満たせる。
+上限値そのものを実装依存のまま残しつつ、**その値を descriptor の必須
+フィールドとして機械判読可能に宣言させる**ことを提案する。具体案は次の
+通り。
+
+**descriptor への追加フィールド案:**
+
+```text
+KCC20Descriptor {
+    prefix: bytes
+    suffix: bytes
+    extended_state_layout: ExtendedStateLayout | none
+    kcc20_extensions: ExtensionId[]
+    max_participants: byte              // NEW
+}
+```
+
+- 型は固定1byte(`0..255`)を提案する。Kaspa の mass 制約下では、1つの
+  covenant-id グループが数百単位の入出力を1トランザクションに収めるこ
+  とは現実的でなく(KOB の `KCC20_TRANSFER_MAX_N = 4` のような値が実務
+  上の下限に近い)、255 で十分な余裕がある。将来的により大きな値が必要
+  になった場合に備え、2byte LE(`byte[2]`)を採用する代案も併記する —
+  trade-off は「1byte: descriptor が1byte軽い」対「2byte: 将来の unroll
+  境界拡大に上限そのものの再定義なしで対応できる」であり、KOB は前者
+  (1byte)で当面十分と考えるが、どちらでも規範の�ココ本質(下記 MUST 条
+  項)は変わらない。
+
+**Transfer Interface 節末尾への MUST 条項の追記案:**
+
+```text
+before: (上限に関する記述なし)
+
+after (追記):
+"An implementation MUST declare, via the descriptor's `max_participants`
+field, the maximum number of KCC20 covenant inputs and outputs sharing
+one `covenant_id` that its `transfer`/`transfer_delegator` bytecode is
+constructed to validate. If the number of KCC20-bound inputs or outputs
+sharing the active `covenant_id` in a transition exceeds
+`max_participants`, the leader's `transfer` entrypoint MUST reject the
+transition in its entirety -- excess members MUST NOT be silently
+ignored or excluded from the conservation check."
+```
+
+**実証(file:line)**: KOB は既にこの規範相当の防御を、descriptor 宣言と
+しては公開せず、Rust 定数 `KCC20_TRANSFER_MAX_N = 4`
+(`transfer.rs:130`)とバイトコード上の `OP_VERIFY` 2本
+(`OpCovInputCount <= MAX_N+1` / `OpCovOutputCount <= MAX_N`,
+`transfer.rs:340-350`)として実装・engine テスト済みである(honest-path
+の `single_input_transfer_happy_path` 等 15 本のテストは全てこの上限
+チェックを経由して通過する、`kob/core/tests/kcc20_contracts.rs`)。ただ
+し現状、この `4` という値は redeem script を逆アセンブルしない限り外部
+から知りようがない — `max_participants` を descriptor に公開フィールド
+として追加する提案は、この既に実装・検証済みの防御ロジックを変えずに、
+その**境界値を外部から機械判読可能にする**ことだけを狙ったものであり、
+KOB 自身の実装変更コストも小さい(定数を descriptor 構造体のフィールド
+にも複写するだけ)。
 
 ## 4. x402 決済ユースケースからの要求
 
@@ -1032,7 +1333,10 @@ kob-x402 は kaspa-exact-v2 (alpha.8 プロファイル分割: `standard-native`
 
 - kcc-0020 の Descriptor に標準化されたワイヤ形式を与えること
   (ISSUE-6 の提案)を、x402 のような decentralized 決済ユースケースの
-  実現条件として改めて強調する。
+  実現条件として改めて強調する。descriptor という概念自体は Manyfest が
+  既に導入しているものであり、本報告の提案はそれに競合する別物を作るの
+  ではなく、著者自身がまだバイト形式まで踏み込んでいない部分を具体化す
+  る一案として提出するものである。
 - descriptor の「公開」経路として、on-chain の何らかの参照可能な場所
   (例えば covenant genesis 時の追加 output やメタデータ)を規定候補と
   して検討することを提案する — オフチェーンの URL レジストリのみに頼
@@ -1084,7 +1388,60 @@ kcc-0020 PR #2 の issue コメントで `michaelsutton`(2026-07-15)は、
 して正式に定義する提案には至っていない。本章はこれを一歩進め、具体的
 な標準化提案として提出する。
 
-### 5.3 なぜ「1グローバル BL 表」は UTXO モデルでは筋が悪いか
+### 5.3 kas-smiths.org スレッド #8 では issuer-authority 設計が既に議論されている(Manyfest / Max143672)
+
+本章 5.1 が指摘する課題(グローバルな freeze/blacklist 状態を UTXO モデ
+ルでどう持つか)は、実は kcc-0020 の草案そのものより前に、著者
+Manyfest 自身が同じスレッド #8 で既に提起し、暫定的な解決の方向性まで
+示している。post #9(2026-07-04、smartgoo への返信):
+
+> "Regarding issuer policies, the challenge is that there is no global
+> token state. Tokens are distinct utxos, and hence it's tricky to allow
+> global lists, freezes and such. **The solution might be creating a
+> token which forces the existence of a global state utxo, which would
+> hold those global states.**"
+
+すなわち、issuer-authority/compliance 機能の必要性自体は Manyfest 自身
+が認めており、彼の暫定案は「global state utxo を強制する token を作る」
+という、5.4 で述べる懸念(BL表 UTXO 自体が全 transfer のボトルネックに
+なる並行性問題)にそのまま該当する設計である。
+
+同スレッドで Max143672 は、これとは異なる方向を後日(2026-07-10)提示し
+ている。post #20(Shawn への返信、Solana/Cardano の freeze/pause モデル
+を参照):
+
+> "Authorities may be replaced with covenants that have actual
+> authorities in the state...freezer is able to freeze any token account
+> of the same mint. **The same property may be implemented as additional
+> spending branch.**"
+
+post #21(自己フォローアップ):
+
+> "There are also hacks that require global state less often. For
+> example it's possible to have a **2 phase transfers**: send allows me
+> to send tokens to some address, and they will be owned by some entity.
+> However to spend it may be required to reference global state. So two
+> states: **pending transfer and ready to spend**."
+
+Max143672 の2つの投稿に共通する狙いは、「通常の transfer 1回ごとにグロ
+ーバル状態を参照させる」設計を避け、freeze/seize のような発行体操作を
+「別の spending branch(独立したエントリポイント)」または「pending →
+ready-to-spend の2段階遷移」という形で通常経路から切り離すことで、
+Manyfest 案が抱える並行性問題を緩和する方向性である。
+
+5.5 で提出する KOB の `kcc20_issuer_authority_v1` 提案は、この2つの既存
+案のどちらとも対立するものではなく、Max143672 の「spending branch 分
+離」の方向性を具体的な optional extension として定式化したものと位置づ
+けられる: 通常の `transfer`/`transfer_delegator` は自分自身の state(の
+`frozen` 相当フィールド)だけを見て完結し(= グローバル状態を毎回参照し
+ない)、Manyfest が示唆した「global state utxo」に相当する発行体側の状
+態更新は、`issuer_seize` という別エントリポイント(まさに Max143672 の
+"additional spending branch")に閉じ込める。Max143672 の two-phase
+transfer(pending/ready-to-spend)は、`issuer_seize` の対象 UTXO がちょ
+うど transfer 実行中である場合の競合の扱い方として、本提案の将来拡張の
+方向性に据えることを提案する(5.5 末尾で改めて触れる)。
+
+### 5.4 なぜ「1グローバル BL 表」は UTXO モデルでは筋が悪いか
 
 アカウントモデル(EVM 系 ERC-20 の blacklist 実装)であれば「アドレス
 → フラグ」のグローバルマッピングを1つのコントラクトストレージスロット
@@ -1094,14 +1451,18 @@ transfer のボトルネックになり、**同時に複数の transfer を並�
 なくなる**(concurrency 問題)。この懸念は Kaspa コミュニティでも認識
 されており(Shawn の並行性懸念として言及される、KIP-20 の "Split /
 One-to-Many" パターンの設計思想とも整合する論点)、Kaspa の BlockDAG
-による高い並行性という設計目標そのものと真っ向から矛盾する。
+による高い並行性という設計目標そのものと真っ向から矛盾する — 5.3 で見
+た Manyfest 自身の「global state utxo を強制する」暫定案も、この意味で
+は同じボトルネックを抱えている。
 
 **現実的な解**は per-UTXO の issuer-seize 権限である: 発行体が
 「この特定の UTXO を没収する」ための鍵/covenant 権限を持ち、それを行
 使する transfer のみがグローバルな状態に触れる(または全く触れない)
-設計にすれば、無関係な transfer 同士の並行性は損なわれない。
+設計にすれば、無関係な transfer 同士の並行性は損なわれない。これは
+5.3 で引用した Max143672 の "additional spending branch" 案と同じ方向
+である。
 
-### 5.4 提案: optional issuer-authority/compliance extension の標準化
+### 5.5 提案: optional issuer-authority/compliance extension の標準化
 
 kcc-0020 の `kcc20_extensions: ExtensionId[]` の仕組み(ISSUE-7 で報告
 した通りワイヤ形式は未定だが、機構自体は存在する)を使って、以下のよ
@@ -1117,7 +1478,7 @@ kcc-0020 の `kcc20_extensions: ExtensionId[]` の仕組み(ISSUE-7 で報告
   可能にする**(= extended_state に `frozen: bool` 相当のフィールドを
   持たせる、または covenant_id 経由で発行体の凍結リストと連動できる
   ようにする)。global な BL 表を必須にせず、per-UTXO の凍結フラグ +
-  発行体による `issuer_seize` の組み合わせで、5.3 で述べた並行性問題を
+  発行体による `issuer_seize` の組み合わせで、5.4 で述べた並行性問題を
   回避する設計を推奨する。
 
 descriptor の `kcc20_extensions` にこの拡張の宣言を **必須(MUST)** に
@@ -1126,7 +1487,18 @@ descriptor の `kcc20_extensions` にこの拡張の宣言を **必須(MUST)** �
 なる — これは「凍結可能性が機械判読可能である方が DEX/エスクロー/
 wallet にとって安全である」という設計原則に基づく。
 
-### 5.5 KOB(DEX)側の副作用: ISSUE-15 との関連
+改めて位置づけを明確にすると、この提案は base `State`/`transfer` を一切
+変更しない — 5.3 で確認した通り、Manyfest 自身が issuer-authority の必
+要性自体は認めており、Max143672 は「spending branch 分離」「two-phase
+transfer」という2つの緩和方向を既に提示している。本提案は前者(spending
+branch 分離 = 独立 entrypoint `issuer_seize`)を `kcc20_extensions` 経由
+の optional extension として具体化するものであり、後者(two-phase
+transfer)は、`issuer_seize` の対象 UTXO が同一トランザクション内で
+transfer とも競合しうるケース(5.6 で述べる KOB 側の副作用と同型の問題)
+への将来拡張の方向性として、pending/ready-to-spend に相当する2状態を
+`extended_state` 側に持たせる案を PR の場での検討候補として残す。
+
+### 5.6 KOB(DEX)側の副作用: ISSUE-15 との関連
 
 issuer-seize 権限を持つ資産が、KOB のような covenant orderbook DEX の
 注文 covenant エスクロー中に没収された場合、注文の settle 処理は
@@ -1216,15 +1588,24 @@ A few smaller, more mechanical points that came up along the way:
   on top of KOB) cannot discover an externally-issued token's template
   bytes to compute its expected P2SH address — it can only validate
   tokens whose exact template it already hard-codes.
-- We also noticed that neither KCC-0020 nor KCC-0001 defines any
-  issuer-side controls (freeze/seize/pause) at all — the only specified
-  extension is Borrowed Receive. Real-world USD-pegged stablecoin
-  issuance generally requires some form of this for compliance reasons.
-  We'd suggest this is worth standardizing as an optional extension
-  (declared, like Borrowed Receive, via `kcc20_extensions`) rather than
-  left to ad hoc per-issuer designs, partly so that wallets/DEXes/escrow
+- Neither KCC-0020 nor KCC-0001 currently defines issuer-side controls
+  (freeze/seize/pause) — the only specified extension is Borrowed
+  Receive — and real-world USD-pegged stablecoin issuance generally
+  needs some form of this for compliance reasons. We saw this discussed
+  in this thread already: Manyfest's own post floated "a token which
+  forces the existence of a global state utxo" for this, and Max143672
+  followed up with an alternative built around an "additional spending
+  branch" for the freeze authority and a two-phase (pending / ready-to-
+  spend) transfer. We like the spending-branch direction specifically
+  because it keeps ordinary transfers from touching any global state at
+  all (a per-UTXO `frozen` flag plus a separate `issuer_seize`
+  entrypoint), and we'd propose formalizing it as an optional extension
+  — declared, like Borrowed Receive, via `kcc20_extensions` — rather
+  than left to ad hoc per-issuer designs, so wallets/DEXes/escrow
   contracts can tell from the descriptor alone whether an asset is
-  subject to issuer seizure.
+  subject to issuer seizure. This is meant as a concrete instantiation of
+  a direction already on the table here, not a new base-interface
+  feature.
 
 We have a fuller writeup (19 numbered items total, each with the spec
 text quoted, the exact code path where we hit the issue, and a concrete

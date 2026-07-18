@@ -17,8 +17,8 @@ use crate::wallet::SecureKey;
 ///
 /// # Example
 /// ```
-/// # use kob_core::signing::schnorr_sign_secure;
-/// # use kob_core::wallet::SecureKey;
+/// # use kob_settle::signing::schnorr_sign_secure;
+/// # use kob_settle::wallet::SecureKey;
 /// let key = SecureKey::from_bytes([1u8; 32]);
 /// let sighash = [0xab; 32];
 /// let sig = schnorr_sign_secure(&sighash, &key).unwrap();
@@ -38,7 +38,7 @@ pub fn schnorr_sign_secure(sighash: &[u8; 32], key: &SecureKey) -> crate::Result
 ///
 /// # Example
 /// ```
-/// # use kob_core::signing::{schnorr_sign, get_public_key};
+/// # use kob_settle::signing::{schnorr_sign, get_public_key};
 /// let privkey = [1u8; 32]; // Example key (not a real key)
 /// let sighash = [0xab; 32]; // Example sighash
 /// // Note: privkey [1; 32] is a valid secp256k1 scalar

@@ -8,3 +8,6 @@ path = "src/lib.rs"
 
 [dependencies]
 kob-core = { path = "../core" }
+
+[dev-dependencies]
+hex = { workspace = true }

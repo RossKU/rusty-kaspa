@@ -24,7 +24,7 @@ use crate::signing::get_public_key;
 ///
 /// # Example
 /// ```
-/// # use kob_core::wallet::SecureKey;
+/// # use kob_settle::wallet::SecureKey;
 /// let key = SecureKey::from_bytes([1u8; 32]);
 /// assert_eq!(key.as_bytes().len(), 32);
 /// // key is zeroed when dropped
@@ -569,7 +569,7 @@ impl HdWallet {
     ///
     /// # Example
     /// ```
-    /// # use kob_core::wallet::HdWallet;
+    /// # use kob_settle::wallet::HdWallet;
     /// let wallet = HdWallet::generate(12).unwrap();
     /// let mnemonic = wallet.mnemonic().unwrap();
     /// assert_eq!(mnemonic.split_whitespace().count(), 12);
@@ -602,7 +602,7 @@ impl HdWallet {
     ///
     /// # Example
     /// ```
-    /// # use kob_core::wallet::HdWallet;
+    /// # use kob_settle::wallet::HdWallet;
     /// let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
     /// let wallet = HdWallet::from_mnemonic(mnemonic).unwrap();
     /// let key = wallet.derive_key(0, 0).unwrap();

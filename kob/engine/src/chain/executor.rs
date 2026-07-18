@@ -687,6 +687,29 @@ pub(crate) fn weighted_shuffle_by<T>(
     *items = out;
 }
 
+/// Owner-configurable per-cycle group cap (`AppConfig::max_groups_per_cycle`
+/// / `KOB_MAX_GROUPS_PER_CYCLE`). Truncates `groups` to at most `max`
+/// entries and returns how many were dropped, so the caller can log it.
+///
+/// `max == 0` means unlimited -- a no-op, preserving the pre-cap behavior
+/// of processing every crossing group found in a cycle.
+///
+/// MUST be called AFTER `weighted_shuffle_by` has reordered the groups by
+/// fee-weighted random priority: truncating a fee-weighted-shuffled list
+/// keeps the (probabilistically) highest-surplus groups first, the same
+/// way a miner selects a bounded subset of mempool transactions by fee --
+/// truncating the raw traversal order instead would introduce an arbitrary,
+/// non-fee-related bias toward whichever pair the book happened to iterate
+/// first.
+fn apply_group_cap<T>(groups: &mut Vec<T>, max: usize) -> usize {
+    if max == 0 || groups.len() <= max {
+        return 0;
+    }
+    let dropped = groups.len() - max;
+    groups.truncate(max);
+    dropped
+}
+
 /// True when a submit error means the tx LOST A RACE for one of its inputs
 /// (another matcher's tx consumed it first, or our sweep went orphan) —
 /// the C-b collision case: back off exponentially and re-plan from the
@@ -4039,6 +4062,19 @@ async fn run_scan_cycle(
             .unwrap_or(1)
             ^ ((std::process::id() as u64) << 32);
         weighted_shuffle_by(&mut opt_groups, seed, |g| g.total_surplus);
+    }
+
+    // Owner-configurable cap on groups processed per cycle (competing-matcher
+    // friendliness): applied AFTER the weighted shuffle above so the
+    // surviving groups are the fee-weighted-random top-N, not an arbitrary
+    // traversal-order prefix. Default (0 / unset) is unlimited, i.e. no
+    // behavior change from before this cap was introduced.
+    let dropped_by_cap = apply_group_cap(&mut opt_groups, config.max_groups_per_cycle);
+    if dropped_by_cap > 0 {
+        info!(
+            "[SCAN] Group cap active: kept {}, dropped {} (max_groups_per_cycle={})",
+            opt_groups.len(), dropped_by_cap, config.max_groups_per_cycle,
+        );
     }
 
     if opt_groups.is_empty() {
@@ -9158,6 +9194,81 @@ mod tests {
         let mut zeros = vec![0u64; 5];
         weighted_shuffle_by(&mut zeros, 7, |x| *x);
         assert_eq!(zeros.len(), 5);
+    }
+
+    // ═════════════════════════════════════════════════════════════════════
+    // Owner-configurable per-cycle group cap (max_groups_per_cycle)
+    // ═════════════════════════════════════════════════════════════════════
+
+    #[test]
+    fn group_cap_zero_is_unlimited_no_op() {
+        let mut groups = vec![1, 2, 3, 4, 5];
+        let dropped = apply_group_cap(&mut groups, 0);
+        assert_eq!(dropped, 0);
+        assert_eq!(groups, vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn group_cap_noop_when_len_at_or_under_max() {
+        // Under the cap: nothing dropped.
+        let mut under = vec![1, 2, 3];
+        assert_eq!(apply_group_cap(&mut under, 10), 0);
+        assert_eq!(under, vec![1, 2, 3]);
+
+        // Exactly at the cap (boundary): nothing dropped.
+        let mut exact = vec![1, 2, 3];
+        assert_eq!(apply_group_cap(&mut exact, 3), 0);
+        assert_eq!(exact, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn group_cap_truncates_and_reports_dropped_count() {
+        let mut groups = vec![10, 20, 30, 40, 50];
+        let dropped = apply_group_cap(&mut groups, 2);
+        assert_eq!(dropped, 3);
+        // Truncation keeps the PREFIX (i.e. whatever order the caller
+        // already established — the weighted shuffle upstream is what
+        // makes this prefix meaningful as a fee-weighted top-N).
+        assert_eq!(groups, vec![10, 20]);
+    }
+
+    #[test]
+    fn group_cap_max_one_keeps_single_element() {
+        let mut groups = vec![7, 8, 9];
+        let dropped = apply_group_cap(&mut groups, 1);
+        assert_eq!(dropped, 2);
+        assert_eq!(groups, vec![7]);
+    }
+
+    #[test]
+    fn group_cap_empty_input_is_noop() {
+        let mut groups: Vec<u64> = vec![];
+        assert_eq!(apply_group_cap(&mut groups, 5), 0);
+        assert!(groups.is_empty());
+        assert_eq!(apply_group_cap(&mut groups, 0), 0);
+        assert!(groups.is_empty());
+    }
+
+    /// Integration-style regression: applying the cap AFTER the weighted
+    /// shuffle keeps exactly the shuffled order's prefix — i.e. capping is
+    /// a pure truncation with no independent reordering of its own. This
+    /// pins the composition order documented on `apply_group_cap`: cap
+    /// must run after shuffle, never before/instead of it.
+    #[test]
+    fn group_cap_after_shuffle_keeps_shuffled_prefix() {
+        let orig: Vec<u64> = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let seed = 0x1234_5678_ABCD_EF01;
+
+        let mut reference = orig.clone();
+        weighted_shuffle_by(&mut reference, seed, |x| *x);
+
+        let mut capped = orig.clone();
+        weighted_shuffle_by(&mut capped, seed, |x| *x);
+        let dropped = apply_group_cap(&mut capped, 3);
+
+        assert_eq!(dropped, orig.len() - 3);
+        assert_eq!(capped.len(), 3);
+        assert_eq!(&capped[..], &reference[..3], "cap keeps shuffle's own prefix");
     }
 
     #[test]

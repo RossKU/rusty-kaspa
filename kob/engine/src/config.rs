@@ -63,6 +63,12 @@ pub struct AppConfig {
     /// C-c: default submission lane for settle txs (per-tx callers may
     /// override). `Auto` = Urgent -> Free fallback.
     pub submit_lane: crate::chain::submitter::TxLane,
+    /// Cap on the number of crossing groups `run_scan_cycle` processes per
+    /// scan cycle, applied AFTER the fee-weighted shuffle (so a lower cap
+    /// still keeps the highest-surplus-weighted groups first, mirroring how
+    /// a miner picks a subset of mempool by fee). `0` = unlimited (default,
+    /// preserves pre-existing behavior). Read from `KOB_MAX_GROUPS_PER_CYCLE`.
+    pub max_groups_per_cycle: usize,
 }
 
 // Custom Debug that doesn't leak key material or auth tokens
@@ -79,6 +85,7 @@ impl std::fmt::Debug for AppConfig {
             .field("zk_prover_enabled", &self.zk_prover_enabled)
             .field("fee_bps", &self.fee_bps)
             .field("submit_lane", &self.submit_lane)
+            .field("max_groups_per_cycle", &self.max_groups_per_cycle)
             .finish()
     }
 }
@@ -145,6 +152,9 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| crate::chain::submitter::TxLane::parse(&v))
                 .unwrap_or_default(),
+            max_groups_per_cycle: parse_max_groups_per_cycle(
+                std::env::var("KOB_MAX_GROUPS_PER_CYCLE").ok().as_deref(),
+            ),
         })
     }
 
@@ -159,6 +169,46 @@ impl AppConfig {
     /// Returns a copy of the key bytes. Caller should zeroize after use.
     pub fn private_key_bytes(&self) -> [u8; 32] {
         *self.private_key.as_bytes()
+    }
+}
+
+/// Parse `KOB_MAX_GROUPS_PER_CYCLE`'s raw env value into a per-cycle group
+/// cap. `0` means "unlimited" (the current, pre-cap behavior). A missing
+/// env var or a value that doesn't parse as a `usize` also falls back to
+/// `0` -- fail open, never surprise-cap an operator who didn't opt in.
+///
+/// Takes `Option<&str>` (rather than reading the env var itself) so it can
+/// be unit tested without mutating global process state.
+fn parse_max_groups_per_cycle(raw: Option<&str>) -> usize {
+    raw.and_then(|v| v.parse::<usize>().ok()).unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn max_groups_per_cycle_absent_env_is_unlimited() {
+        assert_eq!(parse_max_groups_per_cycle(None), 0);
+    }
+
+    #[test]
+    fn max_groups_per_cycle_parses_valid_value() {
+        assert_eq!(parse_max_groups_per_cycle(Some("5")), 5);
+        assert_eq!(parse_max_groups_per_cycle(Some("1")), 1);
+    }
+
+    #[test]
+    fn max_groups_per_cycle_explicit_zero_is_unlimited() {
+        assert_eq!(parse_max_groups_per_cycle(Some("0")), 0);
+    }
+
+    #[test]
+    fn max_groups_per_cycle_invalid_value_falls_back_to_unlimited() {
+        assert_eq!(parse_max_groups_per_cycle(Some("not-a-number")), 0);
+        assert_eq!(parse_max_groups_per_cycle(Some("-3")), 0);
+        assert_eq!(parse_max_groups_per_cycle(Some("3.5")), 0);
+        assert_eq!(parse_max_groups_per_cycle(Some("")), 0);
     }
 }
 

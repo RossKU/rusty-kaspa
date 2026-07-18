@@ -23,6 +23,13 @@ pub mod decay;
 pub mod ratchet;
 pub mod twap;
 
+/// RT-2 adversarial tooling: construct malformed `ratchet_oco` RATCHET-branch
+/// advance transactions for offline (and, later, live) covenant-rejection
+/// proof. Not shipping bytecode -- deliberately NOT re-exported via `pub use`
+/// below so its `RatchetTamperCase`/`SiblingPrint` names stay out of the flat
+/// namespace; consumers `use kob_core::contract::spot::ratchet_tamper::*`.
+pub mod ratchet_tamper;
+
 /// EXPERIMENTAL — batch-limit measurement variants (kob/BATCH_LIMITS.md).
 /// Not shipping bytecode: nothing in the deploy/parse/settle paths uses this
 /// module. Deliberately NOT re-exported via `pub use` below.

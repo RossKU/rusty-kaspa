@@ -42,6 +42,7 @@ pub mod insurance;
 pub mod swap;
 pub mod watch;
 pub mod listing;
+pub mod ratchet_tamper;
 
 use clap::Subcommand;
 
@@ -939,6 +940,28 @@ pub enum Commands {
     Swap {
         #[command(subcommand)]
         action: swap::SwapCommand,
+    },
+
+    /// [DEV] RT-2 adversarial tooling: construct a malformed ratchet_oco
+    /// RATCHET-branch (advance) transaction from the honest baseline, one
+    /// mutation at a time -- mirrors `match --tamper`'s design for the
+    /// ratchet-advance shape. OFFLINE construction only in this build (no
+    /// network call is made); the covenant-rejection proof for every case
+    /// runs through kob-core's real TxScriptEngine harness
+    /// (`cargo test -p kob-core --test ratchet_tamper_repro`). Live firing
+    /// is a later task. Hidden: not part of the product surface.
+    #[command(hide = true)]
+    RatchetTamper {
+        /// Tamper case selector, e.g. l1, l2-cancel-shape, l3,
+        /// l4-neg-pden, l8, l10-wrong-step, l11-forged-spk, rate-rwin,
+        /// rate-travel-cap. Run with --list for the full catalog.
+        #[arg(long)]
+        case: Option<String>,
+
+        /// Print the full 8-category adversarial catalog (case id, category,
+        /// expected guard) and exit.
+        #[arg(long)]
+        list: bool,
     },
 }
 
@@ -3601,6 +3624,9 @@ pub async fn dispatch(
         }
         Commands::Swap { action } => {
             swap::run(wallet_path, node, network, &action).await?;
+        }
+        Commands::RatchetTamper { case, list } => {
+            ratchet_tamper::run(case, list)?;
         }
     }
 

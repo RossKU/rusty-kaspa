@@ -179,6 +179,33 @@ pub struct SubmitResult {
 ///   output[0]: seller KAS
 ///   output[1]: buyer tokens
 ///   output[2]: matcher fee (optional, bps-capped)
+
+/// Decide whether Phase 2 must rebuild `tx.outputs` (and re-sign the wallet
+/// input) so the submitted tx's miner fee actually matches the exact Phase 2
+/// fee -- clamped further up by an optional floor bound (this call site has
+/// no `KOB_FEE_FLOOR` concept, so callers always pass `false`; the parameter
+/// is kept for parity with the sibling gates below).
+///
+/// `BatchPlan::converge_fee_exact` returns `delta = phase1_est.saturating_sub(
+/// exact_fee)`, an UNSIGNED quantity. It collapses to 0 in two very different
+/// situations: (a) `exact_fee == phase1_est` (nothing to do, correctly a
+/// no-op), and (b) `exact_fee > phase1_est` -- Phase 1 UNDER-estimated -- where
+/// a rebuild is very much still required, to RAISE the fee, not to recover a
+/// surplus. Gating the rebuild on `delta > 0` alone (as the pre-fix code did)
+/// silently ships the stale, too-low Phase-1 fee whenever Phase 2's real
+/// compute-mass number comes in higher than the estimate. Same bug, same fix,
+/// as the CLI `match`/`match-batch` paths (commit 83d8293a) and the engine's
+/// `execute_batch_match` (commit 8ce15f89) -- this is the 4th call site of
+/// `converge_fee_exact` that shared the gate bug.
+///
+/// Comparing `phase1_est` and `exact_fee` directly (instead of going through
+/// the lossy, saturated `delta`) restores the missing direction: rebuild
+/// whenever the two fees differ AT ALL, in either direction, or whenever a
+/// floor binds on top.
+fn resolve_fee_rebuild_needed(phase1_est: u64, exact_fee: u64, floor_bound: bool) -> bool {
+    phase1_est != exact_fee || floor_bound
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn submit_match(
     rpc: &NodeClient,
@@ -247,7 +274,7 @@ pub async fn submit_match(
     let sell_order = BatchOrder {
         outpoint: (sell.txid.clone(), sell.index),
         order_type: OrderType::Sell,
-        version: 14,
+        version: sell.version,
         token_cov_id: tcid,
         price_num: sell.price_num,
         price_den: sell.price_den,
@@ -307,9 +334,25 @@ pub async fn submit_match(
         sigscripts[wallet_idx] = signing::build_p2pk_sigscript(&sig);
     }
 
-    let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
-    if delta > 0 {
+    // `_delta` is the lossy saturated value described in
+    // `resolve_fee_rebuild_needed`'s doc comment -- this call site has no
+    // direction-aware log (unlike matching.rs / match_batch.rs / executor.rs),
+    // so it's unused; `phase1_est`/`exact_fee` drive the gate directly.
+    let (exact_fee, _delta) = plan.converge_fee_exact(&tx, &sigscripts);
+    let phase1_est = plan.total_fee;
+    if resolve_fee_rebuild_needed(phase1_est, exact_fee, false) {
+        // `apply_exact_fee` only RECOVERS a Phase-1 over-estimate (its own
+        // internal delta = phase1_est.saturating_sub(exact_fee)) back to the
+        // matcher/wallet-change output -- it is a no-op when Phase 1
+        // under-estimated. `apply_fee_floor` is the general-purpose "raise
+        // the miner fee to at least X, taking the shortfall from the
+        // matcher-side outputs" primitive (see matching.rs / match_batch.rs /
+        // executor.rs); reusing it with `exact_fee` itself as the floor
+        // covers the missing direction (Phase 1 undershot Phase 2) with the
+        // SAME never-touch-seller/buyer semantics. Calling both is safe:
+        // whichever direction doesn't apply is a no-op.
         plan.apply_exact_fee(exact_fee);
+        plan.apply_fee_floor(exact_fee);
 
         tx.outputs.clear();
         for planned in &plan.outputs {
@@ -755,6 +798,57 @@ pub async fn run(
 mod tests {
     use super::*;
 
+    // ---- resolve_fee_rebuild_needed ----
+    //
+    // Mirrors the CLI fix (commit 83d8293a, cli/src/matching.rs +
+    // cli/src/match_batch.rs) and the engine fix (commit 8ce15f89,
+    // engine/src/chain/executor.rs) for the identical `delta > 0` gate bug
+    // in this file's `submit_match` Phase 2 fee convergence -- the 4th call
+    // site of `BatchPlan::converge_fee_exact` found to share it.
+
+    #[test]
+    fn rebuild_not_needed_when_exact_equals_estimate_and_no_floor() {
+        assert!(!resolve_fee_rebuild_needed(524_200, 524_200, false));
+    }
+
+    #[test]
+    fn rebuild_needed_when_exact_is_higher_than_estimate() {
+        // The live bug: Phase 1 estimated 524200, Phase 2's exact compute
+        // fee came in at 986100 (a v18 buy's large redeemScript wasn't fully
+        // accounted for in the Phase-1 estimate). `converge_fee_exact`'s own
+        // `delta` saturates to 0 here (est < exact), but a rebuild is very
+        // much required -- to RAISE the fee, not recover a surplus. Asserts
+        // the gate fires; `submit_match` itself is not unit-testable in
+        // place (it needs a live `NodeClient`/RPC round-trip), so this
+        // covers the Phase-1-under-estimate case at the pure-fn level -- see
+        // the report for that gap.
+        assert!(resolve_fee_rebuild_needed(524_200, 986_100, false));
+    }
+
+    #[test]
+    fn rebuild_needed_when_exact_is_lower_than_estimate_recovered_direction() {
+        // Phase 1 over-estimated; Phase 2's exact fee is lower -- the
+        // "recovered" direction. Must still rebuild so the recovered delta
+        // actually reaches the matcher/wallet-change output instead of
+        // being silently left in the stale Phase-1 tx.
+        assert!(resolve_fee_rebuild_needed(986_100, 524_200, false));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_even_if_exact_equals_estimate() {
+        assert!(resolve_fee_rebuild_needed(524_200, 524_200, true));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_on_top_of_higher_exact() {
+        assert!(resolve_fee_rebuild_needed(524_200, 986_100, true));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_on_top_of_lower_exact() {
+        assert!(resolve_fee_rebuild_needed(986_100, 524_200, true));
+    }
+
     fn make_test_order(side: OrderSide, price_num: u64, price_den: u64, value: u64) -> DetectedOrder {
         DetectedOrder {
             txid: "a".repeat(64),
@@ -860,6 +954,105 @@ mod tests {
         // Cross-multiply: 2*4 = 8 < 3*3 = 9
         let pairs = find_crossing_pairs(&orders, 0.0);
         assert_eq!(pairs.len(), 0, "Rational prices 2/3 < 3/4 should not cross");
+    }
+
+    /// Regression: restores (adapted to the current v18-only API) a test
+    /// deleted in commit 23eb1edc ("refactor: delete all pre-v18 spot
+    /// generations (E2)"). That refactor hard-gated `validate_sweep` (and
+    /// `plan_batch_match`, which calls it) to require `sell.version == 18`
+    /// AND `buy.version == 18`, but left `submit_match`'s sell-side
+    /// `BatchOrder` literal hardcoded at `version: 14` -- so EVERY
+    /// `submit_match` call failed with `BatchError::UnsupportedVersion`
+    /// before a tx was ever built, i.e. `kob-cli auto-match` live matching
+    /// was 100% dead. (Not caught earlier because this is exactly the test
+    /// that check would have failed.)
+    ///
+    /// This builds the same `BatchOrder` pair shape `submit_match` builds
+    /// from a `DetectedOrder` pair -- real v18 redeem scripts via
+    /// `build_buy_redeem_script`/`build_sell_redeem_script` (required:
+    /// `plan_batch_match_at` parses `mmfee_bps` out of the buy redeemScript
+    /// and rejects any script whose length isn't the exact v18 size) -- and
+    /// asserts `plan_batch_match`/`plan.validate()` SUCCEED. Reverting the
+    /// sell-side `version: sell.version` fix back to a hardcoded `14` makes
+    /// this fail with `BatchError::UnsupportedVersion` (sell v14 is rejected
+    /// by `validate_sweep`'s `s.version != 18` gate), which is exactly what
+    /// happened live.
+    #[test]
+    fn detected_order_pair_builds_a_valid_plan() {
+        let tcid = [0u8; 32];
+        let owner_hash = [0x11u8; 32];
+        let spk_hash = [0x22u8; 32];
+        let okspkh = [0x33u8; 32]; // dummy owner KAS refund seat (buy E1 expire)
+        let otspkh = [0x44u8; 32]; // dummy owner token refund seat (sell E1 expire)
+        let wallet_spk = vec![0xCC; 34];
+
+        // Price convention: sell price is KAS-per-token, buy price is
+        // tokens-per-KAS -- the two must be RECIPROCALS at parity, not equal
+        // fractions. sell: 2 KAS per token; buy: 1/2 token per KAS == the
+        // same 2 KAS/token rate, so the aggregate surplus-cap check
+        // (`buy.utxo_value - fair_sum <= cap`) comes out to 0 surplus
+        // instead of spuriously tripping `CapInfeasible` on a mismatched
+        // rate (an earlier draft of this test used equal 1/2 fractions for
+        // both legs and hit exactly that).
+        let buy_rs = kob_core::contract::spot::order::build_buy_redeem_script(
+            &tcid, 1, 2, 1_000_000, &owner_hash, &spk_hash, &okspkh, 100, 0, 0,
+        )
+        .unwrap();
+        let sell_rs = kob_core::contract::spot::order::build_sell_redeem_script(
+            2, 1, 1_000_000, &owner_hash, &spk_hash, &otspkh, 100, 0, 0,
+        )
+        .unwrap();
+
+        let buy_order = BatchOrder {
+            outpoint: ("a".repeat(64), 0),
+            order_type: OrderType::Buy,
+            version: 18,
+            token_cov_id: tcid,
+            price_num: 1,
+            price_den: 2,
+            amount: 10_000_000,
+            redeem_script: buy_rs,
+            utxo_value: 10_000_000,
+            counterparty_spk: wallet_spk.clone(),
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: None,
+            bracket_meta: None,
+        };
+        let sell_order = BatchOrder {
+            // Distinct outpoint from the buy (a duplicate outpoint is
+            // correctly rejected by validate_sweep as a double-spend).
+            outpoint: ("b".repeat(64), 1),
+            order_type: OrderType::Sell,
+            version: 18,
+            token_cov_id: tcid,
+            price_num: 2,
+            price_den: 1,
+            amount: 5_000_000,
+            redeem_script: sell_rs,
+            utxo_value: 5_000_000,
+            counterparty_spk: wallet_spk.clone(),
+            counterparty_spk_version: 0,
+            min_fill: 1_000_000,
+            oco_path: None,
+            bracket_meta: None,
+        };
+
+        // A wallet fee UTXO, exactly as `submit_match` always supplies one
+        // (`Some(wallet_utxo_info)`) -- without it, the buy/sell pair above
+        // exactly balances (total_kas_in == total_planned_out) and leaves no
+        // room for the mass-based miner fee.
+        let wallet_utxo = Some(("c".repeat(64), 2, 5_000_000));
+        let plan = plan_batch_match(&[sell_order], &[buy_order], wallet_utxo, &wallet_spk, 0, None)
+            .expect("plan should succeed for a crossing 1:1 pair of real v18 orders");
+        plan.validate().expect("plan should validate");
+        // Full fill: buyer tokens delivered = sell.amount = 5,000,000.
+        let buyer_out = plan
+            .outputs
+            .iter()
+            .find(|o| o.purpose == OutputPurpose::BuyerTokens)
+            .unwrap();
+        assert_eq!(buyer_out.value, 5_000_000);
     }
 
     #[test]

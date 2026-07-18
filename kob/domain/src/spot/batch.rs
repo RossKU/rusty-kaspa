@@ -311,7 +311,7 @@ impl std::fmt::Display for BatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BatchError::UnsupportedVersion { outpoint, version } => {
-                write!(f, "Order {} is v{}, unsupported (v14/v16 only)", outpoint, version)
+                write!(f, "Order {} is v{}, unsupported (v18 only)", outpoint, version)
             }
             BatchError::EmptyBatch => write!(f, "No orders in batch"),
             BatchError::OutputBelowMinimum { index, value } => {

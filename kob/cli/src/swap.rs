@@ -378,27 +378,53 @@ async fn deploy(
         );
         let unit_utxos = rpc.get_utxos_by_addresses(&[&unit_addr]).await?;
 
-        let all_token_utxos: Vec<_> = mint_utxos.iter().chain(unit_utxos.iter()).collect();
-        if let Some(token_utxo) = all_token_utxos.first() {
-            token_input_value = token_utxo.utxo_entry.amount;
-            println!("Token UTXO: {}:{} ({} sompi)",
-                &token_utxo.outpoint.transaction_id[..16],
-                token_utxo.outpoint.index,
-                token_input_value,
-            );
-            tx.inputs.push(TxInput {
-                prev_tx_id: token_utxo.outpoint.transaction_id.clone(),
-                prev_index: token_utxo.outpoint.index,
-                sequence: 0,
-                sig_op_count: 1,
-                script_version: token_utxo.utxo_entry.script_public_key.version,
-                script_bytes: token_utxo.script_bytes(),
-                value: token_input_value,
-            });
-        } else {
-            println!("WARNING: No token UTXO found at mint or unit P2SH addresses.");
-            println!("  Deploying without covenant input (TX version 0).");
-            tx.version = 0;
+        // Filter to sell-deployable UTXOs only (covenant_id matches the source
+        // token) and never auto-pick a token_mint (admin mint/burn authority)
+        // UTXO -- same discriminator as deploy.rs's sell-side auto-discovery
+        // (see `pick_sell_deployable_token_utxo_auto`). The prior
+        // `mint_utxos.iter().chain(unit_utxos.iter()).first()` here had no
+        // covenant_id filter at all and preferred the mint authority over the
+        // fungible unit balance, which could silently lock/burn the mint
+        // authority into the swap covenant or select a foreign-lineage UTXO
+        // that trips the consensus "expected genesis hashing" check.
+        let unit_refs: Vec<&_> = unit_utxos.iter().collect();
+        let mint_refs: Vec<&_> = mint_utxos.iter().collect();
+        match crate::deploy::pick_sell_deployable_token_utxo_auto(&unit_refs, &mint_refs, source_token_hex, amount) {
+            crate::deploy::SellTokenUtxoPick::Unit(i) => {
+                let token_utxo = unit_refs[i];
+                token_input_value = token_utxo.utxo_entry.amount;
+                println!("Token UTXO: {}:{} ({} sompi)",
+                    &token_utxo.outpoint.transaction_id[..16],
+                    token_utxo.outpoint.index,
+                    token_input_value,
+                );
+                tx.inputs.push(TxInput {
+                    prev_tx_id: token_utxo.outpoint.transaction_id.clone(),
+                    prev_index: token_utxo.outpoint.index,
+                    sequence: 0,
+                    sig_op_count: 1,
+                    script_version: token_utxo.utxo_entry.script_public_key.version,
+                    script_bytes: token_utxo.script_bytes(),
+                    value: token_input_value,
+                });
+            }
+            crate::deploy::SellTokenUtxoPick::MintAuthorityOnly => {
+                anyhow::bail!(
+                    "Only a KCC20 mint-authority UTXO (covenant_id matching {}) was found at the mint P2SH; \
+                     no fungible token_unit UTXO qualifies. Refusing to auto-select the mint authority -- \
+                     spending it here would burn/lock minting for this token. \
+                     Use --token-utxo to specify a token_unit UTXO explicitly.",
+                    source_token_hex
+                );
+            }
+            crate::deploy::SellTokenUtxoPick::None => {
+                println!("WARNING: No sell-deployable token UTXO found (covenant_id match) at mint or unit P2SH addresses.");
+                println!("  Token:     {}", source_token_hex);
+                println!("  Mint addr: {}", &mint_addr[..40]);
+                println!("  Unit addr: {}", &unit_addr[..40]);
+                println!("  Deploying without covenant input (TX version 0).");
+                tx.version = 0;
+            }
         }
     }
 
@@ -899,4 +925,91 @@ async fn info_cmd(
     println!("Mine:         {}", if is_mine { "YES" } else { "no" });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::deploy::{pick_sell_deployable_token_utxo_auto, SellTokenUtxoPick};
+    use crate::rpc::{RpcOutpoint, RpcSpk, RpcUtxo, RpcUtxoEntry};
+
+    /// Mock a mint- or unit-address token UTXO for the swap deploy
+    /// auto-discover selection tests below. `covenant_id` mirrors what the
+    /// node reports for `covenantId`; pass `None` to simulate a foreign-
+    /// lineage / covenant-free UTXO that must never be auto-selected.
+    fn mock_token_utxo(txid: &str, amount: u64, covenant_id: Option<&str>) -> RpcUtxo {
+        RpcUtxo {
+            outpoint: RpcOutpoint {
+                transaction_id: txid.to_string(),
+                index: 0,
+            },
+            utxo_entry: RpcUtxoEntry {
+                amount,
+                script_public_key: RpcSpk {
+                    version: 0,
+                    script: format!("aa20{}87", "cc".repeat(32)),
+                },
+                block_daa_score: 0,
+                is_coinbase: false,
+                covenant_id: covenant_id.map(|s| s.to_string()),
+            },
+        }
+    }
+
+    /// Source-token covenant ID used across the tests below.
+    const SOURCE_TOKEN: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    // Regression coverage for `swap deploy`'s --token-utxo auto-discover
+    // path (kob/cli/src/swap.rs `SwapCommand::Deploy` auto-discover branch):
+    // it must reuse the same covenant_id-filtered, mint-authority-averse
+    // selection as the sell-deploy auto-discover in deploy.rs, instead of
+    // picking `mint_utxos.iter().chain(unit_utxos.iter()).first()` with no
+    // covenant_id check at all.
+
+    #[test]
+    fn swap_deploy_prefers_fungible_unit_utxo_over_mint_authority() {
+        // Both a fungible token_unit UTXO and a covenant-matching mint-
+        // authority UTXO are present; the fungible unit UTXO must win.
+        let unit_utxos = vec![mock_token_utxo("unit_tx", 5_000_000_000, Some(SOURCE_TOKEN))];
+        let mint_utxos = vec![mock_token_utxo("mint_tx", 1_000_000_000, Some(SOURCE_TOKEN))];
+        let unit_refs: Vec<&_> = unit_utxos.iter().collect();
+        let mint_refs: Vec<&_> = mint_utxos.iter().collect();
+
+        let pick = pick_sell_deployable_token_utxo_auto(&unit_refs, &mint_refs, SOURCE_TOKEN, 1_000_000_000);
+        match pick {
+            SellTokenUtxoPick::Unit(i) => assert_eq!(unit_refs[i].outpoint.transaction_id, "unit_tx"),
+            other => panic!("expected Unit(_), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn swap_deploy_mint_authority_only_is_never_silently_picked() {
+        // No fungible token_unit UTXO at all -- only a mint-authority UTXO
+        // qualifies by covenant_id. Auto-pick must refuse (the swap deploy
+        // caller turns this into a bail! pointing at --token-utxo), never
+        // fall back to spending the mint authority as the swap's source.
+        let unit_utxos: Vec<RpcUtxo> = vec![];
+        let mint_utxos = vec![mock_token_utxo("mint_tx", 1_000_000_000, Some(SOURCE_TOKEN))];
+        let unit_refs: Vec<&_> = unit_utxos.iter().collect();
+        let mint_refs: Vec<&_> = mint_utxos.iter().collect();
+
+        let pick = pick_sell_deployable_token_utxo_auto(&unit_refs, &mint_refs, SOURCE_TOKEN, 1_000_000_000);
+        assert_eq!(pick, SellTokenUtxoPick::MintAuthorityOnly);
+    }
+
+    #[test]
+    fn swap_deploy_excludes_unit_utxo_with_mismatched_covenant_id() {
+        // A unit-address UTXO exists but its covenant_id doesn't match the
+        // swap's source token (e.g. a foreign-lineage / match-merged
+        // remainder that happens to sit at the same P2SH address). It must
+        // be excluded even though it would otherwise satisfy the amount, and
+        // with no qualifying mint UTXO either, the result is None (falls
+        // back to "deploy without covenant input").
+        let unit_utxos = vec![mock_token_utxo("unit_tx", 5_000_000_000, Some("other_token_cov_id"))];
+        let mint_utxos: Vec<RpcUtxo> = vec![];
+        let unit_refs: Vec<&_> = unit_utxos.iter().collect();
+        let mint_refs: Vec<&_> = mint_utxos.iter().collect();
+
+        let pick = pick_sell_deployable_token_utxo_auto(&unit_refs, &mint_refs, SOURCE_TOKEN, 1_000_000_000);
+        assert_eq!(pick, SellTokenUtxoPick::None);
+    }
 }

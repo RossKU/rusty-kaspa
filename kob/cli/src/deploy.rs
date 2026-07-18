@@ -229,6 +229,33 @@ pub fn is_sell_deployable_token_utxo(
     }
 }
 
+/// Returns `true` iff `utxo`'s scriptPublicKey is the `token_mint` P2SH
+/// script (i.e. the UTXO sits at the admin mint/burn authority address,
+/// not the fungible `token_unit` address).
+///
+/// `covenant_id` alone cannot make this distinction: the `token_mint`
+/// genesis UTXO carries the same covenant id as the token, so
+/// `is_sell_deployable_token_utxo` returns `true` for it too. The two
+/// addresses derive from different redeemScripts (`build_token_mint_redeem_script`
+/// vs `build_token_unit_redeem_script`), so comparing the raw P2SH script
+/// bytes is the reliable discriminator.
+///
+/// Used to guard the explicit `--token-utxo` path in `deploy_sell` /
+/// `deploy_oco_sell`: an operator-supplied outpoint not found among the
+/// wallet's own P2PK UTXOs is resolved by querying BOTH the `token_mint`
+/// and `token_unit` P2SH addresses in one call and matching on outpoint
+/// alone -- so, unlike auto-discovery (which is address-group-scoped from
+/// the start and already refuses a mint pick via `SellTokenUtxoPick::MintAuthorityOnly`,
+/// added 2026-07-18 after a live testnet-10 near-miss), it can silently
+/// resolve to the mint authority. KCC20 has no legitimate use case for
+/// spending the mint/burn authority covenant as a sell deploy's covenant
+/// input, and consensus's self-continuation check dooms the resulting tx
+/// anyway -- an explicit `--token-utxo` naming that UTXO must be refused
+/// for the same reason auto-pick refuses it.
+pub fn is_mint_authority_utxo(utxo: &crate::rpc::RpcUtxo, mint_p2sh_script: &[u8]) -> bool {
+    utxo.script_bytes().as_slice() == mint_p2sh_script
+}
+
 /// Pick the best sell-deployable token UTXO from the candidate set.
 ///
 /// Returns the index within `candidates` of the preferred UTXO, or `None` if
@@ -435,11 +462,13 @@ pub async fn deploy_buy(
     // v18 (unified spot generation, V18_DESIGN.md) is the SOLE version new
     // buy deploys may target: N:M GTC/IOC sweep + Op2 partial fill + OCO
     // sweep-eligibility via the canonical price attestation. v14/v16/v17
-    // remain fully parseable/cancellable/servicable for orders already
-    // resting on-chain (deleted in Stage E).
+    // parse arms were deleted in Stage E (commit 23eb1edc) -- pre-existing
+    // v14/v16 buy order UTXOs are now unparseable/uncancellable by current
+    // binaries (see README.md).
     if version != 18 {
         anyhow::bail!("Unsupported contract version {} for NEW buy deployment. Only v18 (unified spot) exists; pre-v18 generations were removed in Stage E.", version);
     }
+    let _ = max_matcher_fee; // pre-v18 sompi cap: unused by v18 (BPS-uniform, uses mmfee_bps)
 
     let wallet = WalletContext::load(wallet_path)?;
     let _price = Price::new(price_num, price_den)?;
@@ -576,12 +605,10 @@ pub async fn deploy_buy(
         amount,
         amount as f64 / 1e8
     );
-    if version == 18 {
-        let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
-        println!("Max Matcher Fee: {} bps ({}%)", bps, bps as f64 / 100.0);
-    } else {
-        println!("Max Matcher Fee: {} sompi ({:.8} KAS)", max_matcher_fee, max_matcher_fee as f64 / 1e8);
-    }
+    // version is guaranteed SPOT_GENERATION (18) here (gated above); v18 is
+    // BPS-uniform, so max_matcher_fee (sompi) is never used for the display.
+    let bps = mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS);
+    println!("Max Matcher Fee: {} bps ({}%)", bps, bps as f64 / 100.0);
     println!("Owner:      {}", wallet.pubkey_hex());
     println!("Owner Hash: {}", hex::encode(owner_hash));
     println!("Buyer SPK Hash: {}", hex::encode(buyer_spk_hash));
@@ -862,7 +889,9 @@ pub async fn deploy_buy(
         token: Some(token_covenant_id.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
-        max_matcher_fee: if version >= 16 { mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS) } else { max_matcher_fee },
+        // version is guaranteed SPOT_GENERATION (18) here (gated above);
+        // v18 caches store BPS, so max_matcher_fee (sompi) is never used.
+        max_matcher_fee: mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS),
         // Exact bytes deployed on-chain -- lets later commands (match-batch,
         // match) spend this order without lossily reconstructing the RS.
         redeem_script: Some(hex::encode(&redeem_script)),
@@ -923,7 +952,9 @@ pub async fn deploy_sell(
 ) -> anyhow::Result<String> {
     // v18 (unified spot) is the SOLE version new sell deploys may target:
     // canonical price attestation on all fill-family branches + Fix-3
-    // partial F4. v14 sells remain parseable/cancellable until Stage E.
+    // partial F4. v14 sells were unparseable/uncancellable as of Stage E
+    // (commit 23eb1edc) -- pre-existing v14 sell order UTXOs cannot be
+    // serviced by current binaries (see README.md).
     if version != 18 {
         anyhow::bail!("Unsupported contract version {} for NEW sell deployment. Only v18 (unified spot) exists; pre-v18 generations were removed in Stage E.", version);
     }
@@ -1141,6 +1172,24 @@ pub async fn deploy_sell(
                 .iter()
                 .find(|u| u.outpoint.transaction_id == token_op.transaction_id && u.outpoint.index == token_op.index)
                 .cloned();
+
+            // Guard: an explicit --token-utxo must not resolve to the
+            // token_mint P2SH (admin mint/burn authority covenant). See
+            // `is_mint_authority_utxo` -- this is the explicit-outpoint
+            // analogue of the auto-discovery `MintAuthorityOnly` guard
+            // (2026-07-18, commit a5ecf8bc): consensus's self-continuation
+            // check would reject the resulting tx anyway, but we want a
+            // clear error, not a doomed broadcast.
+            if let Some(ref u) = found_utxo {
+                if is_mint_authority_utxo(u, mint_p2sh.script()) {
+                    anyhow::bail!(
+                        "--token-utxo {} resolves to a KCC20 mint-authority UTXO (token_mint P2SH), not a fungible token_unit balance. \
+                         The mint authority is the admin mint/burn covenant -- spending it here would burn/lock minting for this token. \
+                         Specify a token_unit UTXO instead.",
+                        token_op_str
+                    );
+                }
+            }
         }
         let token_utxo = found_utxo
             .ok_or_else(|| {
@@ -1579,9 +1628,10 @@ pub async fn deploy_sell(
         token: token_covenant_id.map(|s| s.to_string()),
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
-        // v18 caches store BPS (the value baked into the deployed RS), same
-        // as the buy path above; pre-v18 keeps the legacy sompi cap.
-        max_matcher_fee: if version >= 18 { sell_bps } else { max_matcher_fee },
+        // version is guaranteed SPOT_GENERATION (18) here (gated above); v18
+        // caches store BPS (the value baked into the deployed RS), same as
+        // the buy path above.
+        max_matcher_fee: sell_bps,
         // Exact bytes deployed on-chain (covers Plain/Twap/Decay variants
         // alike) -- lets later commands spend this order without lossily
         // reconstructing the RS.
@@ -1752,10 +1802,29 @@ pub async fn deploy_oco_sell(
             let unit_p2sh = build_p2sh(&unit_rs);
             let unit_addr = crate::cancel::kaspa_address_encode(network.address_prefix(), 8, &unit_p2sh.script()[2..34]);
             extra_utxos = rpc.get_utxos_by_addresses(&[&mint_addr, &unit_addr]).await?;
-            extra_utxos
+            let resolved = extra_utxos
                 .iter()
                 .find(|u| u.outpoint.transaction_id == token_op.transaction_id && u.outpoint.index == token_op.index)
-                .cloned()
+                .cloned();
+
+            // Guard: an explicit --token-utxo must not resolve to the
+            // token_mint P2SH (admin mint/burn authority covenant). See
+            // `is_mint_authority_utxo` -- this is the explicit-outpoint
+            // analogue of the auto-discovery `MintAuthorityOnly` guard
+            // (2026-07-18, commit a5ecf8bc): consensus's self-continuation
+            // check would reject the resulting tx anyway, but we want a
+            // clear error, not a doomed broadcast.
+            if let Some(ref u) = resolved {
+                if is_mint_authority_utxo(u, mint_p2sh.script()) {
+                    anyhow::bail!(
+                        "--token-utxo {} resolves to a KCC20 mint-authority UTXO (token_mint P2SH), not a fungible token_unit balance. \
+                         The mint authority is the admin mint/burn covenant -- spending it here would burn/lock minting for this token. \
+                         Specify a token_unit UTXO instead.",
+                        token_op_str
+                    );
+                }
+            }
+            resolved
         };
         let token_utxo = found_utxo.ok_or_else(|| anyhow::anyhow!("Token UTXO {} not found", token_op_str))?;
         token_input_value = token_utxo.utxo_entry.amount;
@@ -2136,8 +2205,62 @@ mod tests {
         }
     }
 
+    /// Helper to create a mock UTXO with an arbitrary scriptPublicKey (hex,
+    /// no framing assumed) for `is_mint_authority_utxo` tests.
+    fn mock_utxo_with_script(txid: &str, amount: u64, script_hex: String) -> RpcUtxo {
+        RpcUtxo {
+            outpoint: RpcOutpoint {
+                transaction_id: txid.to_string(),
+                index: 0,
+            },
+            utxo_entry: RpcUtxoEntry {
+                amount,
+                script_public_key: RpcSpk { version: 0, script: script_hex },
+                block_daa_score: 0,
+                is_coinbase: false,
+                covenant_id: None,
+            },
+        }
+    }
+
     /// 64-hex-char token covenant id used across the pick/auto-pick tests.
     const TOK: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    // --- is_mint_authority_utxo tests ---
+    //
+    // Regression coverage for the explicit --token-utxo MED gap fixed
+    // 2026-07-18: that path resolves an operator-supplied outpoint by
+    // querying BOTH the token_mint and token_unit P2SH addresses in one
+    // combined call and matching on outpoint alone, so -- unlike
+    // auto-discovery, which is address-group-scoped from the start -- it
+    // can silently resolve to the mint authority. `is_mint_authority_utxo`
+    // is the discriminator that lets the caller refuse that case with a
+    // clear error instead of building a tx doomed to fail consensus's
+    // self-continuation check.
+
+    #[test]
+    fn is_mint_authority_utxo_true_when_script_matches_mint_p2sh() {
+        let pubkey = [7u8; 32];
+        let mint_rs = kob_core::contract::build_token_mint_redeem_script(&pubkey);
+        let mint_p2sh = build_p2sh(&mint_rs);
+        let utxo = mock_utxo_with_script("mint_tx", 1_000_000_000, hex::encode(mint_p2sh.script()));
+
+        assert!(is_mint_authority_utxo(&utxo, mint_p2sh.script()));
+    }
+
+    #[test]
+    fn is_mint_authority_utxo_false_when_script_is_token_unit_p2sh() {
+        // Same pubkey, but resolved against the token_unit P2SH instead --
+        // this is the "unit side resolved" case, which must remain accepted.
+        let pubkey = [7u8; 32];
+        let mint_rs = kob_core::contract::build_token_mint_redeem_script(&pubkey);
+        let mint_p2sh = build_p2sh(&mint_rs);
+        let unit_rs = kob_core::contract::build_token_unit_redeem_script(&pubkey);
+        let unit_p2sh = build_p2sh(&unit_rs);
+        let utxo = mock_utxo_with_script("unit_tx", 5_000_000_000, hex::encode(unit_p2sh.script()));
+
+        assert!(!is_mint_authority_utxo(&utxo, mint_p2sh.script()));
+    }
 
     // --- pick_sell_deployable_token_utxo / pick_sell_deployable_token_utxo_auto tests ---
     //

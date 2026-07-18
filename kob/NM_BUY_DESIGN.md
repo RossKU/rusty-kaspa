@@ -1,9 +1,17 @@
 # N:M-capable buy covenant — design (Phase 1) + implementation status (Phase 2)
 
-> **Superseded by v18 (see V18_DESIGN.md).** The v17 N:M buy described here was carried into the v18 unified generation and the v17 code was deleted in Stage E; this file is kept as a historical record.
+> **Superseded by v18 (see `V18_DESIGN.md`).** The v17 N:M buy described here
+> was carried into the v18 unified generation and the v17 code was deleted in
+> Stage E; this file is kept as a historical record. **For current status
+> (v18 is the sole spot generation, `BUY_ORDER_MAX_N=32`, live-proven scope)
+> see `kob/RELEASE_STATUS.md` — every present-tense "v17"/"MAX_N=8" claim
+> below describes the state of the system when this doc was written, not
+> today.**
 
-Status: **IMPLEMENTED (Phase 2 complete); v17 is now the SOLE creatable buy
-contract (version-cleanup pass).** The v17 contract, its full adversarial
+Status: **IMPLEMENTED (Phase 2 complete); ~~v17 is now the SOLE creatable buy
+contract~~ (historical — v17 was later deleted; v18 is now the sole spot
+generation, commits `317f163c`/`23eb1edc`, see `kob/RELEASE_STATUS.md`)
+(version-cleanup pass).** The v17 contract, its full adversarial
 matrix, all the recognition wiring, and the `plan_batch_match` N-per-sell emission
 are landed and green against the real post-Toccata `kaspa-txscript` `TxScriptEngine`.
 A later pass closed the gap where `deploy_buy` and `requote` still accepted
@@ -16,7 +24,9 @@ is preserved below unchanged; the Phase-2 outcome is summarized here.
 
 - **Contract**: `BUY_ORDER_V17` in `kob/core/src/contract/spot/order.rs`
   (`build_buy_v17_body`/`build_buy_v17_redeem_script` + fill/IOC/expire/cancel
-  sigscript builders). **MAX_N = 8** (justified from the tx compute-mass budget:
+  sigscript builders). ~~**MAX_N = 8**~~ **(Update: v18 raised the shipping
+  sweep ceiling to `MAX_N=32`, commit `317f163c`; see `kob/BATCH_LIMITS.md`.)**
+  (justified from the tx compute-mass budget:
   an 8-sell sweep ≈ 12k grams ≈ 12% of the pre-Toccata 100k standard cap). Body
   693B, RS 838B, pinned in `bytecode_stable`. Selector dispatch (Op9 OpRoll), not
   length-based. Both buyer protections carried: aggregate limit-price floor AND
@@ -27,7 +37,9 @@ is preserved below unchanged; the Phase-2 outcome is summarized here.
   terms, over-cap, mixed-price dilution, limit-price-floor violation, IOC theft,
   forged sell price, decoy-uncounted, over-delivery-no-exposure, N=1 parity,
   N=MAX_N boundary, N>MAX_N unrepresentable, RS length/collision) + expire/cancel.
-- **Wiring**: v17 is now the SOLE creatable buy contract -- `deploy_buy`'s
+- **Wiring**: ~~v17 is now the SOLE creatable buy contract~~ (historical — v17
+  was later deleted; v18 is the sole generation today, see
+  `kob/RELEASE_STATUS.md`) -- `deploy_buy`'s
   version gate (`kob/cli/src/deploy.rs`) rejects both v14 and v16 for new
   deploys (previously it allowed v16 through as an alternative to v17); v14
   and v16 stay fully parseable/cancellable for orders already resting

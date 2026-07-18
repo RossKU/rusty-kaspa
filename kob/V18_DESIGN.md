@@ -73,7 +73,9 @@ Delete the non-fixed-offset sigscript builders; the canonical layout is the only
 ## Buy v18 — state 145B unchanged, selector dispatch (depth 9, v17 style)
 Selectors: 0=CANCEL, 1=FILL(GTC full), 2=PARTIAL-FILL (new), 3=CANCEL-MARK, 4=EXPIRE, 5=IOC.
 
-FILL/IOC: carry v17 `emit_fill_body` semantics unchanged (MAX_N=8, strict-increasing tii chain, per-sell delivery `OpAuthOutputIdx(tii_i,0)`, `OpInputCovenantId(tii_i)==tcid`, `blake2b(outSpk)==bspkh`, PASS1 token_sum, PASS2 fair_sum, GTC floor `token_sum >= kas_in/pden*pnum`, IOC floor `token_sum >= mfill`, cap `(kas_in - fair_sum) <= kas_in/10000*mmfee_bps`) — except price reads move to the canonical offsets above. Note sweep is structurally full-fill-only: a partial/IOC sell's auth slot 0 is its residual (self-SPK) and fails the buyer-SPK check, so no extra selector byte check is needed.
+FILL/IOC: carry v17 `emit_fill_body` semantics unchanged (~~MAX_N=8~~ **(Update
+2026-07-17: raised to `MAX_N=32`, `kob/core/src/contract/spot/order.rs:16`,
+commit `317f163c` — see `kob/BATCH_LIMITS.md`.)**, strict-increasing tii chain, per-sell delivery `OpAuthOutputIdx(tii_i,0)`, `OpInputCovenantId(tii_i)==tcid`, `blake2b(outSpk)==bspkh`, PASS1 token_sum, PASS2 fair_sum, GTC floor `token_sum >= kas_in/pden*pnum`, IOC floor `token_sum >= mfill`, cap `(kas_in - fair_sum) <= kas_in/10000*mmfee_bps`) — except price reads move to the canonical offsets above. Note sweep is structurally full-fill-only: a partial/IOC sell's auth slot 0 is its residual (self-SPK) and fails the buyer-SPK check, so no extra selector byte check is needed.
 
 NEW Op2 PARTIAL-FILL (item C):
 - Sigscript adds residual output index `ri` (before selector? — keep buy sigscript layout free; buys are never read by others at fixed offsets).

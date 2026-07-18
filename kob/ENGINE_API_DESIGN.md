@@ -10,6 +10,16 @@ in the operational findings recorded in `kob/E2E_LIVE_RESULTS.md` and
 `kob/NM_BUY_DESIGN.md`. Every section states what already exists (reuse),
 what's new, and why.
 
+**(Update 2026-07-18): this document predates the v18 consolidation.** It was
+drafted while v17 was the shipping buy-sweep generation (`MAX_N=8`); v17 was
+deleted the next day (commit `23eb1edc`) and v18 became the sole spot
+generation, which later raised the sweep ceiling to `MAX_N=32` (commit
+`317f163c`). Every "v17"/"MAX_N=8" reference below (§0, §4, §6.2, §7.6)
+describes that superseded generation — the underlying API-surface arguments (per-leg
+trade records, `leg_index` disambiguation, etc.) are unaffected by the rename
+and still apply to v18 sweeps unchanged. See `kob/RELEASE_STATUS.md` for
+current status; this file otherwise remains design-only and unimplemented.
+
 ## 0. Non-goals
 
 - No Rust code, no route handlers, no migrations. Field names below are the
@@ -253,7 +263,8 @@ Add a stable per-fill disambiguator, currently missing (see §7.6):
 ```
 `leg_index` distinguishes multiple trade legs that share one settlement
 `txid` (already the case for cross-pair swaps today, and for v17 N:1 buy
-sweeps — §7.6). `(txid, leg_index)` becomes the stable trade key.
+sweeps — §7.6; v17 is since superseded by v18, same shape unchanged, see the
+top-of-file note). `(txid, leg_index)` becomes the stable trade key.
 
 ## 5. User-facing WS distribution
 
@@ -377,7 +388,8 @@ split bid/ask).
 ```
 `trade_id` = `(txid, leg_index)` (§4, §7.6) — a plain `txid` is **not**
 sufficient once one settlement TX carries multiple fills (already true
-today for cross-pair swaps and v17 buy sweeps; the spec explicitly requires
+today for cross-pair swaps and v17 buy sweeps — v17 is since superseded by
+v18, same shape unchanged, see the top-of-file note; the spec explicitly requires
 trade_id uniqueness and calls out that "Unix timestamp does not qualify").
 
 ### 6.3 GeckoTerminal specifics
@@ -516,9 +528,10 @@ stays independently auditable (useful both for CoinGecko's data-match rule,
 > `kob/RELEASE_STATUS.md` for current status.
 
 Grounded in `kob/NM_BUY_DESIGN.md` and `kob/E2E_LIVE_RESULTS.md`:
-- **v17 is live** and is now the sole creatable buy contract. A v17 buy
-  sweep settles **1 buy against up to `MAX_N=8` sells in one transaction**,
-  emitting one buyer-token output per sell, each bound to its own sell
+- ~~**v17 is live** and is now the sole creatable buy contract. A v17 buy
+  sweep settles **1 buy against up to `MAX_N=8` sells in one transaction**~~
+  (historical — see the stale-premise note above; today it's v18,
+  `MAX_N=32`), emitting one buyer-token output per sell, each bound to its own sell
   input.
 - The executor **already does the right thing at the reporting layer**:
   `execute_batch_match`'s caller loops `for sell in &group.sells { record_trade(...) }`
@@ -530,7 +543,7 @@ Grounded in `kob/NM_BUY_DESIGN.md` and `kob/E2E_LIVE_RESULTS.md`:
   records under one `txid`, indistinguishable from each other except by
   price/qty, which can coincide. This is exactly the gap §4/§6.2 close with
   `leg_index` / `(txid, leg_index)` as the trade key — needed **now**, not
-  hypothetically, since v17 sweeps are already live.
+  hypothetically, since ~~v17~~ (v18, per the note above) sweeps are already live.
 - The **N:N same-token-in-one-TX fix is designed but not committed** (breaks
   5 unit tests on the partial-fill/merge boundary, and the full-fill success
   path was never live-verified — see `E2E_LIVE_RESULTS.md`). The
@@ -540,7 +553,8 @@ Grounded in `kob/NM_BUY_DESIGN.md` and `kob/E2E_LIVE_RESULTS.md`:
   conservation forbids both. **Trade-tape design implication**: the
   per-leg-record approach above must be scoped to "one record per
   authorized-output-to-input binding" so that whichever multi-fill shape
-  eventually lands (today: v17 N:1; later, possibly N:N), the indexer (§7.1)
+  eventually lands (at the time of writing: v17 N:1, now v18 N:1 per the note
+  above; later, possibly N:N), the indexer (§7.1)
   can derive trades from the settlement TX's actual covenant-authorization
   structure rather than a TX-level aggregate delta — that scoping is a
   design property to hold now, before the indexer is built, not a rewrite to

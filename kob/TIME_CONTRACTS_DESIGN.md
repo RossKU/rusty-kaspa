@@ -4,9 +4,20 @@
 Status: design frozen 2026-07-17. Stage A landed (`45ff9cc`); LIMITS
 re-freeze landed (`317f163` — MAX_N=32 / owner n_max+batch_max / ring 8;
 voids the prior live proofs of the six changed contracts, re-proof owed in
-Stage D); Stage B planners landed (`8d1c83e`). Stage C pending — scope
-includes the addenda and Stage-B residuals recorded in §7.
-Base: v18 single-generation spot (see `V18_DESIGN.md`), HEAD `b37c590`.
+Stage D); Stage B planners landed (`8d1c83e`); Stage C (engine+cli, incl.
+the addenda C-a/C-b/C-c) landed (`9ba03e8`). **Stage D (live E2E,
+recorded as "Stage-G" in `E2E_LIVE_RESULTS.md`) substantially landed
+2026-07-18: RT-1/CP-3/RT-3 all SETTLED LIVE on testnet-10** (script-units
+budget bug found + fixed + permanently regression-tested, see
+`kob/domain/tests/budget_limited_repro.rs`); **RT-2 (adversarial set) and
+the competing-matcher stretch goal remain DEFERRED** (unit-proven against
+the real engine already; live demonstration needs bespoke tooling not yet
+built — see `E2E_LIVE_RESULTS.md`'s "Canary readiness status" handoff
+section, updated 2026-07-18, for the full current picture and next-session
+resume point). Stage E (doc/final: E2E_MATRIX.md rows, README touch-ups,
+this stamp) is still open beyond what this update covers.
+Base: v18 single-generation spot (see `V18_DESIGN.md`), HEAD `bc07c18f`
+(2026-07-18; was `b37c590` at design-freeze time).
 History: this file was briefly `V19_TIME_DESIGN.md` (a generation-bump
 packaging); superseded same day by MK directive — **v18 stays frozen and
 shipping, `SPOT_GENERATION` stays 18**, and the three features ship as four

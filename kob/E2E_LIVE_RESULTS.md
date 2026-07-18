@@ -169,7 +169,12 @@ engine-repro tests execute via `TxScriptEngine::from_transaction_input`
 usage — this is *why* the RT-1 script-units gap above was invisible to the
 existing test suite and only surfaced live. Worth a follow-up: add a
 budget-limited regression for the composed settle+advance shape so this class
-of gap is caught pre-live next time.
+of gap is caught pre-live next time. **DONE (2026-07-18):**
+`kob/domain/tests/budget_limited_repro.rs` — see "Mainnet canary prep"
+below; two-directional-verified against this exact bug (reverting
+`sig_op_count` 1→0 reproduces `ExceededCommittedScriptUnits{used:10307,
+limit:9999}`, matching the live `used=10311,limit=9999` above almost
+exactly).
 
 **CP-3 — SETTLED LIVE (2026-07-18, this run).** Buy sweeps the TP branch of
 the ratchet_oco continuation (`…5e0fd:3`, TP 101/100, unaffected by RT-1's SL
@@ -1334,7 +1339,19 @@ everywhere else in the workspace). (2) the liveness check compared the
 OCO-suffixed book key (`txid:index:tp`/`:sl`) against the raw UTXO set
 (`txid:index`), which would have incorrectly pruned every live OCO/ratchet
 leg on every restart once (1) was fixed; now uses `utxo_outpoint_key()` for
-the liveness check and `outpoint_key()` only for removal.
+the liveness check and `outpoint_key()` only for removal. **Bug (1) masked
+bug (2) — no on-chain/real-world harm occurred from either, historically.**
+Because every `getUtxosByAddresses` query built from the fake addresses
+either errored or matched nothing, `validate_and_prune_order_book` always
+hit its `Err(e) => { warn!(...); return; }` fail-open path and left the book
+untouched — it silently never validated OR pruned anything, live orders
+included. Bug (2)'s mis-keyed OCO comparison therefore never had a chance to
+fire in production; it only surfaces once (1) is fixed, which is exactly
+how it was found (by making the address encoding correct first, then
+building the rescan feature on top and having it wrongly zero out both
+freshly-confirmed-live OCO legs in an early local test run, before the fix).
+Both are fixed together in the same change, verified together by the live
+smoke below (2 live OCO legs, 0 incorrectly pruned).
 
 **Live smoke (testnet-10, 2026-07-18):** a fresh engine (empty `--orderbook`,
 no scan cursor, release binary rebuilt this session) launched with
@@ -1428,3 +1445,87 @@ deferral). **No funds were moved and no orders were consumed** by any
 attempt (`order-status` reconfirmed both `47d4ffe1…:0` and `6eb2a4c4…:0`
 still OPEN afterward) — DEFERRED, unit-proven double-spend rejection
 already covered by consensus-level tests elsewhere in this workspace.
+
+## Mainnet canary prep — repaired two pre-existing broken test suites (2026-07-18)
+
+Sanity/hygiene pass before canary sign-off, unrelated to Tasks A/B/C/E above
+(both were pre-existing, untouched by any of that work): `kob-lab`'s test
+code called `hex::encode`/`hex::decode` with no `hex` dev-dependency
+declared at all (compile error) — added `hex = { workspace = true }` to
+`[dev-dependencies]`. `kob-settle` had 5 doc examples
+(`wallet.rs::SecureKey`/`HdWallet::generate`/`HdWallet::from_mnemonic`,
+`crypto/signing.rs::schnorr_sign`/`schnorr_sign_secure`) importing
+`kob_core::{signing,wallet}::*` — those items live in `kob-settle` itself,
+which does not depend on `kob-core`; leftover from before the settle/core
+split (Phase 1 extraction). Fixed by pointing the imports at `kob_settle::`.
+`kob-lab`: 81 lib tests pass (was: compile error). `kob-settle`: 219 lib
+tests + 6/6 doctests pass (was: 5/6 doctests failing).
+
+## Canary readiness status (handoff, 2026-07-18, HEAD `bc07c18f`)
+
+Read this section alone to resume — it summarizes every "Mainnet canary
+prep" item above plus Stage-G's RT-1/CP-3/RT-3/RT-2.
+
+**DONE:**
+- RT-1 (script-units budget fix, `plan_ratchet_advance` `sig_op_count: 1`) —
+  live-accepted `5759da5e…`; permanent regression added,
+  `kob/domain/tests/budget_limited_repro.rs` (two-directional verified).
+- CP-3 (TP-branch sweep; the two rejected attempts were an operator price-
+  convention mistake, not a bug — buy `price_num`/`price_den` is
+  tokens-per-KAS, inverse of a sell's convention) — live-accepted
+  `10ff4610…`.
+- RT-3 (owner cancel of a live ratchet continuation; new `cancel --rs`
+  override) — live-accepted `956af539…`.
+- Engine resilience: RPC reconnect consecutive-timeout dead-marking +
+  giveup-after-N-attempts (`std::process::exit(10)`), `[HEARTBEAT]` log,
+  opt-in `--rescan-seed` startup rescan, two pre-existing
+  `validate_and_prune_order_book` bugs fixed (fake bech32m address encoding;
+  OCO-suffix liveness-check mismatch — bug 1 masked bug 2, zero on-chain
+  impact from either historically). Live smoke: fresh engine discovered a
+  real resting ratchet_oco via `--rescan-seed` alone, zero incorrect
+  pruning, order left untouched.
+- KIP-10/Toccata: confirmed already active on mainnet (DAA 474,165,565,
+  current ~489M) via the actual consensus gate
+  (`toccata_activation.is_active`) — canary is not blocked on activation.
+- Two pre-existing broken test suites repaired (`kob-lab` missing dev-dep,
+  `kob-settle` doctest crate-path bugs) — see directly above.
+- All of the above: tests green across every touched crate (`kob-core`,
+  `kob-domain`, `kob-settle`, `kob-engine`, `kob-cli`, `kob-x402`, `kob-lab`),
+  pushed to `kob-phase0` through commit `bc07c18f`.
+
+**DEFERRED (owner may resume any of these; none block the canary):**
+- **RT-2** (8-case ratchet adversarial set) — already proven at the unit
+  level against the real `kaspa-txscript` engine (`time_contracts.rs`
+  L1–L4/L8/L10/L11 + rwin/travel-cap tests); a LIVE demonstration needs a
+  bespoke hand-rolled-sigscript CLI tool (same class of tooling the
+  plain-fill `--tamper` mode has, but nothing equivalent exists for
+  ratchet-advance) — not built, judged out of proportion twice now.
+- **Competing-matcher live race** — blocked on two separate, real,
+  pre-existing CLI tooling bugs, not a code path this session touched:
+  `match-batch`'s on-chain order lookup disagreed with `order-status`'s
+  live check on two different confirmed-open pairs (`not found on chain`
+  from `match-batch`, `OPEN` from `order-status`, moments apart, same
+  outpoints); `match` (singular) has no `--dry-run` and its `--mmfee-bps`
+  flag is documented to force `--version` to 16, ambiguous for a v18
+  unified-spot buy. Double-spend rejection itself is unit-proven at the
+  consensus level regardless.
+- **RPC reconnect giveup path, live end-to-end** — the finite-attempt cap
+  and the sentinel error plumbing are verified by code review + a unit test
+  of the config default only (`retry_config_default_has_reconnect_giveup_cap`).
+  Exercising the actual `reconnect()` retry-then-giveup loop against a
+  real dead connection would need a local mock WebSocket server standing in
+  for kaspad (accept once, then refuse/hang) — not built this pass.
+
+**Owner judgment required (not an engineering task):** a mainnet canary
+deploy should get an external security audit or bug-bounty pass before real
+funds are at stake — this is a product/business decision for RossKU, not
+something to resolve in-repo.
+
+**Where to look:** `kob/E2E_LIVE_RESULTS.md` (this file, chronological —
+Stage-G above for RT-1/CP-3/RT-3/RT-2 detail, "Mainnet canary prep" sections
+above for Tasks A–E detail); `kob/BATCH_LIMITS.md` for the budget-limited
+regression's place in the mass-model story; `kob/TIME_CONTRACTS_DESIGN.md`
+§7 for the Stage A–E plan this work sits inside (status stamp updated
+2026-07-18). Code: `kob/domain/tests/budget_limited_repro.rs`,
+`kob/settle/src/rpc/mod.rs`, `kob/engine/src/chain/executor.rs`,
+`kob/engine/src/storage/persistence.rs`.

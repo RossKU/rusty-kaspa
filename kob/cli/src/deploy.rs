@@ -302,6 +302,70 @@ pub fn build_payload_auto_full(
     }
 }
 
+/// Where the leftover between funding inputs and a requested order value
+/// (after paying the required miner fee) should be placed.
+///
+/// Extracted 2026-07-18 after a live testnet-10 bug (see
+/// `competing_matcher_live_2026-07-18.md`): a sell deploy's fee-UTXO
+/// leftover was printed as "donated as fee" but was actually merged into
+/// the covenant/order output, inflating it above the requested `--amount`.
+/// Every deploy path's "no separate change output" fallback must go
+/// through this single decision so the covenant output is exactly the
+/// requested value whenever funds allow, and the log always matches
+/// on-chain reality.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemainderPlacement {
+    /// `available_input` covers exactly `requested_value + fee`. Nothing
+    /// left over; no change output, nothing donated.
+    ExactFit,
+    /// Leftover exists but is below `dust_threshold` -- too small to justify
+    /// its own UTXO (KIP-9 storage mass grows with small outputs, so a tiny
+    /// change output can make the tx heavier or even rejected). The order
+    /// output stays at exactly `requested_value`; the leftover is genuinely
+    /// paid to the miner (the real on-chain fee ends up `fee + amount`, not
+    /// just `fee`).
+    DonateToFee { amount: u64 },
+    /// Leftover is `>= dust_threshold`: worth its own wallet change output.
+    /// The order output stays at exactly `requested_value`.
+    Change { amount: u64 },
+    /// `available_input` cannot cover `requested_value + fee`. The order
+    /// output must be shrunk below `requested_value` to still pay the
+    /// required fee (best-effort fallback for a genuinely underfunded
+    /// selection -- callers should surface this, not swallow it silently).
+    InsufficientFunds { order_value: u64, shortfall: u64 },
+}
+
+/// Decide where a deploy tx's leftover input value goes: folded into the
+/// requested order value would be wrong (that's the bug this fixes) --
+/// it must be an exact fit, a genuine change output, a fee donation, or
+/// (only when truly underfunded) a shrunk order.
+///
+/// `available_input` is the total funding input minus any OTHER fixed
+/// outputs (e.g. a token remainder) that are not part of this decision --
+/// just the pool available to cover `requested_value` + change + `fee`.
+pub fn resolve_remainder_placement(
+    requested_value: u64,
+    available_input: u64,
+    fee: u64,
+    dust_threshold: u64,
+) -> RemainderPlacement {
+    let required = requested_value.saturating_add(fee);
+    if available_input < required {
+        return RemainderPlacement::InsufficientFunds {
+            order_value: available_input.saturating_sub(fee),
+            shortfall: required - available_input,
+        };
+    }
+    let leftover = available_input - required;
+    if leftover == 0 {
+        RemainderPlacement::ExactFit
+    } else if leftover < dust_threshold {
+        RemainderPlacement::DonateToFee { amount: leftover }
+    } else {
+        RemainderPlacement::Change { amount: leftover }
+    }
+}
+
 /// Deploy a buy order (lock KAS, request tokens at a given price).
 #[allow(clippy::too_many_arguments)]
 pub async fn deploy_buy(
@@ -591,23 +655,38 @@ pub async fn deploy_buy(
     let (est_fee, _) = if has_change {
         converge_fee(&mut tx, total_input, change_idx, min_fee_override)
     } else {
-        // No change output — subtract fee from the order output
+        // No change output up-front (leftover was already below dust per
+        // the tentative estimate). Only shrink the order output if funds
+        // are genuinely insufficient to cover amount + fee; otherwise it
+        // stays at exactly `amount` and the change/donate logic below
+        // resolves the (small) leftover -- it must NOT silently flow into
+        // the order output (2026-07-18 live bug, see RemainderPlacement).
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-        let adjusted = amount.saturating_sub(f);
-        tx.outputs[0].value = adjusted;
-        (f, adjusted)
+        let order_value = match resolve_remainder_placement(amount, total_input, f, MIN_UTXO_VALUE) {
+            RemainderPlacement::InsufficientFunds { order_value, .. } => order_value,
+            _ => amount,
+        };
+        tx.outputs[0].value = order_value;
+        (f, order_value)
     };
 
     let change = if has_change { tx.outputs[change_idx].value } else { total_input.saturating_sub(tx.outputs[0].value + est_fee) };
 
+    // Whether a change output currently exists as the last tx output.
+    // Tracked explicitly (not re-derived from `tx.outputs.len()`) so Phase 2
+    // below can't mistake "no change" for "has change" or vice versa.
+    let mut has_change = has_change;
+
     // Remove change output if below MIN_UTXO_VALUE
     if has_change && change < MIN_UTXO_VALUE {
         tx.outputs.pop();
+        has_change = false;
         if change > 0 {
             println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
         }
     } else if !has_change && change >= MIN_UTXO_VALUE {
         tx.outputs.push(TxOutput::new(change, first_rpc.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
+        has_change = true;
     } else if !has_change && change > 0 {
         println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
     }
@@ -625,21 +704,42 @@ pub async fn deploy_buy(
     let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != est_fee {
-        if tx.outputs.len() > 1 {
-            // Re-adjust change output (upward if exact < est, downward if exact > est)
-            let change_idx = tx.outputs.len() - 1;
-            let new_change = total_input.saturating_sub(amount + exact_fee);
-            if new_change >= MIN_UTXO_VALUE {
-                tx.outputs[change_idx].value = new_change;
-            } else {
-                tx.outputs.pop();
-                if new_change > 0 {
-                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+        // Re-derive placement with the EXACT fee. `has_change` (tracked
+        // explicitly through Phase 1, not re-derived from
+        // `tx.outputs.len()`) says whether outputs[1] is currently a change
+        // output we can adjust/remove; either way the order output is
+        // pinned to `amount` unless funds are genuinely insufficient --
+        // never left as `total_input - exact_fee` (that silently folds any
+        // leftover into the covenant output; see RemainderPlacement doc).
+        match resolve_remainder_placement(amount, total_input, exact_fee, MIN_UTXO_VALUE) {
+            RemainderPlacement::Change { amount: new_change } => {
+                tx.outputs[0].value = amount;
+                if has_change {
+                    let change_idx = tx.outputs.len() - 1;
+                    tx.outputs[change_idx].value = new_change;
+                } else {
+                    tx.outputs.push(TxOutput::new(new_change, first_rpc.utxo_entry.script_public_key.version, wallet_spk.clone(), None));
                 }
             }
-        } else {
-            // No change output — adjust order output by exact fee
-            tx.outputs[0].value = total_input.saturating_sub(exact_fee);
+            RemainderPlacement::ExactFit => {
+                tx.outputs[0].value = amount;
+                if has_change {
+                    tx.outputs.pop();
+                }
+            }
+            RemainderPlacement::DonateToFee { amount: donated } => {
+                tx.outputs[0].value = amount;
+                if has_change {
+                    tx.outputs.pop();
+                }
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", donated);
+            }
+            RemainderPlacement::InsufficientFunds { order_value, .. } => {
+                tx.outputs[0].value = order_value;
+                if has_change {
+                    tx.outputs.pop();
+                }
+            }
         }
         // Re-sign
         sigscripts.clear();
@@ -682,7 +782,10 @@ pub async fn deploy_buy(
         println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
         println!("Penalty-free min: {:>9} sompi/output", min_pf);
         println!("Miner fee:        {:>9} sompi", actual_fee);
-        println!("Net order value:  {:>9} sompi", amount);
+        // tx.outputs[0].value, not the requested `amount` -- they only
+        // differ in the (rare, best-effort) InsufficientFunds fallback, and
+        // this line must always match what actually lands on-chain.
+        println!("Net order value:  {:>9} sompi", tx.outputs[0].value);
         println!();
     }
 
@@ -1241,15 +1344,26 @@ pub async fn deploy_sell(
     // Phase 1: converge fee on change output
     let min_fee_override = if fee > 0 { fee } else { 0 };
     let has_change_sell = tent_change >= MIN_UTXO_VALUE;
+    // Funding pool available for the order + KAS change + fee -- i.e.
+    // total_input minus the OTHER fixed output (token remainder), which is
+    // never part of this decision.
+    let available_for_order = total_input.saturating_sub(token_remainder);
     let (est_fee_sell, _) = if has_change_sell {
         let change_idx = tx.outputs.len() - 1;
         converge_fee(&mut tx, total_input, change_idx, min_fee_override)
     } else {
-        // No change output — subtract fee from the order output
+        // No change output up-front. Only shrink the order output if funds
+        // are genuinely insufficient to cover amount + fee; otherwise it
+        // stays at exactly `amount` and the change/donate logic below
+        // resolves the (small) leftover -- it must NOT silently flow into
+        // the covenant output (2026-07-18 live bug, see RemainderPlacement).
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-        let adjusted = amount.saturating_sub(f);
-        tx.outputs[0].value = adjusted;
-        (f, adjusted)
+        let order_value = match resolve_remainder_placement(amount, available_for_order, f, MIN_UTXO_VALUE) {
+            RemainderPlacement::InsufficientFunds { order_value, .. } => order_value,
+            _ => amount,
+        };
+        tx.outputs[0].value = order_value;
+        (f, order_value)
     };
 
     let change = if has_change_sell {
@@ -1258,13 +1372,22 @@ pub async fn deploy_sell(
         total_input.saturating_sub(tx.outputs[0].value + token_remainder + est_fee_sell)
     };
 
+    // Whether a KAS change output currently exists as the LAST tx output.
+    // Tracked explicitly rather than re-derived from `tx.outputs.len()`,
+    // which is ambiguous here: a token-remainder output (when present) also
+    // sits before the change output, so `len() > 1` alone cannot tell
+    // "has KAS change" apart from "has token remainder, no KAS change".
+    let mut has_kas_change = has_change_sell;
+
     if has_change_sell && change < MIN_UTXO_VALUE {
         tx.outputs.pop();
+        has_kas_change = false;
         if change > 0 {
             println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
         }
     } else if !has_change_sell && change >= MIN_UTXO_VALUE {
         tx.outputs.push(TxOutput::new(change, 0, wallet_spk.clone(), None));
+        has_kas_change = true;
     } else if !has_change_sell && change > 0 {
         println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change);
     }
@@ -1298,20 +1421,43 @@ pub async fn deploy_sell(
     let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     let actual_fee = if exact_fee != est_fee_sell {
-        if tx.outputs.len() > 1 {
-            let change_idx = tx.outputs.len() - 1;
-            let new_change = total_input.saturating_sub(amount + token_remainder + exact_fee);
-            if new_change >= MIN_UTXO_VALUE {
-                tx.outputs[change_idx].value = new_change;
-            } else {
-                tx.outputs.pop();
-                if new_change > 0 {
-                    println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", new_change);
+        // Re-derive placement with the EXACT fee. `has_kas_change` (tracked
+        // explicitly through Phase 1) says whether the last output is
+        // currently a KAS change output we can adjust/remove -- NOT
+        // `tx.outputs.len() > 1`, which is ambiguous whenever a token
+        // remainder output is also present. The order output is pinned to
+        // `amount` unless funds are genuinely insufficient -- never left as
+        // `total_input - exact_fee` (that silently folds any leftover into
+        // the covenant output; the 2026-07-18 live bug).
+        match resolve_remainder_placement(amount, available_for_order, exact_fee, MIN_UTXO_VALUE) {
+            RemainderPlacement::Change { amount: new_change } => {
+                tx.outputs[0].value = amount;
+                if has_kas_change {
+                    let change_idx = tx.outputs.len() - 1;
+                    tx.outputs[change_idx].value = new_change;
+                } else {
+                    tx.outputs.push(TxOutput::new(new_change, 0, wallet_spk.clone(), None));
                 }
             }
-        } else {
-            // No change output — adjust order output by exact fee
-            tx.outputs[0].value = total_input.saturating_sub(exact_fee);
+            RemainderPlacement::ExactFit => {
+                tx.outputs[0].value = amount;
+                if has_kas_change {
+                    tx.outputs.pop();
+                }
+            }
+            RemainderPlacement::DonateToFee { amount: donated } => {
+                tx.outputs[0].value = amount;
+                if has_kas_change {
+                    tx.outputs.pop();
+                }
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", donated);
+            }
+            RemainderPlacement::InsufficientFunds { order_value, .. } => {
+                tx.outputs[0].value = order_value;
+                if has_kas_change {
+                    tx.outputs.pop();
+                }
+            }
         }
         sigscripts = sign_all_inputs(&tx, &privkey, &pubkey, token_input_value)?;
         exact_fee
@@ -1348,7 +1494,10 @@ pub async fn deploy_sell(
         println!("Penalty-free min: {:>9} sompi/output", min_pf);
         println!("Compute mass:     {:>9} (exact, post-sign)", exact_compute);
         println!("Miner fee:        {:>9} sompi", actual_fee);
-        println!("Net order value:  {:>9} sompi", amount);
+        // tx.outputs[0].value, not the requested `amount` -- they only
+        // differ in the (rare, best-effort) InsufficientFunds fallback, and
+        // this line must always match what actually lands on-chain.
+        println!("Net order value:  {:>9} sompi", tx.outputs[0].value);
         println!();
     }
 
@@ -1714,14 +1863,44 @@ pub async fn deploy_oco_sell(
     // Phase 1: converge fee on change output
     let min_fee_override = if fee > 0 { fee } else { 0 };
     let has_change = tent_change >= MIN_UTXO_VALUE;
+    // Funding pool available for the order + KAS change + fee -- i.e.
+    // total_input minus the OTHER fixed output (token remainder).
+    let available_for_order = total_input.saturating_sub(token_remainder);
     let (est_fee_oco, _) = if has_change {
         let change_idx = tx.outputs.len() - 1;
         converge_fee(&mut tx, total_input, change_idx, min_fee_override)
     } else {
+        // No change output up-front. Only shrink the order output if funds
+        // are genuinely insufficient to cover amount + fee; otherwise it
+        // stays at exactly `amount` (2026-07-18 live bug: this branch used
+        // to deflate the order by the fee even when the leftover was mere
+        // dust, which Phase 2 would then reinflate back into the order
+        // instead of donating to the miner -- see RemainderPlacement doc).
         let f = kob_core::mass::calc_miner_fee(&tx).max(min_fee_override);
-        tx.outputs[0].value = amount.saturating_sub(f);
-        (f, tx.outputs[0].value)
+        let order_value = match resolve_remainder_placement(amount, available_for_order, f, MIN_UTXO_VALUE) {
+            RemainderPlacement::InsufficientFunds { order_value, .. } => order_value,
+            _ => amount,
+        };
+        tx.outputs[0].value = order_value;
+        (f, order_value)
     };
+
+    // If Phase 1 converged a change output down below dust, remove it now
+    // (converge_fee only sets the value, it never removes the output) and
+    // log the truth. Without this, a coincidental exact_fee == est_fee_oco
+    // in Phase 2 below would ship a sub-dust change UTXO on-chain.
+    let mut has_change = has_change;
+    if has_change {
+        let change_idx = tx.outputs.len() - 1;
+        let change_val = tx.outputs[change_idx].value;
+        if change_val < MIN_UTXO_VALUE {
+            tx.outputs.pop();
+            has_change = false;
+            if change_val > 0 {
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", change_val);
+            }
+        }
+    }
 
     // Sign all inputs
     let sign_all = |tx: &Transaction, privkey: &kob_core::wallet::SecureKey, pubkey: &[u8; 32], token_val: u64| -> anyhow::Result<Vec<Vec<u8>>> {
@@ -1752,16 +1931,38 @@ pub async fn deploy_oco_sell(
     let exact_fee = kob_core::mass::min_relay_fee(exact_mass).max(min_fee_override);
 
     if exact_fee != est_fee_oco {
-        if has_change && tx.outputs.len() > 1 {
-            let change_idx = tx.outputs.len() - 1;
-            let new_change = total_input.saturating_sub(amount + token_remainder + exact_fee);
-            if new_change >= MIN_UTXO_VALUE {
-                tx.outputs[change_idx].value = new_change;
-            } else {
-                tx.outputs.pop();
+        // Re-derive placement with the EXACT fee -- never leave the order
+        // output as `total_input - exact_fee` (that silently folds any
+        // leftover into the covenant output; the 2026-07-18 live bug).
+        match resolve_remainder_placement(amount, available_for_order, exact_fee, MIN_UTXO_VALUE) {
+            RemainderPlacement::Change { amount: new_change } => {
+                tx.outputs[0].value = amount;
+                if has_change {
+                    let change_idx = tx.outputs.len() - 1;
+                    tx.outputs[change_idx].value = new_change;
+                } else {
+                    tx.outputs.push(TxOutput::new(new_change, 0, wallet_spk.clone(), None));
+                }
             }
-        } else {
-            tx.outputs[0].value = total_input.saturating_sub(exact_fee);
+            RemainderPlacement::ExactFit => {
+                tx.outputs[0].value = amount;
+                if has_change {
+                    tx.outputs.pop();
+                }
+            }
+            RemainderPlacement::DonateToFee { amount: donated } => {
+                tx.outputs[0].value = amount;
+                if has_change {
+                    tx.outputs.pop();
+                }
+                println!("Change {} sompi below MIN_UTXO_VALUE, donated as fee.", donated);
+            }
+            RemainderPlacement::InsufficientFunds { order_value, .. } => {
+                tx.outputs[0].value = order_value;
+                if has_change {
+                    tx.outputs.pop();
+                }
+            }
         }
         sigscripts = sign_all(&tx, &privkey, &pubkey, token_input_value)?;
     }
@@ -2088,5 +2289,114 @@ mod tests {
     #[test]
     fn kas_zero_point_five() {
         assert_eq!(parse_kas_amount("0.5").unwrap(), 50_000_000);
+    }
+
+    // --- resolve_remainder_placement tests ---
+    //
+    // 2026-07-18 live bug (competing_matcher_live_2026-07-18.md): a sell
+    // deploy requested a 40,000,000 sompi covenant output, but the actual
+    // on-chain output was 42,799,223 -- the ~2.8M sompi fee-UTXO leftover
+    // that the log claimed was "donated as fee" was instead silently merged
+    // into the covenant output. These tests pin the extracted decision
+    // function so that regression can't happen again.
+
+    #[test]
+    fn remainder_exact_fit_no_leftover() {
+        // available_input covers requested_value + fee with nothing left.
+        let placement = resolve_remainder_placement(40_000_000, 40_000_500, 500, MIN_UTXO_VALUE);
+        assert_eq!(placement, RemainderPlacement::ExactFit);
+    }
+
+    #[test]
+    fn remainder_small_leftover_is_donated_to_fee_not_the_order() {
+        // Reproduces the live bug's numbers: 40M requested order, a
+        // 337,900 sompi fee, and a 2,799,223 sompi leftover (< MIN_UTXO_VALUE
+        // = 3,000,000). The order must stay at exactly 40,000,000 -- the
+        // leftover is donated to the miner, never merged into the order.
+        let requested = 40_000_000u64;
+        let fee = 337_900u64;
+        let leftover = 2_799_223u64;
+        let available = requested + fee + leftover;
+        let placement = resolve_remainder_placement(requested, available, fee, MIN_UTXO_VALUE);
+        assert_eq!(placement, RemainderPlacement::DonateToFee { amount: leftover });
+        // Conservation: requested + fee + donated == available (no value
+        // silently created or destroyed by the decision itself).
+        if let RemainderPlacement::DonateToFee { amount } = placement {
+            assert_eq!(requested + fee + amount, available);
+        }
+    }
+
+    #[test]
+    fn remainder_large_leftover_becomes_change_output() {
+        let requested = 40_000_000u64;
+        let fee = 500_000u64;
+        let leftover = 10_000_000u64; // well above MIN_UTXO_VALUE
+        let available = requested + fee + leftover;
+        let placement = resolve_remainder_placement(requested, available, fee, MIN_UTXO_VALUE);
+        assert_eq!(placement, RemainderPlacement::Change { amount: leftover });
+    }
+
+    #[test]
+    fn remainder_threshold_boundary_just_below_dust_is_donated() {
+        let requested = 1_000_000_000u64;
+        let fee = 100_000u64;
+        let leftover = MIN_UTXO_VALUE - 1;
+        let available = requested + fee + leftover;
+        let placement = resolve_remainder_placement(requested, available, fee, MIN_UTXO_VALUE);
+        assert_eq!(placement, RemainderPlacement::DonateToFee { amount: leftover });
+    }
+
+    #[test]
+    fn remainder_threshold_boundary_exactly_at_dust_becomes_change() {
+        let requested = 1_000_000_000u64;
+        let fee = 100_000u64;
+        let leftover = MIN_UTXO_VALUE;
+        let available = requested + fee + leftover;
+        let placement = resolve_remainder_placement(requested, available, fee, MIN_UTXO_VALUE);
+        assert_eq!(placement, RemainderPlacement::Change { amount: leftover });
+    }
+
+    #[test]
+    fn remainder_insufficient_funds_shrinks_order_as_last_resort() {
+        let requested = 40_000_000u64;
+        let fee = 500_000u64;
+        let available = 39_000_000u64; // short of requested + fee by 1,500,000
+        let placement = resolve_remainder_placement(requested, available, fee, MIN_UTXO_VALUE);
+        assert_eq!(
+            placement,
+            RemainderPlacement::InsufficientFunds {
+                order_value: available - fee,
+                shortfall: (requested + fee) - available,
+            }
+        );
+    }
+
+    #[test]
+    fn remainder_insufficient_funds_does_not_underflow_when_fee_alone_exceeds_input() {
+        // available_input smaller than even the fee: order_value must
+        // saturate to 0 rather than panic on underflow.
+        let placement = resolve_remainder_placement(40_000_000, 100, 500_000, MIN_UTXO_VALUE);
+        match placement {
+            RemainderPlacement::InsufficientFunds { order_value, shortfall } => {
+                assert_eq!(order_value, 0);
+                assert!(shortfall > 0);
+            }
+            other => panic!("expected InsufficientFunds, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn remainder_zero_dust_threshold_any_leftover_becomes_change() {
+        // dust_threshold = 0 means no leftover is ever "below" it, so even a
+        // 1-sompi leftover is treated as a (degenerate) change output
+        // rather than silently donated.
+        let placement = resolve_remainder_placement(1_000, 1_501, 500, 0);
+        assert_eq!(placement, RemainderPlacement::Change { amount: 1 });
+    }
+
+    #[test]
+    fn remainder_zero_leftover_with_zero_fee_is_exact_fit() {
+        let placement = resolve_remainder_placement(5_000_000, 5_000_000, 0, MIN_UTXO_VALUE);
+        assert_eq!(placement, RemainderPlacement::ExactFit);
     }
 }

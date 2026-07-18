@@ -143,6 +143,51 @@ pub async fn run(
         };
         let p2sh = build_p2sh(&rs);
 
+        // OCO-family branch selection (CP-3 glue): an oco_sell / ratchet_oco
+        // sell must be spent via the branch fill sigscript (Op1 TP / Op2 SL),
+        // not the plain v18 shape. The cache entry's price pair names the
+        // branch being executed — match it against the RS's parsed TP/SL
+        // pairs (the RS, usually a --sell-rs override, is authoritative).
+        let oco_path = {
+            use kob_core::contract::spot::oco::OCO_SELL_RS_SIZE;
+            use kob_core::contract::spot::ratchet::RATCHET_OCO_RS_EXPECTED_LEN;
+            if rs.len() == RATCHET_OCO_RS_EXPECTED_LEN || rs.len() == OCO_SELL_RS_SIZE {
+                let (tp, sl) = if rs.len() == RATCHET_OCO_RS_EXPECTED_LEN {
+                    let p = kob_core::contract::spot::parse::parse_ratchet_oco_redeem_script(&rs)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "Sell order {} RS is ratchet_oco-sized but does not parse", op_str))?;
+                    (
+                        (p.oco.price_num_tp, p.oco.price_den_tp),
+                        (p.oco.price_num_sl, p.oco.price_den_sl),
+                    )
+                } else {
+                    let p = kob_core::contract::spot::parse::parse_oco_sell_redeem_script(&rs)
+                        .ok_or_else(|| anyhow::anyhow!(
+                            "Sell order {} RS is oco_sell-sized but does not parse", op_str))?;
+                    (
+                        (p.price_num_tp, p.price_den_tp),
+                        (p.price_num_sl, p.price_den_sl),
+                    )
+                };
+                if (entry.price_num, entry.price_den) == tp {
+                    println!("  sell {}: OCO TP branch {}/{}", op_str, tp.0, tp.1);
+                    Some(kob_core::OcoPath::TakeProfit)
+                } else if (entry.price_num, entry.price_den) == sl {
+                    println!("  sell {}: OCO SL branch {}/{}", op_str, sl.0, sl.1);
+                    Some(kob_core::OcoPath::StopLoss)
+                } else {
+                    anyhow::bail!(
+                        "Sell order {} cache price {}/{} matches neither TP {}/{} nor SL {}/{} \
+                         of its OCO redeemScript — set the cache entry's price to the branch \
+                         you want to execute.",
+                        op_str, entry.price_num, entry.price_den, tp.0, tp.1, sl.0, sl.1,
+                    );
+                }
+            } else {
+                None
+            }
+        };
+
         // Query value from chain
         let addr = crate::cancel::kaspa_address_encode(
             network.address_prefix(), 8, &p2sh.script()[2..34],
@@ -175,7 +220,7 @@ pub async fn run(
             counterparty_spk: seller_spk,
             counterparty_spk_version: 0,
             min_fill: entry.min_fill,
-            oco_path: None,
+            oco_path,
             bracket_meta: None,
         });
     }

@@ -440,7 +440,19 @@ pub fn plan_ratchet_advance(
             tx_id: oco.outpoint.0.clone(),
             index: oco.outpoint.1,
             sigscript,
-            sig_op_count: 0, // permissionless branch
+            // permissionless branch: no real CheckSig executes. sig_op_count
+            // is reused post-Toccata to commit a per-input computeBudget
+            // (`compute_budget_for_sig_ops` in kob/settle/src/tx.rs), not a
+            // literal opcode count. RT-1 live finding (2026-07-18, testnet-10):
+            // the splice+introspection work of a composed settle+advance
+            // measured 10,311 script units on this input, over the node's
+            // 9,999 free per-input allowance ("script units exceeded the
+            // amount committed in the input") — the settle+advance shape is
+            // heavier than the standalone ratchet fill this budget was sized
+            // for. sig_op_count=1 buys 10 budget units (100,000 script units,
+            // same headroom trick as kob_batch_lab.rs's buy input) so total
+            // allowance is 109,999, comfortably covering the measured usage.
+            sig_op_count: 1,
             sequence: p.rwin, // G1
         },
         input_position: settle.sells.len() + 1,

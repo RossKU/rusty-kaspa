@@ -1534,26 +1534,37 @@ pub async fn execute_oco_ratchet(
     )
     .max(fee_floor.unwrap_or(0));
     if exact_fee > batch_tx.fee {
-        let deficit = exact_fee - batch_tx.fee;
-        let Some(mi) = plan
-            .outputs
-            .iter()
-            .position(|o| o.purpose == OutputPurpose::MatcherFee)
-        else {
-            info!("[RATCHET] no matcher-fee output to absorb ratchet mass (deficit {}), skipping advance", deficit);
-            return RatchetExecOutcome::NotComposable;
-        };
-        let cur = sighash_tx.outputs[mi].value;
-        if cur < deficit.saturating_add(kob_core::MIN_UTXO_VALUE) {
+        let mut deficit = exact_fee - batch_tx.fee;
+        // Absorb the deficit from the matcher-side outputs only — WalletChange
+        // first, then MatcherFee (same order as `BatchPlan::apply_fee_floor`);
+        // never seller/buyer/delivery/continuation. RT-1 live finding: the
+        // engine settle plans in this shape return the fee-input remainder as
+        // WalletChange and often carry NO MatcherFee output at all (the bps
+        // take is folded into WalletChange), so a MatcherFee-only absorption
+        // made every composition NotComposable. Outputs stay >= MIN_UTXO (no
+        // output is dropped — indices are load-bearing for koi/binding).
+        for purpose in [OutputPurpose::WalletChange, OutputPurpose::MatcherFee] {
+            if deficit == 0 {
+                break;
+            }
+            if let Some(mi) = plan.outputs.iter().position(|o| o.purpose == purpose) {
+                let cur = sighash_tx.outputs[mi].value;
+                let take = deficit.min(cur.saturating_sub(kob_core::MIN_UTXO_VALUE));
+                if take > 0 {
+                    sighash_tx.outputs[mi].value = cur - take;
+                    rpc_outputs[mi]["value"] = serde_json::json!(cur - take);
+                    deficit -= take;
+                    info!("[RATCHET] {:?} absorbs ratchet mass: -{} sompi", purpose, take);
+                }
+            }
+        }
+        if deficit > 0 {
             info!(
-                "[RATCHET] matcher-fee output {} cannot absorb ratchet mass deficit {}, skipping advance",
-                cur, deficit
+                "[RATCHET] matcher-side outputs cannot absorb ratchet mass (deficit {} remains), skipping advance",
+                deficit
             );
             return RatchetExecOutcome::NotComposable;
         }
-        sighash_tx.outputs[mi].value = cur - deficit;
-        rpc_outputs[mi]["value"] = serde_json::json!(cur - deficit);
-        info!("[RATCHET] matcher fee absorbs ratchet mass: -{} sompi", deficit);
     }
 
     // Mass pre-check (storage + compute, real sigscripts + placeholder sig).
@@ -3923,6 +3934,25 @@ async fn run_scan_cycle(
     for (key, when) in &spent_tracker.failed {
         if when.elapsed().as_secs() < spent_tracker.cooldown_secs {
             spent_keys.insert(key.clone());
+        }
+    }
+
+    // Time-contracts RT-1 (live finding): ratchet_oco virtual TP/SL entries
+    // are advance-composition targets (`find_ratchet_advance_candidate`), not
+    // engine-batchable members — `book_order_to_batch_order` rejects the 760B
+    // RS, and the per-offender `mark_failed` cooldown that rejection triggered
+    // was hiding the resting ratchet from the composition probe for 30s after
+    // every group formation that picked it up (the settle always lands inside
+    // that window). Exclude them from Phase-1 group formation up front so the
+    // sibling settle still forms and the composition probe stays eligible.
+    for pair in order_book.pair_books.values() {
+        for o in pair.asks.values() {
+            if matches!(
+                o.time_meta,
+                Some(crate::matcher::order_book::TimeMeta::RatchetOco { .. })
+            ) {
+                spent_keys.insert(o.outpoint_key());
+            }
         }
     }
 

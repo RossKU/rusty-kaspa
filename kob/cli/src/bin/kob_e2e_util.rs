@@ -138,6 +138,45 @@ async fn main() -> anyhow::Result<()> {
             );
         }
 
+        // ratchet-rs <rstep> <rgap> <rwin> <mrv> <tp_num> <tp_den> <tp_mfill>
+        //            <sl_num> <sl_den> <sl_mfill> <mmfee_bps> <expiry> [k]
+        // Prints the deploy ratchet_oco RS + P2SH address for this wallet,
+        // and (k > 0) the k-step continuation RS/address (pnum_sl += k*rstep)
+        // via the same `derive_ratchet_continuation_rs` splice the engine and
+        // covenant R13 enforce. Stage-G glue: the deploy path prints neither.
+        "ratchet-rs" => {
+            let wallet = WalletContext::load(&wallet_path)?;
+            let p: Vec<u64> = args[2..14]
+                .iter()
+                .map(|s| s.parse::<u64>())
+                .collect::<Result<_, _>>()?;
+            let k: u64 = args.get(14).map(|s| s.parse()).transpose()?.unwrap_or(0);
+            let owner_hash = blake2b_256(&wallet.pubkey);
+            let sspkh = compute_p2pk_spk_hash(&wallet.pubkey);
+            let mut rs = kob_core::contract::spot::ratchet::build_ratchet_oco_redeem_script(
+                p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9],
+                &owner_hash, &sspkh,
+                &kob_core::contract::compute_token_unit_spk_hash(&wallet.pubkey),
+                p[10], 0, p[11],
+            )?;
+            let p2sh = build_p2sh(&rs);
+            println!("RS: {}", hex::encode(&rs));
+            println!(
+                "ADDRESS: {}",
+                kaspa_address_encode("kaspatest", 8, &p2sh.script()[2..34])
+            );
+            for step in 1..=k {
+                rs = kob_core::contract::spot::ratchet::derive_ratchet_continuation_rs(&rs)?;
+                let p2sh = build_p2sh(&rs);
+                println!("K{} RS: {}", step, hex::encode(&rs));
+                println!(
+                    "K{} ADDRESS: {}",
+                    step,
+                    kaspa_address_encode("kaspatest", 8, &p2sh.script()[2..34])
+                );
+            }
+        }
+
         // receipt-rs <pair_id_hex> <price_num> <price_den> <exec_amount> <min_receipt_value>
         "receipt-rs" => {
             let wallet = WalletContext::load(&wallet_path)?;

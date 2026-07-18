@@ -341,7 +341,11 @@ fn ratchet_advance_happy_path_and_compose() {
     let adv = plan_ratchet_advance(&ratchet_ref(rs.clone(), 0), &settle, 100)
         .expect("ratchet advance must plan (trigger 3/1 met by the 3/1 print)");
     assert_eq!(adv.input.sequence, 60, "G1: sequence = rwin");
-    assert_eq!(adv.input.sig_op_count, 0, "permissionless");
+    assert_eq!(
+        adv.input.sig_op_count, 1,
+        "permissionless branch, but sig_op_count=1 buys the extra computeBudget \
+         (RT-1 live finding: settle+advance composition needs >9,999 free script units)"
+    );
     assert_eq!(adv.input_position, 2, "after the buy, sii indices stable");
     assert_eq!(adv.sibling_input_idx, 0);
     assert_eq!(adv.continuation.value, 5_000_000, "full escrow rides through");

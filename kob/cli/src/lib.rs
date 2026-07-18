@@ -43,6 +43,7 @@ pub mod swap;
 pub mod watch;
 pub mod listing;
 pub mod ratchet_tamper;
+pub mod ratchet_tamper_live;
 
 use clap::Subcommand;
 
@@ -962,6 +963,85 @@ pub enum Commands {
         /// expected guard) and exit.
         #[arg(long)]
         list: bool,
+    },
+
+    /// [DEV] RT-2 LIVE adversarial tooling: fire a `ratchet_tamper` case
+    /// (or the honest control) against a REAL deployed testnet ratchet_oco
+    /// UTXO + a REAL sibling sell UTXO, and submit to the node. Every
+    /// tamper case is expected to be REJECTED by the node; `--case honest`
+    /// is expected to be ACCEPTED. Hidden: not part of the product surface,
+    /// testnet-only adversarial proof tooling.
+    #[command(hide = true)]
+    RatchetTamperLive {
+        /// A `ratchet-tamper --list` case id, "honest", "all" (fires every
+        /// case except rate-travel-cap), or "rate-travel-cap" (fires only
+        /// that one, against an already-one-step-advanced ratchet_oco --
+        /// see the module doc in `cli/src/ratchet_tamper_live.rs`).
+        #[arg(long)]
+        case: String,
+        /// The ratchet_oco UTXO under test (txid:index).
+        #[arg(long)]
+        ratchet_outpoint: String,
+        /// That UTXO's exact on-chain redeemScript (hex).
+        #[arg(long)]
+        ratchet_rs: String,
+        /// That UTXO's escrow value (sompi).
+        #[arg(long)]
+        escrow: u64,
+        /// The ratchet_oco's rwin (must match what's baked into --ratchet-rs).
+        #[arg(long)]
+        rwin: u64,
+        /// Genuine sibling sell order outpoint (txid:index).
+        #[arg(long)]
+        sibling_outpoint: String,
+        /// Genuine sibling sell's exact redeemScript (hex).
+        #[arg(long)]
+        sibling_rs: String,
+        /// Sibling's own committed price numerator (attested for a genuine fill).
+        #[arg(long)]
+        sibling_price_num: u64,
+        /// Sibling's own committed price denominator.
+        #[arg(long)]
+        sibling_price_den: u64,
+        /// Sibling UTXO's token amount (sompi).
+        #[arg(long)]
+        sibling_tokens: u64,
+        /// Non-covenant-bound sibling UTXO at the same P2SH address (needed
+        /// for l2-noncovenant).
+        #[arg(long)]
+        sibling_noncov_outpoint: Option<String>,
+        /// Wrong-token-bound sibling UTXO at the same P2SH address (needed
+        /// for l2-wrong-token).
+        #[arg(long)]
+        sibling_wrongtoken_outpoint: Option<String>,
+        /// The ratchet_oco's real token covenant id (hex).
+        #[arg(long)]
+        token: String,
+        /// The WRONG token covenant id (hex), needed for l2-wrong-token.
+        #[arg(long)]
+        wrong_token: Option<String>,
+        /// Fee UTXO outpoint override.
+        #[arg(long)]
+        fee_utxo: Option<String>,
+        /// Flat miner-fee override (sompi). Default: 2,000,000.
+        #[arg(long)]
+        fee_floor: Option<u64>,
+        /// Build and print but do not submit.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// [DEV] Prep helper for `ratchet-tamper-live l2-noncovenant`: sends
+    /// plain KAS (NO covenant binding) to P2SH(--sibling-rs), producing a
+    /// real UTXO shaped like a sell order but with no covenant lineage.
+    #[command(hide = true)]
+    RatchetTamperLivePrepNoncov {
+        #[arg(long)]
+        sibling_rs: String,
+        #[arg(long)]
+        amount: u64,
+        #[arg(long)]
+        fee_utxo: Option<String>,
     },
 }
 
@@ -3627,6 +3707,52 @@ pub async fn dispatch(
         }
         Commands::RatchetTamper { case, list } => {
             ratchet_tamper::run(case, list)?;
+        }
+        Commands::RatchetTamperLive {
+            case,
+            ratchet_outpoint,
+            ratchet_rs,
+            escrow,
+            rwin,
+            sibling_outpoint,
+            sibling_rs,
+            sibling_price_num,
+            sibling_price_den,
+            sibling_tokens,
+            sibling_noncov_outpoint,
+            sibling_wrongtoken_outpoint,
+            token,
+            wrong_token,
+            fee_utxo,
+            fee_floor,
+            dry_run,
+        } => {
+            ratchet_tamper_live::run(
+                wallet_path,
+                node,
+                network,
+                &case,
+                &ratchet_outpoint,
+                &ratchet_rs,
+                escrow,
+                rwin,
+                &sibling_outpoint,
+                &sibling_rs,
+                sibling_price_num,
+                sibling_price_den,
+                sibling_tokens,
+                sibling_noncov_outpoint.as_deref(),
+                sibling_wrongtoken_outpoint.as_deref(),
+                &token,
+                wrong_token.as_deref(),
+                fee_utxo.as_deref(),
+                fee_floor,
+                dry_run,
+            )
+            .await?;
+        }
+        Commands::RatchetTamperLivePrepNoncov { sibling_rs, amount, fee_utxo } => {
+            ratchet_tamper_live::prep_noncov(wallet_path, node, &sibling_rs, amount, fee_utxo.as_deref()).await?;
         }
     }
 

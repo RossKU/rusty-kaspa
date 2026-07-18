@@ -586,6 +586,48 @@ async fn main() -> anyhow::Result<()> {
             println!("TXID: {}", txid);
         }
 
+        // list-token-utxos <token_hex>
+        //
+        // Diagnostic: lists every covenant UTXO at this wallet's mint_addr
+        // and unit_addr P2SH addresses whose covenant_id matches token_hex,
+        // with outpoint + amount. `deploy sell --token`'s auto-discovery
+        // picks the first candidate found across both addresses, which can
+        // surprise callers when a mint-authority UTXO (not a fungible unit)
+        // sorts first -- this lists everything explicitly so a caller can
+        // pick a known-good `--token-utxo` outpoint by hand.
+        "list-token-utxos" => {
+            let wallet = WalletContext::load(&wallet_path)?;
+            let token = hex::decode(&args[2])?;
+            if token.len() != 32 {
+                anyhow::bail!("token covenant id must be 64 hex chars");
+            }
+            let mint_rs = kob_core::contract::build_token_mint_redeem_script(&wallet.pubkey);
+            let mint_p2sh = build_p2sh(&mint_rs);
+            let mint_addr = kaspa_address_encode("kaspatest", 8, &mint_p2sh.script()[2..34]);
+            let unit_rs = kob_core::contract::build_token_unit_redeem_script(&wallet.pubkey);
+            let unit_p2sh = build_p2sh(&unit_rs);
+            let unit_addr = kaspa_address_encode("kaspatest", 8, &unit_p2sh.script()[2..34]);
+
+            let rpc = NodeClient::connect(&node_url).await?;
+            for (label, addr) in [("mint", &mint_addr), ("unit", &unit_addr)] {
+                let utxos = rpc.get_utxos_by_addresses(&[addr.as_str()]).await?;
+                for u in &utxos {
+                    let cov_hex = u
+                        .utxo_entry
+                        .covenant_id
+                        .as_ref()
+                        .map(|h| h.to_string())
+                        .unwrap_or_default();
+                    if cov_hex == hex::encode(&token) {
+                        println!(
+                            "{:<4} {}:{}  {} sompi",
+                            label, u.outpoint.transaction_id, u.outpoint.index, u.utxo_entry.amount
+                        );
+                    }
+                }
+            }
+        }
+
         // decay-fill <txid:idx> <rs_hex> <token_hex> <att_pnum> <att_pden> <lock_time>
         //
         // Direct decay_sell FULL fill (Op1) where the wallet is the taker

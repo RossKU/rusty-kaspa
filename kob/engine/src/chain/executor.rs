@@ -736,6 +736,33 @@ fn mark_submit_failure(
     }
 }
 
+/// Decide whether Phase 2 must rebuild `sighash_tx`/`rpc_outputs` (and thus
+/// re-sign the wallet input) so the submitted tx's miner fee actually
+/// matches the exact Phase 2 fee -- clamped further up by an optional
+/// `KOB_FEE_FLOOR` bump.
+///
+/// `BatchPlan::converge_fee_exact` returns `delta = phase1_est.saturating_sub(
+/// exact_fee)`, an UNSIGNED quantity. It collapses to 0 in two very different
+/// situations: (a) `exact_fee == phase1_est` (nothing to do, correctly a
+/// no-op), and (b) `exact_fee > phase1_est` -- Phase 1 UNDER-estimated -- where
+/// a rebuild is very much still required, to RAISE the fee, not to recover a
+/// surplus. Gating the rebuild on `delta > 0` alone (as the pre-fix code did)
+/// silently ships the stale, too-low Phase-1 fee whenever Phase 2's real
+/// compute-mass number comes in higher than the estimate: covenant-heavy tx
+/// shapes routinely hit this, since Phase 1 assumes a flat ~100B/input
+/// sigscript but a v18 fill sigscript embeds a 5,655B redeemScript. Same bug,
+/// same fix, as the CLI `match`/`match-batch` paths (commit 83d8293a) -- this
+/// is the automated engine's live, unattended settlement path, so it matters
+/// even more here.
+///
+/// Comparing `phase1_est` and `exact_fee` directly (instead of going through
+/// the lossy, saturated `delta`) restores the missing direction: rebuild
+/// whenever the two fees differ AT ALL, in either direction, or whenever an
+/// operator-supplied `KOB_FEE_FLOOR` binds on top.
+fn resolve_fee_rebuild_needed(phase1_est: u64, exact_fee: u64, floor_bound: bool) -> bool {
+    phase1_est != exact_fee || floor_bound
+}
+
 /// to sign the wallet input (P2PK, last input), then submits via RPC.
 ///
 /// The wallet input is the LAST input in the batch TX and needs `sigOpCount: 1`
@@ -971,19 +998,57 @@ pub async fn execute_batch_match(
         // CLI match-batch KOB_FEE_FLOOR. Default (unset) leaves the fee path
         // exactly as before, so the Stage-F engine settles are untouched.
         let fee_floor = std::env::var("KOB_FEE_FLOOR").ok().and_then(|v| v.parse::<u64>().ok());
-        if delta > 0 || fee_floor.map_or(false, |f| f > plan.total_fee) {
-            info!(
-                "[BATCH] Phase 2 fee convergence: exact={}, delta={} (recovered)",
-                exact_fee, delta
-            );
-            if delta > 0 {
-                plan.apply_exact_fee(exact_fee);
+        let phase1_est = plan.total_fee;
+        let floor_bound = fee_floor.map_or(false, |f| f > phase1_est);
+        if resolve_fee_rebuild_needed(phase1_est, exact_fee, floor_bound) {
+            // Truthful direction, not the lossy saturated `delta` alone -- see
+            // `resolve_fee_rebuild_needed`'s doc comment for why gating on
+            // `delta > 0` alone used to silently ship a stale, too-low
+            // Phase-1 fee whenever Phase 1 under-estimated (exact_fee >
+            // phase1_est saturates `delta` to 0, same as "nothing changed").
+            if exact_fee > phase1_est {
+                info!(
+                    "[BATCH] Phase 2 fee convergence: exact={}, delta=+{} (Phase 1 estimate undershot -- raising fee)",
+                    exact_fee, exact_fee - phase1_est
+                );
+            } else if exact_fee < phase1_est {
+                info!(
+                    "[BATCH] Phase 2 fee convergence: exact={}, delta=-{} (recovered)",
+                    exact_fee, delta
+                );
+            } else {
+                info!("[BATCH] Phase 2 fee convergence: exact={}, delta=0 (exact match)", exact_fee);
+            }
+            // `apply_exact_fee` only RECOVERS a Phase-1 over-estimate (its own
+            // internal delta = phase1_est.saturating_sub(exact_fee)) back to
+            // the matcher/wallet-change output -- it is a no-op when Phase 1
+            // under-estimated. `apply_fee_floor` is the general-purpose
+            // "raise the miner fee to at least X, taking the shortfall from
+            // the matcher-side outputs" primitive already used for the
+            // operator's KOB_FEE_FLOOR override below; reusing it with
+            // `exact_fee` itself as the floor covers the missing direction
+            // (Phase 1 undershot Phase 2) with the SAME never-touch-
+            // seller/buyer semantics. Calling both is safe: whichever
+            // direction doesn't apply is a no-op.
+            plan.apply_exact_fee(exact_fee);
+            let raised = plan.apply_fee_floor(exact_fee);
+            if raised > 0 {
+                info!(
+                    "[BATCH] Fee raised to exact: +{} sompi -> {} sompi total (Phase 1 estimate undershot)",
+                    raised, plan.total_fee
+                );
             }
             if let Some(f) = fee_floor {
                 let bumped = plan.apply_fee_floor(f);
                 if bumped > 0 {
                     info!("[BATCH] KOB_FEE_FLOOR raised miner fee by {} sompi -> {}", bumped, plan.total_fee);
                 }
+            }
+            if plan.total_fee < exact_fee {
+                warn!(
+                    "[BATCH] could not raise the fee to the full exact amount ({} sompi short) -- no matcher-side output had room to absorb it.",
+                    exact_fee - plan.total_fee
+                );
             }
 
             // Rebuild sighash_tx outputs and rpc_outputs from adjusted plan.
@@ -6798,6 +6863,51 @@ mod tests {
         tracker.mark_spent("abc:0");
         tracker.mark_spent("abc:0");
         assert_eq!(tracker.spent.len(), 1);
+    }
+
+    // ---- resolve_fee_rebuild_needed ----
+    //
+    // Mirrors the CLI fix (commit 83d8293a, cli/src/match_batch.rs +
+    // cli/src/matching.rs) for the identical `delta > 0` gate bug in this
+    // crate's `execute_batch_match` Phase 2 fee convergence.
+
+    #[test]
+    fn rebuild_not_needed_when_exact_equals_estimate_and_no_floor() {
+        assert!(!super::resolve_fee_rebuild_needed(524_200, 524_200, false));
+    }
+
+    #[test]
+    fn rebuild_needed_when_exact_is_higher_than_estimate() {
+        // The live bug: Phase 1 estimated 524200, Phase 2's exact compute
+        // fee came in at 986100 (a v18 buy's large redeemScript wasn't fully
+        // accounted for in the Phase-1 estimate). `converge_fee_exact`'s own
+        // `delta` saturates to 0 here (est < exact), but a rebuild is very
+        // much required -- to RAISE the fee, not recover a surplus.
+        assert!(super::resolve_fee_rebuild_needed(524_200, 986_100, false));
+    }
+
+    #[test]
+    fn rebuild_needed_when_exact_is_lower_than_estimate_recovered_direction() {
+        // Phase 1 over-estimated; Phase 2's exact fee is lower -- the
+        // "recovered" direction. Must still rebuild so the recovered delta
+        // actually reaches the matcher/wallet-change output instead of
+        // being silently left in the stale Phase-1 tx.
+        assert!(super::resolve_fee_rebuild_needed(986_100, 524_200, false));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_even_if_exact_equals_estimate() {
+        assert!(super::resolve_fee_rebuild_needed(524_200, 524_200, true));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_on_top_of_higher_exact() {
+        assert!(super::resolve_fee_rebuild_needed(524_200, 986_100, true));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_on_top_of_lower_exact() {
+        assert!(super::resolve_fee_rebuild_needed(986_100, 524_200, true));
     }
 
     /// F1 regression: reproduces the Phase 3 starvation race in a unit

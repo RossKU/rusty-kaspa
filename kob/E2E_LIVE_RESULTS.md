@@ -1302,3 +1302,73 @@ all have a real auto-fill submit path in the continuous daemon; stop /
 trailing-stop / IFD auto-broadcast on trigger; **prediction is settlement
 track-only (no auto-submit); options and insurance are deploy-only with no
 engine-side execution at all.**
+
+## Mainnet canary prep — engine resilience + startup rescan (2026-07-18)
+
+RPC-disconnect resilience (`kob/settle/src/rpc/mod.rs`,
+`kob/engine/src/chain/executor.rs`): `call_with_timeout`'s plain-timeout path
+now counts consecutive timeouts and forces the connection dead (so a hung-but-
+technically-open socket still triggers the existing reconnect path instead of
+retrying it forever); `reconnect()` now gives up after
+`RetryConfig::max_reconnect_attempts` (default 20, ~15 min at the capped 60s
+backoff) instead of looping at the backoff cap indefinitely, returning a
+`RECONNECT_GIVEUP_PREFIX`-tagged error the scan loop treats as fatal
+(`std::process::exit(EXIT_CODE_RPC_EXHAUSTED = 10)`) so an external supervisor
+can restart/page. Added a `[HEARTBEAT]` INFO log every 60s (cycle, uptime,
+`node_connected`, cursor) as the minimal watchdog signal.
+
+Startup rescan (opt-in `--rescan-seed <path>`, same JSON schema as
+`--orderbook`): loads a seed file of known covenant orders and validates them
+against the live UTXO set via a direct `getUtxosByAddresses` query
+(`kob/engine/src/storage/persistence.rs::rescan_from_seed`), recovering
+orders deployed before the engine process started WITHOUT replaying blocks —
+the historical gap noted in V16_STATUS.md ("the engine cannot UTXO-rescan
+without knowing per-order P2SH addresses... an operator-seeded orderbook is
+left as a follow-up TODO"). Building this surfaced two pre-existing bugs in
+`validate_and_prune_order_book`, fixed as part of the same change: (1) its
+P2SH→address encoding (`p2sh_to_address`) was a hand-rolled
+`format!("{}:p{}", prefix, hex::encode(spk))`, not real bech32m — a live node
+would never actually match it, silently no-opping every validate/prune call;
+now delegates to `kob_settle::bech32::spk_to_address` (the same codec used
+everywhere else in the workspace). (2) the liveness check compared the
+OCO-suffixed book key (`txid:index:tp`/`:sl`) against the raw UTXO set
+(`txid:index`), which would have incorrectly pruned every live OCO/ratchet
+leg on every restart once (1) was fixed; now uses `utxo_outpoint_key()` for
+the liveness check and `outpoint_key()` only for removal.
+
+**Live smoke (testnet-10, 2026-07-18):** a fresh engine (empty `--orderbook`,
+no scan cursor, release binary rebuilt this session) launched with
+`--rescan-seed` pointed at a seed file containing the still-resting
+ratchet_oco from the 07-17/07-18 RT-1-rerun session
+(`ad0c2027a6a04ccd3c91e23e97fbc26d35eb17aeee2c603e561d8d30d34c9eba:0`, TP
+101/100 / SL 25/100, 100M escrow — confirmed unspent via REST both
+immediately before and immediately after this run; the sibling sell
+`47d4ffe191d05bf2…:0` and buy `6eb2a4c4773c6163…:0` from the same deploy were
+deliberately left out of the seed since together they cross and would have
+triggered a real settle attempt, which this smoke test was explicitly scoped
+to avoid). Log (`[RESCAN]`/`[PRUNE]` tags):
+
+```
+[ORDER BOOK] No persisted file found at /tmp/ob_rescan_smoke.json
+[ORDER BOOK] Added SELL [eab5c99a1f23...]: ad0c2027a6a04ccd value=100000000 price=25/100
+[ORDER BOOK] Added SELL [eab5c99a1f23...]: ad0c2027a6a04ccd value=100000000 price=101/100
+[RESCAN] Loaded 2 candidate order(s) from seed ... — validating against live UTXO set ...
+[PRUNE] Validating 2 persisted orders (1 P2SH addresses) against UTXO set ...
+[PRUNE] Confirmed live: ad0c2027a6a04ccd3c91e23e   (x2 -- both OCO legs, one UTXO)
+[PRUNE] Validation complete: 0 order(s) pruned, 2 live
+[RESCAN] Startup rescan complete (2 candidate(s) from ...)
+```
+
+Both legs discovered and confirmed live via direct UTXO query alone, BEFORE
+the "no full UTXO rescan on startup" banner — proving recovery of an order
+that predates the process, with zero incorrect pruning (bug (2) above). Ran
+4 scan cycles (`[SCAN] No crossing orders found`, `0 bids, 2 asks` throughout
+— no counterparty in the seed, so nothing could cross) then shut down via
+SIGINT (`[SHUTDOWN] Complete.`); the order remained unspent throughout
+(REST-confirmed before and after) and the detached process left zero
+residue. Regression: `kob/domain/tests/budget_limited_repro.rs` (Task A,
+above) + `kob/engine/src/storage/persistence.rs` unit tests
+(`p2sh_to_address_round_trips_through_real_bech32m`,
+`p2sh_to_address_matches_known_live_testnet_vector` — pinned against this
+same `ad0c2027…:0` P2SH/address pair) + `kob-settle`'s
+`retry_config_default_has_reconnect_giveup_cap`.

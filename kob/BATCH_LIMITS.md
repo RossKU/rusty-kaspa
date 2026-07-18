@@ -26,6 +26,15 @@ variants, testnet only).
    - per input: `compute_budget*10,000 + 9,999` free script units;
      stack cap 244; post-Toccata script size cap 1MB.
    Reproduce: `cargo test -p kob-core --test batch_limits_lab -- --nocapture`.
+   **Budget-limited regression** (2026-07-18): the mass model above was
+   validated offline, but `kob-domain`'s planner-engine-repro harness ran
+   every composed tx under an UNLIMITED script-units budget, which missed a
+   live under-commit in `plan_ratchet_advance` (`sig_op_count: 0` — only the
+   9,999-unit free allowance for a shape that measured 10,311). Permanent
+   detector: `kob/domain/tests/budget_limited_repro.rs` runs each planner
+   shape's covenant inputs under `input.compute_commit.allowed_script_units()`
+   — the SAME per-input limit `check_scripts` commits at consensus — instead
+   of `ScriptUnits(u64::MAX)`.
 2. **Model validation** — the lab rebuilds the Stage-F live GTC 3:1 shape
    (5-in/4-out, merged seller KAS, D2 token_unit deliveries) and reproduces
    the live compute mass **exactly: 6,563 grams** (test

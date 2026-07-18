@@ -171,8 +171,16 @@ pub async fn run(
     // guessing a specific historical generation.
     let old_version = old_version.unwrap_or_else(|| cached.as_ref().map_or(12, |c| c.version));
     let old_expiry = old_expiry.unwrap_or_else(|| cached.as_ref().map_or(0, |c| c.expiry_daa));
+    // Resolve old_max_matcher_fee: CLI override > cache > default.
+    // v18 is BPS (basis points); v18 caches store bps -- mirrors the identical
+    // fallback in `cancel.rs`. The old (pre-fix) default here was
+    // `crate::deploy::DEFAULT_MAX_MATCHER_FEE` (10_000_000 sompi), which is
+    // >10000 and always tripped the v18 redeem-script builders' "bps must be
+    // <= 10000" guard on the (rare) cache-miss path -- see
+    // `crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS`'s doc comment: "Use
+    // DEFAULT_MAX_MATCHER_FEE_BPS for every v18 call site."
     let old_max_matcher_fee = old_max_matcher_fee.unwrap_or_else(|| {
-        cached.as_ref().map_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE, |c| c.max_matcher_fee)
+        cached.as_ref().map_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS, |c| c.max_matcher_fee)
     });
     let old_token_owned: Option<String> = match old_token {
         Some(t) => Some(t.to_string()),
@@ -668,5 +676,57 @@ mod tests {
         let needed = amount + est_fee;
         assert!(needed > amount, "needed must exceed order amount");
         assert!(needed < amount + 10_000, "mass-based fee budget should be well below old 10_000 constant");
+    }
+
+    // Regression for the old_max_matcher_fee cache-miss fallback (line ~178):
+    // v18 redeem scripts take max_matcher_fee as BPS (<=10000), but the
+    // fallback used to reach for `crate::deploy::DEFAULT_MAX_MATCHER_FEE`
+    // (10_000_000 sompi) -- a value that ALWAYS trips the redeem-script
+    // builders' bps guard when --old-max-matcher-fee is omitted and the
+    // outpoint isn't in the orders cache. The fix mirrors `cancel.rs`'s
+    // identical fallback: use `crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS`.
+    #[test]
+    fn old_max_matcher_fee_fallback_is_bps_not_sompi() {
+        let fallback = crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS;
+        assert!(fallback <= 10_000, "fallback must be a valid bps value (<=10000)");
+        assert_ne!(
+            fallback,
+            crate::deploy::DEFAULT_MAX_MATCHER_FEE,
+            "fallback must not be the legacy sompi constant"
+        );
+    }
+
+    #[test]
+    fn old_max_matcher_fee_fallback_builds_valid_redeem_scripts() {
+        let fallback = crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS;
+        let tcid = [0xaau8; 32];
+        let owner_hash = [0x11u8; 32];
+        let spk_hash = [0x22u8; 32];
+        let other_spk_hash = [0x33u8; 32];
+
+        let buy_ok = contract::spot::order::build_buy_redeem_script(
+            &tcid, 1, 1, 1000, &owner_hash, &spk_hash, &other_spk_hash, fallback, 0, 0,
+        );
+        assert!(buy_ok.is_ok(), "BPS fallback must build a valid buy redeem script");
+
+        let sell_ok = contract::spot::order::build_sell_redeem_script(
+            1, 1, 1000, &owner_hash, &spk_hash, &other_spk_hash, fallback, 0, 0,
+        );
+        assert!(sell_ok.is_ok(), "BPS fallback must build a valid sell redeem script");
+
+        // Pin down what the bug actually did: the legacy sompi constant is
+        // rejected by both builders' bps guard, so the pre-fix fallback path
+        // could never succeed on a cache miss.
+        let buy_bad = contract::spot::order::build_buy_redeem_script(
+            &tcid, 1, 1, 1000, &owner_hash, &spk_hash, &other_spk_hash,
+            crate::deploy::DEFAULT_MAX_MATCHER_FEE, 0, 0,
+        );
+        assert!(buy_bad.is_err(), "legacy sompi constant must be rejected as bps");
+
+        let sell_bad = contract::spot::order::build_sell_redeem_script(
+            1, 1, 1000, &owner_hash, &spk_hash, &other_spk_hash,
+            crate::deploy::DEFAULT_MAX_MATCHER_FEE, 0, 0,
+        );
+        assert!(sell_bad.is_err(), "legacy sompi constant must be rejected as bps");
     }
 }

@@ -1,28 +1,26 @@
-//! KCC20 Fungible Token Covenant primitives (KCC-0020, first implementation
-//! wave).
+//! KCC20 Fungible Token Covenant primitives (KCC-0020).
 //!
-//! This wave implements the covenant SURFACE only: the standard state header
+//! Wave 1 implemented the covenant SURFACE: the standard state header
 //! (`state.rs`), entrypoint dispatch-tag computation and a 2-entrypoint
 //! dispatch bytecode skeleton (`dispatch.rs`), the kcc-0001 P2SH sigScript
 //! envelope specialized to KCC20's fixed two entrypoints (`p2sh.rs`), the
 //! descriptor shape (`descriptor.rs`), and `identifier_type` ownership-check
 //! bytecode (`identifier.rs`).
 //!
-//! Deliberately NOT implemented here (second wave, per task scope):
+//! Wave 2 (`transfer.rs`) implements the `transfer`/`transfer_delegator`
+//! body validation logic (amount preservation, authorization, successor-
+//! output checks) and the complete redeem-script builder
+//! (`build_kcc20_token_redeem_script`), engine-tested against the real
+//! `TxScriptEngine` in `kob/core/tests/kcc20_contracts.rs`. It does NOT
+//! implement kcc-0020's `next_states: State[]` argument literally -- that
+//! type is not encodable under kcc-0001 §5.5/§5.6 at all (see `transfer.rs`'s
+//! module doc for the full analysis) -- and ships a documented, necessarily
+//! different design instead. `borrowed_receive.rs` (KCC20 Borrowed Receive
+//! Extension v1) is an explicit stub: see that module's doc for why wiring
+//! it in is a `transfer.rs` core-loop redesign, not an add-on, and why it was
+//! time-boxed out of this wave.
 //!
-//! ```text
-//! pub mod transfer;           // wave 2 -- transfer/transfer_delegator body
-//!                             // validation logic (amount preservation,
-//!                             // authorization, successor-output checks).
-//! pub mod borrowed_receive;   // wave 2 -- KCC20 Borrowed Receive Extension v1.
-//! ```
-//!
-//! No CLI wiring and no engine-execution (real script-VM) tests are added in
-//! this wave either. See the accompanying implementation report for the full
-//! ISSUE list; several entries (in particular the `State[]` argument-encoding
-//! contradiction between kcc-0020's `transfer` signature and kcc-0001
-//! §5.5/§5.6's fixed-payload-width requirement for record arrays) block
-//! `transfer.rs` far more than anything built in this module.
+//! No CLI wiring is added.
 //!
 //! Relationship to `crate::contract::token`: `token.rs` is KOB's existing,
 //! UNCHANGED KCC20 implementation. It reads kcc-0020's "State" section as
@@ -39,12 +37,16 @@ pub mod dispatch;
 pub mod p2sh;
 pub mod descriptor;
 pub mod identifier;
+pub mod transfer;
+pub mod borrowed_receive;
 
 pub use state::*;
 pub use dispatch::*;
 pub use p2sh::*;
 pub use descriptor::*;
 pub use identifier::*;
+pub use transfer::*;
+pub use borrowed_receive::*;
 
 // ============================================================================
 // KCC1 (kcc-0001) §5.2 common push-encoding primitives

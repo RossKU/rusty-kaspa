@@ -216,6 +216,32 @@ fn resolve_fee_floor_bump(current_fee: u64, floor: Option<u64>) -> Option<u64> {
     (floor > current_fee).then_some(floor)
 }
 
+/// Decide whether Phase 2 must rebuild `tx.outputs` (and re-sign the wallet
+/// input) so the submitted tx's miner fee actually matches the exact Phase 2
+/// fee -- clamped further up by an optional `KOB_FEE_FLOOR` bump.
+///
+/// `BatchPlan::converge_fee_exact` returns `delta = phase1_est.saturating_sub(
+/// exact_fee)`, an UNSIGNED quantity. It collapses to 0 in two very different
+/// situations: (a) `exact_fee == phase1_est` (nothing to do, correctly a
+/// no-op), and (b) `exact_fee > phase1_est` -- Phase 1 UNDER-estimated -- where
+/// a rebuild is very much still required, to RAISE the fee, not to recover a
+/// surplus. Gating the rebuild on `delta > 0` alone (as the pre-fix code did)
+/// silently ships the stale, too-low Phase-1 fee whenever Phase 2's real
+/// compute-mass number comes in higher than the estimate: this is exactly
+/// the live testnet-10 bug (see `competing_matcher_live_2026-07-18.md`
+/// anomaly #3) where Phase 2 printed "Exact compute fee: 986100 sompi, Fee
+/// delta: 0 sompi (recovered)" while the actually-submitted tx still carried
+/// Phase 1's 524200 sompi estimate -- a ~462K sompi gap between the printed
+/// "recovered" number and on-chain reality.
+///
+/// Comparing `phase1_est` and `exact_fee` directly (instead of going through
+/// the lossy, saturated `delta`) restores the missing direction: rebuild
+/// whenever the two fees differ AT ALL, in either direction, or whenever an
+/// operator-supplied floor binds on top.
+fn resolve_fee_rebuild_needed(phase1_est: u64, exact_fee: u64, floor_bump: Option<u64>) -> bool {
+    phase1_est != exact_fee || floor_bump.is_some()
+}
+
 /// Resolve the cached redeemScript bytes for one side of a match, if the
 /// cache entry has one and it passes the p2sh_hash sanity check.
 ///
@@ -656,10 +682,23 @@ pub async fn run(
 
     // ---- Phase 2: exact mass with real sigscripts ----
     let (exact_fee, delta) = plan.converge_fee_exact(&tx, &sigscripts);
+    let phase1_est = plan.total_fee;
     println!();
     println!("Phase 2 Convergence:");
     println!("  Exact compute fee: {} sompi", exact_fee);
-    println!("  Fee delta:         {} sompi (recovered)", delta);
+    // Truthful direction, not the lossy saturated `delta` alone -- see
+    // `resolve_fee_rebuild_needed`'s doc comment for why `delta > 0` used to
+    // be the wrong gate.
+    if exact_fee > phase1_est {
+        println!(
+            "  Fee delta:         +{} sompi (Phase 1 estimate undershot -- raising fee)",
+            exact_fee - phase1_est
+        );
+    } else if exact_fee < phase1_est {
+        println!("  Fee delta:         -{} sompi (recovered)", delta);
+    } else {
+        println!("  Fee delta:          0 sompi (exact match)");
+    }
 
     // Optional fee floor override (sompi): the node's transient-mass floor
     // (byte-proportional, e.g. a v18 buy's 5,655B redeemScript) can exceed
@@ -677,13 +716,37 @@ pub async fn run(
         println!("  Fee floor override: {} sompi (KOB_FEE_FLOOR)", floor);
     }
 
-    if delta > 0 || fee_floor_bump.is_some() {
+    if resolve_fee_rebuild_needed(phase1_est, exact_fee, fee_floor_bump) {
+        // `apply_exact_fee` only RECOVERS a Phase-1 over-estimate (its own
+        // internal delta = phase1_est.saturating_sub(exact_fee)) back to the
+        // matcher/wallet-change output -- it is a no-op when Phase 1
+        // under-estimated. `apply_fee_floor` is the general-purpose "raise
+        // the miner fee to at least X, taking the shortfall from the
+        // matcher-side outputs" primitive already used for the operator's
+        // KOB_FEE_FLOOR override below; reusing it with `exact_fee` itself as
+        // the floor covers the missing direction (Phase 1 undershot Phase 2)
+        // with the SAME never-touch-seller/buyer semantics. Calling both is
+        // safe: whichever direction doesn't apply is a no-op.
         plan.apply_exact_fee(exact_fee);
+        let raised = plan.apply_fee_floor(exact_fee);
+        if raised > 0 {
+            println!(
+                "  Fee raised to exact: +{} sompi -> {} sompi total (Phase 1 estimate undershot)",
+                raised, plan.total_fee
+            );
+        }
         if let Some(floor) = fee_floor_bump {
             let bumped = plan.apply_fee_floor(floor);
             if bumped > 0 {
                 println!("  Fee floor applied:  +{} sompi -> {} sompi total", bumped, plan.total_fee);
             }
+        }
+        if plan.total_fee < exact_fee {
+            println!(
+                "  WARNING: could not raise the fee to the full exact amount ({} sompi short) -- \
+                 no matcher-side output had room to absorb it.",
+                exact_fee - plan.total_fee
+            );
         }
 
         tx.outputs.clear();
@@ -919,6 +982,47 @@ mod tests {
     #[test]
     fn fee_floor_unset_env_is_noop() {
         assert_eq!(super::resolve_fee_floor_bump(5_000, None), None);
+    }
+
+    // ---- resolve_fee_rebuild_needed ----
+
+    #[test]
+    fn rebuild_not_needed_when_exact_equals_estimate_and_no_floor() {
+        assert!(!super::resolve_fee_rebuild_needed(524_200, 524_200, None));
+    }
+
+    #[test]
+    fn rebuild_needed_when_exact_is_higher_than_estimate() {
+        // The live bug: Phase 1 estimated 524200, Phase 2's exact compute
+        // fee came in at 986100 (a v18 buy's large redeemScript wasn't fully
+        // accounted for in the Phase-1 estimate). `converge_fee_exact`'s own
+        // `delta` saturates to 0 here (est < exact), but a rebuild is very
+        // much required -- to RAISE the fee, not recover a surplus.
+        assert!(super::resolve_fee_rebuild_needed(524_200, 986_100, None));
+    }
+
+    #[test]
+    fn rebuild_needed_when_exact_is_lower_than_estimate_recovered_direction() {
+        // Phase 1 over-estimated; Phase 2's exact fee is lower -- the
+        // "recovered" direction. Must still rebuild so the recovered delta
+        // actually reaches the matcher/wallet-change output instead of
+        // being silently left in the stale Phase-1 tx.
+        assert!(super::resolve_fee_rebuild_needed(986_100, 524_200, None));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_even_if_exact_equals_estimate() {
+        assert!(super::resolve_fee_rebuild_needed(524_200, 524_200, Some(1_600_000)));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_on_top_of_higher_exact() {
+        assert!(super::resolve_fee_rebuild_needed(524_200, 986_100, Some(1_600_000)));
+    }
+
+    #[test]
+    fn rebuild_needed_when_floor_binds_on_top_of_lower_exact() {
+        assert!(super::resolve_fee_rebuild_needed(986_100, 524_200, Some(1_600_000)));
     }
 
     // ---- resolve_cached_rs ----

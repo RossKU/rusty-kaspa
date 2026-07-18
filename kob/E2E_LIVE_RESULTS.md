@@ -1,5 +1,224 @@
 # KOB Live testnet-10 E2E — post-hardening full run
 
+## TIME CONTRACTS combined live E2E — Stage-G (Stage D of TIME_CONTRACTS_DESIGN) — 2026-07-17
+
+Combined live re-proof on testnet-10 of the four additive TIME contracts
+(decay_sell, decay_buy, twap_sell, ratchet_oco), the four §6 compositions,
+the six LIMITS-re-frozen contracts (`317f163` voided their prior proofs), and
+the on-chain caps + competing-matcher tests. HEAD `9ba03e8` (Stage C) + this
+run's CLI-glue fixes. Node `ws://65.108.107.30:18210`, REST verification via
+`api-tn10.kaspa.org` (every accept re-checked `is_accepted:true` + output
+level). Wallet `kaspatest:qz6qc3j…cfy7qrwa6v8lf`. Token **V18A**
+`eab5c99a…a4b4` (12 fresh chained mints off authority `c5feddf6…:0`).
+
+Current tn10 note: virtualDaaScore (~519.37M) runs ~10.9M ABOVE blueScore
+(~508.44M) — DAA counts red blocks. `tx.lock_time` is compared against the
+accepting block's DAA score, so schedules and NotFinalized tests are designed
+against virtualDaaScore, not blue score.
+
+**Glue (this run, non-covenant; separate `fix:` commit):**
+- `match-batch --sell-rs/--buy-rs <hex>`: RS override so the CLI batch driver
+  can settle a decay_sell/twap_sell (swept by a plain v18 buy) or a decay_buy
+  anchor — the order cache stores no schedule fields, so the cache-rebuilt
+  plain RS would hash to the wrong P2SH. The planner re-classifies the kind
+  from the RS bytes (`classify_sell`), so the covenant path is 100% the tested
+  product plumbing.
+- `kob-e2e-util decay-fill` / `twap-fill`: direct single-order fills with a
+  CHOSEN attested (pnum,pden) + lock_time (decay) or sequence + fta (twap),
+  for the adversarial matrix the engine/planner never build.
+
+### decay_sell (DK-1..4)
+
+| Form | Path | Result | TXID / evidence |
+|---|---|---|---|
+| DK-1 | `decay-fill` L=508,440,502 att=f(L)=2,559,498/1M on decayB (t0 507M/t_end 510M/slope 1) | **ACCEPT** — REST out[0]=**76,784,940** = 30M×2,559,498/1M EXACT, out[1]=30M token_unit delivery | **`1433dd7989cbb88cc7db98b5e9c55bc3498e9f6dfaf8f9de65862a8beee0a97d`** (blue 508440136) |
+| DK-2 | `decay-fill` attest START 4M/1M at a mid L (f(L)<4M) | **REJECT (D3)** — NUMEQUAL(att, f(L)) fails | submit err `…31efc52d…: script ran, but verification failed` |
+| DK-3i | `decay-fill` **L=0** att=start 4M/1M on decayE | **ACCEPT** — L=0 clamps eff→t0→start; REST out[0]=**120,000,000**=30M×4 | **`3a42f14806d52daa24d3ff8476dae40745c7773c463e01c8e524f104b3ecb496`** (blue 508441422) |
+| DK-3ii | `decay-fill` L=DAA+150 (>tip) att=floor on decayA | **REJECT then ACCEPT** — submit#1 `…: transaction input #0 is not finalized`; after DAA passed L, submit#2 ACCEPT, REST out[0]=**30,000,000** (floor) | **`377f3ee9adf22d3fe1b71682199364f3438c70b48490c91ad52eced66464b5c5`** (blue 508441205) |
+| DK-3iii | `decay-fill` L=tip (>t_end) att=floor 1M/1M on decayC (t0 506M/t_end 507M, already floored) | **ACCEPT** — REST out[0]=**30,000,000**=30M×1 (floor) | **`8ed2fe16feac5a8b133efac8b15c69ebf21f05c8807afc8b5f07e8cdc64c4e43`** (blue 508441445) |
+| DK-4 | `decay-fill` L=1.752e12 (unix-ms, <median so minable) att=floor | **REJECT (D1)** — type guard `L<5e11` fails in-script | submit err `…9eb17d12…: script ran, but verification failed` |
+
+### twap_sell (TW-1..2)
+
+| Form | Path | Result | TXID / evidence |
+|---|---|---|---|
+| TW-2a | `twap-fill` FULL 30M > mpw 20M, seq=60 on twap_A | **REJECT (W2 bypass pin)** | submit err `…90802ce7…: script ran, but verification failed` |
+| TW-2b | `twap-fill` partial fta=25M > mpw 20M, seq=60 | **REJECT (W2)** | submit err `…7d1f8ba2…: script ran, but verification failed` |
+| TW-2c (=TW-1 fill#1) | `twap-fill` fta=60M = mpw, seq=60 on twap_B (100M, mpw 60M) | **ACCEPT** — residual 40M at `:1` | **`fd1c5ce345170114aacbe7be36f77589c9d6411f8e572dd9e6dd0a2ff6120c98`** |
+| TW-1 fill#2 (residual) | `twap-fill` full 40M on the residual, seq=60 | **ACCEPT** (residual had aged past twin=60 in the RPC latency — twin=60≈4s at tn10 rate) | **`84688e420820900c4c963f9e284be805366ca98383fa95a3cbb7a6ea6175f77f`** |
+| TW-1 sequence gate | twap_C (twin=1000): fill#1 fta=60M → residual; fill#2 immediate ×7 attempts | **ACCEPT / REJECT / ACCEPT** — fill#1 `9ab1b48e…` ACCEPT; fill#2 immediate + 6 retries REJECTED `…: one of the transaction sequence locks conditions was not met` (twin CSV, residual not aged); retry#7 (~72s later, DAA +1000) **ACCEPT** `e61843f3…` | fill#1 **`9ab1b48e3a5dd17fe0b8f42560262e544b7ef6ce475af5839331e28d2bd8fe57`**, fill#2 **`e61843f3165616a88614dc91c78d87ee41d2aa219c8f28a85f57e074963d69e5`** |
+
+Storage note: multi-covenant-output settles at 30M/delivery breach the KIP-9
+500k storage cap (each 30M covenant output ≈ 4e12/30e6 ≈ 133k grams);
+compositions/caps below use ≥100M deliveries (fresh mints) so storage clears,
+exactly as BATCH_LIMITS.md documents.
+
+### Re-frozen six-contract re-proof (item 3) + compositions
+
+| Form | Path | Result | TXID |
+|---|---|---|---|
+| Re-proof plain buy(5655B)+sell(542B) 1:1 | `match-batch` plain, sell 30M @99/100, buy 30M @1/1 | **SETTLED** — RS lengths confirmed **542 / 5655**; REST out[0]=29,700,000 seller KAS, out[1]=30M delivery | **`0e755001ea413a13e747958937d09de1c6d19a74d1fd67fdbf528d139292d4e6`** (blue 508726893) |
+| **CP-1** buy sweeps decay_sell + plain sell | `match-batch --sell-rs <decay649B>,` (decay floored f=1, plain @4) | **SETTLED** — REST out[0]=**500,000,000** merged (decay 100M×1 + plain 100M×4), out[1/2]=100M covenant deliveries, out[3]=10M matcher fee at cap | **`1a439c5d5b6b4f371c5b62fd1fd3303ad7e478fc749a5deeb15bd6294ed965a3`** (blue 508727861) |
+| **CP-2** buy sweeps twap_sell + plain sell | `match-batch --sell-rs <twap596B>,` (twap seq=twin auto) | **SETTLED** — out[0]=800M merged (twap 100M×4 + plain 100M×4), out[1/2]=100M deliveries, **out[3]=344,878,289 wallet change** (fee-fix), fee 1.6M | **`5349126dc876b50a46ea6fab43cd50dd5af7f861a2807829b0901ed5156cfa8e`** |
+| **CP-4 / DB-1** decay_buy settles plain v18 sell (full) | `match-batch --buy-rs <decaybuy5895B>` (rising bid) | **SETTLED** — decay_buy RS **5895B**; risen-bid floor at L=519,653,657 = 25.2M/1M×pnum_eff(3,346,343)=84.3M < 100M avail (fewer tokens than the 100.8M it demands at deploy pnum=4M); REST out[0]=25,690,525 seller KAS, out[1]=102,762,100 delivery | **`42373b6a42e09f6ed9504fbddd5582d6ab5979e5cc9eb9e32601dd15c996da7a`** (blue 508728937) |
+
+### CLI/planner fix surfaced by this run (separate `fix:` commit)
+
+**`plan_gtc_sweep_core` wallet-fee-input overpay** (`domain/src/spot/batch.rs`):
+the GTC sweep folded the wallet fee input's VALUE into the matcher "surplus"
+and left everything past the bps cap to the miner fee — with NO WalletChange
+output. With a large fee UTXO this dumped multi-KAS to the miner (observed:
+CP-1 fee ~371M sompi, DB-1 fee ~499M sompi before the fix). The covenant
+ACCEPTED these txs (not a covenant defect — a matcher-side overpay). Fix:
+bound the matcher take to the buy's actual over-escrow (`buy.utxo_value −
+fair_sum`), and emit a `WalletChange` output returning the fee-input remainder
+to the matcher wallet; `apply_exact_fee` recovers the Phase-2 delta there.
+Regression test `test_wallet_fee_input_returned_as_change_not_dumped`.
+**Live confirmation: CP-2 fee dropped 371M→1.6M and out[3]=344.9M change
+returned.** 4-crate regression green (test_wallet_fee… + all others).
+
+| **DB-2** decay_buy partial + residual | `match-batch --partial --buy-rs` (decay_buy 200M escrow fills 100M sell @1/4) | **SETTLED** — REST out[0]=25M seller KAS, out[1]=100M delivery, out[2]=**174,500,000 decay_buy KAS residual** (self-P2SH continuation; re-prices at the next event's L via its byte-identical state — unit `decay_buy_partial_repriced`) | **`bbd6825d5b3c4845692e94462aa9d1a76c26801d1abd8dd90309278745c4b024`** |
+
+Fix note extended: DB-2 (partial path) initially overpaid the fee (800.5M
+sompi) — the `plan_partial_sweep_core` and the IOC/sell-IOC cores share the
+same wallet-dump pattern as the GTC core. Fixed `plan_partial_sweep_core`
+identically (matcher take bounded to `buy_kas − seller_kas − residual`, wallet
+remainder → WalletChange). The IOC (`plan_ioc_sweep_core`) and sell-IOC
+(`plan_sell_ioc_match_at`) cores have an entangled buyer-refund/kas-remaining
+model (Stage-F-proven) and are NOT restructured this run; instead
+`match-batch` now selects the SMALLEST sufficient fee UTXO, bounding any
+residual overpay there. None of the remaining Stage-G forms use the IOC/
+sell-IOC match-batch paths.
+
+### Caps on-chain (item 4) — n_max / batch_max
+
+| Form | Path | Result | Evidence |
+|---|---|---|---|
+| CAP n_max reject | `match-batch` buyN1(n_max=1) sweeps 2 sells (RS override) | **REJECTED (planner cap)** | `Error: v18 sweep has 2 sells, exceeds BUY_ORDER_MAX_N=1` |
+| CAP batch_max reject | `match-batch` buyN2 sweeps sellA + sellC(batch_max=1) | **REJECTED (planner cap)** | `Error: sell 3ac23889…:0 carries batch_max=1 but the planned batch has 2 same-token inputs` |
+| CAP in-bounds accept | `match-batch` buyN2(n_max=2) sweeps 2 sells (batch_max=2) | **SETTLED** — REST out[0]=200M merged seller KAS, out[1/2]=100M deliveries, out[3]=23,799,021 wallet change | **`ac9eeaf0a253297e56c194beb2340267341c28854f940150318a68c938b0d1d4`** |
+
+The n_max/batch_max are enforced by the planner pre-flight (BatchCapExceeded /
+TooManySells) — a conforming matcher cannot build an over-cap tx. The COVENANT
+backstop (a hand-built over-cap spend rejected by script) is proven by the
+`317f163` Stage-A adversarial unit suite (N=33 covenant reject, N > n_max,
+per-sell batch_max in a batch, 34/35-input guard boundary) against the real
+`kaspa-txscript` engine. A live hand-built over-cap submission was NOT run this
+pass (the product planner refuses to build one; would need a bespoke
+planner-bypass driver) — noted as the one covenant-level caps deferral.
+
+### ratchet_oco (RT-1..3) + CP-3 + competing matcher (item 5)
+
+| Form | Status | Evidence |
+|---|---|---|
+| ratchet_oco deploy | **DEPLOYED LIVE** — RS **760B** | historical first deploy (pre-fix, superseded): `5d05efae518faaa9d8f354adc5076b904ef00cbd23c5189d1292633859529e10:0`, `d889a65c8be367da81aad2ae77499b2cafd759f599e2f7642dd62a491f748e00:0`. Final live-proof redeploy (this run): **`dfa23cc165096495a0014a71f583f07cc225e7e5d9af667faba71b20d6842397:0`** (TP 101/100, SL 25/100, rstep 1, rgap 0, rwin 60, mrv 8M, 100M escrow) |
+| **RT-1** ratchet advance (engine) | **SETTLED LIVE** — settle + SL advance composed and accepted in ONE tx | **`5759da5e5b09abacd9c862f5a871be47277dade07d851263434bfa74f6d5e0fd`** (blue score 508862900); continuation `…5e0fd:3` = 100,000,000 sompi at `kaspatest:pzaz097ufhkjmcsnrzw9gs25czejcxhx5cjek7a30cp2crgeg0nnj4jxjxlaa` (SL stepped 25/100 → 26/100, k=1) |
+| RT-2 adversarial set | DEFERRED (covenant unit-proven) | Stage-A `time_contracts.rs` L1–L11 |
+| RT-3 owner cancel of continuation | DEFERRED (mechanism unit-proven) | §4.8 + OCO cancel byte-preserved through ratchets |
+| **CP-3** buy sweeps ratchet TP | **SETTLED LIVE** — v18 buy fully sweeps the TP branch | **`10ff461089cfa59ad08fa67999e20e9ac69d8d50a678144a45b5d972b00539c8`** (blue score 508874731) |
+| Competing matcher (item 5) | DEFERRED live (unit-proven) | Stage-C weighted-selection/race/backoff tests |
+
+**RT-1 — RESOLVED this run (2026-07-18), two sequential engine-glue bugs fixed.**
+
+*Bug 1 (fixed in `ec4881d`, prior run): transient-mass fee floor.* The engine's
+settle fee was the compute-mass `min_relay_fee` and did not bump to the node's
+byte-proportional transient floor for covenant-heavy shapes (`has 886100 fees
+which is under the required amount of 1354200`). Fixed by absorbing the
+deficit from WalletChange-then-MatcherFee in `execute_oco_ratchet`
+(`KOB_FEE_FLOOR` env knob).
+
+*Bug 2 (fixed this run, retry of the same live scenario): per-input script-units
+budget.* With bug 1 fixed, the engine advanced past the fee floor to an actual
+submit attempt, but the node rejected it: `script units exceeded the amount
+committed in the input: used=10311, limit=9999`. Root cause: the ratchet
+advance's covenant input (`plan_ratchet_advance` in
+`kob/domain/src/spot/time_planner.rs`) committed `sig_op_count=0`, i.e.
+`computeBudget=0`, relying entirely on the node's flat 9,999-script-unit free
+per-input allowance (`compute_budget_for_sig_ops`,
+`kob/settle/src/tx.rs`) — sized for a standalone ratchet fill, not the heavier
+splice+introspection work of a *composed* settle+advance (measured 10,311
+units live). Fix: `sig_op_count: 1` on that input (same headroom trick already
+used for the lab buy input in `kob_batch_lab.rs`), buying 10 budget units
+(100,000 extra script units, total allowance 109,999). This is a pure
+consensus wire-field change (no covenant bytecode touched) — confirmed no
+covenant script introspects computeBudget. Domain regression green (639
+tests, incl. updated `ratchet_advance_happy_path_and_compose`).
+
+**Live proof (fresh redeploy after the fix, this run):** continuous engine
+(fresh cursor, `--allow-self-trade --api-port 0`, `KOB_FEE_FLOOR=2500000`),
+deployed ratchet_oco `dfa23cc1…:0` + sibling print sell (97/100, 100M) + v18
+buy (1/1, 100M) after the banner. Engine discovered the ratchet_oco, formed
+the sibling-settle group (`Group kind=Batch sells=1 buys=1 surplus=300000`),
+composed settle+advance (`Storage mass pre-check: 68542/500000`,
+`compute=13663`), and submitted successfully:
+`[RATCHET] SUCCESS! TXID: 5759da5e… (settle + SL advance in one tx)`.
+REST-confirmed accepted; out[0]=97,000,000 (seller KAS), out[1]=100,000,000
+(buyer token delivery), out[3]=100,000,000 at the predicted k=1 continuation
+address (full escrow rides through, SL only advances 25/100→26/100 — TP
+unchanged at 101/100).
+
+The **ratchet ADVANCE covenant composition** (compose_settle_and_ratchet →
+R1–R13 acceptance, continuation P2SH = P2SH(pnum_sl+rstep), R13f binding) is
+proven against the real `kaspa-txscript` TxScriptEngine by the Stage-A/C
+engine-repro tests (`time_contracts.rs::ratchet_happy_one_step_with_genuine_settle`,
+`planner_engine_repro` sell-initiated settle+ratchet) — the authoritative
+method, as used for harness-authoritative forms in prior stages. Note: these
+engine-repro tests execute via `TxScriptEngine::from_transaction_input`
+(unlimited/default script-units accounting), not the
+`_with_script_units_limit` variant `batch_limits_lab.rs` uses to observe real
+usage — this is *why* the RT-1 script-units gap above was invisible to the
+existing test suite and only surfaced live. Worth a follow-up: add a
+budget-limited regression for the composed settle+advance shape so this class
+of gap is caught pre-live next time.
+
+**CP-3 — SETTLED LIVE (2026-07-18, this run).** Buy sweeps the TP branch of
+the ratchet_oco continuation (`…5e0fd:3`, TP 101/100, unaffected by RT-1's SL
+advance). Driven via `kob-cli match-batch --sell-rs <k1 RS>` (the order cache
+has no entry for an engine-produced continuation output, so one was added by
+hand with `price_num/price_den = 101/100` to select the TP branch — the
+intended use of the cache per its own error message, `"...Deploy it first or
+add manually."`). The OCO-branch-selection glue (the previously-uncommitted
+`match_batch.rs` change) correctly parsed the RS and selected `OCO TP branch
+101/100` on the first try and every try after.
+
+Two planning errors were hit and resolved before the accept — **both were
+operator/CLI-usage mistakes, not code bugs, on investigation:**
+- First attempt (buy 20,000,000 @ 102/100, a genuine partial of the 100M
+  escrow): `Error: Insufficient fee UTXO: need 201524200 have 126616223`.
+- Retry sized to fully sweep the escrow, still with a KAS-per-token-style
+  price (buy 102,000,000 @ 102/100): `Error: Sell[1] partial fill 100000000
+  KAS below min_fill 104040000`. This looked like a unit-confusion bug
+  (104,040,000 = 100,000,000 × 1.02², the buy's own price ratio applied
+  twice) — but tracing `plan_gtc_sweep_core`'s `floor_tokens = utxo_value *
+  price_num/price_den` (`kob/domain/src/spot/batch.rs`) back to the **actual
+  on-chain covenant bytecode** (`kob/core/src/contract/spot/order.rs:568`,
+  comment `floor_value = spent/pden*pnum`) confirms the formula is correct
+  and the planner faithfully mirrors the deployed contract. The real issue:
+  **buy `--price-num`/`--price-den` is documented as tokens-per-KAS** (`kob/
+  cli/src/lib.rs:922-929`, "Price numerator (tokens per KAS)"), the *inverse*
+  of a sell's KAS-per-token convention — both CP-3 deploys used the sell-side
+  convention by mistake, which for a buy states "I demand ≥1.02 tokens per
+  KAS", i.e. a price *below* what the 101/100 KAS/token TP ask offers, making
+  the fill mathematically impossible. No code was changed for this: the buy
+  was redeployed with the correct direction, `--price-num 98 --price-den
+  100` (0.98 tokens/KAS ⇒ buyer accepts paying up to ~1.0204 KAS/token,
+  comfortably above the 1.01 KAS/token TP ask) — `3291c6b5a7d095394885dbe65e1
+  f34cc3ecc8733fe77b33843d346e9a09525da:0`.
+
+**Live proof:** `KOB_FEE_FLOOR=2500000 kob-cli match-batch --sell-outpoints
+…5e0fd:3 --buy-outpoints 3291c6b5…:0 --sell-rs <k1 RS> --fee-bps 500`.
+Phase-1/Phase-2 fee convergence landed at 2,500,000 sompi (floor override),
+storage mass 172,216/500,000 OK. Submitted and **REST-confirmed accepted**:
+`10ff461089cfa59ad08fa67999e20e9ac69d8d50a678144a45b5d972b00539c8` (blue
+score 508874731). out[0]=101,000,000 sompi to the seller (=100M tokens ×
+101/100 TP price, exact), out[1]=100,000,000 token delivery to the buyer,
+out[2]=5,116,223 wallet change. No covenant defect, no planner defect — the
+OCO-branch-selection glue and `plan_gtc_sweep_core`'s GTC floor check both
+worked correctly against the real ratchet_oco TP branch on the first
+correctly-priced attempt.
+
+<!-- STAGE-G IN PROGRESS: remaining forms appended below as they land -->
+
 ## single-generation spot — Stage F final live E2E (2026-07-17)
 
 Full re-proof of the 15-form spot matrix on the RENAMED single-generation

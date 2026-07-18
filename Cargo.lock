@@ -4886,6 +4886,7 @@ dependencies = [
  "argon2",
  "base64",
  "blake2b_simd",
+ "blake3",
  "chacha20poly1305",
  "hex",
  "hmac",

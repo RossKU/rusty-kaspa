@@ -20,6 +20,8 @@ sha2 = { workspace = true }
 hmac = { workspace = true }
 pbkdf2 = { workspace = true }
 blake2b_simd = { workspace = true }
+# KCC20 dispatch tags (kcc-0001 §6.1: dispatch_tag = BLAKE3(FunctionSignature)[0:4]).
+blake3 = { workspace = true }
 kaspa-addresses = { workspace = true }
 kaspa-consensus-core = { workspace = true }
 kaspa-hashes = { workspace = true }

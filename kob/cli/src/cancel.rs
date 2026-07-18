@@ -58,6 +58,13 @@ pub async fn run(
     fee_utxo_override: Option<&str>,
     cancel_pending: u8,
     max_matcher_fee_override: Option<u64>,
+    // TIME-contract / OCO-family RS override: use this exact on-chain
+    // redeemScript verbatim (the order cache / --price-num etc. cannot
+    // reconstruct an OCO or ratchet_oco shape's extra fields). The cancel
+    // sigscript envelope is agnostic to RS content, so this is the only
+    // change needed to cancel a ratchet_oco or any post-splice continuation
+    // (§4.8, "OCO cancel byte-preserved through ratchets").
+    rs_override: Option<&[u8]>,
 ) -> anyhow::Result<()> {
     let wallet = WalletContext::load(wallet_path)?;
     let outpoint = Outpoint::parse(outpoint_str)?;
@@ -175,15 +182,19 @@ pub async fn run(
         }
     };
 
-    let redeem_script = match side {
-        "buy" => {
-            let tcid = parse_token_cov_id(token_cov_id_resolved.as_deref())?;
-            contract::spot::order::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
+    let redeem_script = if let Some(rs) = rs_override {
+        rs.to_vec()
+    } else {
+        match side {
+            "buy" => {
+                let tcid = parse_token_cov_id(token_cov_id_resolved.as_deref())?;
+                contract::spot::order::build_buy_redeem_script(&tcid, price_num, price_den, min_fill, &owner_hash, &spk_hash, &compute_p2pk_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
+            }
+            "sell" => {
+                contract::spot::order::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
+            }
+            other => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", other),
         }
-        "sell" => {
-            contract::spot::order::build_sell_redeem_script(price_num, price_den, min_fill, &owner_hash, &spk_hash, &contract::compute_token_unit_spk_hash(&pubkey), max_matcher_fee, cancel_pending, expiry_daa)?
-        }
-        other => anyhow::bail!("Unknown side '{}'. Use 'buy' or 'sell'.", other),
     };
 
     let p2sh = build_p2sh(&redeem_script);

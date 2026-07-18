@@ -157,6 +157,19 @@ pub enum Commands {
         /// Max matcher fee (sompi) embedded in the redeemScript. Overrides cache value.
         #[arg(long)]
         max_matcher_fee: Option<u64>,
+
+        /// TIME-contract / OCO-family RS override (hex): use this exact
+        /// on-chain redeemScript verbatim instead of reconstructing a plain
+        /// v18 sell/buy shape from --price-num/--price-den/--min-fill. The
+        /// cancel sigscript envelope ([sig][pk][Op0][RS] for sells) is
+        /// agnostic to RS content (`build_sell_cancel_sigscript` /
+        /// `build_buy_cancel_sigscript` just embed whatever RS is given),
+        /// which is what makes an OCO/ratchet_oco cancel byte-preserved
+        /// through ratchets (§4.8) — this flag is the CLI-level plumbing for
+        /// that, mirroring `match-batch --sell-rs`. Required for cancelling
+        /// a ratchet_oco (initial or any post-splice continuation).
+        #[arg(long)]
+        rs: Option<String>,
     },
 
     /// Safely retire an order in two steps: first mark it, then cancel it.
@@ -2603,12 +2616,18 @@ pub async fn dispatch(
             fee_utxo,
             cpend,
             max_matcher_fee,
+            rs,
         } => {
             let token = if let Some(t) = token {
                 Some(token::resolve_token(&t, None)?)
             } else {
                 None
             };
+            let rs_override = rs
+                .as_deref()
+                .map(|s| hex::decode(s.trim()))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("--rs not hex: {}", e))?;
             cancel::run(
                 wallet_path,
                 node,
@@ -2626,6 +2645,7 @@ pub async fn dispatch(
                 fee_utxo.as_deref(),
                 cpend,
                 max_matcher_fee,
+                rs_override.as_deref(),
             )
             .await?;
         }

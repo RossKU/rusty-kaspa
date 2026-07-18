@@ -113,7 +113,7 @@ planner-bypass driver) — noted as the one covenant-level caps deferral.
 |---|---|---|
 | ratchet_oco deploy | **DEPLOYED LIVE** — RS **760B** | historical first deploy (pre-fix, superseded): `5d05efae518faaa9d8f354adc5076b904ef00cbd23c5189d1292633859529e10:0`, `d889a65c8be367da81aad2ae77499b2cafd759f599e2f7642dd62a491f748e00:0`. Final live-proof redeploy (this run): **`dfa23cc165096495a0014a71f583f07cc225e7e5d9af667faba71b20d6842397:0`** (TP 101/100, SL 25/100, rstep 1, rgap 0, rwin 60, mrv 8M, 100M escrow) |
 | **RT-1** ratchet advance (engine) | **SETTLED LIVE** — settle + SL advance composed and accepted in ONE tx | **`5759da5e5b09abacd9c862f5a871be47277dade07d851263434bfa74f6d5e0fd`** (blue score 508862900); continuation `…5e0fd:3` = 100,000,000 sompi at `kaspatest:pzaz097ufhkjmcsnrzw9gs25czejcxhx5cjek7a30cp2crgeg0nnj4jxjxlaa` (SL stepped 25/100 → 26/100, k=1) |
-| RT-2 adversarial set | DEFERRED (covenant unit-proven) — scope note below | Stage-A `time_contracts.rs` L1–L11 |
+| RT-2 adversarial set | **LANDED LIVE (2026-07-18, commit `b2869107`)** — 21/21 tamper cases REJECTED, honest advance ACCEPTED ×2; see "RT-2 — LANDED LIVE (2026-07-18)" section at the end of this file | Stage-A `time_contracts.rs` L1–L11 (unit) + `ratchet_tamper_live.rs` (live) |
 | RT-3 owner cancel of continuation | **SETTLED LIVE** — owner recovers full escrow with the original key | **`956af539b2a428cd3f18477008b901c5aee0446e1eb5309a59ed489a5a499bdd`** (blue score 508892097) |
 | **CP-3** buy sweeps ratchet TP | **SETTLED LIVE** — v18 buy fully sweeps the TP branch | **`10ff461089cfa59ad08fa67999e20e9ac69d8d50a678144a45b5d972b00539c8`** (blue score 508874731) |
 | Competing matcher (item 5) | DEFERRED live (unit-proven) | Stage-C weighted-selection/race/backoff tests |
@@ -258,7 +258,16 @@ Resubmitted and **REST-confirmed accepted**:
 score 508892097). out[0]=100,000,000 token refund to the owner's token_unit
 P2SH, out[1]=344,878,289 KAS change. Full escrow recovered.
 
-**RT-2 — remains DEFERRED (scope decision, 2026-07-18).** The adversarial set
+**RT-2 — superseded: LANDED LIVE 2026-07-18 (commit `b2869107`).** The scope
+decision below was the original call made earlier this same day; live-fire
+tooling was subsequently built later the same day and RT-2 now has a full
+live proof (21/21 tamper cases rejected, honest advance accepted twice) —
+see "RT-2 — LANDED LIVE (2026-07-18)" at the end of this file for the case
+table, TXIDs, and caveats. The original reasoning is kept verbatim below as
+historical record.
+
+*Original scope note (2026-07-18, historical — reasoning below superseded by
+the live-fire tooling built later the same day):* The adversarial set
 (8 sub-cases: second ratchet inside rwin, wrong-step splice, mutated
 non-window byte, print below threshold, cancel-sibling fake print, sub-mrv
 volume, travel-cap breach, self-reference) is already proven against the real
@@ -284,7 +293,11 @@ explicitly given. Marginal live value is also low: the real risk surface
 already exercise against the real engine; live-only differences would have to
 come from node/mempool policy, not covenant logic. Left DEFERRED, same as
 before, with this scope note. Competing-matcher (the stretch goal, gated on
-RT-2/RT-3 landing cleanly) was not attempted since RT-2 didn't land.
+RT-2/RT-3 landing cleanly) was not attempted since RT-2 didn't land — at the
+time of this note. (RT-2 landed live later the same day, see below;
+competing-matcher was separately unblocked and demonstrated live the same
+day too — see "Deferred-item closure" below, which is not gated on this
+RT-2 landing.)
 
 <!-- STAGE-G IN PROGRESS: remaining forms appended below as they land -->
 
@@ -1497,12 +1510,23 @@ prep" item above plus Stage-G's RT-1/CP-3/RT-3/RT-2.
 *(Update, later the same day: items 2 and 3 below are now CLOSED — see
 "Deferred-item closure + competing-matcher live race" at the end of this
 file. Only RT-2 remains deferred.)*
-- **RT-2** (8-case ratchet adversarial set) — already proven at the unit
+*(Further update, still 2026-07-18, a later follow-up session: item 1
+[RT-2] is now ALSO CLOSED — LANDED LIVE, commit `b2869107` — see
+"RT-2 — LANDED LIVE (2026-07-18)" at the end of this file. All three
+DEFERRED items in this list are now closed.)*
+- ~~**RT-2** (8-case ratchet adversarial set) — already proven at the unit
   level against the real `kaspa-txscript` engine (`time_contracts.rs`
   L1–L4/L8/L10/L11 + rwin/travel-cap tests); a LIVE demonstration needs a
   bespoke hand-rolled-sigscript CLI tool (same class of tooling the
   plain-fill `--tamper` mode has, but nothing equivalent exists for
-  ratchet-advance) — not built, judged out of proportion twice now.
+  ratchet-advance) — not built, judged out of proportion twice now.~~
+  **LANDED LIVE 2026-07-18 (commit `b2869107`)** — the reasoning above is
+  kept as historical record of the original call; the tooling described as
+  "not built" was subsequently built the same day (`ratchet_tamper_live.rs`
+  + two hidden CLI subcommands), reused the offline mutation logic
+  unchanged, and produced 21/21 tamper-case rejects plus two accepted
+  honest advances on testnet-10. See "RT-2 — LANDED LIVE (2026-07-18)"
+  below for the full record, including an attribution caveat.
 - **Competing-matcher live race** — blocked on two separate, real,
   pre-existing CLI tooling bugs, not a code path this session touched:
   `match-batch`'s on-chain order lookup disagreed with `order-status`'s
@@ -1596,6 +1620,14 @@ Live run (node `ws://65.108.107.30:18210`, wallet `/tmp/kob_e2e/wallet.json`):
 3. Phase-1/Phase-2 fee inconsistency in both `match` and `match-batch`:
    the submitted tx carries the stale Phase-1 fee even when Phase 2
    prints a "recovered" fee; currently masked by `KOB_FEE_FLOOR`.
+4. **(Cross-referenced, not found during this race — found during the
+   later RT-2 live-fire session, same day, commit `b2869107`; grouping
+   here since this is the file's running open-issues tally.)** `deploy
+   sell`'s token-UTXO auto-discovery (`pick_sell_deployable_token_utxo`)
+   can select a mint-authority UTXO over a fungible unit, causing a live
+   rejection. Worked around with an explicit `--token-utxo`; the
+   auto-discovery bug itself was NOT fixed, out of scope for that pass —
+   see "RT-2 — LANDED LIVE (2026-07-18)" below.
 
 Full logs: session scratchpad `competing_matcher_live_2026-07-18.md` and
 `/tmp/kob_e2e/race3_*.log`.
@@ -1604,3 +1636,129 @@ Full logs: session scratchpad `competing_matcher_live_2026-07-18.md` and
 demonstration still needs bespoke hand-rolled-sigscript tooling, judged
 out of proportion twice. Recommendation stands: skip unless the owner
 decides otherwise.
+
+*(Update, 2026-07-18, a further follow-up session: RT-2 also LANDED LIVE —
+commit `b2869107` ("feat: RT-2 live-fire tooling"), HEAD now `b2869107`,
+pushed. The "skip unless the owner decides otherwise" recommendation above
+was superseded before it was acted on. See "RT-2 — LANDED LIVE
+(2026-07-18)" immediately below for the full case table, TXIDs, and
+caveats. All three DEFERRED items from the "Canary readiness status"
+handoff section are now closed.)*
+
+## RT-2 — LANDED LIVE (2026-07-18)
+
+Adversarial live proof that the `ratchet_oco` covenant rejects malformed
+ratchet-advance transactions, fired against the real node on testnet-10 —
+the item marked DEFERRED everywhere else in this file up to this point has
+now landed. Commit `b2869107` ("feat: RT-2 live-fire tooling"); HEAD is now
+`b2869107`, pushed.
+
+**Tooling built** (all additive; the offline `ratchet-tamper` unit-test
+path is untouched): new `cli/src/ratchet_tamper_live.rs`; two hidden CLI
+subcommands, `ratchet-tamper-live` and `ratchet-tamper-live-prep-noncov`;
+a `list-token-utxos` diagnostic added to `kob-e2e-util`. The live tool
+reuses the offline `core/src/contract/spot/ratchet_tamper.rs` mutation
+logic UNCHANGED, pointing it at real outpoints/redeemScript/signing
+instead of the offline harness's synthetic ones — the same "reuse existing
+plumbing" principle RT-1/CP-3/RT-3 used.
+
+**Deployed live resources** (testnet-10, node `ws://65.108.107.30:18210`):
+token **V18A** `eab5c99a…`; honest `ratchet_oco` at `6b38c9a5…957be:0`
+(760B RS, 100,000,000 sompi escrow; params TP 5/1, SL 2/1, rstep 1, rgap 0,
+rwin 60, mrv 1,000,000, mmfee 30bps — mirroring the offline
+`honest_baseline()` ratios); genuine sibling sell `db983f3c…7f0:0` (542B
+RS, 100,000,000 tokens @ 3/1); no-covenant sibling `f5d93cf7…3e5:0`; V18B
+wrong-token sibling `f1ec4978…63f:0`. A second `ratchet_oco` (TP 4/1, SL
+2/1) plus two more siblings were deployed for the travel-cap stretch case.
+
+### All 21/21 tamper cases REJECTED by the real node
+
+Verbatim node errors, grouped by outcome:
+
+**Group 1 — generic script verification failure (17 cases)**, verbatim
+node error `script ran, but verification failed`: `l1`,
+`l2-cancel-shape`, `l2-wrong-token`, `l4-neg-pden`, `l4-neg-pnum`,
+`l4-zero-pden`, `l8`, `l10-wrong-step`, `l10-no-step`, `l10-sl-decrease`,
+`l10-mutated-prefix`, `l10-mutated-expiry`, `l10-mutated-cpend`,
+`l10-shortened`, `l11-short-value`, `l11-forged-spk`, `rate-travel-cap`.
+
+**Group 2 — covenant output-index check (1 case)**: `l2-noncovenant` →
+`covenants error: 0 is not a valid covenant output index for input 0 with
+0 authorized outputs`.
+
+**Group 3 — orphan (1 case)**: `l3` → `transaction … is an orphan where
+orphan is disallowed`.
+
+**Group 4 — ratchet-branch AuthOutputIdx check, named specifically (1
+case)**: `l11-unbound` → `covenants error: 0 is not a valid covenant
+output index for input 1 with 0 authorized outputs` — input 1, not input
+0 as in Group 2; this is the R13f AuthOutputIdx check firing on the
+ratchet branch itself.
+
+**Group 5 — CSV lock-time check, named specifically (1 case)**:
+`rate-rwin` → `Unsatisfied lock time: locktime is greater than the
+transaction locktime: 60 > 59` — the G1/R4 rwin CSV check.
+
+17 + 1 + 1 + 1 + 1 = **21/21 REJECTED**.
+
+### Honest advance ACCEPTED, twice (both REST-confirmed `is_accepted:true`)
+
+1. **`4c017ea7dd19184b6e4626cfede69312b4a0c66410b0a7a00f580b57175a404e`**
+   (accepting blue score 509107826); continuation output at
+   `kaspatest:pqepdadpv27mfg8vrg2xqwf7gk25d9j355hvxq30rsd3l9rkmlmrj25jdjwcv`,
+   independently re-derived byte-for-byte, proving SL genuinely stepped
+   2/1 → 3/1 on-chain with the full 100M escrow preserved.
+2. **`9c413867a05edc2b7d2e1a918364fa1738a442b20dfba26b32764cbf5e4d48bb`**
+   (accepting blue score 509108753) — the travel-cap precursor step 1,
+   same confirmation + continuation-address match.
+
+These two accepts matter as much as the 21 rejects: the same live tooling,
+against the same class of deployed contracts, DOES successfully advance
+the ratchet when the advance is honest — so the 21 rejects are rejections
+of specific malformations, not artifacts of a covenant that simply can't
+be used.
+
+### Attribution caveat — read before citing "21/21 isolated to the ratchet branch"
+
+For the cases that corrupt the sibling's OWN shape/price/covenant (`l1`,
+`l2-*`, `l3`, `l4-*`), the sibling's own independent covenant check also
+fails alongside the ratchet branch — because one shared genuine sibling
+was reused across cases rather than a bespoke sibling built per case. The
+live REJECT is real in every one of the 21 cases, but it is **not always
+as cleanly isolated to "the ratchet branch specifically"** as the offline
+proof (which executes only the ratchet input via
+`core/src/contract/spot/ratchet_tamper.rs` and has no sibling to conflate
+with). This does not weaken the core claim — every malformed advance
+tested was rejected on-chain — but some of the 21 rejects should be read
+as "the batch containing this malformation was rejected", not "the
+ratchet branch's specific guard fired in isolation, provably excluding the
+sibling as a cause". Groups 4 and 5 above (`l11-unbound`, `rate-rwin`) are
+the cleanest of the 21: both name a specific ratchet-branch check (R13f
+AuthOutputIdx, G1/R4 CSV) directly in the node's own error text.
+
+### Minor tooling bug found + fixed mid-run
+
+`l3`'s sibling sigscript initially embedded the sibling's own
+redeemScript instead of the ratchet's `rs`/`new_rs`. Functionally harmless
+(R7's byte-0 check fails identically either way) but patched in the live
+tool — now consistent with `core/src/contract/spot/ratchet_tamper.rs` — to
+give a faithful reproduction of the offline `l3` case, then re-fired:
+still rejects, now surfacing as the "orphan" error recorded in Group 3
+above.
+
+### Known issue found (NOT fixed, out of scope — product-side, separate from RT-2's own correctness)
+
+`deploy sell`'s token-UTXO auto-discovery
+(`pick_sell_deployable_token_utxo`) can select a mint-authority UTXO over
+a fungible unit, causing a live rejection. Worked around during this run
+with an explicit `--token-utxo`; the auto-discovery bug itself was not
+fixed, left as a known issue for a future pass. Cross-referenced as item 4
+in "New anomalies found during the race" above (this file's other
+open-issues tally).
+
+**Status: RT-2 LANDED LIVE — 21/21 malformed advances rejected, honest
+advance accepted twice, one minor tooling bug found-and-fixed, one
+product-side known issue found-not-fixed, one attribution caveat recorded
+prominently above. This closes the last item in the "Canary readiness
+status" DEFERRED list (see above); all three DEFERRED items from that
+handoff are now closed.**

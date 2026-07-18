@@ -12,12 +12,23 @@ budget bug found + fixed + permanently regression-tested, see
 `kob/domain/tests/budget_limited_repro.rs`); **the competing-matcher race
 SETTLED LIVE later the same day** (winner `d6cd4cff…`, loser cleanly
 double-spend-rejected — see `E2E_LIVE_RESULTS.md`'s "Deferred-item
-closure" section); **only RT-2 (adversarial set) remains DEFERRED**
-(unit-proven against the real engine already; live demonstration needs
-bespoke hand-rolled-sigscript tooling not yet built — see
-`E2E_LIVE_RESULTS.md`'s "Canary readiness status" handoff section for the
-full picture). Stage E (doc/final: E2E_MATRIX.md rows, README touch-ups,
-this stamp) is still open beyond what this update covers.
+closure" section). **RT-2 (adversarial set) LANDED LIVE the same day,
+2026-07-18 (commit `b2869107`, "feat: RT-2 live-fire tooling")** — new
+live-fire CLI tooling (`ratchet_tamper_live.rs` + two hidden subcommands)
+reused the offline `ratchet_tamper.rs` mutation logic UNCHANGED against
+real testnet-10 outpoints/redeemScript/signing; **all 21/21 tamper cases
+REJECTED** by the real node and the honest advance **ACCEPTED twice**
+(both REST-confirmed `is_accepted:true`) — see `E2E_LIVE_RESULTS.md`'s
+"RT-2 — LANDED LIVE (2026-07-18)" section for the full case table, TXIDs,
+and an attribution caveat (some reject cases reuse one shared genuine
+sibling whose own covenant check also fails alongside the ratchet branch,
+so the reject is not always as cleanly isolated to "the ratchet branch
+specifically" as the offline proof; this does not weaken the core
+on-chain-rejected claim). No longer deferred; RT-2's prior DEFERRED
+rationale (unit-proven against the real engine, live demonstration needs
+bespoke hand-rolled-sigscript tooling) is superseded now that tooling was
+built. Stage E (doc/final: E2E_MATRIX.md rows, README touch-ups, this
+stamp) is still open beyond what this update covers.
 Base: v18 single-generation spot (see `V18_DESIGN.md`), HEAD `bc07c18f`
 (2026-07-18; was `b37c590` at design-freeze time).
 History: this file was briefly `V19_TIME_DESIGN.md` (a generation-bump

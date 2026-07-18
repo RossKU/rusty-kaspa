@@ -338,9 +338,10 @@ pub enum Commands {
         #[arg(long)]
         buy_token: Option<String>,
 
-        /// Contract version: 18 (unified spot, both sides v18, BPS-uniform),
-        /// 16 (F6-fix buy contract, --mmfee-bps semantics), or 13/14
-        /// (legacy, shared RS layout; sell side is v14 for 13/14/16).
+        /// Contract version. Only 18 (unified spot, both sides v18,
+        /// BPS-uniform, canonical price attestation) is supported --
+        /// pre-v18 generations (13/14/16) were removed in Stage E and any
+        /// other value is a hard error.
         #[arg(long, default_value = "18")]
         version: u8,
 
@@ -359,12 +360,17 @@ pub enum Commands {
         #[arg(long, default_value = "10000000")]
         max_matcher_fee: u64,
 
-        /// Max matcher fee in basis points, embedded in a v16 buy
-        /// redeemScript (must match the deployed value). Sets --version to
-        /// 16 automatically. Also used (unless --fee-bps overrides it) as
-        /// the canonical planner's matcher-fee cap, so the built tx never
-        /// asks for more surplus than the buy's own on-chain F6 check
-        /// allows. Default when --version 16 and unset: 30 (0.30%).
+        /// Max matcher fee in basis points (v18), used to reconstruct the
+        /// buy/sell redeemScripts -- must match each order's deployed
+        /// value or the reconstructed P2SH won't match the on-chain order.
+        /// When set, applies to BOTH sides; when omitted, each side is
+        /// resolved independently from its orders.json cache entry
+        /// (max_matcher_fee), falling back to DEFAULT_MAX_MATCHER_FEE_BPS
+        /// (30 = 0.30%) if that outpoint isn't cached. Also used (unless
+        /// --fee-bps overrides it) as the canonical planner's matcher-fee
+        /// cap -- the conservative (tighter) of the two resolved sides --
+        /// so the built tx never asks for more surplus than either order's
+        /// own on-chain F6 check allows.
         #[arg(long)]
         mmfee_bps: Option<u64>,
 
@@ -381,6 +387,11 @@ pub enum Commands {
         /// Modes: f2-redirect-seller, f2-redirect-buyer, f4-remove-binding, f4-reduce-value
         #[arg(long)]
         tamper: Option<String>,
+
+        /// Build, fee-converge, and print the match transaction without
+        /// submitting it to the node.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// N:M atomic batch match -- fills multiple sell and buy orders in a single TX.
@@ -2723,6 +2734,7 @@ pub async fn dispatch(
             mmfee_bps,
             fee_bps,
             tamper,
+            dry_run,
         } => {
             let token = token::resolve_token(&token, None)?;
             let _buy_token = if let Some(bt) = buy_token {
@@ -2777,6 +2789,7 @@ pub async fn dispatch(
                     mmfee_bps,
                     fee_bps,
                     tamper_mode,
+                    dry_run,
                 )
                 .await?;
             }

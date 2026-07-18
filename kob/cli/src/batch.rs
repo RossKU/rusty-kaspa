@@ -531,6 +531,7 @@ async fn execute_operation(
                 Some(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
                 None, // fee_bps (defaults to mmfee_bps for v18 in matching::run)
                 None, // no tamper mode in batch
+                false, // no dry-run mode in batch
             )
             .await?;
             Ok(None)

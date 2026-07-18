@@ -41,6 +41,7 @@
 //! canonical planner; see that function's doc comment for why.
 
 use crate::node::NodeClient;
+use crate::order_cache::{self, OrderCache};
 use crate::signing;
 use kob_core::contract;
 use kob_core::p2sh::{blake2b_256, build_p2sh, compute_p2pk_spk_hash};
@@ -170,6 +171,35 @@ fn apply_tamper(tx: &mut Transaction, mode: &TamperMode) {
     }
 }
 
+/// Resolve the effective max_matcher_fee (BPS) for ONE side of a match.
+///
+/// Precedence: an explicit `--mmfee-bps` CLI flag (applies uniformly to
+/// both sides, matching the flag's documented behavior) wins; otherwise
+/// the order-cache entry's recorded `max_matcher_fee` for that specific
+/// outpoint (if the outpoint is cached) is used; otherwise the global
+/// default. Buy and sell orders can be deployed with different BPS caps,
+/// so callers MUST invoke this independently per side -- reusing one
+/// side's result for the other reconstructs the wrong redeemScript (wrong
+/// P2SH hash -> "UTXO not found on chain" at best, a mismatched/rejected
+/// spend at worst).
+fn resolve_side_mmfee_bps(explicit: Option<u64>, cached: Option<u64>) -> u64 {
+    explicit
+        .or(cached)
+        .unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS)
+}
+
+/// Resolve the canonical planner's matcher-surplus BPS cap from the two
+/// sides' resolved mmfee_bps values.
+///
+/// An explicit `--fee-bps` override always wins. Otherwise the
+/// CONSERVATIVE (tighter, i.e. min) of the two sides binds: the built tx
+/// spends both orders in the same transaction, so matcher surplus must
+/// stay within whichever side's on-chain F6 check is stricter -- capping
+/// to the looser side would let the tx be rejected by the tighter one.
+fn resolve_planner_fee_bps_cap(fee_bps: Option<u16>, buy_mmfee_bps: u64, sell_mmfee_bps: u64) -> Option<u16> {
+    fee_bps.or_else(|| Some(buy_mmfee_bps.min(sell_mmfee_bps) as u16))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 pub async fn run(
@@ -206,6 +236,7 @@ pub async fn run(
     mmfee_bps: Option<u64>,
     fee_bps: Option<u16>,
     tamper: Option<TamperMode>,
+    dry_run: bool,
 ) -> anyhow::Result<()> {
     if let Some(ref mode) = tamper {
         println!("!!! ADVERSARIAL TEST MODE: {:?} !!!", mode);
@@ -309,6 +340,32 @@ pub async fn run(
             );
         };
 
+    // Per-side mmfee_bps resolution: buy and sell orders can be deployed
+    // with different max_matcher_fee BPS caps, so a single --mmfee-bps
+    // value must not be blindly reused for both redeemScript rebuilds (a
+    // wrong guess produces the wrong P2SH, which then either fails the
+    // "UTXO not found on chain" lookup below or -- if it happens to match
+    // some other live UTXO by coincidence -- builds against the wrong
+    // order entirely). Precedence per side: explicit --mmfee-bps flag >
+    // that outpoint's orders.json cache entry > the global default. This
+    // mirrors `match-batch`, which always rebuilds each side's RS from its
+    // own cache entry's `max_matcher_fee` (see match_batch.rs).
+    let cache_path = order_cache::orders_cache_path(wallet_path);
+    let cache = OrderCache::load(&cache_path);
+    let buy_op_str = format!("{}:{}", buy_outpoint.transaction_id, buy_outpoint.index);
+    let sell_op_str = format!("{}:{}", sell_outpoint.transaction_id, sell_outpoint.index);
+    let buy_cached_mmfee = cache.orders.iter().find(|e| e.outpoint == buy_op_str).map(|e| e.max_matcher_fee);
+    let sell_cached_mmfee = cache.orders.iter().find(|e| e.outpoint == sell_op_str).map(|e| e.max_matcher_fee);
+    let buy_mmfee_bps = resolve_side_mmfee_bps(mmfee_bps, buy_cached_mmfee);
+    let sell_mmfee_bps = resolve_side_mmfee_bps(mmfee_bps, sell_cached_mmfee);
+    if buy_mmfee_bps != sell_mmfee_bps {
+        println!(
+            "Note: buy and sell resolved to different mmfee_bps (buy={}, sell={}) -- \
+             each side's redeemScript uses its own value.",
+            buy_mmfee_bps, sell_mmfee_bps
+        );
+    }
+
     // Reconstruct redeemScripts. v13/v14 share a layout (build_buy_redeem_script);
     // v16 is the F6-fix buy contract (mmfee_bps semantics, see V16_STATUS.md);
     // v18 is the unified spot generation (BOTH sides v18, BPS-uniform,
@@ -326,7 +383,7 @@ pub async fn run(
             &buy_owner_hash,
             &buy_spk_hash,
             &kob_core::compute_p2pk_spk_hash(&buyer_pubkey), // okspkh (E1 expire seat)
-            mmfee_bps.unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
+            buy_mmfee_bps,
             0,
             buy_expiry,
         )?
@@ -341,7 +398,7 @@ pub async fn run(
             &sell_owner_hash,
             &sell_spk_hash,
             &contract::compute_token_unit_spk_hash(&seller_pubkey), // otspkh (E1 expire seat)
-            mmfee_bps.unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS),
+            sell_mmfee_bps,
             0,
             sell_expiry,
         )?
@@ -446,18 +503,16 @@ pub async fn run(
     matcher_spk.extend_from_slice(&pubkey);
     matcher_spk.push(0xac);
 
-    // F6 correctness: a v16 buy's on-chain F6 check enforces
-    // `surplus <= buy.utxo_value/10000 * mmfee_bps`. Default the planner's
-    // own bps cap (applied to total_seller_kas <= buy.utxo_value) to the
-    // SAME mmfee_bps so the built tx never asks for more matcher surplus
-    // than F6 allows -- this is always a conservative subset of F6's
-    // allowance, never an over-cap. --fee-bps lets the operator choose a
-    // tighter cap; for a v14 buy (no on-chain F6 at all) the default stays
-    // uncapped, matching v14's existing "matcher takes the full spread"
-    // semantics.
-    let effective_fee_bps = fee_bps.or_else(|| {
-        Some(mmfee_bps.unwrap_or(crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS) as u16)
-    });
+    // F6 correctness: the buy's on-chain F6 check enforces
+    // `surplus <= buy.utxo_value/10000 * buy_mmfee_bps`, and (v18) the sell
+    // side carries its own analogous cap at sell_mmfee_bps. Default the
+    // planner's own bps cap (applied to total_seller_kas <= buy.utxo_value)
+    // to the CONSERVATIVE (tighter) of the two resolved sides so the built
+    // tx never asks for more matcher surplus than either order's own
+    // on-chain check allows -- this is always a subset of what's permitted,
+    // never an over-cap. --fee-bps lets the operator choose an even
+    // tighter cap explicitly.
+    let effective_fee_bps = resolve_planner_fee_bps_cap(fee_bps, buy_mmfee_bps, sell_mmfee_bps);
 
     let wallet_utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     let fee_utxo = if let Some(ref op) = fee_outpoint {
@@ -606,6 +661,12 @@ pub async fn run(
         println!("Miner fee:        {:>9} sompi", actual_fee);
     }
 
+    if dry_run {
+        println!();
+        println!("[DRY RUN] Match transaction built and validated. Not submitted.");
+        return Ok(());
+    }
+
     // Submit
     let payload = to_rpc_payload(&tx, &sigscripts);
     println!();
@@ -690,4 +751,56 @@ mod tests {
         assert_eq!(rs.len(), 119);
     }
 
+    // ---- resolve_side_mmfee_bps ----
+
+    #[test]
+    fn side_mmfee_explicit_flag_wins() {
+        // --mmfee-bps overrides even when the outpoint is cached at a
+        // different value.
+        assert_eq!(super::resolve_side_mmfee_bps(Some(50), Some(10)), 50);
+    }
+
+    #[test]
+    fn side_mmfee_cache_hit_used_when_no_flag() {
+        assert_eq!(super::resolve_side_mmfee_bps(None, Some(10)), 10);
+    }
+
+    #[test]
+    fn side_mmfee_falls_back_to_default() {
+        assert_eq!(
+            super::resolve_side_mmfee_bps(None, None),
+            kob_domain::DEFAULT_MAX_MATCHER_FEE_BPS
+        );
+    }
+
+    #[test]
+    fn side_mmfee_sides_can_differ_from_cache_alone() {
+        // No explicit flag: each side resolves independently from its own
+        // cache entry, so buy and sell can legitimately land on different
+        // BPS values (this is the bug this fix addresses -- previously a
+        // single value was reused for both sides).
+        let buy = super::resolve_side_mmfee_bps(None, Some(10));
+        let sell = super::resolve_side_mmfee_bps(None, Some(50));
+        assert_ne!(buy, sell);
+        assert_eq!(buy, 10);
+        assert_eq!(sell, 50);
+    }
+
+    // ---- resolve_planner_fee_bps_cap ----
+
+    #[test]
+    fn planner_cap_explicit_fee_bps_wins() {
+        assert_eq!(super::resolve_planner_fee_bps_cap(Some(5), 10, 50), Some(5));
+    }
+
+    #[test]
+    fn planner_cap_uses_conservative_min_of_sides() {
+        assert_eq!(super::resolve_planner_fee_bps_cap(None, 10, 50), Some(10));
+        assert_eq!(super::resolve_planner_fee_bps_cap(None, 50, 10), Some(10));
+    }
+
+    #[test]
+    fn planner_cap_equal_sides() {
+        assert_eq!(super::resolve_planner_fee_bps_cap(None, 30, 30), Some(30));
+    }
 }

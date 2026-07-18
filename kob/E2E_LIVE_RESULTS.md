@@ -113,8 +113,8 @@ planner-bypass driver) — noted as the one covenant-level caps deferral.
 |---|---|---|
 | ratchet_oco deploy | **DEPLOYED LIVE** — RS **760B** | historical first deploy (pre-fix, superseded): `5d05efae518faaa9d8f354adc5076b904ef00cbd23c5189d1292633859529e10:0`, `d889a65c8be367da81aad2ae77499b2cafd759f599e2f7642dd62a491f748e00:0`. Final live-proof redeploy (this run): **`dfa23cc165096495a0014a71f583f07cc225e7e5d9af667faba71b20d6842397:0`** (TP 101/100, SL 25/100, rstep 1, rgap 0, rwin 60, mrv 8M, 100M escrow) |
 | **RT-1** ratchet advance (engine) | **SETTLED LIVE** — settle + SL advance composed and accepted in ONE tx | **`5759da5e5b09abacd9c862f5a871be47277dade07d851263434bfa74f6d5e0fd`** (blue score 508862900); continuation `…5e0fd:3` = 100,000,000 sompi at `kaspatest:pzaz097ufhkjmcsnrzw9gs25czejcxhx5cjek7a30cp2crgeg0nnj4jxjxlaa` (SL stepped 25/100 → 26/100, k=1) |
-| RT-2 adversarial set | DEFERRED (covenant unit-proven) | Stage-A `time_contracts.rs` L1–L11 |
-| RT-3 owner cancel of continuation | DEFERRED (mechanism unit-proven) | §4.8 + OCO cancel byte-preserved through ratchets |
+| RT-2 adversarial set | DEFERRED (covenant unit-proven) — scope note below | Stage-A `time_contracts.rs` L1–L11 |
+| RT-3 owner cancel of continuation | **SETTLED LIVE** — owner recovers full escrow with the original key | **`956af539b2a428cd3f18477008b901c5aee0446e1eb5309a59ed489a5a499bdd`** (blue score 508892097) |
 | **CP-3** buy sweeps ratchet TP | **SETTLED LIVE** — v18 buy fully sweeps the TP branch | **`10ff461089cfa59ad08fa67999e20e9ac69d8d50a678144a45b5d972b00539c8`** (blue score 508874731) |
 | Competing matcher (item 5) | DEFERRED live (unit-proven) | Stage-C weighted-selection/race/backoff tests |
 
@@ -216,6 +216,70 @@ out[2]=5,116,223 wallet change. No covenant defect, no planner defect — the
 OCO-branch-selection glue and `plan_gtc_sweep_core`'s GTC floor check both
 worked correctly against the real ratchet_oco TP branch on the first
 correctly-priced attempt.
+
+**RT-3 — SETTLED LIVE (2026-07-18).** A fresh ratchet_oco/sibling-sell/buy
+cycle (identical params to the RT-1 proof) was deployed and the continuous
+engine composed the same settle+SL-advance
+(`e50ee3424b6f60ed91fb1a72ba8f1472b26f22ebdbb4f51b1bedc4b24a6fcf60`, accepted;
+continuation `…fcf60:3` = 100,000,000 sompi at the same deterministic k=1
+address as the RT-1 proof, confirming the splice is byte-for-byte
+reproducible). The owner then cancelled that continuation with the original
+key — **new CLI capability added for this**: `kob-cli cancel` could
+previously only reconstruct a plain v18 sell/buy redeemScript from
+`--price-num`/`--price-den`/`--min-fill`; it had no way to cancel an
+OCO/ratchet_oco shape (extra TP/SL/rstep/rgap/rwin/mrv fields, per the same
+gap `match-batch` closed earlier with `--sell-rs`). Added a `--rs` hex
+override (`kob/cli/src/cancel.rs`, `kob/cli/src/lib.rs`) that uses the exact
+on-chain redeemScript verbatim instead of reconstructing one; confirmed the
+cancel sigscript envelope (`build_sell_cancel_sigscript`) is already
+content-agnostic (just embeds whatever RS it's given), so this is the only
+change needed — proves §4.8's "OCO cancel byte-preserved through ratchets"
+end-to-end for the first time outside a unit test. `kob-cli cancel-mark` and
+the batch/TIF auto-cancel paths (`kob/cli/src/batch.rs`, `kob/cli/src/tif.rs`)
+were updated to pass the new parameter through unchanged (`None`, no behavior
+change) since they only ever cancel plain v18 orders.
+
+First attempt with the auto-selected (small, ~3.1M sompi) fee UTXO was
+rejected by the node: `transaction storage mass of 603305 is larger than max
+allowed size of 500000`. Root cause (operator/UTXO-selection, not a code
+bug): the cancel's own recovered-KAS change output ended up tiny (~1.5M
+sompi after the miner fee), and KIP-9 storage mass is inversely related to
+output value — a small-value output costs disproportionately more storage
+mass than a large one. Fixed by pointing `--fee-utxo` at one of the wallet's
+large (~346M sompi) UTXOs instead of relying on auto-selection, which made
+the KAS change output large too; storage mass dropped from 603,305 to 13.
+Resubmitted and **REST-confirmed accepted**:
+`956af539b2a428cd3f18477008b901c5aee0446e1eb5309a59ed489a5a499bdd` (blue
+score 508892097). out[0]=100,000,000 token refund to the owner's token_unit
+P2SH, out[1]=344,878,289 KAS change. Full escrow recovered.
+
+**RT-2 — remains DEFERRED (scope decision, 2026-07-18).** The adversarial set
+(8 sub-cases: second ratchet inside rwin, wrong-step splice, mutated
+non-window byte, print below threshold, cancel-sibling fake print, sub-mrv
+volume, travel-cap breach, self-reference) is already proven against the real
+`kaspa-txscript` TxScriptEngine by `time_contracts.rs`'s L1/L2/L3/L4/L8/L10/
+L11 + rwin-rate-limit + travel-cap unit tests (`ratchet_print_below_threshold_
+rejected`, `ratchet_garbage_prints_rejected`, `ratchet_nested_ratchet_print_
+rejected`, `ratchet_negative_encoding_print_rejected`, `ratchet_self_
+reference_rejected`, `ratchet_splice_pins`, `ratchet_continuation_escrow_
+pins`, `ratchet_rwin_rate_limit`, `ratchet_travel_cap`, `ratchet_handrolled_
+rstep_zero_rejected`) — the same script-verification engine the live node
+runs. Constructing genuinely malformed advance transactions to submit live
+(rather than just declining to compose, which the honest engine/planner
+already does) requires porting those tests' hand-rolled sigscript
+construction from their synthetic-UTXO harness into new live-network-capable
+CLI tooling (there is no existing flag or command that emits a deliberately
+invalid ratchet-advance tx, unlike the plain-fill `--tamper` mode
+`match-batch` already has for F6). That is materially more engineering than
+RT-1/CP-3/RT-3 needed (each of which reused or minimally extended existing
+plumbing) and was judged out of proportion to attempt in this pass — applying
+the same "don't deep-dive if it turns heavy" call the stretch goal was
+explicitly given. Marginal live value is also low: the real risk surface
+(consensus-level script verification) is identical to what the unit tests
+already exercise against the real engine; live-only differences would have to
+come from node/mempool policy, not covenant logic. Left DEFERRED, same as
+before, with this scope note. Competing-matcher (the stretch goal, gated on
+RT-2/RT-3 landing cleanly) was not attempted since RT-2 didn't land.
 
 <!-- STAGE-G IN PROGRESS: remaining forms appended below as they land -->
 

@@ -55,6 +55,22 @@ pub struct OrderCacheEntry {
     /// Max matcher fee cap embedded in the redeemScript (BPS in v18).
     #[serde(default = "default_max_matcher_fee")]
     pub max_matcher_fee: u64,
+    /// The exact redeemScript bytes (hex) that were deployed on-chain, if
+    /// known.
+    ///
+    /// Populated verbatim at deploy time from the same bytes used to build
+    /// the on-chain P2SH output (`deploy.rs`), so it can never diverge from
+    /// `p2sh_hash`. Reconstructing the redeemScript from this entry's other
+    /// (decomposed) fields is lossy -- it hardcodes the owner batch cap
+    /// (`--n-max`/`--batch-max`) and derives the E1 expire-seat SPK hash
+    /// from the CURRENTLY RUNNING wallet, both of which can silently differ
+    /// from what was actually deployed. Callers that need the real
+    /// redeemScript (matching, spending) should prefer this field over
+    /// reconstruction whenever it's present. `None` for cache entries
+    /// written before this field existed, or by code paths that never had
+    /// the exact bytes (e.g. `recover`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redeem_script: Option<String>,
 }
 
 fn default_cache_version() -> u8 {
@@ -63,6 +79,59 @@ fn default_cache_version() -> u8 {
 
 fn default_max_matcher_fee() -> u64 {
     crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS
+}
+
+/// Which source supplied the redeemScript bytes used for one side of a
+/// match (or cancel/spend of any kind that reads the order cache).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RsSource {
+    /// An explicit CLI override (e.g. `--sell-rs`/`--buy-rs`). Always wins:
+    /// the operator is asserting ground truth.
+    Override,
+    /// The cache entry's `redeem_script` field, recorded verbatim at deploy
+    /// time. Cannot diverge from the on-chain script.
+    Cached,
+    /// Reconstructed from the cache entry's decomposed fields. See the
+    /// `OrderCacheEntry::redeem_script` doc comment for why this can
+    /// silently diverge from the deployed script.
+    Reconstructed,
+}
+
+/// Resolve which RS source to use for one side of a match, given whether an
+/// explicit override was supplied and whether the cache carries a
+/// `redeem_script` for this entry.
+///
+/// Precedence: override > cached > reconstructed. `match-batch` has CLI
+/// override flags (`--sell-rs`/`--buy-rs`); `match` (singular) has none, so
+/// its callers always pass `has_override = false`.
+pub fn select_rs_source(has_override: bool, has_cached: bool) -> RsSource {
+    if has_override {
+        RsSource::Override
+    } else if has_cached {
+        RsSource::Cached
+    } else {
+        RsSource::Reconstructed
+    }
+}
+
+/// Verify that `rs`'s P2SH hash matches a cache-recorded `p2sh_hash` (hex).
+///
+/// `redeem_script` and `p2sh_hash` are written together at deploy time from
+/// the same bytes and must never disagree; a mismatch means the cache entry
+/// was hand-edited or corrupted some other way. Callers MUST treat a
+/// mismatch as fatal rather than proceeding -- spending against the wrong
+/// redeemScript either fails outright or, worse, succeeds against an
+/// unrelated on-chain script.
+pub fn verify_cached_rs_p2sh(rs: &[u8], p2sh_hash_hex: &str) -> anyhow::Result<()> {
+    let computed = hex::encode(kob_core::p2sh::blake2b_256(rs));
+    if !computed.eq_ignore_ascii_case(p2sh_hash_hex) {
+        anyhow::bail!(
+            "cached redeem_script's P2SH hash ({}) does not match cached p2sh_hash ({}) -- \
+             corrupt orders.json cache entry",
+            computed, p2sh_hash_hex
+        );
+    }
+    Ok(())
 }
 
 /// Persistent order cache file.
@@ -146,6 +215,8 @@ impl From<crate::cancel_all::CachedOrder> for OrderCacheEntry {
             expiry_daa: c.expiry_daa,
             // v18 caches store BPS.
             max_matcher_fee: crate::deploy::DEFAULT_MAX_MATCHER_FEE_BPS,
+            // Legacy format never carried the exact redeemScript bytes.
+            redeem_script: None,
         }
     }
 }
@@ -183,6 +254,7 @@ mod tests {
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
+            redeem_script: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let decoded: OrderCacheEntry = serde_json::from_str(&json).unwrap();
@@ -190,6 +262,79 @@ mod tests {
         assert_eq!(decoded.side, "buy");
         assert_eq!(decoded.price_num, 100);
         assert_eq!(decoded.version, 14);
+    }
+
+    #[test]
+    fn order_cache_entry_redeem_script_roundtrip() {
+        // Entry WITH redeem_script: hex round-trips and the field survives
+        // serialize -> deserialize.
+        let entry = OrderCacheEntry {
+            outpoint: "abc123:0".into(),
+            side: "sell".into(),
+            pair_id: "ff".repeat(32),
+            price_num: 100,
+            price_den: 1,
+            min_fill: 1_000_000,
+            owner_hash: "aa".repeat(32),
+            spk_hash: "bb".repeat(32),
+            p2sh_hash: "cc".repeat(32),
+            value: 50_000_000,
+            token: None,
+            version: 18,
+            expiry_daa: 0,
+            cancel_pending: false,
+            max_matcher_fee: 10_000_000,
+            redeem_script: Some("deadbeef".to_string()),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("redeem_script"), "field must serialize when present");
+        let decoded: OrderCacheEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.redeem_script, Some("deadbeef".to_string()));
+    }
+
+    #[test]
+    fn order_cache_entry_redeem_script_omitted_when_none() {
+        // Entry WITHOUT redeem_script: the field is skipped on serialize
+        // (compact cache files for entries that never had it) and
+        // deserializes back to None.
+        let entry = OrderCacheEntry {
+            outpoint: "abc123:0".into(),
+            side: "sell".into(),
+            pair_id: "ff".repeat(32),
+            price_num: 100,
+            price_den: 1,
+            min_fill: 1_000_000,
+            owner_hash: "aa".repeat(32),
+            spk_hash: "bb".repeat(32),
+            p2sh_hash: "cc".repeat(32),
+            value: 50_000_000,
+            token: None,
+            version: 18,
+            expiry_daa: 0,
+            cancel_pending: false,
+            max_matcher_fee: 10_000_000,
+            redeem_script: None,
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("redeem_script"), "field must be omitted when None");
+        let decoded: OrderCacheEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded.redeem_script, None);
+    }
+
+    #[test]
+    fn order_cache_entry_old_format_json_without_redeem_script_field() {
+        // A cache file written before this field existed must still parse,
+        // with redeem_script defaulting to None.
+        let json = r#"{
+            "outpoint": "abc:0",
+            "side": "sell",
+            "price_num": 1,
+            "price_den": 2,
+            "min_fill": 100,
+            "value": 5000000
+        }"#;
+        let entry: OrderCacheEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.redeem_script, None);
     }
 
     #[test]
@@ -237,6 +382,7 @@ mod tests {
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
+            redeem_script: None,
         });
 
         let path = &std::env::temp_dir().join("kob_test_order_cache.json");
@@ -292,6 +438,7 @@ mod tests {
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
+            redeem_script: None,
         });
 
         let lookup = cache.by_p2sh_hash();
@@ -319,6 +466,7 @@ mod tests {
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
+            redeem_script: None,
         });
         cache.orders.push(OrderCacheEntry {
             outpoint: "ee".repeat(32) + ":1",
@@ -336,6 +484,7 @@ mod tests {
             expiry_daa: 0,
             cancel_pending: false,
             max_matcher_fee: 10_000_000,
+            redeem_script: None,
         });
 
         assert_eq!(cache.orders.len(), 2);
@@ -349,5 +498,51 @@ mod tests {
         let wallet = Path::new("/tmp/wallets/w0.json");
         let cache = orders_cache_path(wallet);
         assert_eq!(cache, Path::new("/tmp/wallets/orders.json"));
+    }
+
+    // ---- select_rs_source ----
+
+    #[test]
+    fn rs_source_override_wins_over_cached() {
+        assert_eq!(select_rs_source(true, true), RsSource::Override);
+    }
+
+    #[test]
+    fn rs_source_override_wins_when_nothing_cached() {
+        assert_eq!(select_rs_source(true, false), RsSource::Override);
+    }
+
+    #[test]
+    fn rs_source_cached_used_when_no_override() {
+        assert_eq!(select_rs_source(false, true), RsSource::Cached);
+    }
+
+    #[test]
+    fn rs_source_falls_back_to_reconstructed() {
+        assert_eq!(select_rs_source(false, false), RsSource::Reconstructed);
+    }
+
+    // ---- verify_cached_rs_p2sh ----
+
+    #[test]
+    fn verify_cached_rs_p2sh_accepts_matching_hash() {
+        let rs = b"some redeem script bytes".to_vec();
+        let hash_hex = hex::encode(kob_core::p2sh::blake2b_256(&rs));
+        assert!(verify_cached_rs_p2sh(&rs, &hash_hex).is_ok());
+    }
+
+    #[test]
+    fn verify_cached_rs_p2sh_accepts_matching_hash_case_insensitively() {
+        let rs = b"some redeem script bytes".to_vec();
+        let hash_hex = hex::encode(kob_core::p2sh::blake2b_256(&rs)).to_uppercase();
+        assert!(verify_cached_rs_p2sh(&rs, &hash_hex).is_ok());
+    }
+
+    #[test]
+    fn verify_cached_rs_p2sh_rejects_mismatch() {
+        let rs = b"some redeem script bytes".to_vec();
+        let wrong_hash = "ff".repeat(32);
+        let err = verify_cached_rs_p2sh(&rs, &wrong_hash).unwrap_err();
+        assert!(err.to_string().contains("corrupt"));
     }
 }

@@ -118,28 +118,57 @@ pub async fn run(
             spk_hash
         };
 
-        // TIME-contract RS override (positionally matched): use the deployed
-        // decay_sell / twap_sell redeemScript verbatim so the planner can
-        // re-classify the kind from the bytes. The order cache does not store
-        // the schedule fields, so the cache-rebuilt plain-sell RS would hash
-        // to the wrong P2SH and never match the on-chain UTXO.
-        let rs = if let Some(hex_rs) = sell_rs_override.get(op_i).filter(|s| !s.is_empty()) {
-            hex::decode(hex_rs.trim())
-                .map_err(|e| anyhow::anyhow!("--sell-rs[{}] not hex: {}", op_i, e))?
-        } else if entry.version == 18 {
-            contract::spot::order::build_sell_redeem_script(
-                entry.price_num,
-                entry.price_den,
-                entry.min_fill,
-                &sell_owner,
-                &sell_spkh,
-                &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
-                entry.max_matcher_fee, // v18 caches store BPS
-                0, // cancel_pending
-                entry.expiry_daa,
-            )?
+        // RS source precedence: explicit --sell-rs override (positionally
+        // matched) > cached entry.redeem_script (recorded verbatim at deploy
+        // time) > reconstruct-from-fields. Reconstruction hardcodes the
+        // owner batch cap (deploy allows narrowing it via --batch-max) and
+        // derives the E1 expire-seat SPK hash from the CURRENTLY RUNNING
+        // wallet, either of which can silently diverge from the real
+        // deployed script -- this also bit TIME-contract orders (decay_sell
+        // / twap_sell), since the cache never stored the schedule fields.
+        // A cached/overridden RS is used verbatim for BOTH the P2SH query
+        // address below and the sigscript build, so the two can't disagree.
+        let override_hex = sell_rs_override.get(op_i).filter(|s| !s.is_empty());
+        let cached_rs: Option<Vec<u8>> = if override_hex.is_some() {
+            None
+        } else if let Some(hex_rs) = &entry.redeem_script {
+            let bytes = hex::decode(hex_rs)
+                .map_err(|e| anyhow::anyhow!("Sell order {} cache redeem_script not valid hex: {}", op_str, e))?;
+            order_cache::verify_cached_rs_p2sh(&bytes, &entry.p2sh_hash)
+                .map_err(|e| anyhow::anyhow!("Sell order {}: {}", op_str, e))?;
+            Some(bytes)
         } else {
-            anyhow::bail!("Sell order {} has unsupported version {} (pre-v18 removed in Stage E)", op_str, entry.version);
+            None
+        };
+        let rs_source = order_cache::select_rs_source(override_hex.is_some(), cached_rs.is_some());
+        let rs = match rs_source {
+            order_cache::RsSource::Override => {
+                hex::decode(override_hex.unwrap().trim())
+                    .map_err(|e| anyhow::anyhow!("--sell-rs[{}] not hex: {}", op_i, e))?
+            }
+            order_cache::RsSource::Cached => cached_rs.unwrap(),
+            order_cache::RsSource::Reconstructed if entry.version == 18 => {
+                eprintln!(
+                    "warning: sell order {} cache predates redeem-script storage; reconstructing \
+                     from decomposed fields. This may diverge from the deployed script for orders \
+                     deployed with a custom --n-max/--batch-max or from a different wallet.",
+                    op_str
+                );
+                contract::spot::order::build_sell_redeem_script(
+                    entry.price_num,
+                    entry.price_den,
+                    entry.min_fill,
+                    &sell_owner,
+                    &sell_spkh,
+                    &contract::compute_token_unit_spk_hash(&pubkey), // otspkh (E1 expire seat)
+                    entry.max_matcher_fee, // v18 caches store BPS
+                    0, // cancel_pending
+                    entry.expiry_daa,
+                )?
+            }
+            order_cache::RsSource::Reconstructed => {
+                anyhow::bail!("Sell order {} has unsupported version {} (pre-v18 removed in Stage E)", op_str, entry.version);
+            }
         };
         let p2sh = build_p2sh(&rs);
 
@@ -188,10 +217,24 @@ pub async fn run(
             }
         };
 
-        // Query value from chain
-        let addr = crate::cancel::kaspa_address_encode(
-            network.address_prefix(), 8, &p2sh.script()[2..34],
-        );
+        // Query value from chain. When the RS was cached/overridden, `rs` IS
+        // the real deployed script, so deriving the address from it (via
+        // `p2sh`) is exact. When it was reconstructed (no cached RS), don't
+        // trust that reconstruction for the lookup either -- query the
+        // cache's ground-truth `p2sh_hash` instead (the same value
+        // `order-status` uses), which fixes the false "not found on chain"
+        // for orders whose reconstruction diverges from the real script.
+        let query_hash: Vec<u8> = if rs_source == order_cache::RsSource::Reconstructed {
+            let h = hex::decode(&entry.p2sh_hash)
+                .map_err(|e| anyhow::anyhow!("Sell order {} cache p2sh_hash not valid hex: {}", op_str, e))?;
+            if h.len() != 32 {
+                anyhow::bail!("Sell order {} cache p2sh_hash is not 32 bytes ({}); re-deploy or supply --sell-rs", op_str, h.len());
+            }
+            h
+        } else {
+            p2sh.script()[2..34].to_vec()
+        };
+        let addr = crate::cancel::kaspa_address_encode(network.address_prefix(), 8, &query_hash);
         let utxos = rpc.get_utxos_by_addresses(&[&addr]).await?;
         let value = utxos.iter()
             .find(|u| u.outpoint.transaction_id == op.transaction_id && u.outpoint.index == op.index)
@@ -253,33 +296,72 @@ pub async fn run(
             spk_hash
         };
 
-        // TIME-contract RS override: a decay_buy (rising bid) redeemScript is
-        // used verbatim so `buy_is_decay` fires and the decay_buy planners run.
-        let rs = if let Some(hex_rs) = buy_rs_override.get(op_i).filter(|s| !s.is_empty()) {
-            hex::decode(hex_rs.trim())
-                .map_err(|e| anyhow::anyhow!("--buy-rs[{}] not hex: {}", op_i, e))?
-        } else if entry.version == 18 {
-            contract::spot::order::build_buy_redeem_script(
-                &tcid,
-                entry.price_num,
-                entry.price_den,
-                entry.min_fill,
-                &buy_owner,
-                &buy_spkh,
-                &kob_core::compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
-                entry.max_matcher_fee, // v18 caches store BPS
-                0, // cancel_pending
-                entry.expiry_daa,
-            )?
+        // RS source precedence: explicit --buy-rs override (positionally
+        // matched, e.g. a decay_buy rising-bid script so `buy_is_decay`
+        // fires downstream) > cached entry.redeem_script (recorded verbatim
+        // at deploy time) > reconstruct-from-fields. See the sell path above
+        // for why reconstruction can silently diverge from the deployed
+        // script. A cached/overridden RS is used verbatim for BOTH the P2SH
+        // query address below and the sigscript build.
+        let override_hex = buy_rs_override.get(op_i).filter(|s| !s.is_empty());
+        let cached_rs: Option<Vec<u8>> = if override_hex.is_some() {
+            None
+        } else if let Some(hex_rs) = &entry.redeem_script {
+            let bytes = hex::decode(hex_rs)
+                .map_err(|e| anyhow::anyhow!("Buy order {} cache redeem_script not valid hex: {}", op_str, e))?;
+            order_cache::verify_cached_rs_p2sh(&bytes, &entry.p2sh_hash)
+                .map_err(|e| anyhow::anyhow!("Buy order {}: {}", op_str, e))?;
+            Some(bytes)
         } else {
-            anyhow::bail!("Buy order {} has unsupported version {} (pre-v18 removed in Stage E)", op_str, entry.version);
+            None
+        };
+        let rs_source = order_cache::select_rs_source(override_hex.is_some(), cached_rs.is_some());
+        let rs = match rs_source {
+            order_cache::RsSource::Override => {
+                hex::decode(override_hex.unwrap().trim())
+                    .map_err(|e| anyhow::anyhow!("--buy-rs[{}] not hex: {}", op_i, e))?
+            }
+            order_cache::RsSource::Cached => cached_rs.unwrap(),
+            order_cache::RsSource::Reconstructed if entry.version == 18 => {
+                eprintln!(
+                    "warning: buy order {} cache predates redeem-script storage; reconstructing \
+                     from decomposed fields. This may diverge from the deployed script for orders \
+                     deployed with a custom --n-max/--batch-max or from a different wallet.",
+                    op_str
+                );
+                contract::spot::order::build_buy_redeem_script(
+                    &tcid,
+                    entry.price_num,
+                    entry.price_den,
+                    entry.min_fill,
+                    &buy_owner,
+                    &buy_spkh,
+                    &kob_core::compute_p2pk_spk_hash(&pubkey), // okspkh (E1 expire seat)
+                    entry.max_matcher_fee, // v18 caches store BPS
+                    0, // cancel_pending
+                    entry.expiry_daa,
+                )?
+            }
+            order_cache::RsSource::Reconstructed => {
+                anyhow::bail!("Buy order {} has unsupported version {} (pre-v18 removed in Stage E)", op_str, entry.version);
+            }
         };
         let p2sh = build_p2sh(&rs);
 
-        // Query value from chain
-        let addr = crate::cancel::kaspa_address_encode(
-            network.address_prefix(), 8, &p2sh.script()[2..34],
-        );
+        // Query value from chain (see the sell path above for why the
+        // ground-truth `p2sh_hash` is used instead of the reconstructed RS
+        // when nothing better is cached/overridden).
+        let query_hash: Vec<u8> = if rs_source == order_cache::RsSource::Reconstructed {
+            let h = hex::decode(&entry.p2sh_hash)
+                .map_err(|e| anyhow::anyhow!("Buy order {} cache p2sh_hash not valid hex: {}", op_str, e))?;
+            if h.len() != 32 {
+                anyhow::bail!("Buy order {} cache p2sh_hash is not 32 bytes ({}); re-deploy or supply --buy-rs", op_str, h.len());
+            }
+            h
+        } else {
+            p2sh.script()[2..34].to_vec()
+        };
+        let addr = crate::cancel::kaspa_address_encode(network.address_prefix(), 8, &query_hash);
         let utxos = rpc.get_utxos_by_addresses(&[&addr]).await?;
         let value = utxos.iter()
             .find(|u| u.outpoint.transaction_id == op.transaction_id && u.outpoint.index == op.index)

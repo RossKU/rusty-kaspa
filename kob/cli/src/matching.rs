@@ -200,6 +200,28 @@ fn resolve_planner_fee_bps_cap(fee_bps: Option<u16>, buy_mmfee_bps: u64, sell_mm
     fee_bps.or_else(|| Some(buy_mmfee_bps.min(sell_mmfee_bps) as u16))
 }
 
+/// Resolve the cached redeemScript bytes for one side of a match, if the
+/// cache entry has one and it passes the p2sh_hash sanity check.
+///
+/// `match` (singular) has no `--sell-rs`/`--buy-rs` override flags, so this
+/// is the whole precedence: cached (ground truth, recorded verbatim at
+/// deploy time) beats reconstruction from the CLI-supplied price/hash
+/// arguments, which -- like `match-batch`'s reconstruction path -- hardcodes
+/// the owner batch cap and derives the E1 expire-seat SPK hash from the
+/// currently running wallet. Returns `Ok(None)` when there's nothing cached
+/// (the reconstruction fallback applies); `Err` when a cached entry exists
+/// but its `redeem_script` doesn't hash to its own `p2sh_hash` (corrupt
+/// cache).
+fn resolve_cached_rs(entry: Option<&order_cache::OrderCacheEntry>, op_str: &str) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(entry) = entry else { return Ok(None) };
+    let Some(hex_rs) = &entry.redeem_script else { return Ok(None) };
+    let bytes = hex::decode(hex_rs)
+        .map_err(|e| anyhow::anyhow!("Order {} cache redeem_script not valid hex: {}", op_str, e))?;
+    order_cache::verify_cached_rs_p2sh(&bytes, &entry.p2sh_hash)
+        .map_err(|e| anyhow::anyhow!("Order {}: {}", op_str, e))?;
+    Ok(Some(bytes))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[allow(deprecated)]
 pub async fn run(
@@ -354,8 +376,10 @@ pub async fn run(
     let cache = OrderCache::load(&cache_path);
     let buy_op_str = format!("{}:{}", buy_outpoint.transaction_id, buy_outpoint.index);
     let sell_op_str = format!("{}:{}", sell_outpoint.transaction_id, sell_outpoint.index);
-    let buy_cached_mmfee = cache.orders.iter().find(|e| e.outpoint == buy_op_str).map(|e| e.max_matcher_fee);
-    let sell_cached_mmfee = cache.orders.iter().find(|e| e.outpoint == sell_op_str).map(|e| e.max_matcher_fee);
+    let buy_cached_entry = cache.orders.iter().find(|e| e.outpoint == buy_op_str);
+    let sell_cached_entry = cache.orders.iter().find(|e| e.outpoint == sell_op_str);
+    let buy_cached_mmfee = buy_cached_entry.map(|e| e.max_matcher_fee);
+    let sell_cached_mmfee = sell_cached_entry.map(|e| e.max_matcher_fee);
     let buy_mmfee_bps = resolve_side_mmfee_bps(mmfee_bps, buy_cached_mmfee);
     let sell_mmfee_bps = resolve_side_mmfee_bps(mmfee_bps, sell_cached_mmfee);
     if buy_mmfee_bps != sell_mmfee_bps {
@@ -366,15 +390,27 @@ pub async fn run(
         );
     }
 
-    // Reconstruct redeemScripts. v13/v14 share a layout (build_buy_redeem_script);
-    // v16 is the F6-fix buy contract (mmfee_bps semantics, see V16_STATUS.md);
-    // v18 is the unified spot generation (BOTH sides v18, BPS-uniform,
-    // canonical price attestation — see V18_DESIGN.md).
+    // Resolve redeemScripts. Precedence per side (no CLI override flags
+    // exist for `match`, singular): cached entry.redeem_script (recorded
+    // verbatim at deploy time) > reconstruct from the price/hash arguments
+    // above. v13/v14 share a layout (build_buy_redeem_script); v16 is the
+    // F6-fix buy contract (mmfee_bps semantics, see V16_STATUS.md); v18 is
+    // the unified spot generation (BOTH sides v18, BPS-uniform, canonical
+    // price attestation — see V18_DESIGN.md).
     if version != 18 {
         anyhow::bail!("Unsupported contract version {}. Only v18 is supported (pre-v18 removed in Stage E).", version);
     }
     let buy_version: u8 = 18;
-    let buy_rs = if buy_version == 18 {
+    let buy_cached_rs = resolve_cached_rs(buy_cached_entry, &buy_op_str)?;
+    let buy_rs = if let Some(bytes) = buy_cached_rs {
+        bytes
+    } else if buy_version == 18 {
+        eprintln!(
+            "warning: buy order {} cache predates redeem-script storage; reconstructing from \
+             the supplied price/hash arguments. This may diverge from the deployed script for \
+             orders deployed with a custom --n-max or from a different wallet.",
+            buy_op_str
+        );
         contract::spot::order::build_buy_redeem_script(
             &tcid,
             buy_price_num,
@@ -390,7 +426,16 @@ pub async fn run(
     } else {
         anyhow::bail!("Unsupported buy version {} (pre-v18 removed in Stage E)", buy_version);
     };
-    let sell_rs = if version == 18 {
+    let sell_cached_rs = resolve_cached_rs(sell_cached_entry, &sell_op_str)?;
+    let sell_rs = if let Some(bytes) = sell_cached_rs {
+        bytes
+    } else if version == 18 {
+        eprintln!(
+            "warning: sell order {} cache predates redeem-script storage; reconstructing from \
+             the supplied price/hash arguments. This may diverge from the deployed script for \
+             orders deployed with a custom --batch-max or from a different wallet.",
+            sell_op_str
+        );
         contract::spot::order::build_sell_redeem_script(
             sell_price_num,
             sell_price_den,
@@ -802,5 +847,59 @@ mod tests {
     #[test]
     fn planner_cap_equal_sides() {
         assert_eq!(super::resolve_planner_fee_bps_cap(None, 30, 30), Some(30));
+    }
+
+    // ---- resolve_cached_rs ----
+
+    fn make_order_cache_entry(redeem_script: Option<&[u8]>, p2sh_hash: &str) -> crate::order_cache::OrderCacheEntry {
+        crate::order_cache::OrderCacheEntry {
+            outpoint: "aa".repeat(32) + ":0",
+            side: "buy".to_string(),
+            pair_id: "00".repeat(32),
+            price_num: 1,
+            price_den: 1,
+            min_fill: 1,
+            owner_hash: String::new(),
+            spk_hash: String::new(),
+            p2sh_hash: p2sh_hash.to_string(),
+            value: 1,
+            cancel_pending: false,
+            token: None,
+            version: 18,
+            expiry_daa: 0,
+            max_matcher_fee: 30,
+            redeem_script: redeem_script.map(hex::encode),
+        }
+    }
+
+    #[test]
+    fn resolve_cached_rs_none_when_no_entry() {
+        assert_eq!(super::resolve_cached_rs(None, "op").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_cached_rs_none_when_entry_has_no_redeem_script() {
+        let entry = make_order_cache_entry(None, &"cc".repeat(32));
+        assert_eq!(super::resolve_cached_rs(Some(&entry), "op").unwrap(), None);
+    }
+
+    #[test]
+    fn resolve_cached_rs_returns_bytes_when_hash_matches() {
+        let rs = vec![0x51u8, 0x52, 0x53];
+        let hash_hex = hex::encode(blake2b_256(&rs));
+        let entry = make_order_cache_entry(Some(&rs), &hash_hex);
+        let result = super::resolve_cached_rs(Some(&entry), "op").unwrap();
+        assert_eq!(result, Some(rs));
+    }
+
+    #[test]
+    fn resolve_cached_rs_errors_on_p2sh_mismatch() {
+        // Corrupt cache: redeem_script present but doesn't hash to the
+        // entry's own p2sh_hash -- must error out loudly, not proceed.
+        let rs = vec![0x51u8, 0x52, 0x53];
+        let wrong_hash = "ff".repeat(32);
+        let entry = make_order_cache_entry(Some(&rs), &wrong_hash);
+        let err = super::resolve_cached_rs(Some(&entry), "op").unwrap_err();
+        assert!(err.to_string().contains("corrupt"));
     }
 }

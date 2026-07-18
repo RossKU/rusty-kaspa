@@ -716,6 +716,9 @@ pub async fn deploy_buy(
         version,
         expiry_daa: expiry_daa.unwrap_or(0),
         max_matcher_fee: if version >= 16 { mmfee_bps.unwrap_or(DEFAULT_MAX_MATCHER_FEE_BPS) } else { max_matcher_fee },
+        // Exact bytes deployed on-chain -- lets later commands (match-batch,
+        // match) spend this order without lossily reconstructing the RS.
+        redeem_script: Some(hex::encode(&redeem_script)),
     };
     let mut cache = OrderCache::load(&cache_path);
     cache.orders.push(entry);
@@ -1380,6 +1383,10 @@ pub async fn deploy_sell(
         // v18 caches store BPS (the value baked into the deployed RS), same
         // as the buy path above; pre-v18 keeps the legacy sompi cap.
         max_matcher_fee: if version >= 18 { sell_bps } else { max_matcher_fee },
+        // Exact bytes deployed on-chain (covers Plain/Twap/Decay variants
+        // alike) -- lets later commands spend this order without lossily
+        // reconstructing the RS.
+        redeem_script: Some(hex::encode(&redeem_script)),
     };
     let mut cache = OrderCache::load(&cache_path);
     cache.orders.push(entry);

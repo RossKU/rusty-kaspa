@@ -787,6 +787,9 @@ pub async fn recover_orders(
             version: 13,
             expiry_daa: 0,
             max_matcher_fee: crate::deploy::DEFAULT_MAX_MATCHER_FEE,
+            // Chain-scan recovery doesn't have the exact deployed RS bytes,
+            // only the parsed fields and the on-chain p2sh_hash.
+            redeem_script: None,
         });
     }
 

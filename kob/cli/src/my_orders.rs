@@ -365,6 +365,7 @@ mod tests {
             version: 13,
             expiry_daa: 0,
             max_matcher_fee: 10_000_000,
+            redeem_script: None,
         }
     }
 

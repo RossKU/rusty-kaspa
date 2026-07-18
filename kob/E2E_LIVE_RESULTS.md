@@ -1372,3 +1372,59 @@ above) + `kob/engine/src/storage/persistence.rs` unit tests
 `p2sh_to_address_matches_known_live_testnet_vector` — pinned against this
 same `ad0c2027…:0` P2SH/address pair) + `kob-settle`'s
 `retry_config_default_has_reconnect_giveup_cap`.
+
+## Mainnet canary prep — KIP-10/Toccata activation status (2026-07-18)
+
+**Conclusion: already active on mainnet, ~2.5 weeks ago — the canary is not
+gated on activation.** KOB's covenant/introspection opcodes are gated by a
+single consensus flag, set directly from the Toccata hardfork activation
+(`consensus/src/processes/transaction_validator/tx_validation_in_utxo_context.rs`,
+non-test code): `let covenants_enabled = self.toccata_activation.is_active(block_daa_score);`
+— there is no separate KIP-10-specific flag in this codebase; the vestigial
+`kip10_enabled` name only survives in one stale doc comment
+(`crypto/txscript/src/lib.rs`) on a function whose actual signature dropped
+that parameter, an artifact from upstream's now-long-since-activated
+original KIP-10 introspection opcodes predating this fork's covenant work.
+Mainnet's `toccata_activation` is a hardcoded DAA score,
+`consensus/core/src/config/params.rs::MAINNET_PARAMS`:
+`ForkActivation::new(474_165_565)` ("Roughly 2026-06-30 1615 UTC" per the
+same file's comment, corroborated by `docs/toccata-guide.md`'s "The hard
+fork is scheduled to activate on mainnet at DAA score `474,165,565`,
+roughly on June 30, 2026" — attributing the covenant/introspection opcode
+set to KIP16/17/20/21 under the Toccata umbrella, which is what "KIP-10" is
+colloquially referring to here). Live-queried mainnet `virtualDaaScore` via
+`https://api.kaspa.org/info/network` on 2026-07-18: **489,251,582** — about
+15.09M DAA past the activation threshold, consistent with the calendar
+estimate (today is ~18 days after the ~June 30 estimate). Testnet-10 (where
+all KOB live proofs run) activated even earlier: `toccata_activation =
+467_579_632` ("~16:00 UTC, May 18, 2026").
+
+## Mainnet canary prep — competing-matcher live test: DEFERRED (2026-07-18)
+
+Attempted a live double-spend race on testnet-10 (two `match-batch`/`match`
+invocations built to settle the same resting order pair, launched
+concurrently, expecting one accepted + one node-rejected as double-spend).
+Wallet had ample funds (70.95 KAS free) and several genuinely-live crossing
+pairs were confirmed via `order-status` (a direct live UTXO check) —
+including the sell `47d4ffe1…:0` / buy `6eb2a4c4…:0` pair from the Task-B
+rescan smoke test, still OPEN and untouched. However:
+- `match-batch` (cache-based, reads `orders.json`) failed on TWO different
+  confirmed-open pairs with `Sell order ... not found on chain`, even though
+  `order-status` had just confirmed each one OPEN moments earlier — pointing
+  at a real discrepancy between `match-batch`'s own on-chain lookup/P2SH
+  reconstruction and the order's actual live UTXO, not a race artifact
+  (both concurrent invocations failed identically, before either could
+  reach submission).
+- `match` (singular, explicit-parameter reconstruction, no cache
+  dependency) has no `--dry-run`, and its `--mmfee-bps` flag is documented
+  to force `--version` to 16 — ambiguous/conflicting for this pair's v18
+  unified-spot buy, with no safe way to validate the reconstruction before
+  an irreversible submit attempt.
+
+Both dead ends look like real, pre-existing tooling bugs in order
+lookup/reconstruction, separate from anything in Task A/B/C/D — chasing them
+down was explicitly out of scope for this pass (same principle as RT-2's
+deferral). **No funds were moved and no orders were consumed** by any
+attempt (`order-status` reconfirmed both `47d4ffe1…:0` and `6eb2a4c4…:0`
+still OPEN afterward) — DEFERRED, unit-proven double-spend rejection
+already covered by consensus-level tests elsewhere in this workspace.

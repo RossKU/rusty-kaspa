@@ -281,6 +281,66 @@ pub async fn load_order_book(
 /// in one RPC call. Any order whose outpoint is absent from the response is
 /// dropped. The wallet address prefix ("kaspatest" / "kaspa") is inferred
 /// from `wallet_address`.
+/// Max addresses per `getUtxosByAddresses` call during validate/rescan.
+///
+/// The block-catchup path (H1-CHUNK, `chain/executor.rs`) chunks by BLOCK
+/// COUNT over a totally different RPC (`getVirtualChainFromBlock` /
+/// `getBlock`) and isn't reusable here as code -- checked before writing
+/// this. The same BOUNDED-BATCH principle applies to address lists though
+/// (avoid one unbounded `getUtxosByAddresses` call growing without limit as
+/// the book / seed file grows, and don't let one bad chunk abort the whole
+/// validation): chunk the address list and keep going past a failed chunk.
+const VALIDATE_ADDR_CHUNK_SIZE: usize = 100;
+
+/// Query `getUtxosByAddresses` for `addr_refs` in bounded chunks, returning
+/// the union of all live outpoint keys (`txid:index`) found. A chunk that
+/// fails (RPC error) is logged and skipped rather than aborting the whole
+/// validation -- partial results are still useful (better to under-prune a
+/// few orders than to skip validation entirely on a single flaky chunk).
+async fn live_outpoint_keys(
+    rpc: &RpcClient,
+    addr_refs: &[&str],
+) -> std::collections::HashSet<String> {
+    let mut live = std::collections::HashSet::new();
+    for chunk in addr_refs.chunks(VALIDATE_ADDR_CHUNK_SIZE) {
+        match rpc.get_utxos_by_addresses(chunk).await {
+            Ok(utxos) => {
+                for u in utxos {
+                    live.insert(format!("{}:{}", u.outpoint.transaction_id, u.outpoint.index));
+                }
+            }
+            Err(e) => {
+                warn!(
+                    "[PRUNE] getUtxosByAddresses chunk failed ({} addr(s)): {} — \
+                     skipping this chunk, remaining chunks still validated",
+                    chunk.len(), e
+                );
+            }
+        }
+    }
+    live
+}
+
+/// Validate persisted orders against the live UTXO set and prune any whose
+/// UTXOs no longer exist on-chain.
+///
+/// Called once at startup after `load_order_book`, before the matching loop
+/// begins. Without this check a stale order whose UTXO was spent while the
+/// matcher was offline would sit in the book forever: it would keep crossing
+/// against a valid counterpart, `execute_match` would fail every cycle (the
+/// node rejects the TX because one input doesn't exist), and the error would
+/// be retried indefinitely generating noisy logs and wasted RPC traffic.
+///
+/// Also the second half of the opt-in startup rescan (`rescan_from_seed`):
+/// after a seed file's candidate orders are merged into the live book via
+/// `load_order_book`, this same liveness check confirms which ones still
+/// exist on-chain and drops the rest — so "rescan" and "prune" are the same
+/// operation from two different starting books.
+///
+/// Strategy: batch all order P2SH addresses (chunked, see
+/// `VALIDATE_ADDR_CHUNK_SIZE`) and query `getUtxosByAddresses`. Any order
+/// whose outpoint is absent from the response is dropped. The wallet address
+/// prefix ("kaspatest" / "kaspa") is inferred from `wallet_address`.
 pub async fn validate_and_prune_order_book(
     rpc: &RpcClient,
     order_book: &Arc<Mutex<OrderBook>>,
@@ -292,7 +352,13 @@ pub async fn validate_and_prune_order_book(
         .unwrap_or("kaspa")
         .to_string();
 
-    // Collect all orders and their P2SH addresses.
+    // Collect all orders: (raw UTXO key for the liveness check, book key for
+    // removal/logging, P2SH address). These differ for OCO/ratchet legs —
+    // `outpoint_key()` carries a `:tp`/`:sl` suffix (two virtual book
+    // entries share one on-chain UTXO) but the UTXO set is keyed by the raw
+    // `txid:index`. Comparing the SUFFIXED key against the raw live set
+    // would never match and every OCO/ratchet leg would be pruned as
+    // "stale" on every restart even while its UTXO is live.
     let orders: Vec<(String, String, String)> = {
         let ob = order_book.lock().await;
         let mut out = Vec::new();
@@ -300,12 +366,12 @@ pub async fn validate_and_prune_order_book(
             for order in book.bids.values() {
                 let spk = order.p2sh_script();
                 let addr = p2sh_to_address(&spk, &prefix);
-                out.push((order.outpoint_key(), addr, order.tx_id.clone()));
+                out.push((order.utxo_outpoint_key(), order.outpoint_key(), addr));
             }
             for order in book.asks.values() {
                 let spk = order.p2sh_script();
                 let addr = p2sh_to_address(&spk, &prefix);
-                out.push((order.outpoint_key(), addr, order.tx_id.clone()));
+                out.push((order.utxo_outpoint_key(), order.outpoint_key(), addr));
             }
         }
         out
@@ -315,9 +381,9 @@ pub async fn validate_and_prune_order_book(
         return;
     }
 
-    // Deduplicate addresses for a single batched RPC call.
+    // Deduplicate addresses for the batched (chunked) RPC calls.
     let mut addr_set: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for (_, addr, _) in &orders {
+    for (_, _, addr) in &orders {
         addr_set.insert(addr.clone());
     }
     let addr_refs: Vec<&str> = addr_set.iter().map(|s| s.as_str()).collect();
@@ -328,33 +394,20 @@ pub async fn validate_and_prune_order_book(
         addr_refs.len()
     );
 
-    let utxos = match rpc.get_utxos_by_addresses(&addr_refs).await {
-        Ok(u) => u,
-        Err(e) => {
-            warn!(
-                "[PRUNE] UTXO validation skipped (RPC error: {}). \
-                 Persisted orders kept as-is; stale ones will fail on first match attempt.",
-                e
-            );
-            return;
-        }
-    };
+    let live = live_outpoint_keys(rpc, &addr_refs).await;
 
-    // Build a set of live outpoint keys (txid:index).
-    let live: std::collections::HashSet<String> = utxos
-        .iter()
-        .map(|u| format!("{}:{}", u.outpoint.transaction_id, u.outpoint.index))
-        .collect();
-
-    // Prune orders not in the live set.
+    // Prune orders not in the live set (checked by the RAW utxo key);
+    // removal itself uses the book key (with OCO suffix where applicable).
     let mut pruned = 0u32;
     {
         let mut ob = order_book.lock().await;
-        for (outpoint_key, _, _) in &orders {
-            if !live.contains(outpoint_key) {
-                ob.remove_order(outpoint_key);
-                warn!("[PRUNE] Removed stale persisted order: {}", &outpoint_key[..outpoint_key.len().min(20)]);
+        for (utxo_key, book_key, _) in &orders {
+            if !live.contains(utxo_key) {
+                ob.remove_order(book_key);
+                warn!("[PRUNE] Removed stale persisted order: {}", &book_key[..book_key.len().min(24)]);
                 pruned += 1;
+            } else {
+                tracing::debug!("[PRUNE] Confirmed live: {}", &book_key[..book_key.len().min(24)]);
             }
         }
     }
@@ -366,10 +419,83 @@ pub async fn validate_and_prune_order_book(
     );
 }
 
-// P2SH address helpers (inline hex fallback — no bech32 dependency).
+/// Opt-in startup rescan: load a seed file of known covenant orders (same
+/// JSON schema as `--orderbook`, i.e. a `load_order_book`-compatible
+/// snapshot) and validate every entry against the live UTXO set via a direct
+/// `getUtxosByAddresses` query.
+///
+/// This exists because the engine has no general way to discover orders it
+/// doesn't already know the redeemScript for: KOB orders are true P2SH
+/// (`kob/settle/src/crypto/p2sh.rs::build_p2sh` — script HASH only), so an
+/// unknown order's on-chain output reveals nothing about its parameters
+/// until it's spent. Recovering orders deployed while the engine was down
+/// (or on a first-ever startup) therefore requires the operator to already
+/// know their redeemScripts — supplied here as a seed file, e.g. exported
+/// from a prior session's `orderbook.json` or hand-built from known deploy
+/// parameters. The seed's candidates are merged into the live book (via the
+/// existing `load_order_book`) and then confirmed/pruned by
+/// `validate_and_prune_order_book` exactly like the normal persisted book —
+/// so this recovers orders WITHOUT replaying blocks, avoiding the
+/// `getVirtualChainFromBlock`/`getBlock` catch-up path that has hung on
+/// large windows historically (see kob/E2E_LIVE_RESULTS.md, V16_STATUS.md).
+///
+/// A missing seed file is not an error (rescan is opt-in and the flag may be
+/// left pointing at a path that doesn't exist yet) — logged and skipped.
+pub async fn rescan_from_seed(
+    rpc: &RpcClient,
+    order_book: &Arc<Mutex<OrderBook>>,
+    seed_path: &str,
+    wallet_address: &str,
+) {
+    if !std::path::Path::new(seed_path).exists() {
+        warn!("[RESCAN] Seed file not found at {} — startup rescan skipped", seed_path);
+        return;
+    }
 
+    let before: usize = {
+        let ob = order_book.lock().await;
+        ob.pair_books.values().map(|b| b.bids.len() + b.asks.len()).sum()
+    };
+
+    if let Err(e) = load_order_book(seed_path, order_book).await {
+        warn!("[RESCAN] Failed to load seed file {}: {}", seed_path, e);
+        return;
+    }
+
+    let seeded: usize = {
+        let ob = order_book.lock().await;
+        let after: usize = ob.pair_books.values().map(|b| b.bids.len() + b.asks.len()).sum();
+        after.saturating_sub(before)
+    };
+    info!(
+        "[RESCAN] Loaded {} candidate order(s) from seed {} — validating against live UTXO set ...",
+        seeded, seed_path
+    );
+
+    validate_and_prune_order_book(rpc, order_book, wallet_address).await;
+
+    info!("[RESCAN] Startup rescan complete ({} candidate(s) from {})", seeded, seed_path);
+}
+
+// P2SH address helpers.
+
+/// Convert a P2SH scriptPublicKey to its Kaspa bech32m address string.
+///
+/// Delegates to `kob_settle::bech32::spk_to_address` (the same real bech32m
+/// codec used everywhere else in this workspace — x402, cli, settle/observe)
+/// instead of hand-rolling encoding. `getUtxosByAddresses` on a real node
+/// only recognizes real bech32m addresses; anything else is either rejected
+/// outright or silently matches nothing, which would make
+/// `validate_and_prune_order_book` (and the rescan path built on it) a
+/// no-op that never actually confirms or prunes anything.
 fn p2sh_to_address(spk: &[u8], prefix: &str) -> String {
-    format!("{}:p{}", prefix, hex::encode(spk))
+    match kob_settle::bech32::spk_to_address(spk, prefix) {
+        Ok(addr) => addr,
+        Err(e) => {
+            warn!("[PRUNE] Failed to encode P2SH address (prefix={}): {}", prefix, e);
+            String::new()
+        }
+    }
 }
 
 
@@ -554,5 +680,46 @@ mod tests {
 
         // Cleanup
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// `p2sh_to_address` must produce a real bech32m Kaspa address that
+    /// round-trips through the SAME codec's decoder
+    /// (`kob_settle::bech32::address_to_spk`). The old implementation
+    /// (`format!("{}:p{}", prefix, hex::encode(spk))`) produced a string
+    /// that LOOKED plausible (Kaspa ScriptHash addresses do start with
+    /// `:p` after bech32's charset) but was not valid bech32m — a real node
+    /// would reject or silently no-op on it, making
+    /// `validate_and_prune_order_book` (and the rescan path built on it)
+    /// never actually confirm or prune anything.
+    #[test]
+    fn p2sh_to_address_round_trips_through_real_bech32m() {
+        let spk = kob_core::build_p2sh(&[0x51]); // minimal redeemScript: Op1
+        let addr = p2sh_to_address(spk.script(), "kaspatest");
+        assert!(!addr.is_empty(), "must produce a non-empty address");
+        assert!(addr.starts_with("kaspatest:"), "must carry the requested prefix; got {addr}");
+
+        let decoded = kob_settle::bech32::address_to_spk(&addr).expect("must decode as valid bech32m");
+        assert_eq!(decoded, spk.script().to_vec(), "decoded SPK must round-trip byte-exact");
+    }
+
+    /// Pin against a REAL testnet-10 vector: the ratchet_oco order at
+    /// `ad0c2027a6a04ccd3c91e23e97fbc26d35eb17aeee2c603e561d8d30d34c9eba:0`
+    /// (confirmed unspent via REST 2026-07-18, used as the Task-B rescan
+    /// smoke-test target — see kob/E2E_LIVE_RESULTS.md). Its on-chain P2SH
+    /// scriptPublicKey is `aa201110c395...a74687`; the live indexer resolves
+    /// that SPK to `kaspatest:pqg3psu43pqqfqeszzne0k88kkmqhats0cfluzd3j9f22ajnjwn5vjdvhwc8t`.
+    /// `p2sh_to_address` must reproduce that exact string, or a
+    /// `getUtxosByAddresses` rescan query against it would silently match
+    /// nothing on the real node.
+    #[test]
+    fn p2sh_to_address_matches_known_live_testnet_vector() {
+        let spk_hex = "aa201110c395884004833010a797d8e7b5b60bf5707e13fe09b19152a5765393a74687";
+        let spk = hex::decode(spk_hex).unwrap();
+        let addr = p2sh_to_address(&spk, "kaspatest");
+        assert_eq!(
+            addr,
+            "kaspatest:pqg3psu43pqqfqeszzne0k88kkmqhats0cfluzd3j9f22ajnjwn5vjdvhwc8t",
+            "must match the address the live indexer actually resolves this UTXO under"
+        );
     }
 }

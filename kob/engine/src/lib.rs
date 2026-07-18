@@ -121,6 +121,9 @@ pub struct ContinuousParams<'a> {
     pub mm_mid_den: Option<u64>,
     pub mm_amount: Option<u64>,
     pub mm_min_fill: u64,
+    /// Opt-in startup rescan seed file path (see `main.rs`'s `--rescan-seed`
+    /// doc). `None`/absent = disabled.
+    pub rescan_seed: Option<String>,
 }
 
 /// Load persisted auxiliary books (stop / trailing / IFD / perp / lending /
@@ -423,6 +426,24 @@ async fn run_continuous_mode(
         drop(rpc_lock);
     }
 
+    // Opt-in startup rescan: recover orders the normal persisted book
+    // doesn't know about (deployed before this process, fresh cursor / fresh
+    // orderbook.json) via a direct UTXO query against a seed file of known
+    // covenant orders — runs regardless of whether the normal load above
+    // succeeded, since an empty/fresh book is exactly the scenario rescan
+    // is for.
+    if let Some(ref seed_path) = params.rescan_seed {
+        let rpc_lock = rpc.lock().await;
+        matcher::persistence::rescan_from_seed(
+            &rpc_lock,
+            &order_book,
+            seed_path,
+            &app_config.address,
+        )
+        .await;
+        drop(rpc_lock);
+    }
+
     let books = load_shared_books(order_book, params.orderbook_path).await;
 
     let (ws_broadcaster, shared_state_for_executor) =
@@ -514,6 +535,7 @@ pub async fn run_engine(
     mm_min_fill: u64,
     token_cov_id: Option<String>,
     token_utxo: Option<String>,
+    rescan_seed: Option<String>,
 ) -> anyhow::Result<()> {
     tracing::info!("[ENGINE] allow_self_trade={} cross_pair={}", allow_self_trade, cross_pair);
     // Create shared order book
@@ -556,6 +578,7 @@ pub async fn run_engine(
                 mm_mid_den,
                 mm_amount,
                 mm_min_fill,
+                rescan_seed,
             };
             run_continuous_mode(rpc, order_book, app_config, params).await;
         }

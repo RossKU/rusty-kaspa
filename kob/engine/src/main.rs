@@ -106,6 +106,17 @@ struct Cli {
     /// If not provided, falls back to KOB_WALLET_PASSWORD or KOB_PASSPHRASE env var.
     #[arg(long)]
     wallet_password: Option<String>,
+
+    /// Opt-in startup rescan (continuous mode only): path to a seed file of
+    /// known covenant orders (same JSON schema as --orderbook) to validate
+    /// against the live UTXO set via a direct getUtxosByAddresses query at
+    /// startup. Recovers orders deployed before this engine process started
+    /// (fresh cursor / fresh orderbook.json) WITHOUT replaying blocks --
+    /// there is no full UTXO rescan on startup otherwise (order discovery
+    /// is block-scan-only; see kob/V16_STATUS.md). Empty = disabled
+    /// (default).
+    #[arg(long, default_value = "")]
+    rescan_seed: String,
 }
 
 #[tokio::main]
@@ -186,6 +197,7 @@ async fn main() {
         cli.mm_min_fill,
         None,
         None,
+        if cli.rescan_seed.is_empty() { None } else { Some(cli.rescan_seed.clone()) },
     )
     .await
     {

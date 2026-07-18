@@ -5687,6 +5687,25 @@ async fn run_scan_cycle(
 
 // Continuous Mode
 
+/// Process exit codes used by `run_continuous_with_ws`'s fatal paths.
+/// Distinct from `main.rs`'s config-load / unknown-mode / operator
+/// double-Ctrl+C-force-exit codes (all `1`, established before this pass) so
+/// an external supervisor's exit-code handling can tell "bad config, don't
+/// bother restarting" apart from "was connected fine, lost the node for too
+/// long, safe to restart".
+///
+/// R1: returned when `RpcClient::reconnect()` exhausts
+/// `RetryConfig::max_reconnect_attempts` (a PERSISTENT RPC failure, not a
+/// transient one the engine already rides out with backoff+retry).
+const EXIT_CODE_RPC_EXHAUSTED: i32 = 10;
+
+/// How often (wall-clock) to emit a `[HEARTBEAT]` log line from the main
+/// scan loop, independent of whether there was anything to do that cycle.
+/// Minimal watchdog signal: an external process supervisor / log monitor
+/// can alert on "no heartbeat for N minutes" without this engine needing its
+/// own daemon/health-check infrastructure.
+const HEARTBEAT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Main continuous matcher loop with optional WS broadcaster for emitting
 /// user-order lifecycle events (OrderFilled, OrderCancelled, etc.).
 pub async fn run_continuous_with_ws(
@@ -5771,6 +5790,9 @@ pub async fn run_continuous_with_ws(
     let mut spent_tracker = SpentTracker::new();
     let mut reorg_tracker = ReorgTracker::new();
     let mut covenant_cache = CovenantCache::new();
+    // Minimal watchdog: periodic heartbeat log (see HEARTBEAT_INTERVAL doc).
+    let loop_started = std::time::Instant::now();
+    let mut last_heartbeat = std::time::Instant::now();
 
     // Pre-seed covenant cache from existing pair book keys.
     // The order book's pair_books map is keyed by token_cov_id; any token
@@ -5883,6 +5905,21 @@ pub async fn run_continuous_with_ws(
                         drop(rpc_lock);
                         break;
                     }
+                    // R1: reconnect() gives up (instead of retrying forever)
+                    // once it exhausts retry_config.max_reconnect_attempts —
+                    // a PERSISTENT failure (bad URL, node permanently down),
+                    // not a transient blip. Exit with a dedicated code so an
+                    // external supervisor can detect and restart/page,
+                    // rather than a matcher that silently stopped matching
+                    // while the process kept running.
+                    if e.starts_with(crate::rpc::RECONNECT_GIVEUP_PREFIX) {
+                        tracing::error!(
+                            "[RPC] FATAL: {} — exiting with code {} for supervisor restart",
+                            e, EXIT_CODE_RPC_EXHAUSTED
+                        );
+                        drop(rpc_lock);
+                        std::process::exit(EXIT_CODE_RPC_EXHAUSTED);
+                    }
                     warn!("[RPC] Reconnect failed: {}, retrying in 5s...", e);
                     drop(rpc_lock);
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -5949,13 +5986,28 @@ pub async fn run_continuous_with_ws(
         // H4-SYNC: cheap per-cycle connectivity refresh (local atomic flag,
         // no network call) so /health's node_connected never goes stale
         // during quiet cycles with no new blocks to process.
+        let node_connected = !rpc.lock().await.needs_reconnect();
         if let Some(ref state) = shared_state {
-            let connected = !rpc.lock().await.needs_reconnect();
-            state.write().await.sync.node_connected = connected;
+            state.write().await.sync.node_connected = node_connected;
         }
 
         cycle += 1;
         debug!("--- Scan cycle {} ---", cycle);
+
+        // Minimal watchdog: a periodic INFO-level heartbeat independent of
+        // whether there's anything to do this cycle, so an external log
+        // monitor / process supervisor can alert on "no heartbeat for N
+        // minutes" without any new daemon/health-check infrastructure here.
+        if last_heartbeat.elapsed() >= HEARTBEAT_INTERVAL {
+            info!(
+                "[HEARTBEAT] cycle={} uptime={}s node_connected={} last_seen_hash={}",
+                cycle,
+                loop_started.elapsed().as_secs(),
+                node_connected,
+                last_seen_hash.as_deref().map(|h| &h[..h.len().min(16)]).unwrap_or("none"),
+            );
+            last_heartbeat = std::time::Instant::now();
+        }
 
         // M-6 / H-1: Mempool-aware pruning of spent tracker entries every cycle.
         // Uses SPENT_PRUNE_AGE_SECS (600s) for the base age threshold, but

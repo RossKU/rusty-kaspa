@@ -8,10 +8,19 @@ pub use crate::rpc_types::{RpcUtxo, RpcOutpoint, RpcUtxoEntry, RpcSpk, parse_res
 
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+/// Sentinel prefix `reconnect()` returns instead of looping forever once a
+/// persistent (not transient) connection failure exhausts
+/// `RetryConfig::max_reconnect_attempts`. Callers should check
+/// `err.starts_with(RECONNECT_GIVEUP_PREFIX)` and treat it as fatal —
+/// distinct from `"shutdown"` (operator-requested) and from an ordinary
+/// per-attempt failure (which `reconnect()` retries internally and never
+/// surfaces to the caller).
+pub const RECONNECT_GIVEUP_PREFIX: &str = "giveup";
 
 /// JSON-RPC request
 #[derive(Debug, Serialize)]
@@ -53,6 +62,15 @@ pub struct RetryConfig {
     pub initial_backoff: std::time::Duration,
     /// Backoff multiplier applied after each retry (exponential backoff).
     pub backoff_multiplier: u32,
+    /// Maximum number of `reconnect()` attempts before giving up and
+    /// returning a `RECONNECT_GIVEUP_PREFIX`-prefixed error instead of
+    /// retrying forever. Distinguishes a transient outage (ride it out,
+    /// engine keeps running) from a persistent one (give up, exit with a
+    /// distinct code so an external supervisor can restart/alert) — without
+    /// this cap a permanently unreachable node/URL makes `reconnect()` loop
+    /// at its capped backoff (`RpcClient::MAX_RECONNECT_BACKOFF_SECS`)
+    /// forever.
+    pub max_reconnect_attempts: u32,
 }
 
 impl Default for RetryConfig {
@@ -61,6 +79,11 @@ impl Default for RetryConfig {
             max_retries: 3,
             initial_backoff: std::time::Duration::from_secs(1),
             backoff_multiplier: 2,
+            // ~15 min worst case at the capped 60s backoff (1+2+4+8+16+32 +
+            // 14*60 ≈ 903s) before giving up — long enough to ride out a
+            // node restart or a network blip, short enough that a stuck
+            // engine gets flagged well within a canary shift.
+            max_reconnect_attempts: 20,
         }
     }
 }
@@ -105,6 +128,15 @@ pub struct RpcClient {
     /// known block hash so dropped block notifications do not silently leave
     /// orders invisible.
     notification_dropped: Arc<AtomicBool>,
+    /// R1: consecutive `call_with_timeout` timeouts (the "RPC call timed
+    /// out" path). A plain timeout does NOT set `alive = false` on its own
+    /// (the socket may still be technically open — the node is just slow or
+    /// hung), so without this counter a genuinely unresponsive connection
+    /// never trips `needs_reconnect()` and the engine keeps retrying the
+    /// same dead connection forever. Reset to 0 on any successful
+    /// round-trip; once it reaches `MAX_CONSECUTIVE_TIMEOUTS` the connection
+    /// is marked dead so the normal reconnect path takes over.
+    consecutive_timeouts: Arc<AtomicU32>,
 }
 
 impl RpcClient {
@@ -296,6 +328,7 @@ impl RpcClient {
             subscribed_addresses: Arc::new(Mutex::new(HashSet::new())),
             shutdown: Arc::new(AtomicBool::new(false)),
             notification_dropped,
+            consecutive_timeouts: Arc::new(AtomicU32::new(0)),
         })
     }
 
@@ -369,9 +402,28 @@ impl RpcClient {
                 // Timeout — remove pending entry so late responses don't
                 // send on a dropped channel (BUG 3 fix)
                 self.pending.lock().await.remove(&id);
+                // R1: a plain timeout leaves `alive` untouched (the socket
+                // itself may still be open), so repeated timeouts alone
+                // never trip `needs_reconnect()`. Count them and force a
+                // reconnect after MAX_CONSECUTIVE_TIMEOUTS in a row —
+                // otherwise a node that's up but hung answers every call
+                // with "RPC call timed out" forever and the engine never
+                // recovers the connection.
+                let n = self.consecutive_timeouts.fetch_add(1, AtomicOrdering::Relaxed) + 1;
+                if n >= Self::MAX_CONSECUTIVE_TIMEOUTS {
+                    tracing::warn!(
+                        "[RPC] {} consecutive timeouts on {} — marking connection dead for reconnect",
+                        n, self.url
+                    );
+                    self.alive.store(false, AtomicOrdering::Relaxed);
+                    self.consecutive_timeouts.store(0, AtomicOrdering::Relaxed);
+                }
                 return Err("RPC call timed out".to_string());
             }
         };
+        // Any successful round-trip (including an RPC-level error response —
+        // the transport itself is healthy) resets the timeout streak.
+        self.consecutive_timeouts.store(0, AtomicOrdering::Relaxed);
 
         if let Some(err) = resp.error {
             return Err(format!("RPC error: {}", err));
@@ -752,22 +804,52 @@ impl RpcClient {
     /// Maximum backoff duration for reconnection attempts.
     const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
 
-    /// Attempt to re-establish the WebSocket connection with exponential backoff.
+    /// R1: consecutive `call_with_timeout` timeouts before the connection is
+    /// forced dead (see `consecutive_timeouts` field doc). 3 tolerates one
+    /// or two genuinely slow calls without flapping a healthy connection,
+    /// while still recovering a hung one within a few RPC round-trips
+    /// instead of retrying it forever.
+    const MAX_CONSECUTIVE_TIMEOUTS: u32 = 3;
+
+    /// Attempt to re-establish the WebSocket connection with exponential
+    /// backoff, giving up after `retry_config.max_reconnect_attempts`
+    /// attempts.
     ///
     /// C3: respects `self.shutdown` — if the flag is set, returns
     /// `Err("shutdown")` instead of looping forever. Also polls the flag every
     /// 200ms during backoff sleep so a Ctrl+C during a 60s backoff does not
     /// block shutdown for up to a minute.
+    ///
+    /// R1: once `max_reconnect_attempts` is exhausted (a PERSISTENT failure —
+    /// bad URL, node permanently down, DNS broken, etc., as opposed to a
+    /// transient blip), returns `Err("{RECONNECT_GIVEUP_PREFIX}: ...")`
+    /// instead of continuing to retry forever. Callers (the executor's scan
+    /// loop) should treat that distinctly: log fatal and exit with a
+    /// dedicated code so an external supervisor can restart/page, rather
+    /// than silently spinning at the capped 60s backoff indefinitely.
     pub async fn reconnect(&mut self) -> Result<(), String> {
         let mut backoff_secs: u64 = 1;
+        let mut attempts: u32 = 0;
+        let max_attempts = self.retry_config.max_reconnect_attempts;
 
         loop {
             if self.shutdown.load(AtomicOrdering::SeqCst) {
                 return Err("shutdown".to_string());
             }
+            attempts += 1;
+            if attempts > max_attempts {
+                tracing::error!(
+                    "[RPC RECONNECT] Giving up on {} after {} failed attempt(s)",
+                    self.url, max_attempts
+                );
+                return Err(format!(
+                    "{RECONNECT_GIVEUP_PREFIX}: exhausted {max_attempts} reconnect attempt(s) to {}",
+                    self.url
+                ));
+            }
             tracing::info!(
-                "[RPC RECONNECT] Attempting reconnection to {} (backoff {}s)...",
-                self.url, backoff_secs
+                "[RPC RECONNECT] Attempting reconnection to {} (attempt {}/{}, backoff {}s)...",
+                self.url, attempts, max_attempts, backoff_secs
             );
 
             let sleep_until = std::time::Instant::now()
@@ -826,6 +908,8 @@ impl RpcClient {
                             );
                         }
                     }
+                    // R1: fresh connection, fresh timeout streak.
+                    self.consecutive_timeouts = new_client.consecutive_timeouts;
                     tracing::info!(
                         "[RPC RECONNECT] Successfully reconnected to {}",
                         self.url
@@ -1140,10 +1224,25 @@ mod tests {
             max_retries: 5,
             initial_backoff: std::time::Duration::from_millis(100),
             backoff_multiplier: 3,
+            max_reconnect_attempts: 7,
         };
         assert_eq!(config.max_retries, 5);
         assert_eq!(config.initial_backoff, std::time::Duration::from_millis(100));
         assert_eq!(config.backoff_multiplier, 3);
+        assert_eq!(config.max_reconnect_attempts, 7);
+    }
+
+    #[test]
+    fn retry_config_default_has_reconnect_giveup_cap() {
+        // R1: the default must not be "retry forever" — a persistent outage
+        // (bad URL, node gone) must eventually surface a giveup error rather
+        // than looping at the capped 60s backoff indefinitely.
+        let config = RetryConfig::default();
+        assert!(config.max_reconnect_attempts > 0, "must have a finite giveup cap");
+        assert!(
+            config.max_reconnect_attempts < 1000,
+            "cap should be a real bound, not a de-facto infinite one"
+        );
     }
 
     // RPC type tests (RpcUtxo, RpcSpk, etc.) are in kob_core::rpc_types::tests

@@ -1,5 +1,6 @@
 #![allow(clippy::too_many_arguments)]
 
+pub mod attest;
 pub mod auto_match;
 pub mod batch;
 pub mod bracket;
@@ -31,6 +32,7 @@ pub mod rest;
 pub mod rpc;
 pub mod scan;
 pub mod signing;
+pub mod stablecoin;
 pub mod status;
 pub mod stop;
 pub mod tif;
@@ -502,6 +504,22 @@ pub enum Commands {
     Token {
         #[command(subcommand)]
         action: token::TokenCommand,
+    },
+
+    /// KCC-0020 stablecoin issuer-attestation tool (WU-D): sign the
+    /// per-spend attestation a stablecoin transfer needs from the token
+    /// issuer. Fully offline -- no node/wallet connection is made.
+    Attest {
+        #[command(subcommand)]
+        action: attest::AttestCommand,
+    },
+
+    /// KCC-0020 stablecoin (Plan A, native-value) operations: deploy, mint,
+    /// transfer (WU-E). Transfers are gated by a fresh issuer attestation
+    /// from `kob-cli attest sign` (WU-D) -- see `stablecoin transfer --help`.
+    Stablecoin {
+        #[command(subcommand)]
+        action: stablecoin::StablecoinCommand,
     },
 
     /// Automated continuous scanning and matching for a token pair.
@@ -3166,6 +3184,47 @@ pub async fn dispatch(
             token::TokenCommand::Aliases { alias_file, json } => {
                 let path = alias_file.as_deref().map(std::path::Path::new);
                 token::list_aliases(path, json)?;
+            }
+        },
+        Commands::Attest { action } => {
+            attest::run(&action)?;
+        }
+        Commands::Stablecoin { action } => match action {
+            stablecoin::StablecoinCommand::Deploy { issuer_key, ticker, supply, decimals, amount } => {
+                stablecoin::stablecoin_deploy(wallet_path, node, network, &issuer_key, &ticker, supply, decimals, amount)
+                    .await?;
+            }
+            stablecoin::StablecoinCommand::Mint { issuer_key, txid, index, token, amount, recipient_pubkey, fee_utxo } => {
+                let token = token::resolve_token(&token, None)?;
+                stablecoin::stablecoin_mint(
+                    wallet_path,
+                    node,
+                    network,
+                    &issuer_key,
+                    &txid,
+                    index,
+                    &token,
+                    amount,
+                    recipient_pubkey.as_deref(),
+                    fee_utxo.as_deref(),
+                )
+                .await?;
+            }
+            stablecoin::StablecoinCommand::Transfer { txid, index, token, issuer_pubkey, recipient_pubkey, issuer_sig, fee_utxo } => {
+                let token = token::resolve_token(&token, None)?;
+                stablecoin::stablecoin_transfer(
+                    wallet_path,
+                    node,
+                    network,
+                    &txid,
+                    index,
+                    &token,
+                    &issuer_pubkey,
+                    &recipient_pubkey,
+                    &issuer_sig,
+                    fee_utxo.as_deref(),
+                )
+                .await?;
             }
         },
         Commands::AutoMatch {

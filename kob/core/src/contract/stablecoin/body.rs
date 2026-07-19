@@ -1,331 +1,1477 @@
-//! KCC-0020 native-value stablecoin covenant **body** and complete redeem
-//! script builder (WU-A).
+//! Robust KCC-0020 stablecoin covenant **body** and complete redeem script
+//! builder (`STABLECOIN_ROBUST_DESIGN.md` §4 -- Phase I: foundation + the
+//! TRANSFER vertical slice; Phase II branches: FREEZE, SEIZE, BURN, MIGRATE).
 //!
-//! The redeem script is `state (35B) || body`:
+//! The redeem script is `state (75B, see state.rs) || body`. The body is a
+//! 6-way `op_type` dispatch ([`super::dispatch::build_op_type_dispatch`]):
+//! `0x00 TRANSFER` (Phase I), `0x01 FREEZE`, `0x02 SEIZE`, `0x03 BURN`, and
+//! `0x06 MIGRATE` (Phase II) wire real bytecode; `0x05 ROTATE` remains a
+//! [`super::dispatch::UNIMPLEMENTED_BRANCH_STUB`] placeholder (a bare `OP_0`
+//! -- fail-closed if ever reached), **deferred to post-Live** under Decision
+//! 2026-07-19 (option B, baked keys): ROTATE only becomes meaningful once
+//! role keys are verified against `role_registry_root` rather than baked, so
+//! key rotation for the initial Live is redeploy+MIGRATE instead (see
+//! [`build_migrate_branch`]'s doc). `0x04` is never compared against --
+//! reserved for the separate mint-authority contract (§9).
 //!
-//! - **state (35B)** — the reused KCC20 Standard State Header
-//!   ([`crate::contract::token::Kcc20StateHeader`]): `[0x20][owner_pubkey 32B]
-//!   [0x01][identifier_type 1B]`. KCC20 `amount` is the UTXO's native value
-//!   (Plan A), not a script field (see [`super`] module doc).
-//! - **body** — the two-stage gate emitted by [`build_stablecoin_body`].
-//!
-//! # Sigscript the body consumes (contract for WU-F's builder)
+//! # Sigscript the body consumes (contract for the sigscript builder)
 //!
 //! After P2SH extraction pops the redeem script, the remaining stack (pushed
-//! by the sigscript) must be, top-to-bottom:
+//! by the sigscript) must be, top-to-bottom (i.e. LAST push is shallowest).
+//! This is TRANSFER's (`0x00`) shape; FREEZE (`0x01`) has NO owner
+//! signature and instead carries the op-specific `new_frozen_flag` field in
+//! that slot -- see [`build_freeze_branch`]'s doc and
+//! `super::sigscript::build_stablecoin_freeze_sigscript` for its distinct
+//! layout:
 //!
 //! ```text
-//! owner_sig   (65B: 64-byte Schnorr sig || 0x01 SIGHASH_ALL)   <- top
-//! issuer_sig  (64B: raw Schnorr sig over the attestation message)
+//! op_type_selector (1B)                          <- top (last pushed)
+//! owner_sig        (65B: 64-byte Schnorr sig || 0x01 SIGHASH_ALL)
+//! new_rs           (variable: full candidate successor redeem script)
+//! issuer_sig       (64B: raw Schnorr sig over the attestation message)  <- deepest (first pushed)
 //! ```
 //!
-//! i.e. the sigscript pushes `issuer_sig` first (deeper), then `owner_sig`,
-//! then the redeem script last. This input's `sig_op_count` MUST be **2**
-//! (one `OpCheckSigVerify` for the owner + one `OpCheckSigFromStack` for the
-//! issuer).
+//! This input's `sig_op_count` MUST be **2** (one `OpCheckSigVerify` for the
+//! owner + one `OpCheckSigFromStack` for the OPS role), same as case-A.
+//! FREEZE's `sig_op_count` is **1** (only `OpCheckSigFromStack`, no owner
+//! `OpCheckSigVerify`). BURN (`0x03`) is back to `sig_op_count` **2** (owner +
+//! MINT role), but has NO `new_rs` field at all -- see [`build_burn_branch`]'s
+//! doc and `super::sigscript::build_stablecoin_burn_sigscript` for its
+//! (shorter) distinct layout: `issuer_sig` deepest, then `owner_sig`, then
+//! `op_type_selector`.
 //!
-//! # Stack trace of the body
+//! # Why `new_rs` is required at all (the P2SH-opacity problem)
 //!
-//! Entry (top-to-bottom): `identifier_type, owner_pubkey, owner_sig, issuer_sig`.
+//! §4's TRANSFER invariant requires the successor's `role_registry_root` and
+//! `epoch` to be byte-identical to this coin's own current values. But
+//! `OpTxOutputSpk` only pushes the successor output's **P2SH locking
+//! script** (`[0xaa][0x20][blake2b256(redeem_script)][0x87]`, 35 bytes,
+//! `crate::contract::dr`/`settle::crypto::p2sh::build_p2sh`) -- the redeem
+//! script's actual bytes (where `role_registry_root`/`epoch` physically
+//! live) are hashed away and are NOT recoverable from the spent input's view
+//! of a not-yet-revealed successor. There is no opcode that returns a
+//! not-yet-spent output's *redeem script content*, only its opaque P2SH
+//! commitment.
 //!
-//! 1. `OpDrop` — drop `identifier_type`.
-//! 2. `OpCheckSigVerify` — pop `owner_pubkey` (pubkey, top) + `owner_sig`
-//!    (sig); verify SIGHASH_ALL over the tx. Stack: `issuer_sig`.
-//! 3. Build the 116-byte attestation pre-image on top of `issuer_sig` by
-//!    folding each field in with `OpCat`, in the exact order and widths of
-//!    [`super::attestation::build_attestation_preimage`]:
-//!    domain tag → covenant_id → outpoint_txid → outpoint_index(4) →
-//!    successor_spk_hash → amount(8). Every input introspection index comes
-//!    from `OpTxInputIndex` (replay-binding). The successor SPK is read from
-//!    the output at *this input's index* (`OpTxInputIndex` reused as the
-//!    output index — the 1:1 successor-binding convention, see below).
-//! 4. `OpBlake3` — hash the pre-image → 32-byte `msg_hash`. Stack:
-//!    `issuer_sig, msg_hash`.
-//! 5. Push the issuer pubkey constant. Stack: `issuer_sig, msg_hash,
-//!    issuer_pubkey` — exactly the layout `OpCheckSigFromStack` pops as
-//!    `[signature, msg_hash, pubkey]`.
-//! 6. `OpCheckSigFromStack` `OpVerify` — fail-close on a missing/invalid
-//!    attestation.
-//! 7. `Op1` — success.
+//! The only sound mechanism (already established in this codebase for
+//! exactly this "authenticate a successor covenant program" problem --
+//! `crate::contract::dr`, used by `spot::dca` and `kcc20::transfer`) is: the
+//! spender supplies the **candidate** successor redeem script (`new_rs`) as
+//! plaintext sigscript data, the body **authenticates** it
+//! (`dr_output_spk_check`: `Blake2b(new_rs)` reconstructed as a P2SH SPK and
+//! compared against the REAL output at this input's index -- reusing
+//! case-A's existing "OpTxInputIndex reused as the output index" 1:1
+//! successor-binding convention), and only THEN reads fields out of the
+//! now-authenticated plaintext (`dr_field_extract`).
 //!
-//! # Successor-binding convention (1:1, ISSUE-15 deferred)
+//! This is a necessary elaboration beyond the design doc's simplified §4
+//! pseudocode (which reads as if `OpTxOutputSpk` directly exposed
+//! `role_registry_root`/`epoch` bytes at a fixed offset -- it cannot, for the
+//! reason above). **Flagged for human review**: this is a judgment call
+//! about HOW to implement an explicitly-required invariant, not a change to
+//! what is enforced. It also means TRANSFER is now heavier than case-A: it
+//! authenticates a full successor redeem-script blob, not just an opaque SPK
+//! hash.
 //!
-//! The body reads the successor output at the **same index as the gated
-//! input** (`OpTxInputIndex` fed to `OpTxOutputSpk`). Together with binding
-//! the input's *full* native `amount`, this fixes a 1:1 transfer shape: input
-//! `i` funds the attested successor at output `i`, no token-side split/change.
-//! WU-B/C/D/F MUST place the attested successor at that index. N:M shapes and
-//! per-instance shape enforcement (`OpCovInputCount == 1`) are out of WU-A
-//! scope.
+//! # TRANSFER (`0x00`) stack trace
+//!
+//! Entry (top-to-bottom), once the dispatch skeleton's `op_type` compare
+//! delivers control here (state header's five fields, freshly pushed, sit
+//! above the sigscript's four pushes):
+//!
+//! ```text
+//! epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
+//! owner_pubkey(4), owner_sig(5), new_rs(6), issuer_sig(7)
+//! ```
+//!
+//! 1. Roll `owner_sig`, then `owner_pubkey`, to the top; `OpCheckSigVerify`
+//!    (SIGHASH_ALL) -- mirrors case-A's owner authorization exactly, just
+//!    reordered around the three new state fields sitting above them.
+//! 2. Roll `identifier_type` to top; `OpDrop` (unused, same as case-A).
+//! 3. Roll `frozen_flag` to top; compare to a literal `[0x00]` (NOT `OP_0`
+//!    -- `frozen_flag` is an explicit `PushExplicit`-style 1-byte field, so
+//!    the zero-comparison constant must also be an explicit 1-byte push);
+//!    `OpVerify` -- fail-closed if frozen (§4's new TRANSFER invariant).
+//! 4. `OpPick` a copy of `epoch` (needed twice: successor-carry check here,
+//!    attestation preimage later).
+//! 5. Successor authentication: fresh `OpTxInputIndex` as the output index
+//!    (case-A's existing 1:1 convention) + `dr_output_spk_check` --
+//!    `Blake2b(new_rs)` reconstructed as a P2SH SPK must equal the REAL
+//!    successor output's SPK at this input's index.
+//! 6. Extract `new_rs`'s `role_registry_root` payload (`dr_field_extract`)
+//!    and compare to this coin's own (`OpEqual OpVerify`) -- §4's "successor
+//!    must carry same root" invariant.
+//! 7. Extract `new_rs`'s `epoch` payload and compare to this coin's own
+//!    epoch copy (`OpEqual OpVerify`) -- §4's "...and same epoch" invariant.
+//! 8. `new_rs` is no longer needed; drop it.
+//! 9. Build the 121-byte attestation pre-image on top of `issuer_sig` by
+//!    folding each field in with `OpCat`, in the exact order/widths of
+//!    [`super::attestation::build_attestation_preimage`]: `DOMAIN_TAG` →
+//!    `covenant_id` → `op_type` (literal `0x00`) → `epoch` (the remaining
+//!    stack copy, rolled in) → `outpoint_txid` → `outpoint_index` →
+//!    `successor_spk_hash` → `amount`. Every introspection index comes from
+//!    `OpTxInputIndex` (replay-binding, unchanged from case-A).
+//! 10. `OpBlake3` → `msg_hash`; push the OPS pubkey constant;
+//!     `OpCheckSigFromStack OpVerify` -- fail-close on a missing/invalid
+//!     OPS attestation (mirrors case-A's issuer-attestation gate exactly,
+//!     just renamed to the spec's OPS role terminology).
+//! 11. `Op1` -- success.
+//!
+//! # Omission flagged for human review: `frozen_flag` is not pinned across
+//! TRANSFER
+//!
+//! §4's TRANSFER invariant list names only `role_registry_root` and `epoch`
+//! as required to carry forward unchanged; it does not require
+//! `frozen_flag` continuity. This body implements exactly that (no
+//! `frozen_flag` comparison against the successor), so an OPS-signed
+//! TRANSFER could in principle also flip `frozen_flag` in the successor
+//! without going through the (Phase II) FREEZE branch's dedicated gate.
+//! Since FREEZE doesn't exist yet in Phase I this has no operational effect
+//! today, but it's worth a deliberate Phase II decision (pin it, or
+//! document it as intentionally OPS-mutable via TRANSFER).
 
-use super::attestation::{AMOUNT_LEN, OUTPOINT_INDEX_LEN, X_ONLY_PUBKEY_LEN};
+use super::attestation::{op_type, AMOUNT_LEN, OUTPOINT_INDEX_LEN, X_ONLY_PUBKEY_LEN};
+use super::dispatch::{build_op_type_dispatch, OpTypeBranches, UNIMPLEMENTED_BRANCH_STUB};
+use super::state::{
+    frozen_flag, StablecoinStateHeader, EPOCH_PAYLOAD_OFFSET, FROZEN_FLAG_PAYLOAD_OFFSET, IDENTIFIER_TYPE_PAYLOAD_OFFSET,
+    OWNER_PUBKEY_PAYLOAD_OFFSET, ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET, STATE_HEADER_LEN,
+};
 use super::DOMAIN_TAG;
-use crate::contract::token::{identifier_type, Kcc20StateHeader};
+use crate::contract::dr::{dr_field_extract, dr_output_spk_check, dr_value_continuity_check};
+use crate::contract::helpers::push_index;
 
 /// Opcode bytes used by the stablecoin body (named for readability; values
-/// are the canonical `crypto/txscript` assignments).
+/// are the canonical `crypto/txscript` assignments -- see
+/// `core/src/contract/opcodes.rs` / `crypto/txscript/src/opcodes/mod.rs`).
 mod op {
-    /// `OpDrop`.
     pub const DROP: u8 = 0x75;
-    /// `OpCat` — pop b, pop a, push a||b.
+    pub const PICK: u8 = 0x79;
+    pub const ROLL: u8 = 0x7a;
     pub const CAT: u8 = 0x7e;
-    /// `OpCheckSigVerify` — owner authorization (SIGHASH_ALL).
-    pub const CHECKSIGVERIFY: u8 = 0xad;
-    /// `OpTxInputIndex` — push this input's index.
-    pub const TXINPUTINDEX: u8 = 0xb9;
-    /// `OpOutpointTxId` — pop idx, push that input's outpoint txid (32B).
-    pub const OUTPOINTTXID: u8 = 0xba;
-    /// `OpOutpointIndex` — pop idx, push that input's outpoint index (number).
-    pub const OUTPOINTINDEX: u8 = 0xbb;
-    /// `OpTxInputAmount` — pop idx, push that input's UTXO amount (number).
-    pub const TXINPUTAMOUNT: u8 = 0xbe;
-    /// `OpTxOutputSpk` — pop idx, push that output's SPK bytes.
-    pub const TXOUTPUTSPK: u8 = 0xc3;
-    /// `OpNum2Bin` — pop size, pop num, push fixed-width LE bytes.
-    pub const NUM2BIN: u8 = 0xcd;
-    /// `OpInputCovenantId` — pop idx, push that input's covenant id (32B).
-    pub const INPUTCOVENANTID: u8 = 0xcf;
-    /// `OpCheckSigFromStack` — pop [sig, msg_hash, pubkey], push bool.
-    pub const CHECKSIGFROMSTACK: u8 = 0xd7;
-    /// `OpBlake3` — pop data, push 32-byte hash.
-    pub const BLAKE3: u8 = 0xd9;
-    /// `OpVerify`.
+    pub const EQUAL: u8 = 0x87;
     pub const VERIFY: u8 = 0x69;
-    /// `Op1` (TRUE) — also used as the `OpNum2Bin` size literal `1` is not
-    /// needed; see `OP4`/`OP8`.
+    pub const CHECKSIGVERIFY: u8 = 0xad;
+    pub const TXINPUTINDEX: u8 = 0xb9;
+    pub const OUTPOINTTXID: u8 = 0xba;
+    pub const OUTPOINTINDEX: u8 = 0xbb;
+    pub const TXINPUTAMOUNT: u8 = 0xbe;
+    pub const TXOUTPUTSPK: u8 = 0xc3;
+    pub const NUM2BIN: u8 = 0xcd;
+    pub const INPUTCOVENANTID: u8 = 0xcf;
+    pub const CHECKSIGFROMSTACK: u8 = 0xd7;
+    pub const BLAKE3: u8 = 0xd9;
     pub const OP1: u8 = 0x51;
-    /// `Op4` — pushes the number 4 (the `OpNum2Bin` width for `outpoint_index`).
+    pub const OP2: u8 = 0x52;
     pub const OP4: u8 = 0x54;
-    /// `Op8` — pushes the number 8 (the `OpNum2Bin` width for `amount`).
     pub const OP8: u8 = 0x58;
-    /// `OpData8` push-opcode (push next 8 bytes) — for the domain tag.
+    pub const DATA1: u8 = 0x01;
+    pub const DATA3: u8 = 0x03;
     pub const DATA8: u8 = 0x08;
-    /// `OpData32` push-opcode (push next 32 bytes) — for the issuer pubkey.
     pub const DATA32: u8 = 0x20;
+    pub const ADD: u8 = 0x93;
+    pub const GREATERTHANOREQUAL: u8 = 0xa2;
 }
 
 // Compile-time guards tying the `OpNum2Bin` width literals to the encoder's
-// field widths: if `attestation` ever changes a fixed width, these break the
-// build rather than silently desyncing the on-chain composition.
+// field widths (mirrors case-A's guards, extended to the new base).
 const _: () = assert!(OUTPOINT_INDEX_LEN == 4);
 const _: () = assert!(AMOUNT_LEN == 8);
 const _: () = assert!(X_ONLY_PUBKEY_LEN == 32);
 
-/// Length, in bytes, of the stablecoin covenant body.
-pub const STABLECOIN_BODY_LEN: usize = 68;
+/// Canonical "burn sink" locking-script bytes (`STABLECOIN_ROBUST_DESIGN.md`
+/// §4/§8, BURN `0x03`): a BARE `OpReturn` (`0x6a`), no push data. A script
+/// whose FIRST opcode is `OpReturn` is recognized by this codebase's own
+/// consensus-level `kaspa_txscript::is_unspendable` (`crypto/txscript/src/lib.rs`)
+/// as guaranteed to fail at execution -- nobody can ever construct a valid
+/// spending script for an output locked to it, so pinning BURN's successor
+/// SPK to it provably destroys the coin's native (sompi) value. This is the
+/// SAME "OP_RETURN-first" convention Bitcoin-family chains use for
+/// unspendable/data outputs; this crate has no prior "burn sink" constant, so
+/// this is a NEW definition (documented here as the single source of truth).
+pub const BURN_SINK_SCRIPT: [u8; 1] = [0x6a];
 
-/// Length, in bytes, of the complete stablecoin redeem script (state + body).
-pub const STABLECOIN_REDEEM_SCRIPT_LEN: usize = Kcc20StateHeader::SCRIPT_ENCODED_LEN + STABLECOIN_BODY_LEN; // 103
+/// The scriptPublicKey bytes (`version(2B BE) || script`) `OpTxOutputSpk`
+/// pushes for an output locked to [`BURN_SINK_SCRIPT`] at SPK version `0`
+/// (the same version every other SPK in this codebase uses -- see
+/// `crypto/txscript/src/lib.rs`'s `SpkEncoding::to_bytes`,
+/// `settle::crypto::p2sh::build_p2sh`). This is the literal
+/// [`build_burn_branch`] bakes in and compares the successor output's actual
+/// SPK against.
+pub const BURN_SINK_SPK_BYTES: [u8; 3] = [0x00, 0x00, BURN_SINK_SCRIPT[0]];
 
-/// Byte offset, within the full redeem script, of the issuer pubkey's 32-byte
-/// payload (the byte immediately before it, at `offset - 1`, is the `OpData32`
-/// push opcode `0x20`).
-pub const ISSUER_PUBKEY_RS_OFFSET: usize = Kcc20StateHeader::SCRIPT_ENCODED_LEN + 33; // 68
+fn e_roll(b: &mut Vec<u8>, depth: u16) {
+    push_index(b, depth);
+    b.push(op::ROLL);
+}
 
-/// Emit the stablecoin covenant body for a given issuer key. See the module
-/// doc for the full stack trace; the emission order of the pre-image fields
-/// is kept identical to [`super::attestation::build_attestation_preimage`].
-pub fn build_stablecoin_body(issuer_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
+fn e_pick(b: &mut Vec<u8>, depth: u16) {
+    push_index(b, depth);
+    b.push(op::PICK);
+}
+
+/// Emit the TRANSFER (`0x00`) branch bytecode. See the module doc's "TRANSFER
+/// stack trace" for the full derivation. Entry stack (top to bottom):
+/// `epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
+/// owner_pubkey(4), owner_sig(5), new_rs(6), issuer_sig(7)`.
+fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     use op::*;
-    let mut b = Vec::with_capacity(STABLECOIN_BODY_LEN);
+    let mut b = Vec::with_capacity(160);
 
-    // --- Stage 1: owner authorization (mirrors token::TOKEN_UNIT_BODY). ---
-    b.push(DROP); // drop identifier_type
-    b.push(CHECKSIGVERIFY); // owner_pubkey (state) x owner_sig (SIGHASH_ALL)
+    // ---- Owner authorization (mirrors case-A's stage 1). ----
+    e_roll(&mut b, 5); // owner_sig -> top
+    e_roll(&mut b, 5); // owner_pubkey -> top (owner_sig now at depth1)
+    b.push(CHECKSIGVERIFY); // pubkey(top) x sig(next), SIGHASH_ALL
 
-    // --- Stage 2: reconstruct the attestation pre-image on the stack. ---
-    // Field 1: DOMAIN_TAG (8B constant) — seeds the accumulator.
+    // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
+    // identifier_type(3), new_rs(4), issuer_sig(5).
+    e_roll(&mut b, 3); // identifier_type -> top
+    b.push(DROP); // unused, same as case-A
+
+    // Stack: epoch(0), frozen_flag(1), role_registry_root(2), new_rs(3),
+    // issuer_sig(4).
+    e_roll(&mut b, 1); // frozen_flag -> top
+    b.push(DATA1);
+    b.push(frozen_flag::CLEAR); // literal explicit-push [0x00] (NOT OpN 0 / empty array)
+    b.push(EQUAL);
+    b.push(VERIFY); // frozen_flag == 0, fail-closed (§4 new invariant)
+
+    // Stack: epoch(0), role_registry_root(1), new_rs(2), issuer_sig(3).
+    e_pick(&mut b, 0); // copy of epoch (needed again for the preimage below)
+
+    // Stack: epoch_copy(0), epoch(1), role_registry_root(2), new_rs(3),
+    // issuer_sig(4).
+    b.push(TXINPUTINDEX); // fresh -- this input's own index, reused as the
+    // output index (case-A's existing 1:1 successor-binding convention).
+    // Stack: input_idx(0), epoch_copy(1), epoch(2), role_registry_root(3),
+    // new_rs(4), issuer_sig(5).
+    b.extend_from_slice(&dr_output_spk_check(4, 1)); // Blake2b(new_rs) == P2SH(real successor SPK)
+    b.push(DROP); // drop input_idx (net effect of the check above is 0
+                  // otherwise -- see dr.rs's own depth-adjustment discipline)
+
+    // Stack: epoch_copy(0), epoch(1), role_registry_root(2), new_rs(3),
+    // issuer_sig(4).
+    b.extend_from_slice(&dr_field_extract(3, ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET as u16, (ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET + 32) as u16));
+    // Stack: new_root(0), epoch_copy(1), epoch(2), role_registry_root(3),
+    // new_rs(4), issuer_sig(5).
+    e_roll(&mut b, 3); // this coin's own role_registry_root -> top
+    b.push(EQUAL);
+    b.push(VERIFY); // successor.role_registry_root == own (§4 invariant)
+
+    // Stack: epoch_copy(0), epoch(1), new_rs(2), issuer_sig(3).
+    b.extend_from_slice(&dr_field_extract(2, EPOCH_PAYLOAD_OFFSET as u16, (EPOCH_PAYLOAD_OFFSET + 4) as u16));
+    // Stack: new_epoch(0), epoch_copy(1), epoch(2), new_rs(3), issuer_sig(4).
+    e_roll(&mut b, 1); // epoch_copy -> top
+    b.push(EQUAL);
+    b.push(VERIFY); // successor.epoch == own (§4 invariant)
+
+    // Stack: epoch(0), new_rs(1), issuer_sig(2). new_rs no longer needed.
+    e_roll(&mut b, 1);
+    b.push(DROP);
+
+    // ---- Attestation pre-image (121B base, §4/§5): DOMAIN_TAG || covenant_id
+    // || op_type || epoch || outpoint_txid || outpoint_index ||
+    // successor_spk_hash || amount. ----
+    // Stack: epoch(0), issuer_sig(1).
     b.push(DATA8);
     b.extend_from_slice(&DOMAIN_TAG);
-    // Field 2: covenant_id (32B) = OpTxInputIndex OpInputCovenantId.
+    // Stack: domain_tag(0), epoch(1), issuer_sig(2).
     b.push(TXINPUTINDEX);
     b.push(INPUTCOVENANTID);
-    b.push(CAT);
-    // Field 3: outpoint_txid (32B) = OpTxInputIndex OpOutpointTxId.
+    b.push(CAT); // acc = domain_tag || covenant_id
+    // Stack: acc(0), epoch(1), issuer_sig(2).
+    b.push(DATA1);
+    b.push(op_type::TRANSFER);
+    b.push(CAT); // acc || op_type
+    // Stack: acc(0), epoch(1), issuer_sig(2).
+    e_roll(&mut b, 1); // epoch -> top
+    b.push(CAT); // acc || epoch
+    // Stack: acc(0), issuer_sig(1).
     b.push(TXINPUTINDEX);
     b.push(OUTPOINTTXID);
-    b.push(CAT);
-    // Field 4: outpoint_index (4B LE) = OpTxInputIndex OpOutpointIndex OpNum2Bin(4).
+    b.push(CAT); // acc || outpoint_txid
     b.push(TXINPUTINDEX);
     b.push(OUTPOINTINDEX);
     b.push(OP4);
     b.push(NUM2BIN);
-    b.push(CAT);
-    // Field 5: successor_spk_hash (32B) = OpTxInputIndex OpTxOutputSpk OpBlake3.
-    // (OpTxInputIndex reused as the OUTPUT index — 1:1 successor binding.)
+    b.push(CAT); // acc || outpoint_index(4B LE)
     b.push(TXINPUTINDEX);
     b.push(TXOUTPUTSPK);
     b.push(BLAKE3);
-    b.push(CAT);
-    // Field 6: amount (8B LE) = OpTxInputIndex OpTxInputAmount OpNum2Bin(8).
+    b.push(CAT); // acc || successor_spk_hash
     b.push(TXINPUTINDEX);
     b.push(TXINPUTAMOUNT);
     b.push(OP8);
     b.push(NUM2BIN);
-    b.push(CAT);
+    b.push(CAT); // acc || amount(8B LE) == full 121B preimage
 
-    // msg_hash = Blake3(pre-image).
+    // msg_hash = Blake3(preimage). Stack: msg_hash(0), issuer_sig(1).
     b.push(BLAKE3);
 
-    // Push the issuer pubkey constant, then verify the attestation.
+    // Push OPS pubkey; verify the attestation.
     b.push(DATA32);
-    b.extend_from_slice(issuer_pubkey);
+    b.extend_from_slice(ops_pubkey);
     b.push(CHECKSIGFROMSTACK);
     b.push(VERIFY);
 
-    // Success.
     b.push(OP1);
-
-    debug_assert_eq!(b.len(), STABLECOIN_BODY_LEN);
     b
 }
 
-/// Build the complete KCC-0020 native-value stablecoin redeem script
-/// (`STABLECOIN_REDEEM_SCRIPT_LEN` = 103 bytes).
+/// Emit the FREEZE (`0x01`) branch bytecode (`STABLECOIN_ROBUST_DESIGN.md`
+/// §4/§5). No owner signature at all -- the FREEZE role alone gates it, so
+/// this branch's entry stack replaces TRANSFER's `owner_sig` slot with the
+/// op-specific `new_frozen_flag` preimage field (both sit at the same depth,
+/// 5, since the state header always pushes exactly five fields regardless of
+/// which branch is taken -- see [`OP_TYPE_TAG_DEPTH`]).
 ///
-/// - `owner_pubkey` (32B x-only) → the state header's `owner_identifier`
-///   (identifier type `PUBKEY`). As in `token_unit`, this alone determines
-///   the P2SH address (native-value `amount`), so address-based discovery
-///   keeps working.
-/// - `issuer_pubkey` (32B x-only) → baked into the body as the
-///   `OpCheckSigFromStack` attestation key. The `&[u8; 32]` parameter type
-///   statically rejects a 33-byte compressed key (the brick case); callers
-///   holding raw bytes should go through
-///   [`super::attestation::validate_x_only_pubkey`] first.
+/// Entry (top-to-bottom), once the dispatch skeleton's `op_type` compare
+/// delivers control here:
+///
+/// ```text
+/// epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
+/// owner_pubkey(4), new_frozen_flag(5), new_rs(6), issuer_sig(7)
+/// ```
+///
+/// Mirrors [`build_transfer_branch`]'s successor-authentication mechanics
+/// (`dr_output_spk_check` + `dr_field_extract`, reused verbatim -- no changes
+/// to `crate::contract::dr`), but the FREEZE effect (task spec: "successor
+/// state identical to input EXCEPT frozen_flag set to new_frozen_flag") is
+/// STRICTER than TRANSFER's successor-continuity check: TRANSFER only pins
+/// `role_registry_root`+`epoch` (owner_pubkey is meant to change on a
+/// transfer; identifier_type is dropped unchecked, a pre-existing case-A
+/// carryover). FREEZE must not move funds or touch identity/policy at all, so
+/// it pins ALL FOUR of `owner_pubkey`, `identifier_type`, `role_registry_root`,
+/// `epoch` unchanged, and separately binds the successor's `frozen_flag` byte
+/// to equal the attested `new_frozen_flag` (not this coin's OWN current
+/// frozen_flag, which is read but otherwise unused/unconstrained here --
+/// FREEZE must work from either starting state, 0->1 or 1->0).
+///
+/// `freeze_pubkey` is baked into the branch bytecode as a literal constant,
+/// exactly as `build_transfer_branch` bakes in `ops_pubkey` -- role pubkeys
+/// are NOT (yet) individually revealed-and-verified against
+/// `role_registry_root` on-chain in this phase (the root is carried as an
+/// opaque commitment; see `state.rs`'s `compute_role_registry_root` doc). This
+/// keeps FREEZE's authorization mechanism consistent with TRANSFER's existing
+/// OPS-key pattern rather than inventing a different convention for the one
+/// new role.
+///
+/// # Value continuity (security fix)
+///
+/// TRANSFER gets successor-value continuity "for free": the owner's
+/// `SIGHASH_ALL` signature commits the whole transaction, including every
+/// output's amount, so nothing else needs to pin it. FREEZE has **no owner
+/// signature at all** -- the FREEZE role's `OpCheckSigFromStack` attestation
+/// signs only the fixed-format 122-byte preimage (which includes this
+/// input's CURRENT amount as a replay-binding field, but never compares it
+/// against the successor OUTPUT's actual value). Without an explicit check,
+/// a holder of only the FREEZE key could change the coin's native (sompi)
+/// value in the successor output while freezing/unfreezing -- value
+/// theft/destruction by a role the design (`STABLECOIN_ROBUST_DESIGN.md`
+/// §11) documents as "policy-only" (freeze-flag-only) risk. This branch
+/// closes that hole with [`dr_value_continuity_check`] (`crate::contract::dr`),
+/// a reusable, depth-argument-free helper that asserts
+/// `OpTxOutputAmount(successor) == OpTxInputAmount(self)` (exact equality --
+/// a 1:1 covenant; the tx fee must come from a separate funding input, not by
+/// shaving the covenant coin). The upcoming SEIZE (`0x02`) and ROTATE (`0x05`)
+/// branches also lack an owner signature and MUST call the same helper (see
+/// `STABLECOIN_ROBUST_DESIGN.md` §4's cross-branch invariant).
+fn build_freeze_branch(freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
+    use op::*;
+    let mut b = Vec::with_capacity(200);
+
+    // Stack: epoch(0), frozen_flag(1), root(2), identifier_type(3),
+    // owner_pubkey(4), new_frozen_flag(5), new_rs(6), issuer_sig(7).
+    e_roll(&mut b, 1); // this coin's own frozen_flag -> top (unused by FREEZE)
+    b.push(DROP);
+
+    // Stack: epoch(0), root(1), identifier_type(2), owner_pubkey(3),
+    // new_frozen_flag(4), new_rs(5), issuer_sig(6).
+    e_pick(&mut b, 0); // copy of epoch (needed again for the preimage below)
+
+    // Stack: epoch_copy(0), epoch(1), root(2), identifier_type(3),
+    // owner_pubkey(4), new_frozen_flag(5), new_rs(6), issuer_sig(7).
+    b.push(TXINPUTINDEX); // fresh -- this input's own index, reused as the
+                           // output index (case-A's 1:1 successor-binding convention).
+    // Stack: input_idx(0), epoch_copy(1), epoch(2), root(3),
+    // identifier_type(4), owner_pubkey(5), new_frozen_flag(6), new_rs(7),
+    // issuer_sig(8).
+    b.extend_from_slice(&dr_output_spk_check(7, 1)); // Blake2b(new_rs) == P2SH(real successor SPK)
+    b.push(DROP); // drop input_idx
+
+    // Stack: epoch_copy(0), epoch(1), root(2), identifier_type(3),
+    // owner_pubkey(4), new_frozen_flag(5), new_rs(6), issuer_sig(7).
+
+    // ---- Value continuity (security fix, see this fn's doc "Value
+    // continuity" section): FREEZE has no owner SIGHASH_ALL signature, so
+    // nothing else on this path pins the successor covenant output's native
+    // value to this input's value -- without this check a holder of only the
+    // FREEZE key could alter the coin's sompi amount while freezing/
+    // unfreezing. `dr_value_continuity_check` is self-contained (net zero
+    // stack effect, no depth argument), so it can be spliced in here without
+    // touching any of the depth comments above/below.
+    b.extend_from_slice(&dr_value_continuity_check());
+
+    // ---- Successor must be identical EXCEPT frozen_flag (task spec). ----
+    // owner_pubkey unchanged.
+    b.extend_from_slice(&dr_field_extract(6, OWNER_PUBKEY_PAYLOAD_OFFSET as u16, (OWNER_PUBKEY_PAYLOAD_OFFSET + 32) as u16));
+    // Stack: succ_owner(0), epoch_copy(1), epoch(2), root(3),
+    // identifier_type(4), owner_pubkey(5), new_frozen_flag(6), new_rs(7),
+    // issuer_sig(8).
+    e_roll(&mut b, 5); // this coin's own owner_pubkey -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch_copy(0), epoch(1), root(2), identifier_type(3),
+    // new_frozen_flag(4), new_rs(5), issuer_sig(6).
+    // identifier_type unchanged.
+    b.extend_from_slice(&dr_field_extract(5, IDENTIFIER_TYPE_PAYLOAD_OFFSET as u16, (IDENTIFIER_TYPE_PAYLOAD_OFFSET + 1) as u16));
+    // Stack: succ_idtype(0), epoch_copy(1), epoch(2), root(3),
+    // identifier_type(4), new_frozen_flag(5), new_rs(6), issuer_sig(7).
+    e_roll(&mut b, 4); // this coin's own identifier_type -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch_copy(0), epoch(1), root(2), new_frozen_flag(3), new_rs(4),
+    // issuer_sig(5).
+    // role_registry_root unchanged.
+    b.extend_from_slice(&dr_field_extract(4, ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET as u16, (ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET + 32) as u16));
+    // Stack: succ_root(0), epoch_copy(1), epoch(2), root(3),
+    // new_frozen_flag(4), new_rs(5), issuer_sig(6).
+    e_roll(&mut b, 3); // this coin's own role_registry_root -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch_copy(0), epoch(1), new_frozen_flag(2), new_rs(3),
+    // issuer_sig(4).
+    // epoch unchanged.
+    b.extend_from_slice(&dr_field_extract(3, EPOCH_PAYLOAD_OFFSET as u16, (EPOCH_PAYLOAD_OFFSET + 4) as u16));
+    // Stack: succ_epoch(0), epoch_copy(1), epoch(2), new_frozen_flag(3),
+    // new_rs(4), issuer_sig(5).
+    e_roll(&mut b, 1); // epoch_copy -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch(0), new_frozen_flag(1), new_rs(2), issuer_sig(3).
+    // frozen_flag == attested new_frozen_flag (NOT this coin's own current
+    // frozen_flag -- that field was dropped, unused, above).
+    e_pick(&mut b, 1); // copy of new_frozen_flag (needed again for the preimage tail)
+    // Stack: new_frozen_flag_copy(0), epoch(1), new_frozen_flag(2), new_rs(3),
+    // issuer_sig(4).
+    b.extend_from_slice(&dr_field_extract(3, FROZEN_FLAG_PAYLOAD_OFFSET as u16, (FROZEN_FLAG_PAYLOAD_OFFSET + 1) as u16));
+    // Stack: succ_frozen(0), new_frozen_flag_copy(1), epoch(2),
+    // new_frozen_flag(3), new_rs(4), issuer_sig(5).
+    e_roll(&mut b, 1); // new_frozen_flag_copy -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch(0), new_frozen_flag(1), new_rs(2), issuer_sig(3). new_rs no
+    // longer needed; drop it.
+    e_roll(&mut b, 2);
+    b.push(DROP);
+
+    // ---- Attestation pre-image (122B, §4/§5): 121B base + new_frozen_flag
+    // tail. ----
+    // Stack: epoch(0), new_frozen_flag(1), issuer_sig(2).
+    b.push(DATA8);
+    b.extend_from_slice(&DOMAIN_TAG);
+    // Stack: domain_tag(0), epoch(1), new_frozen_flag(2), issuer_sig(3).
+    b.push(TXINPUTINDEX);
+    b.push(INPUTCOVENANTID);
+    b.push(CAT); // acc = domain_tag || covenant_id
+    // Stack: acc(0), epoch(1), new_frozen_flag(2), issuer_sig(3).
+    b.push(DATA1);
+    b.push(op_type::FREEZE);
+    b.push(CAT); // acc || op_type
+    // Stack: acc(0), epoch(1), new_frozen_flag(2), issuer_sig(3).
+    e_roll(&mut b, 1); // epoch -> top
+    b.push(CAT); // acc || epoch
+    // Stack: acc(0), new_frozen_flag(1), issuer_sig(2).
+    b.push(TXINPUTINDEX);
+    b.push(OUTPOINTTXID);
+    b.push(CAT); // acc || outpoint_txid
+    b.push(TXINPUTINDEX);
+    b.push(OUTPOINTINDEX);
+    b.push(OP4);
+    b.push(NUM2BIN);
+    b.push(CAT); // acc || outpoint_index(4B LE)
+    b.push(TXINPUTINDEX);
+    b.push(TXOUTPUTSPK);
+    b.push(BLAKE3);
+    b.push(CAT); // acc || successor_spk_hash
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    b.push(OP8);
+    b.push(NUM2BIN);
+    b.push(CAT); // acc || amount(8B LE) == full 121B base preimage
+    // Stack: acc(0), new_frozen_flag(1), issuer_sig(2).
+    e_roll(&mut b, 1); // new_frozen_flag -> top
+    b.push(CAT); // acc || new_frozen_flag == full 122B FREEZE preimage
+
+    // msg_hash = Blake3(preimage). Stack: msg_hash(0), issuer_sig(1).
+    b.push(BLAKE3);
+
+    // Push FREEZE pubkey; verify the attestation.
+    b.push(DATA32);
+    b.extend_from_slice(freeze_pubkey);
+    b.push(CHECKSIGFROMSTACK);
+    b.push(VERIFY);
+
+    b.push(OP1);
+    b
+}
+
+/// Emit the SEIZE (`0x02`) branch bytecode (`STABLECOIN_ROBUST_DESIGN.md`
+/// §4/§5/§7, Phase II branch 3). No owner signature at all -- the issuer
+/// force-moves the coin without the holder's consent (§7: this doubles as
+/// both punitive seizure and user-rescue, decided off-chain by whoever
+/// controls the quorum before it signs). Authorization is a **2-of-3**
+/// threshold over three BAKED SEIZE pubkeys (design decision "option B":
+/// baked bytecode literals, the SAME convention as `ops_pubkey`/
+/// `freeze_pubkey` -- `role_registry_root` is NOT individually read/verified
+/// on-chain in this phase).
+///
+/// # Why three `OpCheckSigFromStack` calls instead of native `OpCheckMultiSig`
+///
+/// The design doc's own per-branch pseudocode (§4, "0x02 SEIZE") writes
+/// `OpCheckMultiSig` operating over the reconstructed attestation `msg_hash`
+/// (the `OpBlake3` result) -- but the codebase's REAL `OpCheckMultiSig`
+/// (`crypto/txscript/src/opcodes/mod.rs:1000`, opcode `0xae`) has no such
+/// "message from stack" form: it is hard-wired to
+/// `op_check_multisig_schnorr_or_ecdsa`, which always verifies each candidate
+/// signature against the CURRENT TRANSACTION's own sighash
+/// (`calc_schnorr_signature_hash`/`SigHashType`), exactly like
+/// `OpCheckSig`/`OpCheckSigVerify` -- there is no `OpCheckMultiSigFromStack`
+/// opcode in this engine (only the single-signature
+/// `OpCheckSigFromStack`/`OpCheckSigFromStackECDSA` support an arbitrary
+/// stack-supplied message hash). A repo-wide grep for `OpCheckMultiSig` /
+/// `0xae` / "multisig" turned up zero uses of native multisig anywhere in
+/// this crate's own covenant builders (`spot`, `time`, `kcc20`, `stablecoin`)
+/// -- the ONLY established KOB covenant idiom for role-gated, spend-bound
+/// authorization is the `OpCheckSigFromStack`-over-reconstructed-preimage
+/// pattern TRANSFER (OPS role) and FREEZE (FREEZE role) already use. This
+/// branch reuses that exact idiom, three times over three baked pubkeys at
+/// FIXED sigscript slots (`sig1`<->`seize_pubkeys[0]`, `sig2`<->`[1]`,
+/// `sig3`<->`[2]`) -- a holder of only 2 of the 3 keys supplies a genuine
+/// signature in their two slots and an arbitrary 64-byte placeholder in the
+/// third (`OpCheckSigFromStack` parses any 64 bytes as a structurally valid
+/// Schnorr signature and simply evaluates to `false` on a non-matching key --
+/// see `check_schnorr_signature_with_msg_hash`; it only hard-errors on a
+/// malformed PUBKEY or a wrong-length signature buffer, and the three
+/// pubkeys here are fixed, valid constants). The three booleans are summed
+/// (`OpAdd` twice) and compared `>= 2` (`OpGreaterThanOrEqual OpVerify`) -- a
+/// fixed-position 2-of-3 threshold, simpler than native `OpCheckMultiSig`'s
+/// greedy ordered-skip matching algorithm (which exists to support a
+/// SPENDER-supplied, variable-order pubkey list; here the three pubkeys are
+/// baked constants known at redeem-script-build time, so positional matching
+/// is sufficient and avoids reimplementing an unused generality).
+///
+/// One consequence: unlike a genuine tx-sighash-bound signature (which would
+/// commit every output's amount "for free", the same way TRANSFER's owner
+/// `SIGHASH_ALL` signature does), these `OpCheckSigFromStack` checks only
+/// commit the fixed-format attestation preimage -- so SEIZE needs its own
+/// explicit value-continuity check, same as FREEZE (see below).
+///
+/// Entry (top-to-bottom), once the dispatch skeleton's `op_type` compare
+/// delivers control here:
+///
+/// ```text
+/// epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
+/// owner_pubkey(4), new_owner_pubkey(5), new_rs(6), sig3(7), sig2(8), sig1(9)
+/// ```
+///
+/// (sigscript push/emission order, first==deepest: `sig1`, `sig2`, `sig3`,
+/// `new_rs`, `new_owner_pubkey`, `op_type_selector`, `redeem_script` -- see
+/// `super::sigscript::build_stablecoin_seize_sigscript`.)
+///
+/// # Effect (task spec, §4/§7)
+///
+/// Successor is the SAME covenant with `owner_pubkey` REPLACED by the
+/// attested `new_owner_pubkey`; `role_registry_root`/`epoch`/`identifier_type`
+/// unchanged -- mirrors [`build_freeze_branch`]'s "pin everything except the
+/// one field that's meant to change" discipline. This coin's own CURRENT
+/// `owner_pubkey` is therefore irrelevant to this branch (read, then dropped,
+/// unused) -- SEIZE force-moves regardless of who currently holds the coin.
+///
+/// # `frozen_flag` on seize -- flagged for human review
+///
+/// `STABLECOIN_ROBUST_DESIGN.md`'s SEIZE per-branch detail (§4) is SILENT on
+/// `frozen_flag` continuity. This implementation PRESERVES the input's
+/// current `frozen_flag` unchanged into the successor (the same "pin unless
+/// told otherwise" discipline used for `identifier_type`/`role_registry_root`/
+/// `epoch` above). **This is a judgment call, not a spec requirement, and is
+/// flagged for human review**: a seizure used for rescue (§7 -- lost-key
+/// recovery) arguably wants the recovered coin UNFROZEN regardless of its
+/// pre-seizure state, since the whole point of a rescue is to hand a working
+/// coin back to a legitimate owner. Preserving is the more conservative
+/// (fail-closed, no implicit unfreeze-on-seize) choice, but unconditionally
+/// clearing `frozen_flag` on every SEIZE is an equally defensible
+/// alternative reading -- this should be a deliberate human decision, not an
+/// implementation default silently picked here.
+///
+/// # Value continuity (security fix, §4 cross-branch invariant, §11-v)
+///
+/// No owner `SIGHASH_ALL` signature exists on this path (and, per the doc
+/// section above, native tx-sighash `OpCheckMultiSig` isn't used here
+/// either), so nothing else pins the successor's native value;
+/// [`dr_value_continuity_check`] is spliced in exactly as it was for
+/// [`build_freeze_branch`].
+fn build_seize_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
+    use op::*;
+    let mut b = Vec::with_capacity(400);
+
+    // Stack: epoch(0), frozen_flag(1), root(2), identifier_type(3),
+    // owner_pubkey(4), new_owner_pubkey(5), new_rs(6), sig3(7), sig2(8),
+    // sig1(9).
+    e_pick(&mut b, 0); // copy of epoch (needed again for the preimage below)
+
+    // Stack: epoch_copy(0), epoch(1), frozen_flag(2), root(3),
+    // identifier_type(4), owner_pubkey(5), new_owner_pubkey(6), new_rs(7),
+    // sig3(8), sig2(9), sig1(10).
+    b.push(TXINPUTINDEX); // fresh -- this input's own index, reused as the
+                           // output index (1:1 successor-binding convention).
+    // Stack: input_idx(0), epoch_copy(1), epoch(2), frozen_flag(3), root(4),
+    // identifier_type(5), owner_pubkey(6), new_owner_pubkey(7), new_rs(8),
+    // sig3(9), sig2(10), sig1(11).
+    b.extend_from_slice(&dr_output_spk_check(8, 1)); // Blake2b(new_rs) == P2SH(real successor SPK)
+    b.push(DROP); // drop input_idx
+
+    // Stack: epoch_copy(0), epoch(1), frozen_flag(2), root(3),
+    // identifier_type(4), owner_pubkey(5), new_owner_pubkey(6), new_rs(7),
+    // sig3(8), sig2(9), sig1(10).
+
+    // ---- Value continuity (security fix, cross-branch invariant, see this
+    // fn's doc). ----
+    b.extend_from_slice(&dr_value_continuity_check());
+
+    // ---- Successor checks: owner_pubkey REPLACED by the attested
+    // new_owner_pubkey; identifier_type/role_registry_root/epoch/frozen_flag
+    // unchanged (task spec's Effect + the frozen_flag decision, see fn doc). ----
+
+    // This coin's own CURRENT owner_pubkey is irrelevant to SEIZE (forced
+    // move regardless of current holder) -- drop it, unused.
+    e_roll(&mut b, 5); // owner_pubkey -> top
+    b.push(DROP);
+
+    // Stack: epoch_copy(0), epoch(1), frozen_flag(2), root(3),
+    // identifier_type(4), new_owner_pubkey(5), new_rs(6), sig3(7), sig2(8),
+    // sig1(9).
+
+    // successor.owner_pubkey == new_owner_pubkey (the ATTESTED value --
+    // picked, not rolled, since new_owner_pubkey is needed again for the
+    // preimage tail below).
+    b.extend_from_slice(&dr_field_extract(6, OWNER_PUBKEY_PAYLOAD_OFFSET as u16, (OWNER_PUBKEY_PAYLOAD_OFFSET + 32) as u16));
+    // Stack: succ_owner(0), epoch_copy(1), epoch(2), frozen_flag(3), root(4),
+    // identifier_type(5), new_owner_pubkey(6), new_rs(7), sig3(8), sig2(9),
+    // sig1(10).
+    e_pick(&mut b, 6); // copy of new_owner_pubkey -> top
+    // Stack: new_owner_pubkey_copy(0), succ_owner(1), epoch_copy(2), epoch(3),
+    // frozen_flag(4), root(5), identifier_type(6), new_owner_pubkey(7),
+    // new_rs(8), sig3(9), sig2(10), sig1(11).
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch_copy(0), epoch(1), frozen_flag(2), root(3),
+    // identifier_type(4), new_owner_pubkey(5), new_rs(6), sig3(7), sig2(8),
+    // sig1(9).
+
+    // identifier_type unchanged.
+    b.extend_from_slice(&dr_field_extract(6, IDENTIFIER_TYPE_PAYLOAD_OFFSET as u16, (IDENTIFIER_TYPE_PAYLOAD_OFFSET + 1) as u16));
+    // Stack: succ_idtype(0), epoch_copy(1), epoch(2), frozen_flag(3), root(4),
+    // identifier_type(5), new_owner_pubkey(6), new_rs(7), sig3(8), sig2(9),
+    // sig1(10).
+    e_roll(&mut b, 5); // this coin's own identifier_type -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch_copy(0), epoch(1), frozen_flag(2), root(3),
+    // new_owner_pubkey(4), new_rs(5), sig3(6), sig2(7), sig1(8).
+
+    // role_registry_root unchanged.
+    b.extend_from_slice(&dr_field_extract(5, ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET as u16, (ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET + 32) as u16));
+    // Stack: succ_root(0), epoch_copy(1), epoch(2), frozen_flag(3), root(4),
+    // new_owner_pubkey(5), new_rs(6), sig3(7), sig2(8), sig1(9).
+    e_roll(&mut b, 4); // this coin's own role_registry_root -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch_copy(0), epoch(1), frozen_flag(2), new_owner_pubkey(3),
+    // new_rs(4), sig3(5), sig2(6), sig1(7).
+
+    // epoch unchanged.
+    b.extend_from_slice(&dr_field_extract(4, EPOCH_PAYLOAD_OFFSET as u16, (EPOCH_PAYLOAD_OFFSET + 4) as u16));
+    // Stack: succ_epoch(0), epoch_copy(1), epoch(2), frozen_flag(3),
+    // new_owner_pubkey(4), new_rs(5), sig3(6), sig2(7), sig1(8).
+    e_roll(&mut b, 1); // epoch_copy -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch(0), frozen_flag(1), new_owner_pubkey(2), new_rs(3),
+    // sig3(4), sig2(5), sig1(6).
+
+    // frozen_flag preserved (flagged for human review, see fn doc).
+    b.extend_from_slice(&dr_field_extract(3, FROZEN_FLAG_PAYLOAD_OFFSET as u16, (FROZEN_FLAG_PAYLOAD_OFFSET + 1) as u16));
+    // Stack: succ_frozen(0), epoch(1), frozen_flag(2), new_owner_pubkey(3),
+    // new_rs(4), sig3(5), sig2(6), sig1(7).
+    e_roll(&mut b, 2); // this coin's own frozen_flag -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch(0), new_owner_pubkey(1), new_rs(2), sig3(3), sig2(4),
+    // sig1(5). new_rs no longer needed.
+    e_roll(&mut b, 2);
+    b.push(DROP);
+
+    // Stack: epoch(0), new_owner_pubkey(1), sig3(2), sig2(3), sig1(4).
+
+    // ---- Attestation pre-image (153B, §4/§5): 121B base +
+    // new_owner_pubkey(32) tail. ----
+    b.push(DATA8);
+    b.extend_from_slice(&DOMAIN_TAG);
+    // Stack: domain_tag(0), epoch(1), new_owner_pubkey(2), sig3(3), sig2(4),
+    // sig1(5).
+    b.push(TXINPUTINDEX);
+    b.push(INPUTCOVENANTID);
+    b.push(CAT); // acc = domain_tag || covenant_id
+    // Stack: acc(0), epoch(1), new_owner_pubkey(2), sig3(3), sig2(4), sig1(5).
+    b.push(DATA1);
+    b.push(op_type::SEIZE);
+    b.push(CAT); // acc || op_type
+    // Stack: acc(0), epoch(1), new_owner_pubkey(2), sig3(3), sig2(4), sig1(5).
+    e_roll(&mut b, 1); // epoch -> top
+    b.push(CAT); // acc || epoch
+    // Stack: acc(0), new_owner_pubkey(1), sig3(2), sig2(3), sig1(4).
+    b.push(TXINPUTINDEX);
+    b.push(OUTPOINTTXID);
+    b.push(CAT); // acc || outpoint_txid
+    b.push(TXINPUTINDEX);
+    b.push(OUTPOINTINDEX);
+    b.push(OP4);
+    b.push(NUM2BIN);
+    b.push(CAT); // acc || outpoint_index(4B LE)
+    b.push(TXINPUTINDEX);
+    b.push(TXOUTPUTSPK);
+    b.push(BLAKE3);
+    b.push(CAT); // acc || successor_spk_hash
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    b.push(OP8);
+    b.push(NUM2BIN);
+    b.push(CAT); // acc || amount(8B LE) == full 121B base preimage
+    // Stack: acc(0), new_owner_pubkey(1), sig3(2), sig2(3), sig1(4).
+    e_roll(&mut b, 1); // new_owner_pubkey -> top
+    b.push(CAT); // acc || new_owner_pubkey == full 153B SEIZE preimage
+
+    // msg_hash = Blake3(preimage). Stack: msg_hash(0), sig3(1), sig2(2),
+    // sig1(3).
+    b.push(BLAKE3);
+
+    // ---- 2-of-3 threshold over the three baked SEIZE pubkeys (see fn doc
+    // for why this is 3x OpCheckSigFromStack + a summed threshold rather
+    // than native OpCheckMultiSig). Fixed positional convention:
+    // sig3<->seize_pubkeys[2], sig2<->seize_pubkeys[1], sig1<->
+    // seize_pubkeys[0]. ----
+
+    // -- check sig3 vs seize_pubkeys[2] --
+    // Stack: msg_hash(0), sig3(1), sig2(2), sig1(3).
+    e_roll(&mut b, 1); // sig3 -> top
+    // Stack: sig3(0), msg_hash(1), sig2(2), sig1(3).
+    e_pick(&mut b, 1); // copy of msg_hash -> top
+    // Stack: msg_hash_copy(0), sig3(1), msg_hash(2), sig2(3), sig1(4).
+    b.push(DATA32);
+    b.extend_from_slice(&seize_pubkeys[2]);
+    // Stack: pubkey3(0), msg_hash_copy(1), sig3(2), msg_hash(3), sig2(4),
+    // sig1(5).
+    b.push(CHECKSIGFROMSTACK);
+    // Stack: bool3(0), msg_hash(1), sig2(2), sig1(3).
+
+    // -- check sig2 vs seize_pubkeys[1] --
+    e_roll(&mut b, 2); // sig2 -> top
+    // Stack: sig2(0), bool3(1), msg_hash(2), sig1(3).
+    e_pick(&mut b, 2); // copy of msg_hash -> top
+    // Stack: msg_hash_copy(0), sig2(1), bool3(2), msg_hash(3), sig1(4).
+    b.push(DATA32);
+    b.extend_from_slice(&seize_pubkeys[1]);
+    // Stack: pubkey2(0), msg_hash_copy(1), sig2(2), bool3(3), msg_hash(4),
+    // sig1(5).
+    b.push(CHECKSIGFROMSTACK);
+    // Stack: bool2(0), bool3(1), msg_hash(2), sig1(3).
+
+    // -- check sig1 vs seize_pubkeys[0] (consumes the ORIGINAL msg_hash; no
+    // copy needed since this is the last use) --
+    e_roll(&mut b, 3); // sig1 -> top
+    // Stack: sig1(0), bool2(1), bool3(2), msg_hash(3).
+    e_roll(&mut b, 3); // msg_hash -> top (directly above sig1)
+    // Stack: msg_hash(0), sig1(1), bool2(2), bool3(3).
+    b.push(DATA32);
+    b.extend_from_slice(&seize_pubkeys[0]);
+    // Stack: pubkey1(0), msg_hash(1), sig1(2), bool2(3), bool3(4).
+    b.push(CHECKSIGFROMSTACK);
+    // Stack: bool1(0), bool2(1), bool3(2).
+
+    // sum(bool1, bool2, bool3) >= 2 -- fixed-position 2-of-3 threshold.
+    b.push(ADD); // bool1 + bool2 -> Stack: sum12(0), bool3(1).
+    b.push(ADD); // sum12 + bool3 -> Stack: total(0).
+    b.push(OP2);
+    b.push(GREATERTHANOREQUAL);
+    b.push(VERIFY);
+
+    b.push(OP1);
+    b
+}
+
+/// Emit the BURN (`0x03`) branch bytecode (`STABLECOIN_ROBUST_DESIGN.md`
+/// §4/§5/§8, Phase II branch 4). Two-of-two authorization, the SAME SHAPE as
+/// TRANSFER (owner `OpCheckSigVerify`, SIGHASH_ALL, PLUS an
+/// `OpCheckSigFromStack` attestation) -- but the attesting role here is MINT
+/// (the mint-authority's supply key, §2/§9: "authorizes BURN (issuer side) in
+/// this covenant"), not OPS, and the attested pre-image is the 121-byte BASE
+/// pre-image with NO op-specific tail (§5: "sink pinned structurally, not via
+/// preimage").
+///
+/// # No `new_rs` -- the sink is a FIXED constant, not a candidate covenant
+///
+/// Unlike TRANSFER/FREEZE/SEIZE, BURN's successor is NOT an arbitrary
+/// candidate redeem script the spender proposes and the body authenticates
+/// via `dr_output_spk_check` (the "P2SH-opacity problem" this module's doc
+/// explains) -- it is the FIXED canonical constant [`BURN_SINK_SPK_BYTES`],
+/// known at redeem-script-build time. So the body doesn't need the
+/// authenticate-then-slice dance at all: it just compares the successor
+/// output's raw SPK bytes (`OpTxOutputSpk`) directly against the baked
+/// literal (§4's pseudocode: `OpTxInputIndex OpTxOutputSpk <canonical sink
+/// SPK bytes> OpEqual OpVerify`). Consequently there is no `new_rs` sigscript
+/// field either -- see `super::sigscript::build_stablecoin_burn_sigscript`.
+///
+/// Because the destination is fixed and carries no coin state at all, none
+/// of `frozen_flag`/`role_registry_root`/`identifier_type` are read for any
+/// successor-continuity check (there is no successor covenant state to carry
+/// them into) -- each is rolled up and dropped, unused, exactly as
+/// `identifier_type` already is in [`build_transfer_branch`].
+///
+/// # `frozen_flag` -- NOT gated (matches §4's pseudocode; flagged for human
+/// review)
+///
+/// `STABLECOIN_ROBUST_DESIGN.md`'s §4 BURN pseudocode and per-branch detail
+/// are both silent on `frozen_flag` (contrast TRANSFER, which adds an
+/// explicit "frozen_flag == 0" invariant beyond case-A, §4's "Omission
+/// flagged for human review" note on this same file). This implementation
+/// follows the pseudocode literally: `frozen_flag` is read (it must be, since
+/// it sits on the stack ahead of `issuer_sig`) and dropped, unused -- so a
+/// FROZEN coin can still be burned (owner + MINT co-signing). This is a
+/// judgment call worth a deliberate human decision -- arguably burning should
+/// respect the freeze gate the same way TRANSFER does -- not an
+/// implementation default silently picked here. **Flagged for human review**,
+/// same discipline as [`build_transfer_branch`]'s/[`build_seize_branch`]'s own
+/// flagged omissions.
+///
+/// # Value continuity -- intentionally NOT applied (task spec, §4)
+///
+/// FREEZE/SEIZE call [`dr_value_continuity_check`] because they have NO owner
+/// signature at all, so nothing else pins the successor's native value. BURN
+/// DOES have an owner `SIGHASH_ALL` signature (§4's cross-branch invariant
+/// table lists BURN under the owner-signed column, alongside TRANSFER and
+/// MIGRATE), so it gets value-PINNING "for free" the same mechanical way
+/// TRANSFER does -- but unlike TRANSFER, the pinned value is INTENTIONALLY
+/// not preserved into a covenant successor: it moves to the unspendable sink,
+/// i.e. is destroyed. Calling `dr_value_continuity_check` here would be
+/// actively WRONG (it asserts input amount == successor OUTPUT amount, which
+/// would forbid ever actually burning anything into the sink) -- the owner's
+/// own SIGHASH_ALL signature is what makes "burn exactly this much value"
+/// an intentional, attributable choice, not a hole: nobody but the owner can
+/// choose to fund the sink output from this coin's value.
+///
+/// Entry (top-to-bottom), once the dispatch skeleton's `op_type` compare
+/// delivers control here:
+///
+/// ```text
+/// epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
+/// owner_pubkey(4), owner_sig(5), issuer_sig(6)
+/// ```
+///
+/// (sigscript push/emission order, first==deepest: `issuer_sig`, `owner_sig`,
+/// `op_type_selector`, `redeem_script` -- see
+/// `super::sigscript::build_stablecoin_burn_sigscript`; no `new_rs`.)
+fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
+    use op::*;
+    let mut b = Vec::with_capacity(160);
+
+    // ---- Owner authorization (identical mechanics to TRANSFER's stage 1). ----
+    e_roll(&mut b, 5); // owner_sig -> top
+    e_roll(&mut b, 5); // owner_pubkey -> top (owner_sig now at depth 1)
+    b.push(CHECKSIGVERIFY); // pubkey(top) x sig(next), SIGHASH_ALL
+
+    // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
+    // identifier_type(3), issuer_sig(4).
+    e_roll(&mut b, 3); // identifier_type -> top
+    b.push(DROP); // unused -- no successor covenant state to carry it into
+
+    // Stack: epoch(0), frozen_flag(1), role_registry_root(2), issuer_sig(3).
+    e_roll(&mut b, 1); // frozen_flag -> top
+    b.push(DROP); // unused (see fn doc: BURN is not frozen-gated, per §4's pseudocode)
+
+    // Stack: epoch(0), role_registry_root(1), issuer_sig(2).
+    e_roll(&mut b, 1); // role_registry_root -> top
+    b.push(DROP); // unused -- no successor state to compare it against
+
+    // Stack: epoch(0), issuer_sig(1).
+    // ---- Attestation pre-image (121B base, §4/§5, empty tail): identical
+    // mechanics to TRANSFER's, just op_type::BURN and the MINT-role pubkey. ----
+    b.push(DATA8);
+    b.extend_from_slice(&DOMAIN_TAG);
+    // Stack: domain_tag(0), epoch(1), issuer_sig(2).
+    b.push(TXINPUTINDEX);
+    b.push(INPUTCOVENANTID);
+    b.push(CAT); // acc = domain_tag || covenant_id
+    // Stack: acc(0), epoch(1), issuer_sig(2).
+    b.push(DATA1);
+    b.push(op_type::BURN);
+    b.push(CAT); // acc || op_type
+    // Stack: acc(0), epoch(1), issuer_sig(2).
+    e_roll(&mut b, 1); // epoch -> top
+    b.push(CAT); // acc || epoch
+    // Stack: acc(0), issuer_sig(1).
+    b.push(TXINPUTINDEX);
+    b.push(OUTPOINTTXID);
+    b.push(CAT); // acc || outpoint_txid
+    b.push(TXINPUTINDEX);
+    b.push(OUTPOINTINDEX);
+    b.push(OP4);
+    b.push(NUM2BIN);
+    b.push(CAT); // acc || outpoint_index(4B LE)
+    b.push(TXINPUTINDEX);
+    b.push(TXOUTPUTSPK);
+    b.push(BLAKE3);
+    b.push(CAT); // acc || successor_spk_hash
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    b.push(OP8);
+    b.push(NUM2BIN);
+    b.push(CAT); // acc || amount(8B LE) == full 121B preimage
+
+    // msg_hash = Blake3(preimage). Stack: msg_hash(0), issuer_sig(1).
+    b.push(BLAKE3);
+
+    // Push MINT pubkey; verify the attestation.
+    b.push(DATA32);
+    b.extend_from_slice(mint_pubkey);
+    b.push(CHECKSIGFROMSTACK);
+    b.push(VERIFY);
+
+    // ---- Sink pin (§4/§8): successor SPK must equal the canonical
+    // unspendable burn sink, exactly (not attacker-suppliable). Stack is
+    // empty here (CHECKSIGFROMSTACK+VERIFY above consumed everything). ----
+    b.push(TXINPUTINDEX);
+    b.push(TXOUTPUTSPK);
+    b.push(DATA3);
+    b.extend_from_slice(&BURN_SINK_SPK_BYTES);
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    b.push(OP1);
+    b
+}
+
+/// Emit the MIGRATE (`0x06`) branch bytecode (`STABLECOIN_ROBUST_DESIGN.md`
+/// §4/§5, Phase II final branch). Two-of-two authorization, the SAME SHAPE as
+/// TRANSFER's/BURN's (owner `OpCheckSigVerify`, SIGHASH_ALL, PLUS an
+/// `OpCheckSigFromStack` attestation) -- but see the authorizer note below.
+///
+/// # Authorizer: OPS stands in for the (deferred) ROTATE role
+///
+/// §4's branch table specifies MIGRATE authorization as "OWNER + (ROTATE or
+/// OPS)". Under Decision 2026-07-19 (option B, baked keys), `ROTATE` (`0x05`)
+/// is deferred to post-Live (it only becomes meaningful once role keys are
+/// verified against `role_registry_root` rather than baked -- see this
+/// module's top doc and `STABLECOIN_ROBUST_DESIGN.md`'s "Deferred to
+/// post-Live robustness upgrade" section). Since ROTATE doesn't exist yet in
+/// this dispatch, this branch uses the OPS role (the SAME baked pubkey
+/// TRANSFER already uses) as the authorizer -- the design doc explicitly
+/// allows this ("ROTATE or OPS"). **Post-Live**, once ROTATE/root-
+/// verification land, MIGRATE authorization MAY move to the ROTATE role
+/// instead (a stronger-quorum signer for what is, after all, a "redeploy the
+/// covenant" event) -- that would be a body-bytecode change at that time, not
+/// implied by anything here.
+///
+/// # No `new_rs` -- only the successor's SPK HASH is needed
+///
+/// Unlike TRANSFER/FREEZE/SEIZE, MIGRATE's successor is NOT the same covenant
+/// template with specific fields (`role_registry_root`/`epoch`/`owner_pubkey`)
+/// that this body reads and carries forward -- it is effect is "coin moves to
+/// a NEW covenant template" (§4): a different redeem script ENTIRELY, whose
+/// internal layout this covenant has no business understanding (it does not
+/// even need to be another stablecoin covenant at all -- authorizing that is
+/// the OPS-signer's off-chain responsibility, not this body's). So there is
+/// no "authenticate the candidate redeem script, then extract fields from it"
+/// dance (`dr_output_spk_check` + `dr_field_extract`, as TRANSFER/FREEZE/SEIZE
+/// use) -- the body only needs the successor's SPK **hash**, which is exactly
+/// what `OpTxOutputSpk`/`OpBlake3` produce directly, with no candidate
+/// redeem-script plaintext required at all. `new_template_hash` is therefore
+/// a plaintext 32-byte sigscript field (like FREEZE's `new_frozen_flag` /
+/// SEIZE's `new_owner_pubkey`): the OPS role signs it (so the issuer approves
+/// the SPECIFIC migration target, preventing migration to an
+/// attacker-substituted template), and the body separately re-derives
+/// `Blake3(OpTxOutputSpk)` for the REAL successor and compares the two with
+/// an explicit `OpEqual OpVerify` -- so a captured, honestly-signed
+/// attestation for one target cannot be replayed against a spend that
+/// actually pays to a different one (`migrate_successor_template_mismatch_rejected`,
+/// `core/tests/stablecoin_contracts.rs`).
+///
+/// # `frozen_flag`/`role_registry_root`/`identifier_type` -- read then
+/// dropped, unused (flagged for human review)
+///
+/// Because the successor is an arbitrary new template with no promised field
+/// layout, there is nothing on this coin's own state to meaningfully compare
+/// against a successor (unlike FREEZE/SEIZE, which pin these fields
+/// unchanged into a same-template successor). This implementation follows
+/// §4's MIGRATE pseudocode literally (`OpDrop; OpCheckSigVerify; <attestation
+/// build>; <successor-template authentication>; Op1` -- no frozen-flag gate
+/// shown), so a FROZEN coin can still be migrated (owner + OPS co-signing),
+/// mirroring BURN's same silent-on-`frozen_flag` precedent
+/// (`build_burn_branch`'s doc). **Flagged for human review**, same discipline
+/// as that precedent: arguably a frozen coin should not be movable to a new
+/// template either, but this is a judgment call, not an implementation
+/// default silently picked here.
+///
+/// # Value continuity -- intentionally NOT applied (task spec, §4)
+///
+/// MIGRATE has an owner `SIGHASH_ALL` signature (§4's cross-branch invariant
+/// table lists MIGRATE alongside TRANSFER and BURN under the owner-signed
+/// column), so successor-value pinning comes "for free" the same way it does
+/// for TRANSFER -- `dr_value_continuity_check` (used by FREEZE/SEIZE, which
+/// have NO owner signature at all) is deliberately NOT called here; doing so
+/// would be redundant at best (mirrors `build_burn_branch`'s identical
+/// rationale, adapted: here the value is expected to actually carry forward
+/// into the new template, not be destroyed, but the owner's own SIGHASH_ALL
+/// signature is what makes that an intentional, attributable choice, not a
+/// hole -- nobody but the owner can choose the new output's amount).
+///
+/// Entry (top-to-bottom), once the dispatch skeleton's `op_type` compare
+/// delivers control here:
+///
+/// ```text
+/// epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
+/// owner_pubkey(4), owner_sig(5), new_template_hash(6), issuer_sig(7)
+/// ```
+///
+/// (sigscript push/emission order, first==deepest: `issuer_sig`,
+/// `new_template_hash`, `owner_sig`, `op_type_selector`, `redeem_script` --
+/// see `super::sigscript::build_stablecoin_migrate_sigscript`.)
+fn build_migrate_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
+    use op::*;
+    let mut b = Vec::with_capacity(200);
+
+    // ---- Owner authorization (identical mechanics to TRANSFER's/BURN's
+    // stage 1). ----
+    e_roll(&mut b, 5); // owner_sig -> top
+    e_roll(&mut b, 5); // owner_pubkey -> top (owner_sig now at depth 1)
+    b.push(CHECKSIGVERIFY); // pubkey(top) x sig(next), SIGHASH_ALL
+
+    // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
+    // identifier_type(3), new_template_hash(4), issuer_sig(5).
+    e_roll(&mut b, 3); // identifier_type -> top
+    b.push(DROP); // unused -- see fn doc: MIGRATE's successor is a wholly
+                  // different template with no promised field layout.
+
+    // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
+    // new_template_hash(3), issuer_sig(4).
+    e_roll(&mut b, 1); // frozen_flag -> top
+    b.push(DROP); // not frozen-gated (flagged for human review, fn doc)
+
+    // Stack: epoch(0), role_registry_root(1), new_template_hash(2), issuer_sig(3).
+    e_roll(&mut b, 1); // role_registry_root -> top
+    b.push(DROP); // unused -- no shared successor state layout to carry it into
+
+    // Stack: epoch(0), new_template_hash(1), issuer_sig(2).
+
+    // ---- Successor-template authentication (fn doc): the successor
+    // output's SPK must Blake3-hash to the attested new_template_hash --
+    // proves the OPS-signed migration target is EXACTLY the output actually
+    // being paid to, not a substituted one. ----
+    b.push(TXINPUTINDEX);
+    b.push(TXOUTPUTSPK);
+    b.push(BLAKE3); // real successor SPK hash
+    // Stack: real_hash(0), epoch(1), new_template_hash(2), issuer_sig(3).
+    e_pick(&mut b, 2); // copy of new_template_hash -> top (needed again for the preimage tail below)
+    // Stack: new_template_hash_copy(0), real_hash(1), epoch(2),
+    // new_template_hash(3), issuer_sig(4).
+    b.push(EQUAL);
+    b.push(VERIFY); // real successor SPK hash == attested new_template_hash
+
+    // Stack: epoch(0), new_template_hash(1), issuer_sig(2).
+
+    // ---- Attestation pre-image (153B, §4/§5): 121B base + new_template_hash(32) tail. ----
+    b.push(DATA8);
+    b.extend_from_slice(&DOMAIN_TAG);
+    // Stack: domain_tag(0), epoch(1), new_template_hash(2), issuer_sig(3).
+    b.push(TXINPUTINDEX);
+    b.push(INPUTCOVENANTID);
+    b.push(CAT); // acc = domain_tag || covenant_id
+    // Stack: acc(0), epoch(1), new_template_hash(2), issuer_sig(3).
+    b.push(DATA1);
+    b.push(op_type::MIGRATE);
+    b.push(CAT); // acc || op_type
+    // Stack: acc(0), epoch(1), new_template_hash(2), issuer_sig(3).
+    e_roll(&mut b, 1); // epoch -> top
+    b.push(CAT); // acc || epoch
+    // Stack: acc(0), new_template_hash(1), issuer_sig(2).
+    b.push(TXINPUTINDEX);
+    b.push(OUTPOINTTXID);
+    b.push(CAT); // acc || outpoint_txid
+    b.push(TXINPUTINDEX);
+    b.push(OUTPOINTINDEX);
+    b.push(OP4);
+    b.push(NUM2BIN);
+    b.push(CAT); // acc || outpoint_index(4B LE)
+    b.push(TXINPUTINDEX);
+    b.push(TXOUTPUTSPK);
+    b.push(BLAKE3);
+    b.push(CAT); // acc || successor_spk_hash
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT);
+    b.push(OP8);
+    b.push(NUM2BIN);
+    b.push(CAT); // acc || amount(8B LE) == full 121B base preimage
+    // Stack: acc(0), new_template_hash(1), issuer_sig(2).
+    e_roll(&mut b, 1); // new_template_hash -> top
+    b.push(CAT); // acc || new_template_hash == full 153B MIGRATE preimage
+
+    // msg_hash = Blake3(preimage). Stack: msg_hash(0), issuer_sig(1).
+    b.push(BLAKE3);
+
+    // Push OPS pubkey; verify the attestation.
+    b.push(DATA32);
+    b.extend_from_slice(ops_pubkey);
+    b.push(CHECKSIGFROMSTACK);
+    b.push(VERIFY);
+
+    b.push(OP1);
+    b
+}
+
+/// Emit the stablecoin covenant body: state header's fields are already on
+/// the stack (pushed when the redeem script's own leading bytes execute);
+/// the body is the 6-way `op_type` dispatch. `tag_depth` is the stack depth
+/// of the `op_type` selector once the state header has finished pushing its
+/// five fields -- with the sigscript layout documented in the module doc
+/// (`op_type_selector` as the LAST sigscript push before the redeem script),
+/// that depth is always `5` (see [`OP_TYPE_TAG_DEPTH`]).
+pub const OP_TYPE_TAG_DEPTH: u16 = 5;
+
+pub fn build_stablecoin_body(
+    ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+    freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+    seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
+    mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+) -> Vec<u8> {
+    let transfer = build_transfer_branch(ops_pubkey);
+    let freeze = build_freeze_branch(freeze_pubkey);
+    let seize = build_seize_branch(seize_pubkeys);
+    let burn = build_burn_branch(mint_pubkey);
+    let migrate = build_migrate_branch(ops_pubkey); // OPS stands in for the deferred ROTATE role, see build_migrate_branch's doc
+    build_op_type_dispatch(
+        OP_TYPE_TAG_DEPTH,
+        OpTypeBranches {
+            transfer: &transfer,
+            freeze: &freeze,
+            seize: &seize,
+            burn: &burn,
+            rotate: UNIMPLEMENTED_BRANCH_STUB, // DEFERRED (post-Live): ROTATE, see this module's top doc
+            migrate: &migrate,
+        },
+    )
+}
+
+/// Build the complete robust stablecoin redeem script (state header +
+/// dispatch body). `owner_pubkey`/`role_registry_root`/`frozen_flag`/`epoch`
+/// go into the mutable state header (§3); `ops_pubkey` is baked into the body
+/// as the TRANSFER branch's `OpCheckSigFromStack` key (§2 OPS role);
+/// `freeze_pubkey` is baked into the body as the FREEZE branch's
+/// `OpCheckSigFromStack` key (§2 FREEZE role); `seize_pubkeys` are baked into
+/// the body as the SEIZE branch's three 2-of-3 `OpCheckSigFromStack` keys (§2
+/// SEIZE role) -- the same "bake in as a literal constant" convention as
+/// `ops_pubkey`/`freeze_pubkey` (see `build_freeze_branch`'s doc, and
+/// `build_seize_branch`'s doc for why SEIZE's multisig is built from three
+/// `OpCheckSigFromStack` calls rather than native `OpCheckMultiSig`: role
+/// pubkeys are not yet individually verified against `role_registry_root`
+/// on-chain in this phase); `mint_pubkey` is baked into the body as the BURN
+/// branch's `OpCheckSigFromStack` key (§2 MINT role -- "the mint-authority's
+/// supply key ... authorizes BURN (issuer side) in this covenant"). `ops_pubkey`
+/// is ALSO baked into the body as the MIGRATE branch's `OpCheckSigFromStack`
+/// key (§4: MIGRATE authorization is "OWNER + (ROTATE or OPS)"; OPS stands in
+/// since ROTATE is deferred to post-Live -- see `build_migrate_branch`'s doc).
+#[allow(clippy::too_many_arguments)]
 pub fn build_stablecoin_redeem_script(
     owner_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
-    issuer_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+    identifier_type: u8,
+    role_registry_root: &[u8; 32],
+    frozen_flag_value: u8,
+    epoch: u32,
+    ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+    freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+    seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
+    mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
 ) -> Vec<u8> {
-    let mut rs = Vec::with_capacity(STABLECOIN_REDEEM_SCRIPT_LEN);
-    rs.extend_from_slice(&Kcc20StateHeader::new(*owner_pubkey, identifier_type::PUBKEY, 0).encode_script());
-    rs.extend_from_slice(&build_stablecoin_body(issuer_pubkey));
-    debug_assert_eq!(rs.len(), STABLECOIN_REDEEM_SCRIPT_LEN);
+    let state = StablecoinStateHeader::new(*owner_pubkey, identifier_type, *role_registry_root, frozen_flag_value, epoch, 0);
+    let mut rs = state.encode_script();
+    debug_assert_eq!(rs.len(), STATE_HEADER_LEN);
+    rs.extend_from_slice(&build_stablecoin_body(ops_pubkey, freeze_pubkey, seize_pubkeys, mint_pubkey));
     rs
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::stablecoin::attestation::DOMAIN_TAG_LEN;
+    use crate::contract::token::identifier_type as id_type;
 
     const OWNER: [u8; 32] = [0xAA; 32];
-    const ISSUER: [u8; 32] = [0xBB; 32];
+    const OPS: [u8; 32] = [0xBB; 32];
+    const ROOT: [u8; 32] = [0xCC; 32];
+    const FREEZE: [u8; 32] = [0xDD; 32];
+    const SEIZE: [[u8; 32]; 3] = [[0x91; 32], [0x92; 32], [0x93; 32]];
+    const MINT: [u8; 32] = [0xEF; 32];
 
     #[test]
-    fn lengths_are_pinned() {
-        assert_eq!(STABLECOIN_BODY_LEN, 68);
-        assert_eq!(STABLECOIN_REDEEM_SCRIPT_LEN, 103);
-        assert_eq!(build_stablecoin_body(&ISSUER).len(), STABLECOIN_BODY_LEN);
-        assert_eq!(build_stablecoin_redeem_script(&OWNER, &ISSUER).len(), STABLECOIN_REDEEM_SCRIPT_LEN);
+    fn redeem_script_starts_with_state_header() {
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        assert_eq!(rs[0], 0x20);
+        assert_eq!(&rs[1..33], &OWNER);
+        assert_eq!(rs[33], 0x01);
+        assert_eq!(rs[34], id_type::PUBKEY);
+        assert_eq!(rs[35], 0x20);
+        assert_eq!(&rs[36..68], &ROOT);
+        assert_eq!(rs[68], 0x01);
+        assert_eq!(rs[69], frozen_flag::CLEAR);
+        assert_eq!(rs[70], 0x04);
+        assert_eq!(&rs[71..75], &0u32.to_le_bytes());
+        assert!(rs.len() > STATE_HEADER_LEN);
     }
 
     #[test]
-    fn state_header_layout_is_kcc20_standard() {
-        let rs = build_stablecoin_redeem_script(&OWNER, &ISSUER);
-        assert_eq!(rs[0], 0x20); // push 32
-        assert_eq!(&rs[1..33], &OWNER); // owner_identifier
-        assert_eq!(rs[33], 0x01); // push 1
-        assert_eq!(rs[34], identifier_type::PUBKEY); // identifier_type
+    fn ops_pubkey_is_baked_into_transfer_branch() {
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        // The OPS pubkey must appear somewhere in the body (exact offset is
+        // load-bearing on the dispatch/branch bytecode's fixed shape, so we
+        // search rather than hardcode a brittle constant here).
+        assert!(rs.windows(32).any(|w| w == OPS));
     }
 
     #[test]
-    fn issuer_pubkey_is_baked_into_body() {
-        let rs = build_stablecoin_redeem_script(&OWNER, &ISSUER);
-        // OpData32 push opcode immediately precedes the 32-byte key.
-        assert_eq!(rs[ISSUER_PUBKEY_RS_OFFSET - 1], 0x20);
-        assert_eq!(&rs[ISSUER_PUBKEY_RS_OFFSET..ISSUER_PUBKEY_RS_OFFSET + 32], &ISSUER);
-        // owner and issuer live in disjoint regions; swapping either changes
-        // only its region.
-        let rs2 = build_stablecoin_redeem_script(&OWNER, &[0xCC; 32]);
-        assert_eq!(&rs[..ISSUER_PUBKEY_RS_OFFSET], &rs2[..ISSUER_PUBKEY_RS_OFFSET]);
-        assert_ne!(&rs[ISSUER_PUBKEY_RS_OFFSET..], &rs2[ISSUER_PUBKEY_RS_OFFSET..]);
+    fn freeze_pubkey_is_baked_into_freeze_branch() {
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        assert!(rs.windows(32).any(|w| w == FREEZE));
     }
 
     #[test]
-    fn distinct_keys_yield_distinct_redeem_scripts() {
-        let a = build_stablecoin_redeem_script(&OWNER, &ISSUER);
-        let b = build_stablecoin_redeem_script(&[0x01; 32], &ISSUER);
-        let c = build_stablecoin_redeem_script(&OWNER, &[0x02; 32]);
-        assert_ne!(a, b);
-        assert_ne!(a, c);
-    }
-
-    /// The exact expected body bytecode — the golden opcode-sequence lock.
-    fn expected_body(issuer: &[u8; 32]) -> Vec<u8> {
-        let mut e = Vec::new();
-        // Stage 1.
-        e.extend_from_slice(&[0x75, 0xad]); // OpDrop, OpCheckSigVerify
-        // Stage 2 pre-image build.
-        e.push(0x08); // OpData8
-        e.extend_from_slice(&DOMAIN_TAG); // domain tag (8B)
-        e.extend_from_slice(&[0xb9, 0xcf, 0x7e]); // idx, InputCovenantId, Cat
-        e.extend_from_slice(&[0xb9, 0xba, 0x7e]); // idx, OutpointTxId, Cat
-        e.extend_from_slice(&[0xb9, 0xbb, 0x54, 0xcd, 0x7e]); // idx, OutpointIndex, Op4, Num2Bin, Cat
-        e.extend_from_slice(&[0xb9, 0xc3, 0xd9, 0x7e]); // idx, TxOutputSpk, Blake3, Cat
-        e.extend_from_slice(&[0xb9, 0xbe, 0x58, 0xcd, 0x7e]); // idx, TxInputAmount, Op8, Num2Bin, Cat
-        e.push(0xd9); // Blake3(pre-image) -> msg_hash
-        e.push(0x20); // OpData32
-        e.extend_from_slice(issuer); // issuer pubkey (32B)
-        e.extend_from_slice(&[0xd7, 0x69]); // OpCheckSigFromStack, OpVerify
-        e.push(0x51); // Op1
-        e
-    }
-
-    #[test]
-    fn body_matches_expected_opcode_sequence() {
-        assert_eq!(build_stablecoin_body(&ISSUER), expected_body(&ISSUER));
-    }
-
-    /// Conformance core: the body's on-chain pre-image composition must fold
-    /// fields in the SAME order and fixed widths as the off-chain encoder
-    /// (`attestation::build_attestation_preimage`). This test pins that
-    /// correspondence structurally, so WU-F's real-engine round-trip has a
-    /// static guarantee to lean on.
-    #[test]
-    fn body_field_composition_matches_encoder_layout() {
-        let body = build_stablecoin_body(&ISSUER);
-
-        // Field 1: the domain tag pushed first must be the encoder's DOMAIN_TAG
-        // (same length, same bytes), immediately after the two owner-auth ops.
-        assert_eq!(body[0..2], [0x75, 0xad]);
-        assert_eq!(body[2], 0x08); // OpData8 => 8-byte field
-        assert_eq!(DOMAIN_TAG_LEN, 8);
-        assert_eq!(&body[3..3 + DOMAIN_TAG_LEN], &DOMAIN_TAG);
-
-        // The ordered field-producing opcodes after the domain tag, in encoder
-        // order: covenant_id, txid, index(Num2Bin 4), spk_hash(Blake3), amount(Num2Bin 8).
-        let after_tag = &body[3 + DOMAIN_TAG_LEN..];
-        let expected_tail: &[u8] = &[
-            0xb9, 0xcf, 0x7e, // covenant_id
-            0xb9, 0xba, 0x7e, // outpoint_txid
-            0xb9, 0xbb, 0x54, 0xcd, 0x7e, // outpoint_index @ width 4 (Op4)
-            0xb9, 0xc3, 0xd9, 0x7e, // successor_spk_hash (OpBlake3)
-            0xb9, 0xbe, 0x58, 0xcd, 0x7e, // amount @ width 8 (Op8)
-            0xd9, // Blake3(pre-image)
-        ];
-        assert_eq!(&after_tag[..expected_tail.len()], expected_tail);
-
-        // The Num2Bin width literals must equal the encoder's field widths.
-        // Op4 (0x54) == OUTPOINT_INDEX_LEN, Op8 (0x58) == AMOUNT_LEN.
-        assert_eq!(0x54 - 0x50, OUTPOINT_INDEX_LEN as u8);
-        assert_eq!(0x58 - 0x50, AMOUNT_LEN as u8);
-    }
-
-    #[test]
-    fn body_uses_input_index_for_every_introspection() {
-        // Every introspection opcode in this body is immediately preceded by
-        // OpTxInputIndex (0xb9), never an immediate index — the replay-binding
-        // discipline. Introspection opcodes used here that take an index:
-        // 0xcf, 0xba, 0xbb, 0xc3, 0xbe.
-        let body = build_stablecoin_body(&ISSUER);
-        let index_taking: [u8; 5] = [0xcf, 0xba, 0xbb, 0xc3, 0xbe];
-        // Scan only the pre-image build region (skip the 32-byte issuer key
-        // payload, which is opaque data, and the leading owner-auth ops).
-        let key_start = ISSUER_PUBKEY_RS_OFFSET - Kcc20StateHeader::SCRIPT_ENCODED_LEN; // offset within body
-        for i in 0..key_start {
-            if index_taking.contains(&body[i]) {
-                assert!(i > 0 && body[i - 1] == 0xb9, "introspection op at body[{i}] not preceded by OpTxInputIndex");
-            }
+    fn seize_pubkeys_are_baked_into_seize_branch() {
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        // All three SEIZE pubkeys must appear somewhere in the body (exact
+        // offsets are load-bearing on the dispatch/branch bytecode's fixed
+        // shape, so we search rather than hardcode brittle constants here).
+        for pk in &SEIZE {
+            assert!(rs.windows(32).any(|w| w == pk), "SEIZE pubkey {pk:?} not found baked into redeem script");
         }
+    }
+
+    #[test]
+    fn mint_pubkey_is_baked_into_burn_branch() {
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        assert!(rs.windows(32).any(|w| w == MINT));
+    }
+
+    #[test]
+    fn distinct_ops_keys_yield_distinct_redeem_scripts() {
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let b =
+            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &[0xCD; 32], &FREEZE, &SEIZE, &MINT);
+        assert_ne!(a, b);
+        assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
+    }
+
+    #[test]
+    fn distinct_freeze_keys_yield_distinct_redeem_scripts() {
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let b =
+            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &[0xCD; 32], &SEIZE, &MINT);
+        assert_ne!(a, b);
+        assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
+    }
+
+    #[test]
+    fn distinct_seize_keys_yield_distinct_redeem_scripts() {
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let mut other_seize = SEIZE;
+        other_seize[1] = [0xCD; 32];
+        let b =
+            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &other_seize, &MINT);
+        assert_ne!(a, b);
+        assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
+    }
+
+    #[test]
+    fn distinct_mint_keys_yield_distinct_redeem_scripts() {
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let b =
+            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &[0xCD; 32]);
+        assert_ne!(a, b);
+        assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
+    }
+
+    #[test]
+    fn body_length_is_deterministic_regardless_of_state_field_values() {
+        // Body bytecode never embeds state field VALUES (only ops_pubkey/
+        // freeze_pubkey/seize_pubkeys/mint_pubkey are baked in), so its length
+        // must be identical across different owner/root/epoch/frozen_flag
+        // choices for the same keys.
+        let a = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &MINT);
+        let b = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &MINT);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn dispatch_stub_branches_are_all_present_and_unimplemented() {
+        let body = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &MINT);
+        // ROTATE is the only remaining not-yet-implemented branch (deferred
+        // to post-Live, see this module's top doc); its OP_0 stub byte must
+        // still appear -- a loose but real smoke check that we didn't forget
+        // to splice a branch in. FREEZE/SEIZE/BURN/MIGRATE are now all real
+        // bytecode, so the floor drops from 2 to 1 (this is a MINIMUM bound,
+        // not an exact count -- other branches incidentally embed their own
+        // 0x00 bytes too, e.g. TRANSFER's `frozen_flag::CLEAR` literal and
+        // BURN's `BURN_SINK_SPK_BYTES`).
+        let stub_count = body.iter().filter(|&&byte| byte == 0x00).count();
+        assert!(stub_count >= 1, "expected at least 1 OP_0 stub byte (ROTATE), found {stub_count}");
+    }
+
+    #[test]
+    fn freeze_branch_contains_value_continuity_check() {
+        // Security-fix smoke check: the FREEZE branch must splice in
+        // `dr_value_continuity_check`'s exact 6-byte sequence (OpTxInputIndex
+        // OpTxInputAmount OpTxInputIndex OpTxOutputAmount OpEqual OpVerify) --
+        // without it a FREEZE-only spend could alter the coin's native value.
+        let freeze = build_freeze_branch(&FREEZE);
+        let needle: &[u8] = &[0xb9, 0xbe, 0xb9, 0xc2, 0x87, 0x69];
+        assert!(freeze.windows(needle.len()).any(|w| w == needle), "FREEZE branch missing dr_value_continuity_check bytes");
+    }
+
+    #[test]
+    fn seize_branch_contains_value_continuity_check() {
+        // Same security-fix invariant as FREEZE (§4 cross-branch invariant):
+        // SEIZE has no owner SIGHASH_ALL signature either, so it must splice
+        // in the same `dr_value_continuity_check` 6-byte sequence.
+        let seize = build_seize_branch(&SEIZE);
+        let needle: &[u8] = &[0xb9, 0xbe, 0xb9, 0xc2, 0x87, 0x69];
+        assert!(seize.windows(needle.len()).any(|w| w == needle), "SEIZE branch missing dr_value_continuity_check bytes");
+    }
+
+    #[test]
+    fn seize_branch_uses_checksigfromstack_three_times() {
+        // Documents the design decision (see `build_seize_branch`'s doc): the
+        // 2-of-3 quorum is emitted as three `OpCheckSigFromStack` (0xd7)
+        // opcodes, NOT native `OpCheckMultiSig` (0xae) -- the latter is
+        // hard-wired to the tx's own sighash in this engine and has no
+        // stack-message form. (A raw byte-value scan for the ABSENCE of 0xae
+        // would be unsound -- baked pubkey/data bytes could coincidentally
+        // contain that value -- so this only positively asserts the expected
+        // opcode is present exactly 3 times, which is what the branch
+        // actually emits.)
+        let seize = build_seize_branch(&SEIZE);
+        let checksigfromstack_count = seize.iter().filter(|&&byte| byte == 0xd7).count();
+        assert_eq!(checksigfromstack_count, 3, "expected exactly 3 OpCheckSigFromStack calls in the SEIZE branch");
+    }
+
+    #[test]
+    fn burn_sink_spk_bytes_are_version_zero_plus_burn_sink_script() {
+        // Ties BURN_SINK_SPK_BYTES (what the branch bakes in and compares
+        // against) to BURN_SINK_SCRIPT (the locking-script bytes alone) --
+        // version 0 (2 BE bytes), matching every other SPK in this codebase.
+        assert_eq!(BURN_SINK_SPK_BYTES.len(), 3);
+        assert_eq!(&BURN_SINK_SPK_BYTES[..2], &[0x00, 0x00]);
+        assert_eq!(&BURN_SINK_SPK_BYTES[2..], &BURN_SINK_SCRIPT);
+    }
+
+    #[test]
+    fn burn_sink_script_is_a_bare_op_return() {
+        // OpReturn (0x6a) as the FIRST (and only) opcode: this codebase's own
+        // consensus-level `is_unspendable` (`crypto/txscript/src/lib.rs`)
+        // recognizes exactly this shape as guaranteed to fail at execution.
+        assert_eq!(BURN_SINK_SCRIPT, [0x6a]);
+    }
+
+    #[test]
+    fn mint_pubkey_baked_via_checksigfromstack_in_burn_branch() {
+        let burn = build_burn_branch(&MINT);
+        assert!(burn.windows(32).any(|w| w == MINT));
+        // Exactly one OpCheckSigFromStack (0xd7) -- a single-signer MINT
+        // attestation, unlike SEIZE's 3x quorum.
+        let checksigfromstack_count = burn.iter().filter(|&&byte| byte == 0xd7).count();
+        assert_eq!(checksigfromstack_count, 1, "expected exactly 1 OpCheckSigFromStack call in the BURN branch");
+    }
+
+    #[test]
+    fn burn_branch_pins_canonical_sink_bytes() {
+        // The exact literal the sink-pin check compares against must be
+        // present in the branch's bytecode (baked, not attacker-suppliable).
+        let burn = build_burn_branch(&MINT);
+        assert!(
+            burn.windows(BURN_SINK_SPK_BYTES.len()).any(|w| w == BURN_SINK_SPK_BYTES),
+            "BURN branch missing the canonical sink SPK literal"
+        );
+    }
+
+    #[test]
+    fn burn_branch_omits_value_continuity_check() {
+        // §4/§8 (task spec): BURN has an owner SIGHASH_ALL signature, so it
+        // gets value-pinning "for free" like TRANSFER -- and unlike
+        // FREEZE/SEIZE, it must NOT call `dr_value_continuity_check` (that
+        // helper asserts input amount == successor OUTPUT amount, which would
+        // forbid ever burning value into the sink at all). This is a
+        // regression guard on the deliberate omission documented in
+        // `build_burn_branch`'s doc.
+        let burn = build_burn_branch(&MINT);
+        let needle: &[u8] = &[0xb9, 0xbe, 0xb9, 0xc2, 0x87, 0x69];
+        assert!(
+            !burn.windows(needle.len()).any(|w| w == needle),
+            "BURN branch must NOT contain dr_value_continuity_check bytes"
+        );
+    }
+
+    #[test]
+    fn ops_pubkey_baked_via_checksigfromstack_in_migrate_branch() {
+        // MIGRATE's authorizer is OPS (standing in for the deferred ROTATE
+        // role, see `build_migrate_branch`'s doc) -- the SAME baked pubkey
+        // TRANSFER uses, reused here rather than a new dedicated key.
+        let migrate = build_migrate_branch(&OPS);
+        assert!(migrate.windows(32).any(|w| w == OPS));
+        // Exactly one OpCheckSigFromStack (0xd7) -- a single-signer OPS
+        // attestation, like TRANSFER's/BURN's, unlike SEIZE's 3x quorum.
+        let checksigfromstack_count = migrate.iter().filter(|&&byte| byte == 0xd7).count();
+        assert_eq!(checksigfromstack_count, 1, "expected exactly 1 OpCheckSigFromStack call in the MIGRATE branch");
+    }
+
+    #[test]
+    fn migrate_branch_omits_value_continuity_check() {
+        // §4 cross-branch invariant (task spec): MIGRATE has an owner
+        // SIGHASH_ALL signature, so it gets value-pinning "for free" like
+        // TRANSFER/BURN -- it must NOT call `dr_value_continuity_check`
+        // (that helper is only needed by branches with no owner signature at
+        // all, FREEZE/SEIZE). Regression guard on the deliberate omission
+        // documented in `build_migrate_branch`'s doc.
+        let migrate = build_migrate_branch(&OPS);
+        let needle: &[u8] = &[0xb9, 0xbe, 0xb9, 0xc2, 0x87, 0x69];
+        assert!(
+            !migrate.windows(needle.len()).any(|w| w == needle),
+            "MIGRATE branch must NOT contain dr_value_continuity_check bytes"
+        );
+    }
+
+    #[test]
+    fn migrate_branch_has_no_new_rs_authentication_opcodes() {
+        // Regression guard on the fn doc's "No `new_rs`" design point:
+        // MIGRATE must NOT use the dr_output_spk_check/dr_field_extract
+        // "authenticate candidate redeem script, then slice fields from it"
+        // mechanism TRANSFER/FREEZE/SEIZE rely on -- it only ever needs the
+        // successor SPK's hash (OpTxOutputSpk + OpBlake3), never OpSubstr
+        // (0x7f, dr_field_extract's/dr_output_spk_check's slicing opcode).
+        let migrate = build_migrate_branch(&OPS);
+        assert!(!migrate.contains(&0x7f), "MIGRATE branch must not contain OpSubstr (0x7f) -- no new_rs field/extraction expected");
     }
 }

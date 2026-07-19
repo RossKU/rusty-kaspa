@@ -71,11 +71,14 @@
 
 pub mod attestation;
 pub mod body;
+pub mod dispatch;
 pub mod sigscript;
+pub mod state;
 
 pub use attestation::*;
 pub use body::*;
 pub use sigscript::*;
+pub use state::{StablecoinStateHeader, STATE_HEADER_LEN};
 
 /// 8-byte domain-separation tag for the KCC-0020 native-value stablecoin
 /// attestation message.

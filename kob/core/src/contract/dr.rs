@@ -1,6 +1,6 @@
 //! Composable Direct & Responsive (D&R) bytecode builders.
 //!
-//! Redeem-script bodies repeat five D&R validation patterns that authenticate
+//! Redeem-script bodies repeat six D&R validation patterns that authenticate
 //! the transaction's continuation covenant:
 //!
 //! 1. [`dr_input_spk_check`] — the spending input's SPK equals `P2SH(rs)`.
@@ -8,6 +8,8 @@
 //! 3. [`dr_prefix_check`] — the `new_rs` prefix up to a boundary matches `old_rs`.
 //! 4. [`dr_suffix_check`] — the `new_rs` tail from a boundary matches `old_rs`.
 //! 5. [`dr_field_extract`] — extract a byte range from a redeem-script value.
+//! 6. [`dr_value_continuity_check`] — the successor covenant output's native
+//!    value equals the spending input's native value.
 //!
 //! These builders emit the exact same opcode sequences that the existing body
 //! constants hand-tabulate; a byte-for-byte match is asserted in the tests
@@ -158,6 +160,49 @@ pub fn dr_field_extract(data_depth: u16, begin: u16, end: u16) -> Vec<u8> {
     out
 }
 
+/// Assert the spending input's native value (sompi) equals the successor
+/// covenant output's native value — an exact-equality 1:1 covenant. The tx
+/// fee MUST come from a separate funding input, never by shaving the
+/// covenant coin's own value.
+///
+/// This closes a value-continuity hole that exists in any branch with no
+/// owner `SIGHASH_ALL` signature: an ordinary owner-signed spend gets value
+/// continuity "for free" because `SIGHASH_ALL` commits the whole
+/// transaction, including every output's amount, so the owner's signature
+/// alone already pins the successor's value. A branch authorized by some
+/// OTHER role's `OpCheckSigFromStack` attestation (which signs only a
+/// specific message, not the whole transaction) has nothing else pinning the
+/// successor's value unless it explicitly checks it here — otherwise a
+/// holder of only that lower-privileged role's key could alter the coin's
+/// native value while exercising the branch (value theft/destruction by a
+/// low-privilege role). See `STABLECOIN_ROBUST_DESIGN.md` §4/§11 for the
+/// cross-branch invariant this helper is required by.
+///
+/// Uses the same "`OpTxInputIndex` reused as the output index" 1:1
+/// successor-binding convention already relied on by every caller of
+/// [`dr_output_spk_check`] in this codebase, so it needs no depth argument at
+/// all — it is entirely self-contained: it reads nothing from, and has zero
+/// net effect on, the caller's existing stack (it pushes exactly the two
+/// values it then consumes), so callers may splice it in anywhere without
+/// adjusting any other op's depth argument.
+///
+/// Layout:
+/// ```text
+///   OpTxInputIndex OpTxInputAmount    -> this input's native value
+///   OpTxInputIndex OpTxOutputAmount   -> successor output's native value (same index)
+///   OpEqual OpVerify
+/// ```
+///
+/// Output: 6 bytes, unconditionally (no numeric pushes, so no depth-dependent
+/// size variation).
+pub fn dr_value_continuity_check() -> Vec<u8> {
+    vec![
+        0xb9, 0xbe, // OpTxInputIndex OpTxInputAmount -> this input's value
+        0xb9, 0xc2, // OpTxInputIndex OpTxOutputAmount -> successor output's value
+        0x87, 0x69, // OpEqual OpVerify
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +343,21 @@ mod tests {
             0x7f,       // OpSubstr
         ];
         assert_eq!(bytes, expected);
+    }
+
+    #[test]
+    fn dr_value_continuity_check_emits_expected_bytes() {
+        let expected: &[u8] = &[
+            0xb9, 0xbe, // OpTxInputIndex OpTxInputAmount
+            0xb9, 0xc2, // OpTxInputIndex OpTxOutputAmount
+            0x87, 0x69, // OpEqual OpVerify
+        ];
+        assert_eq!(dr_value_continuity_check(), expected);
+    }
+
+    #[test]
+    fn dr_value_continuity_check_is_fixed_six_bytes() {
+        // No numeric-depth arguments at all, so length can never vary.
+        assert_eq!(dr_value_continuity_check().len(), 6);
     }
 }

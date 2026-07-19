@@ -841,27 +841,30 @@ fn build_seize_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
 /// SPK bytes> OpEqual OpVerify`). Consequently there is no `new_rs` sigscript
 /// field either -- see `super::sigscript::build_stablecoin_burn_sigscript`.
 ///
-/// Because the destination is fixed and carries no coin state at all, none
-/// of `frozen_flag`/`role_registry_root`/`identifier_type` are read for any
+/// Because the destination is fixed and carries no coin state at all, neither
+/// `role_registry_root` nor `identifier_type` is read for any
 /// successor-continuity check (there is no successor covenant state to carry
 /// them into) -- each is rolled up and dropped, unused, exactly as
-/// `identifier_type` already is in [`build_transfer_branch`].
+/// `identifier_type` already is in [`build_transfer_branch`]. `frozen_flag`,
+/// by contrast, IS gated (see the "frozen_flag -- gated" section below) --
+/// it is the one field BURN reads for an owner-immobility check, not a
+/// successor-continuity comparison.
 ///
-/// # `frozen_flag` -- NOT gated (matches §4's pseudocode; flagged for human
-/// review)
+/// # `frozen_flag` -- gated (resolved: freeze means total owner immobility)
 ///
 /// `STABLECOIN_ROBUST_DESIGN.md`'s §4 BURN pseudocode and per-branch detail
-/// are both silent on `frozen_flag` (contrast TRANSFER, which adds an
-/// explicit "frozen_flag == 0" invariant beyond case-A, §4's "Omission
-/// flagged for human review" note on this same file). This implementation
-/// follows the pseudocode literally: `frozen_flag` is read (it must be, since
-/// it sits on the stack ahead of `issuer_sig`) and dropped, unused -- so a
-/// FROZEN coin can still be burned (owner + MINT co-signing). This is a
-/// judgment call worth a deliberate human decision -- arguably burning should
-/// respect the freeze gate the same way TRANSFER does -- not an
-/// implementation default silently picked here. **Flagged for human review**,
-/// same discipline as [`build_transfer_branch`]'s/[`build_seize_branch`]'s own
-/// flagged omissions.
+/// are both silent on `frozen_flag`, but the resolved cross-branch invariant
+/// is: a FROZEN coin is fully immobile to its owner. BURN is owner-initiated
+/// (owner `OpCheckSigVerify` + MINT attestation), so it MUST respect the same
+/// `frozen_flag == 0` gate [`build_transfer_branch`] enforces -- mirrored here
+/// verbatim (same opcodes: roll `frozen_flag` to top, compare to the explicit
+/// 1-byte literal `frozen_flag::CLEAR`, `OpVerify`). A FROZEN coin can
+/// therefore no longer be burned by its owner; only the issuer's SEIZE branch
+/// (which has no owner signature and intentionally no frozen gate -- it force-
+/// moves the coin regardless of its frozen state, e.g. for sanctions
+/// enforcement or lost-key rescue) can act on a frozen coin. Unfreezing
+/// (via FREEZE, `frozen_flag` 1->0) is the only other way to make a frozen
+/// coin burnable again.
 ///
 /// # Value continuity -- intentionally NOT applied (task spec, §4)
 ///
@@ -906,7 +909,13 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 
     // Stack: epoch(0), frozen_flag(1), role_registry_root(2), issuer_sig(3).
     e_roll(&mut b, 1); // frozen_flag -> top
-    b.push(DROP); // unused (see fn doc: BURN is not frozen-gated, per §4's pseudocode)
+    b.push(DATA1);
+    b.push(frozen_flag::CLEAR); // literal explicit-push [0x00] (NOT OpN 0 / empty array)
+    b.push(EQUAL);
+    b.push(VERIFY); // frozen_flag == 0, fail-closed -- a frozen coin is fully
+                    // owner-immobile (see fn doc "frozen_flag" section);
+                    // mirrors build_transfer_branch's gate exactly (same
+                    // opcodes, same net stack effect as the DROP it replaces).
 
     // Stack: epoch(0), role_registry_root(1), issuer_sig(2).
     e_roll(&mut b, 1); // role_registry_root -> top
@@ -1015,21 +1024,30 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 /// actually pays to a different one (`migrate_successor_template_mismatch_rejected`,
 /// `core/tests/stablecoin_contracts.rs`).
 ///
-/// # `frozen_flag`/`role_registry_root`/`identifier_type` -- read then
-/// dropped, unused (flagged for human review)
+/// # `role_registry_root`/`identifier_type` -- read then dropped, unused
 ///
 /// Because the successor is an arbitrary new template with no promised field
 /// layout, there is nothing on this coin's own state to meaningfully compare
 /// against a successor (unlike FREEZE/SEIZE, which pin these fields
-/// unchanged into a same-template successor). This implementation follows
-/// §4's MIGRATE pseudocode literally (`OpDrop; OpCheckSigVerify; <attestation
-/// build>; <successor-template authentication>; Op1` -- no frozen-flag gate
-/// shown), so a FROZEN coin can still be migrated (owner + OPS co-signing),
-/// mirroring BURN's same silent-on-`frozen_flag` precedent
-/// (`build_burn_branch`'s doc). **Flagged for human review**, same discipline
-/// as that precedent: arguably a frozen coin should not be movable to a new
-/// template either, but this is a judgment call, not an implementation
-/// default silently picked here.
+/// unchanged into a same-template successor). Both fields are rolled up and
+/// dropped, unused -- §4's MIGRATE pseudocode shows no continuity check for
+/// either.
+///
+/// # `frozen_flag` -- gated (resolved: freeze means total owner immobility)
+///
+/// Unlike `role_registry_root`/`identifier_type` above, `frozen_flag` is NOT
+/// merely dropped: MIGRATE is owner-initiated (owner `OpCheckSigVerify` + OPS
+/// attestation), so it MUST respect the same total-immobility invariant
+/// [`build_transfer_branch`] enforces -- otherwise a frozen (sanctioned) coin
+/// could escape governance entirely by migrating to an arbitrary,
+/// non-stablecoin template. This branch mirrors TRANSFER's gate verbatim
+/// (same opcodes: roll `frozen_flag` to top, compare to the explicit 1-byte
+/// literal `frozen_flag::CLEAR`, `OpVerify`) -- a FROZEN coin can therefore no
+/// longer be migrated by its owner, mirroring BURN's same resolved
+/// `frozen_flag == 0` gate (`build_burn_branch`'s doc). Only the issuer's
+/// SEIZE branch (no owner signature, intentionally no frozen gate) can act on
+/// a frozen coin; unfreezing (via FREEZE) is the only other way to make a
+/// frozen coin migratable again.
 ///
 /// # Value continuity -- intentionally NOT applied (task spec, §4)
 ///
@@ -1074,7 +1092,13 @@ fn build_migrate_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
     // new_template_hash(3), issuer_sig(4).
     e_roll(&mut b, 1); // frozen_flag -> top
-    b.push(DROP); // not frozen-gated (flagged for human review, fn doc)
+    b.push(DATA1);
+    b.push(frozen_flag::CLEAR); // literal explicit-push [0x00] (NOT OpN 0 / empty array)
+    b.push(EQUAL);
+    b.push(VERIFY); // frozen_flag == 0, fail-closed -- a frozen coin is fully
+                    // owner-immobile (see fn doc "frozen_flag" section);
+                    // mirrors build_transfer_branch's gate exactly (same
+                    // opcodes, same net stack effect as the DROP it replaces).
 
     // Stack: epoch(0), role_registry_root(1), new_template_hash(2), issuer_sig(3).
     e_roll(&mut b, 1); // role_registry_root -> top

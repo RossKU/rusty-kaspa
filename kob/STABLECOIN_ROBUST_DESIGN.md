@@ -388,47 +388,173 @@ workflow this on-chain burn is one half of.
 
 ## §9 Mint + Supply Cap
 
-**RESOLVED: MINT is a fully separate authority contract, not a branch of this transfer covenant.**
-Minting is authorized entirely inside its own **separate, low-frequency, self-continuing
-mint-authority contract** — it reuses the existing `token_mint` self-continuation/admin pattern
-already present in the codebase (`core/src/contract/token.rs:164-238`: self-continuation via
-`output[0].spk == input.spk` + admin `OpCheckSigVerify`), generalized so that, alongside its own
-self-continuation output, a MINT spend also emits the newly-minted stablecoin UTXO(s) **paying to
-this covenant's P2SH** (fresh per-coin state: owner, `role_registry_root`, `frozen_flag == 0`,
-`epoch == 0`). This covenant never attests against an arbitrary holder coin to mint, never branches
-on `op_type 0x04` (§4), and never reads or writes supply state — the running-supply counter and the
-cap check live entirely inside the mint-authority contract, isolated from the high-frequency
-TRANSFER/FREEZE/SEIZE path.
+**RESOLVED 2026-07-19: MINT is a fully separate, self-continuing mint-authority contract — a
+per-token-series singleton — not a branch of this transfer covenant's `op_type` dispatch.** Supply
+model: **raisable cap (elastic, issuer-first)** — see Resolved Decisions (e). Exactly one
+mint-authority contract instance exists per deployed stablecoin token series, and exactly one
+newly-minted stablecoin coin is emitted per MINT spend (no batch/multi-recipient mints).
 
-- The mint-authority contract carries the **running-supply counter** (its own mutable state field,
-  analogous to this covenant's `epoch`) that is read, incremented by `mint_amount`, and re-written
-  into its own self-continuation successor on every MINT spend.
-- **Cap check**: `OpVerify(new_running_supply <= SUPPLY_CAP)`, enforced entirely inside the
-  mint-authority contract, where `SUPPLY_CAP` is either a baked-in constant in its body, or itself a
-  mutable-but-monotonically-non-increasing field (issuer policy choice, out of scope here — default
-  assumption: constant).
-- `new_running_supply` is signed by the MINT-role (supply) key (§5, 0x04 preimage tail:
-  `mint_amount || new_running_supply` — this preimage belongs to the mint-authority contract's own
-  attestation set, not this covenant's) and independently re-derived on-chain
-  (`old_running_supply + mint_amount`) inside the mint-authority contract, so its attestation cannot
-  claim a supply value inconsistent with its own prior state — same discipline as this covenant's
-  ROTATE self-state reconstruction (§4, 0x05).
-- BURN (0x03) still lives in *this* covenant (§4, §8) — it is authorized by OWNER + the
-  mint-authority's supply key (MINT role) via `OpCheckSigFromStack`, not by the mint-authority
-  contract itself; only MINT (new supply) is fully external.
+**Mutable state.** The mint-authority contract carries exactly two mutable state fields:
 
-## §10 DEX-Escrow Safety
+| Field | Width | Notes |
+|---|---|---|
+| `running_supply` | 8B, LE | monotonic, issued-only counter; `+= mint_amount` on every MINT (see Deferred (d) for the net-vs-gross-supply limitation this implies) |
+| `current_cap` | 8B, LE | **mutable, raisable only** — `RAISE_CAP` may increase it (`new_cap > current_cap`); nothing ever decreases it |
 
-Standardize a **coin descriptor** (metadata, not new opcodes) that declares:
+**Baked constants (option B, per Resolved Decisions (d)).** Consistent with this covenant's own
+option-B decision, the mint-authority body bakes its authority keys as bytecode literals rather than
+a verified registry root:
+- `mint_pubkey` — the hot MINT-role key. This is the SAME key referenced throughout as the "MINT
+  role" in §2's role table and as the BURN-branch attestor in §4/§8 — one key, two authorized uses
+  spanning the two contracts.
+- `cap_authority` — a cold **2-of-3** multisig commit (3 pubkeys + threshold), structurally identical
+  in strength to this covenant's SEIZE quorum (§2, §11-iii's "cold multisig for fund-moving/master-key
+  roles" principle, applied here to the cap ceiling instead of fund redirection).
+- The full set of **covenant role constants** needed to reconstruct a freshly-minted coin's redeem
+  script byte-for-byte: this covenant's `OPS_pk`, `FREEZE_pk`, `SEIZE_multisig_commit`, `MINT_pk`,
+  `ROTATE_multisig_commit` (or, equivalently, the precomputed `role_registry_root = Blake3(...)`
+  digest over them with `epoch = 0`, since both are static for a given deployment), plus this
+  covenant's full body-template bytes (§4, ~500–700B dispatch) — see "Anti-backdoor reconstruction,"
+  below.
+
+**Two operations (mini op_type dispatch).** Structurally a 2-way selector — the same shape as
+`TOKEN_MINT_BODY`'s `Op1 OpRoll ... OpIf/OpElse` (`core/src/contract/token.rs:164-186`), but with real
+state-mutating logic in each branch instead of TOKEN_MINT's flat admin-only branches:
+
+- **MINT** (authorized by hot `mint_pubkey`): self-continue with
+  `new_running_supply = old_running_supply + mint_amount`; `OpVerify(new_running_supply <=
+  current_cap)`; successor `current_cap` unchanged; emit exactly one shape-verified stablecoin coin to
+  the attested recipient (`output[1]`), whose native value == `mint_amount`.
+- **RAISE_CAP** (authorized by cold **2-of-3** `cap_authority`): self-continue with
+  `current_cap' = new_cap` where `OpVerify(new_cap > current_cap)`; `running_supply` unchanged in the
+  successor; no coin emitted (self-continuation output only).
+
+**The cap is a genuine safety bound, not a policy suggestion.** Because MINT enforces
+`running_supply <= current_cap` against the coin's own CURRENT state and cannot itself write a new
+`current_cap`, a compromised hot `mint_pubkey` — the highest-frequency, lowest-assurance key in the
+whole system — can mint up to the existing ceiling and no further. Only the cold 2-of-3
+`cap_authority` quorum can move that ceiling. This mirrors this covenant's SEIZE/ROTATE-vs-hot-key
+trust model (§11, "Why an issuer should still be comfortable...") one level down: a stolen hot key
+here is bounded damage, never unbounded issuance.
+
+**Recipient-binding security fix (closes a gap in the earlier §9 draft).** The earlier draft of this
+section (and §5's `0x04 MINT` preimage-tail row, cross-referenced there as belonging to this
+contract's own attestation set, not the covenant's) specified a MINT attestation preimage tail of only
+`mint_amount(8,LE) || new_running_supply(8,LE)` — nothing in the signed message bound *who receives*
+the newly-minted coin. A validly-signed MINT attestation could therefore have been replayed into a
+transaction paying the new coin to an attacker-chosen recipient instead of the intended one (a
+redirection attack, structurally the same kind of hole as the FREEZE value-continuity gap found and
+fixed in §11(v), just on the mint side rather than the value side). **Fixed**: the mint-authority's
+own attestation preimage now explicitly binds the recipient:
+
+```text
+DOMAIN_TAG_MINT(8) || covenant_id(32) || outpoint_txid(32) || outpoint_index(4,LE)
+  || mint_amount(8,LE) || new_running_supply(8,LE) || recipient_spk_hash(32)
+```
+
+124B total. `DOMAIN_TAG_MINT` is a **distinct domain tag** from this covenant's own `DOMAIN_TAG`
+(§4/§5) — the two contracts must never accept each other's attestations, even incidentally, so the
+tags are chosen to differ. `covenant_id` here is the mint-authority contract's own id (self-replay
+domain separation, the same discipline as this covenant's own `covenant_id` field). `RAISE_CAP`'s
+attestation preimage follows the same prefix with a `new_cap(8,LE)` tail in place of the MINT-specific
+fields (`DOMAIN_TAG_MINT || covenant_id || outpoint_txid || outpoint_index || new_cap(8,LE)`, 84B
+total) — no recipient field is needed since `RAISE_CAP` never emits a coin. Cross-op replay is
+structurally impossible regardless, since MINT and RAISE_CAP are authorized by entirely different keys
+(`mint_pubkey` vs. the `cap_authority` quorum) and neither attestation shape can satisfy the other op's
+signature check.
+
+**Anti-backdoor reconstruction.** The mint-authority contract does not trust the sigscript for
+anything about the emitted coin's *shape* — only its recipient and amount. On every MINT spend, the
+body reconstructs the entire emitted coin's redeem script on-chain: `state_header || body`, where
+`state_header` = the baked push-opcode framing (§3) + `owner_pubkey = recipient_pubkey` (the one
+sigscript-supplied field) + baked `identifier_type` + baked `role_registry_root` (from the baked role
+constants, above) + baked `frozen_flag = 0x00` + baked `epoch = 0x00000000`, and `body` = the baked
+covenant body-template bytes (§4) — byte-identical for every coin ever minted in this series. It
+Blake3-hashes the assembled redeem script, wraps it in the P2SH template, and `OpEqualVerify`s the
+result against `output[1].spk`. **The signer's only discretion is `recipient_pubkey` (via sigscript)
+and `mint_amount` (the coin's native UTXO value, per the existing KCC20 amount-as-native-value
+convention, `token.rs`'s `Kcc20StateHeader` decision note) — every other byte of the minted coin is
+either a baked constant or independently on-chain-derived.** A compromised `mint_pubkey` cannot mint a
+coin with a forged `frozen_flag`, a non-zero starting `epoch`, a different role registry, or a
+different body — only a legitimate coin to an address of the attacker's choosing, up to the cap.
+
+**Genesis-binding fix (closes a CRITICAL audit finding — unbounded parallel-authority minting,
+2026-07-19).** Baked keys (option B, above) are, definitionally, *public* bytecode literals — anyone
+can read `mint_pubkey`/`cap_authority` out of the deployed script and bake the identical keys into a
+brand-new, self-funded mint-authority instance of their own. Without a further check, that fake
+instance would pass every rule described above (shape reconstruction, recipient-binding, cap
+enforcement) using the SAME keys, producing coins indistinguishable on their face from the legitimate
+authority's output — an unbounded parallel-authority minting hole. **Fixed**: the mint-authority body
+additionally bakes the deployment's own genesis `covenant_id` — call it `G`, the consensus-tracked id
+fixed once, at genesis, and unique per deployed instance (distinct from any individual stablecoin
+coin's own `covenant_id`, §4/§9's attestation fields) — as a literal, and both MINT and RAISE_CAP now
+enforce `OpTxInputIndex OpInputCovenantId <baked G> OpEqualVerify` before doing anything else. A fake
+parallel authority baking the same public `mint_pubkey`/`cap_authority` still gets its OWN distinct,
+consensus-assigned `covenant_id` at its own genesis (an outpoint it does not and cannot share with the
+real deployment) — it cannot forge `G` to match — so its spends fail this check and it can never mint
+a coin traceable to the real authority. `covenant_id` propagates unchanged through every
+self-continuation spend (verified in consensus code, not merely this contract's own logic), so `G`
+stays pinned to the one legitimate instance for its entire lifetime.
+
+**Deploy consequence: two-transaction bootstrap.** `G` cannot be derived from the same script it is
+baked into — a literal that is a hash of the script containing that literal is a hash fixed-point, not
+directly constructible. Deployment is therefore two transactions: **TX1** fixes `G` by creating a
+covenant-tagged anchor output (establishing the genesis `covenant_id` on-chain, without yet baking any
+`G`-literal into it); **TX2** creates the real mint-authority body with `G` baked in, declared as a
+continuation of TX1's anchor so consensus assigns it the same `covenant_id` `G` rather than minting a
+fresh, unrelated one. Only once TX2 confirms is the mint-authority contract live and mintable under
+its bound genesis.
+
+**Self-continuation lineage.** The mint-authority's self-continuation is deliberately NOT
+`token.rs`'s `TOKEN_MINT_BODY` (`core/src/contract/token.rs:164-238`) pattern: TOKEN_MINT carries no
+mutable per-spend state at all (only a baked `admin_pk`), so its self-continuation is a single flat
+`output[0].spk == input.spk` check with nothing to reconstruct — too weak for a contract with mutable
+supply/cap fields. This contract has two mutable fields that change on every spend (`running_supply`,
+`current_cap`), so it needs the same **D&R (Destroy & Recreate)** discipline
+`core/src/contract/spot/dca.rs` uses for its own mutable fields (`next_execution_daa`,
+`periods_remaining`) — reusing the composable helpers in `core/src/contract/dr.rs`:
+`dr_input_spk_check` (`dr.rs:43`, this input's own SPK really is `P2SH(old_rs)`), prefix/suffix checks
+over the baked-constant region (`dr_prefix_check`/`dr_suffix_check`, `dr.rs:100,127`, mirroring
+`dca.rs`'s 136B-locked-prefix / 153B-suffix split, generalized to this contract's own boundary), and
+`dr_output_spk_check` (`dr.rs:72`, the successor really is locked to `new_rs`) — before independently
+re-deriving `new_running_supply`/`new_current_cap` from old state + attested deltas, exactly as this
+covenant's own ROTATE branch (§4, 0x05) re-derives its successor fields rather than trusting
+attacker-suppliable output data.
+
+**BURN stays in this covenant.** Unchanged from the earlier draft: BURN (0x03, §4/§8) is authorized by
+OWNER + the same `mint_pubkey`/MINT-role key via `OpCheckSigFromStack`, executed entirely inside *this*
+covenant, not the mint-authority contract — only issuance (MINT) and the cap ceiling (RAISE_CAP) are
+fully external. See Deferred (d) for why BURN does not, and structurally cannot, decrement the
+mint-authority's `running_supply`.
+
+## §10 DEX-Escrow Safety — KNOWN LIMITATION, NOT YET IMPLEMENTED (audit finding, 2026-07-19)
+
+**Status: proposed design, zero integration today.** A grep of `engine/`, `domain/`, `settle/`, and
+`core/src/contract/spot/` finds no reference to any issuer-authority/seize descriptor from any spot
+order type — KOB's spot covenant does not read, reject, or hedge on stablecoin issuer-authority state
+in any form. An earlier draft of this section stated in the present tense that the spot covenant
+"consumes this descriptor to statically reject or hedge seize-capable collateral"; that was an
+overclaim and is corrected here: **no such consumption exists in the codebase.**
+
+The proposed (still-unimplemented) design is to standardize a **coin descriptor** (metadata, not new
+opcodes) that declares:
 - issuer-authority present (yes/no, and which roles),
 - seize-capability present (yes/no).
 
-KOB's spot covenant consumes this descriptor to **statically reject or hedge** seize-capable
-collateral at order-placement/escrow time, so that settlement **fails closed** rather than suffering
-"silent death on seize" (an in-flight escrowed stablecoin leg vanishing out from under a live order
-because the issuer exercised SEIZE mid-trade, with no covenant-level awareness). Ties to
-`KCC20_ISSUES.md` **ISSUE-15** (successor-binding/descriptor deferral already flagged in case-A,
-`body.rs:51-59`).
+The intent would be for KOB's spot covenant to consume this descriptor to **statically reject or
+hedge** seize-capable collateral at order-placement/escrow time, so that settlement **fails closed**
+rather than suffering "silent death on seize."
+
+**Consequence of the current state — risk is UNMITIGATED today.** Composing today's stablecoin
+covenant (this design) with today's spot covenants leaves the "silent death on seize" risk fully live:
+an escrowed stablecoin leg can be frozen or seized (§4 FREEZE/SEIZE, issuer-side only, no owner
+co-sign required) mid-order, with **zero on-chain awareness** on the spot side — the order proceeds as
+if the collateral were still good until settlement itself fails. There is no static rejection, no
+hedge, and no fail-closed behavior at escrow time. This is a **known limitation**, not a mitigated
+risk, for as long as the stablecoin and spot covenants are deployed independently as they are today.
+Deferred work: design and wire the descriptor-consumption path described above into the spot covenant
+before composing seize-capable stablecoins with DEX escrow in Live. Ties to `KCC20_ISSUES.md`
+**ISSUE-15** (successor-binding/descriptor deferral already flagged in case-A, `body.rs:51-59`).
 
 ## §11 Kaspa L1 Trust Costs (honest) + Residual Risks
 
@@ -571,6 +697,15 @@ MIGRATE-d across) — an explicit, intentional, documented limitation, not an in
 (`0x05`, 3-of-5) is therefore **deferred to post-Live** (§4, §11); `SEIZE` (`0x02`, 2-of-3) is
 implemented now.
 
+**(e) Supply model + mint-authority security.** **Resolved 2026-07-19.** Supply model is a
+**raisable cap — elastic, issuer-first**: `current_cap` (§9) is mutable and may only be *raised*
+(`new_cap > current_cap`), never lowered, and only by the cold **2-of-3 `cap_authority`** multisig via
+the `RAISE_CAP` op (§9) — the hot `mint_pubkey` can mint under the cap but can never move the cap
+itself. Also resolved: the mint-authority's attestation preimage now explicitly binds
+`recipient_spk_hash` (§9), closing a redirection gap in the earlier §9 draft, where the signed message
+covered only `mint_amount || new_running_supply` and a valid attestation could have been replayed
+against a different recipient.
+
 ## Deferred to post-Live robustness upgrade
 
 The following are explicitly out of scope for the initial testnet Live (Decision 2026-07-19, option
@@ -592,4 +727,51 @@ No state-layout migration is required to add this upgrade later: the state alrea
 `role_registry_root` and `epoch` (§3), carried-forward-and-continuity-enforced end-to-end since the
 initial Live — the upgrade only changes what the covenant body *checks* against those already-present
 bytes, not their layout or presence.
+
+Also deferred, orthogonal to the above (mint-authority side, §9):
+
+- **(d) Net/circulating supply accounting.** `running_supply` (§9) is monotonic and issued-only — it
+  counts total minted, never decremented. BURN (`0x03`, §4/§8) executes entirely inside *this*
+  covenant and destroys sompi there; it does NOT, and structurally CANNOT, decrement the
+  mint-authority contract's `running_supply`, because the two contracts share no on-chain state —
+  Kaspa has no reference-input mechanism (§6), so the mint-authority contract has no way to observe an
+  unrelated transaction's BURN spend happening elsewhere. Consequence: `running_supply`/`current_cap`
+  bound *gross issuance*, not net/circulating supply; true net supply (`running_supply` minus
+  cumulative burns) is not tracked on-chain anywhere today and must be reconstructed off-chain (e.g. by
+  indexing all BURN outputs to the canonical sink). A future robustness upgrade could add a
+  burn-receipt mechanism (e.g. BURN emits a canonical receipt the mint-authority side periodically
+  consumes to reconcile `running_supply` downward, or a shared/committed net-supply oracle) — deferred;
+  **known limitation for the initial Live**.
+
+- **(e) Coin-level provenance ("is this specific coin authority-issued?").** Under the amount =
+  native-sompi model (§9, following `token.rs`'s `Kcc20StateHeader` convention), a coin an attacker
+  self-funds directly at the stablecoin covenant's P2SH — the role keys are baked, public bytecode
+  literals (§1, §2, option B), so anyone can compute the same P2SH and pay their own real KAS into it —
+  is **ON-CHAIN INDISTINGUISHABLE** from a coin legitimately emitted by a MINT spend. Stablecoin coins
+  carry no shared, coin-level on-chain class identifier: each MINT output gets its own fresh genesis
+  `covenant_id`, exactly as a self-funded lookalike coin would get its own fresh genesis `covenant_id`
+  simply by existing as a new UTXO — there is no bit pattern that says "issued by the authority" versus
+  "self-funded," because the covenant script itself is, by design, byte-identical either way (§9's
+  anti-backdoor reconstruction). Consequences:
+  - `running_supply` (§9, mint-authority) counts only supply that actually passed through a MINT spend
+    of the mint-authority contract — it says nothing about, and cannot observe, coins funded directly at
+    the covenant's P2SH outside the mint-authority contract entirely. It is **not** a total-coins-in-
+    existence counter.
+  - Coin provenance — "was this specific coin actually MINT-issued?" — is inherently an **OFF-CHAIN /
+    INDEXER responsibility**, not something decidable by the covenant at spend time: an indexer must
+    trace the pinned-genesis mint-authority contract's own lineage (from its bound `G`, above) and
+    record each of *its* MINT tx's emitted output as known-good; any coin at the P2SH not reachable from
+    that lineage is not authority-issued, however identical its script and state layout.
+  - Within the amount = native-sompi model this is **not a peg attack**: a self-funded coin is backed
+    1:1 by its own locked KAS (the funder's own real sompi, not fabricated value) and remains fully
+    issuer-governable exactly like any other coin at this P2SH — FREEZE/SEIZE apply to it identically,
+    since those branches authorize on role keys and per-coin state, not on provenance. It is a
+    bookkeeping/classification gap (which coins count as "the stablecoin, as issued by us"), not a
+    value-forgery or inflation gap.
+  - **Considered and REJECTED**: baking the mint-authority's genesis `covenant_id` `G` (above) into
+    every minted coin's own state, so a coin could self-report its issuing authority on-chain. Rejected
+    because `G`, like the role keys, would be a public baked value readable out of any real coin's
+    script — a self-funder could simply copy the same `G` bytes into their own self-funded lookalike,
+    reproducing an identical coin. This has **zero security value**: it does not change who *can*
+    produce the byte pattern, it only makes the fake coin look more convincing.
 

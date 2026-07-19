@@ -72,6 +72,7 @@
 pub mod attestation;
 pub mod body;
 pub mod dispatch;
+pub mod mint_authority;
 pub mod sigscript;
 pub mod state;
 

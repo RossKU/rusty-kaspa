@@ -1174,6 +1174,28 @@ fn burn_replay_other_outpoint_rejected() {
     assert_rejected_with(&res, "VerifyError");
 }
 
+#[test]
+fn burn_of_frozen_coin_rejected() {
+    // Audit fix (MEDIUM): "freeze == total owner immobility" -- a frozen coin
+    // must not be burnable by its owner, even with an otherwise fully honest
+    // owner + MINT co-signature. Only the issuer's SEIZE branch (no owner
+    // signature, no frozen gate) may act on a frozen coin.
+    let cfg = BurnCfg { frozen_flag: frozen_flag::SET, ..BurnCfg::honest() };
+    let res = run(&build_burn(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn burn_of_unfrozen_coin_accepts() {
+    // Regression guard: the new frozen_flag gate must not disturb the
+    // existing happy path -- an unfrozen coin's owner + MINT co-signed BURN
+    // still accepts (same scenario as `burn_owner_plus_mint_accepts`, named
+    // to pair explicitly with `burn_of_frozen_coin_rejected` above).
+    let cfg = BurnCfg { frozen_flag: frozen_flag::CLEAR, ..BurnCfg::honest() };
+    let res = run(&build_burn(&cfg));
+    assert!(res.is_ok(), "honest owner+MINT BURN of an UNFROZEN coin must be accepted: {res:?}");
+}
+
 // ============================================================================
 // 6. MIGRATE (`op_type = 0x06`, Phase II final branch) -- happy path +
 //    adversarial batch. Two-of-two authorization, the SAME shape as
@@ -1434,4 +1456,28 @@ fn migrate_replay_other_outpoint_rejected() {
     let cfg = MigrateCfg { attest_outpoint_txid_seed: Some(0x77), ..MigrateCfg::honest() };
     let res = run(&build_migrate(&cfg));
     assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn migrate_of_frozen_coin_rejected() {
+    // Audit fix (MEDIUM): "freeze == total owner immobility" -- a frozen
+    // (sanctioned) coin must not be migratable to an arbitrary successor
+    // template by its owner, even with an otherwise fully honest owner + OPS
+    // co-signature -- that would let a frozen coin escape governance
+    // entirely. Only the issuer's SEIZE branch (no owner signature, no frozen
+    // gate) may act on a frozen coin.
+    let cfg = MigrateCfg { frozen_flag: frozen_flag::SET, ..MigrateCfg::honest() };
+    let res = run(&build_migrate(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn migrate_of_unfrozen_coin_accepts() {
+    // Regression guard: the new frozen_flag gate must not disturb the
+    // existing happy path -- an unfrozen coin's owner + OPS co-signed MIGRATE
+    // still accepts (same scenario as `migrate_owner_plus_ops_accepts`, named
+    // to pair explicitly with `migrate_of_frozen_coin_rejected` above).
+    let cfg = MigrateCfg { frozen_flag: frozen_flag::CLEAR, ..MigrateCfg::honest() };
+    let res = run(&build_migrate(&cfg));
+    assert!(res.is_ok(), "honest owner+OPS MIGRATE of an UNFROZEN coin must be accepted: {res:?}");
 }

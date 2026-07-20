@@ -66,12 +66,30 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) -> Result<(), Au
         serde_json::Value::Null => out.push_str("null"),
         serde_json::Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
         serde_json::Value::Number(n) => {
-            // Non-finite numbers cannot occur in `serde_json::Number`, but an
-            // arbitrary-precision float still must round-trip as JSON.
-            if n.as_f64().map(|f| !f.is_finite()).unwrap_or(false) {
-                return Err(AuthError::NotSerializable);
+            if n.is_i64() || n.is_u64() {
+                out.push_str(&n.to_string());
+            } else {
+                // JavaScript has no integer/float distinction, so
+                // `JSON.stringify(1.0)` is `1`, while serde_json's Float
+                // variant always prints a decimal point (`1.0`). An offer that
+                // spells a whole number with a decimal point anywhere in
+                // `extra` or an unmodelled top-level field would otherwise hash
+                // differently here than in the JS reference implementation --
+                // it fails closed (digest mismatch), but it fails.
+                let f = n.as_f64().ok_or(AuthError::NotSerializable)?;
+                if !f.is_finite() {
+                    return Err(AuthError::NotSerializable);
+                }
+                if f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0 {
+                    out.push_str(&format!("{}", f as i64));
+                } else {
+                    // Both sides emit the shortest representation that
+                    // round-trips. They can still differ in exponent spelling
+                    // for extreme magnitudes; no documented x402 field is a
+                    // non-integral number, so that residue stays theoretical.
+                    out.push_str(&n.to_string());
+                }
             }
-            out.push_str(&n.to_string());
         }
         serde_json::Value::String(s) => write_json_string(s, out),
         serde_json::Value::Array(items) => {
@@ -358,6 +376,19 @@ mod tests {
             &foreign,
         );
         assert_eq!(res, Err(AuthError::BadSignature));
+    }
+
+    #[test]
+    fn whole_numbers_serialize_the_way_javascript_prints_them() {
+        // `JSON.stringify({a: 1.0, b: 1e3})` is `{"a":1,"b":1000}`. serde_json's
+        // Float variant would print `1.0`/`1000.0`, which would make every
+        // digest computed from an offer carrying such a literal disagree with
+        // the JS reference implementation.
+        let v: serde_json::Value = serde_json::from_str(r#"{"a":1.0,"b":1e3,"c":-2.0}"#).unwrap();
+        assert_eq!(canonical_json(&v).unwrap(), r#"{"a":1,"b":1000,"c":-2}"#);
+        // Genuine integers are untouched.
+        let v2: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":18446744073709551615}"#).unwrap();
+        assert_eq!(canonical_json(&v2).unwrap(), r#"{"a":1,"b":18446744073709551615}"#);
     }
 
     #[test]

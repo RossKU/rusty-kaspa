@@ -1896,7 +1896,9 @@ async fn main() -> anyhow::Result<()> {
         raise_cap.txid, raise_cap.current_cap
     );
     println!();
-    println!("=== ALL 7 OPS COMPLETE (DEPLOY, MINT, TRANSFER, FREEZE, SEIZE, BURN, RAISE_CAP; +1 extra UNFREEZE) ===");
+    println!(
+        "=== ALL 7 OPS COMPLETE (DEPLOY, MINT, TRANSFER, FREEZE, SEIZE, {}, RAISE_CAP; +1 extra UNFREEZE) ===",
+        if migrate_demo { "MIGRATE" } else { "BURN" });
 
     Ok(())
 }

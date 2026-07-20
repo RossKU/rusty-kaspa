@@ -35,6 +35,20 @@
 
 use crate::wire_v2::TX_ENCODING_SAFE_JSON;
 
+/// Upper bounds on what a single artifact may declare before we do any
+/// per-element work. A transaction id is computed from attacker-supplied JSON
+/// on an unauthenticated request path, and it runs BEFORE the profile's own
+/// shape checks (which would otherwise cap outputs at 2), so without these a
+/// single request could drive a multi-hundred-megabyte hex decode. The limits
+/// are far above anything a real Kaspa transaction reaches: consensus caps a
+/// block at 500_000 mass, and one input costs ~1_100 mass on its own.
+const MAX_INPUTS: usize = 10_000;
+const MAX_OUTPUTS: usize = 10_000;
+/// Generous relative to the ~35-byte P2SH / 34-byte P2PK scripts in use, and
+/// still far below the 1MB script limit, let alone anything worth allocating
+/// for on an unauthenticated path.
+const MAX_HEX_CHARS: usize = 200_000;
+
 /// Anything that makes an artifact non-projectable onto the consensus
 /// transaction. Callers treat all of these the same (`invalid_payload`); the
 /// variants exist so a rejection can be logged precisely.
@@ -49,6 +63,9 @@ pub enum TxIdError {
     BadField(&'static str),
     /// Only transaction versions 0 and 1 have a defined identifier here.
     UnsupportedVersion(u64),
+    /// The artifact declares more inputs/outputs, or a longer hex field, than
+    /// any real transaction has -- refused before allocating for it.
+    TooLarge(&'static str),
     /// The artifact carries a convenience `id` that disagrees with the
     /// independently recomputed identifier. The spec forbids trusting it, so
     /// this is a hard rejection rather than a silent preference for ours.
@@ -85,7 +102,12 @@ fn u32_field(value: Option<&serde_json::Value>, field: &'static str) -> Result<u
 fn hex_field(value: Option<&serde_json::Value>, field: &'static str) -> Result<Vec<u8>, TxIdError> {
     match value {
         None | Some(serde_json::Value::Null) => Ok(Vec::new()),
-        Some(serde_json::Value::String(s)) => hex::decode(s).map_err(|_| TxIdError::BadField(field)),
+        Some(serde_json::Value::String(s)) => {
+            if s.len() > MAX_HEX_CHARS {
+                return Err(TxIdError::TooLarge(field));
+            }
+            hex::decode(s).map_err(|_| TxIdError::BadField(field))
+        }
         Some(_) => Err(TxIdError::BadField(field)),
     }
 }
@@ -137,17 +159,25 @@ fn put_varbytes(out: &mut Vec<u8>, bytes: &[u8]) {
 /// Serialize the consensus projection of `tx`.
 ///
 /// `include_covenant_byte` follows the transaction version (version-1 outputs
-/// append a covenant-presence byte). Signature scripts and the payload are
-/// always emitted empty: version 0 excludes signature scripts by definition,
-/// and version 1's `restPreimage` empties both because the payload is
-/// committed separately through `payloadDigest`.
+/// append a covenant-presence byte). Signature scripts are always emitted
+/// empty -- both id constructions exclude them, which is what keeps the id
+/// stable while a transaction is being signed. The payload is included for
+/// version 0 (consensus commits it there) and emptied for version 1's
+/// `restPreimage`, where `payloadDigest` commits it instead.
 fn serialize_consensus_projection(
     tx: &serde_json::Value,
     include_covenant_byte: bool,
+    include_payload: bool,
 ) -> Result<Vec<u8>, TxIdError> {
     let version = u64_field(tx.get("version"), "version")?;
     let inputs = tx.get("inputs").and_then(|v| v.as_array()).ok_or(TxIdError::Malformed("inputs"))?;
     let outputs = tx.get("outputs").and_then(|v| v.as_array()).ok_or(TxIdError::Malformed("outputs"))?;
+    if inputs.len() > MAX_INPUTS {
+        return Err(TxIdError::TooLarge("inputs"));
+    }
+    if outputs.len() > MAX_OUTPUTS {
+        return Err(TxIdError::TooLarge("outputs"));
+    }
 
     let mut out = Vec::with_capacity(128 + inputs.len() * 52 + outputs.len() * 64);
     out.extend_from_slice(&(u16::try_from(version).map_err(|_| TxIdError::BadField("version"))?).to_le_bytes());
@@ -189,7 +219,12 @@ fn serialize_consensus_projection(
         return Err(TxIdError::BadField("subnetworkId"));
     }
     out.extend_from_slice(&u64_field(tx.get("gas"), "gas")?.to_le_bytes());
-    put_varbytes(&mut out, &[]); // payload, emptied in both id constructions
+    // Version 0 COMMITS the payload (rusty-kaspa's
+    // write_transaction_v0_for_transaction_id excludes only the signature
+    // scripts and the mass commitment). Version 1's `restPreimage` empties it
+    // because `payloadDigest` commits it separately.
+    let payload = if include_payload { hex_field(tx.get("payload"), "payload")? } else { Vec::new() };
+    put_varbytes(&mut out, &payload);
 
     Ok(out)
 }
@@ -200,7 +235,7 @@ pub fn transaction_id(tx: &serde_json::Value) -> Result<String, TxIdError> {
     let version = u64_field(tx.get("version"), "version")?;
     let digest = match version {
         0 => {
-            let preimage = serialize_consensus_projection(tx, false)?;
+            let preimage = serialize_consensus_projection(tx, false, true)?;
             let mut hasher = kob_settle::p2sh::Blake2bSimple::new_keyed(b"TransactionID");
             hasher.update(&preimage);
             hasher.finalize()
@@ -208,7 +243,8 @@ pub fn transaction_id(tx: &serde_json::Value) -> Result<String, TxIdError> {
         1 => {
             let payload = hex_field(tx.get("payload"), "payload")?;
             let payload_digest = blake3_domain("PayloadDigest", &payload);
-            let rest_digest = blake3_domain("TransactionRest", &serialize_consensus_projection(tx, true)?);
+            let rest_digest =
+                blake3_domain("TransactionRest", &serialize_consensus_projection(tx, true, false)?);
             let mut preimage = [0u8; 64];
             preimage[..32].copy_from_slice(&payload_digest);
             preimage[32..].copy_from_slice(&rest_digest);
@@ -257,7 +293,7 @@ mod tests {
     fn version_0_preimage_and_id_match_the_vector() {
         let v = vector();
         let profile = &v["transactionEncoding"]["profiles"]["standardNative"];
-        let preimage = serialize_consensus_projection(&profile["artifact"], false).unwrap();
+        let preimage = serialize_consensus_projection(&profile["artifact"], false, true).unwrap();
         assert_eq!(hex::encode(&preimage), profile["txid"]["preimage"].as_str().unwrap());
         assert_eq!(profile["txid"]["algorithm"].as_str().unwrap(), "blake2b-256-keyed");
         assert_eq!(profile["txid"]["domain"].as_str().unwrap(), "TransactionID");
@@ -274,7 +310,7 @@ mod tests {
         let profile = &v["transactionEncoding"]["profiles"]["additive"];
         let txid = &profile["txid"];
 
-        let rest_preimage = serialize_consensus_projection(&profile["artifact"], true).unwrap();
+        let rest_preimage = serialize_consensus_projection(&profile["artifact"], true, false).unwrap();
         assert_eq!(hex::encode(&rest_preimage), txid["restPreimage"].as_str().unwrap());
 
         let payload = hex_field(profile["artifact"].get("payload"), "payload").unwrap();
@@ -292,6 +328,25 @@ mod tests {
         let id = transaction_id(&profile["artifact"]).unwrap();
         assert_eq!(id, txid["digest"].as_str().unwrap());
         assert_eq!(id, profile["artifact"]["id"].as_str().unwrap());
+    }
+
+    #[test]
+    fn version_0_payload_is_committed() {
+        // Regression guard: consensus's write_transaction_v0_for_transaction_id
+        // excludes only signature scripts and the mass commitment, so the
+        // payload IS hashed into a v0 id. We previously emptied it, which was
+        // invisible against the vector (its payload is empty) and against the
+        // exact profile (which forbids a non-empty payload) -- but it would
+        // have made us disagree with consensus for any other v0 transaction.
+        let v = vector();
+        let mut artifact = v["transactionEncoding"]["profiles"]["standardNative"]["artifact"].clone();
+        let empty_payload_id = transaction_id(&artifact).unwrap();
+        artifact["payload"] = serde_json::json!("010203");
+        assert_ne!(
+            transaction_id(&artifact).unwrap(),
+            empty_payload_id,
+            "a v0 payload must change the transaction id"
+        );
     }
 
     #[test]

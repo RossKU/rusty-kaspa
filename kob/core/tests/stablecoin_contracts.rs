@@ -168,6 +168,11 @@ struct Cfg {
     // (matching this coin's own `root`/`epoch` -- the honest case).
     successor_root: Option<[u8; 32]>,
     successor_epoch: Option<u32>,
+    /// Role keys baked into the SUCCESSOR body. `None` == this covenant's own
+    /// (the honest case). Setting it is the audit-2026-07-20-section-E attack:
+    /// a successor that keeps every state field this branch compares while
+    /// swapping the role set out from under the issuer.
+    successor_role_seeds: Option<(u8, u8, [u8; 3], u8)>,
 
     // Overrides for what the OPS role actually SIGNS over (None/default ==
     // truthful, matching the real spend). A disagreeing value is the
@@ -193,6 +198,7 @@ impl Cfg {
             out_value: IN_AMOUNT,
             successor_root: None,
             successor_epoch: None,
+            successor_role_seeds: None,
             attest_ops_seed: 2, // == ops_seed
             attest_op_type: op_type::TRANSFER,
             attest_outpoint_txid_seed: None,
@@ -229,16 +235,25 @@ fn build(cfg: &Cfg) -> Built {
     let recipient_pub = pubkey(cfg.recipient_seed);
     let successor_root = cfg.successor_root.unwrap_or(cfg.root);
     let successor_epoch = cfg.successor_epoch.unwrap_or(cfg.epoch);
+    let (s_ops, s_freeze, s_seize, s_mint) = match cfg.successor_role_seeds {
+        None => (ops_pub, freeze_pub, seize_pubs, mint_pub),
+        Some((o, f, sz, m)) => (
+            pubkey(o),
+            pubkey(f),
+            [pubkey(sz[0]), pubkey(sz[1]), pubkey(sz[2])],
+            pubkey(m),
+        ),
+    };
     let new_rs = build_stablecoin_redeem_script(
         &recipient_pub,
         id_type::PUBKEY,
         &successor_root,
         frozen_flag::CLEAR,
         successor_epoch,
-        &ops_pub,
-        &freeze_pub,
-        &seize_pubs,
-        &mint_pub,
+        &s_ops,
+        &s_freeze,
+        &s_seize,
+        &s_mint,
     );
     let out_spk = build_p2sh(&new_rs);
 
@@ -350,6 +365,46 @@ fn transfer_wrong_ops_key_rejected() {
     let cfg = Cfg { attest_ops_seed: 99, ..Cfg::honest() };
     let res = run(&build(&cfg));
     assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn transfer_successor_swapping_the_role_set_rejected() {
+    // Audit 2026-07-20 section E, the CRITICAL one. Everything here is honest
+    // except the successor's BODY: same owner-transfer, same role_registry_root,
+    // same epoch, same frozen_flag, correctly OPS-attested, paying exactly the
+    // output whose P2SH the branch checks. Only the baked role pubkeys differ.
+    //
+    // Before template authentication this was ACCEPTED, which meant owner plus a
+    // stolen HOT ops key could move the coin into a covenant the real issuer
+    // holds no keys for -- the same governance exit the MIGRATE cold-quorum gate
+    // was added to close, reachable without touching MIGRATE.
+    let cfg = Cfg { successor_role_seeds: Some((40, 41, [42, 43, 44], 45)), ..Cfg::honest() };
+    let res = run(&build(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn transfer_successor_swapping_only_the_ops_key_rejected() {
+    // The narrowest form: every role key carried forward honestly except OPS
+    // (seed 50 instead of the covenant's own 2).
+    // A suffix comparison catches it the same way it catches a full swap --
+    // there is no "small enough to slip through" version of this attack.
+    let cfg = Cfg { successor_role_seeds: Some((50, TRANSFER_SCENARIO_FREEZE_SEED, UNRELATED_SEIZE_SEEDS, UNRELATED_MINT_SEED)), ..Cfg::honest() };
+    let res = run(&build(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn transfer_successor_with_identical_role_set_still_accepts() {
+    // Guard on the other side: template authentication must not break the
+    // honest path it wraps. Spelling the role seeds out explicitly (rather than
+    // relying on the None default) proves the comparison is by VALUE.
+    let cfg = Cfg {
+        successor_role_seeds: Some((2, TRANSFER_SCENARIO_FREEZE_SEED, UNRELATED_SEIZE_SEEDS, UNRELATED_MINT_SEED)),
+        ..Cfg::honest()
+    };
+    let res = run(&build(&cfg));
+    assert!(res.is_ok(), "an unchanged role set must still transfer: {res:?}");
 }
 
 #[test]
@@ -552,6 +607,11 @@ fn build_freeze_scenario(cfg: &FreezeCfg, raw_issuer_sig: Option<&[u8]>) -> Buil
     let ss = match raw_issuer_sig {
         Some(raw) => {
             let mut ss = Vec::new();
+            // self_rs (deepest) -- the template-authentication copy the branch
+            // proves against this input's own SPK. Present in every honest
+            // sigscript, so a hand-assembled one must supply it too or the
+            // branch's picks land on the wrong items.
+            ss.extend_from_slice(&push_data(&rs));
             ss.extend_from_slice(&push_data(raw));
             ss.extend_from_slice(&push_data(&new_rs));
             ss.extend_from_slice(&push_data(&[cfg.new_frozen_flag]));

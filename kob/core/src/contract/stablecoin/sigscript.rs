@@ -73,6 +73,13 @@ pub fn build_stablecoin_transfer_sigscript(
     owner_sig_with_type.push(SIGHASH_ALL);
 
     let mut ss = Vec::with_capacity(2 + 64 + 3 + new_rs.len() + 2 + 65 + 2 + 3 + redeem_script.len());
+    // Deepest item: this coin's OWN redeem script, for the branch's template
+    // authentication (audit 2026-07-20 section E -- the successor's body, where
+    // every role pubkey is baked, was previously unchecked). These are the same
+    // bytes pushed last for the P2SH wrapper, so no caller-visible field was
+    // added; the branch proves the copy genuine against this input's own SPK
+    // before comparing suffixes.
+    ss.extend_from_slice(&push_data(redeem_script));
     // Emitted first -> ends up deepest on the stack: the OPS attestation sig.
     ss.extend_from_slice(&push_data(issuer_sig));
     // Then the candidate successor redeem script (plaintext, authenticated
@@ -107,6 +114,13 @@ pub fn build_stablecoin_transfer_sigscript(
 /// (`0x01 == FREEZE`), then the redeem script last.
 pub fn build_stablecoin_freeze_sigscript(issuer_sig: &[u8; 64], new_frozen_flag: u8, new_rs: &[u8], redeem_script: &[u8]) -> Vec<u8> {
     let mut ss = Vec::with_capacity(2 + 64 + 3 + new_rs.len() + 2 + 1 + 2 + 3 + redeem_script.len());
+    // Deepest item: this coin's OWN redeem script, for the branch's template
+    // authentication (audit 2026-07-20 section E -- the successor's body, where
+    // every role pubkey is baked, was previously unchecked). These are the same
+    // bytes pushed last for the P2SH wrapper, so no caller-visible field was
+    // added; the branch proves the copy genuine against this input's own SPK
+    // before comparing suffixes.
+    ss.extend_from_slice(&push_data(redeem_script));
     // Emitted first -> ends up deepest on the stack: the FREEZE attestation sig.
     ss.extend_from_slice(&push_data(issuer_sig));
     // Then the candidate successor redeem script (plaintext, authenticated
@@ -161,6 +175,13 @@ pub fn build_stablecoin_seize_sigscript(
     let mut ss = Vec::with_capacity(
         3 * (2 + 64) + 3 + new_rs.len() + 2 + 32 + 2 + 3 + redeem_script.len(),
     );
+    // Deepest item: this coin's OWN redeem script, for the branch's template
+    // authentication (audit 2026-07-20 section E -- the successor's body, where
+    // every role pubkey is baked, was previously unchecked). These are the same
+    // bytes pushed last for the P2SH wrapper, so no caller-visible field was
+    // added; the branch proves the copy genuine against this input's own SPK
+    // before comparing suffixes.
+    ss.extend_from_slice(&push_data(redeem_script));
     // Emitted first -> ends up deepest on the stack: the three SEIZE
     // attestation sigs, in fixed positional order (sig1, sig2, sig3).
     ss.extend_from_slice(&push_data(sig1));
@@ -335,9 +356,13 @@ mod tests {
         let new_rs = sample_new_rs();
         let ss = build_stablecoin_transfer_sigscript(&OWNER_SIG, &ISSUER_SIG, &new_rs, &rs);
 
-        // Field 1 (deepest): issuer_sig — OpData64 (0x40) + 64 raw bytes.
-        assert_eq!(ss[0], 64);
-        assert_eq!(&ss[1..65], &ISSUER_SIG);
+        // Field 1 (deepest) is now self_rs (the template-authentication copy);
+        // the attestation sig follows it.
+        let self_rs_push = crate::primitives::push_data(&rs);
+        assert_eq!(&ss[..self_rs_push.len()], &self_rs_push[..]);
+        let after = &ss[self_rs_push.len()..];
+        assert_eq!(after[0], 64);
+        assert_eq!(&after[1..65], &ISSUER_SIG);
 
         // Fields 2-5: rather than hand-decode `push_data`'s length-dependent
         // opcode choice (OpDataN / PUSHDATA1 / PUSHDATA2 depending on payload
@@ -352,6 +377,9 @@ mod tests {
         owner_sig_with_type.push(SIGHASH_ALL);
 
         let mut expected = Vec::new();
+        // self_rs (deepest): the template-authentication copy, same bytes as
+        // the trailing P2SH push.
+        expected.extend_from_slice(&crate::primitives::push_data(&rs));
         expected.extend_from_slice(&crate::primitives::push_data(&ISSUER_SIG));
         expected.extend_from_slice(&crate::primitives::push_data(&new_rs));
         expected.extend_from_slice(&crate::primitives::push_data(&owner_sig_with_type));
@@ -379,11 +407,17 @@ mod tests {
         );
         let ss = build_stablecoin_freeze_sigscript(&ISSUER_SIG, frozen_flag::SET, &new_rs, &rs);
 
-        // Field 1 (deepest): issuer_sig — OpData64 (0x40) + 64 raw bytes.
-        assert_eq!(ss[0], 64);
-        assert_eq!(&ss[1..65], &ISSUER_SIG);
+        // Field 1 (deepest) is now self_rs; the attestation sig follows it.
+        let self_rs_push = crate::primitives::push_data(&rs);
+        assert_eq!(&ss[..self_rs_push.len()], &self_rs_push[..]);
+        let after = &ss[self_rs_push.len()..];
+        assert_eq!(after[0], 64);
+        assert_eq!(&after[1..65], &ISSUER_SIG);
 
         let mut expected = Vec::new();
+        // self_rs (deepest): the template-authentication copy, same bytes as
+        // the trailing P2SH push.
+        expected.extend_from_slice(&crate::primitives::push_data(&rs));
         expected.extend_from_slice(&crate::primitives::push_data(&ISSUER_SIG));
         expected.extend_from_slice(&crate::primitives::push_data(&new_rs));
         expected.extend_from_slice(&crate::primitives::push_data(&[frozen_flag::SET]));
@@ -415,11 +449,17 @@ mod tests {
         );
         let ss = build_stablecoin_seize_sigscript(&SIG1, &SIG2, &SIG3, &NEW_OWNER, &new_rs, &rs);
 
-        // Field 1 (deepest): sig1 — OpData64 (0x40) + 64 raw bytes.
-        assert_eq!(ss[0], 64);
-        assert_eq!(&ss[1..65], &SIG1);
+        // Field 1 (deepest) is now self_rs; sig1 follows it.
+        let self_rs_push = crate::primitives::push_data(&rs);
+        assert_eq!(&ss[..self_rs_push.len()], &self_rs_push[..]);
+        let after = &ss[self_rs_push.len()..];
+        assert_eq!(after[0], 64);
+        assert_eq!(&after[1..65], &SIG1);
 
         let mut expected = Vec::new();
+        // self_rs (deepest): the template-authentication copy, same bytes as
+        // the trailing P2SH push.
+        expected.extend_from_slice(&crate::primitives::push_data(&rs));
         expected.extend_from_slice(&crate::primitives::push_data(&SIG1));
         expected.extend_from_slice(&crate::primitives::push_data(&SIG2));
         expected.extend_from_slice(&crate::primitives::push_data(&SIG3));

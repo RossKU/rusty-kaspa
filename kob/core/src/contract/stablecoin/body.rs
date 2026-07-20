@@ -137,7 +137,9 @@ use super::state::{
     OWNER_PUBKEY_PAYLOAD_OFFSET, ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET, STATE_HEADER_LEN,
 };
 use super::DOMAIN_TAG;
-use crate::contract::dr::{dr_field_extract, dr_output_spk_check, dr_value_continuity_check};
+use crate::contract::dr::{
+    dr_field_extract, dr_input_spk_check, dr_output_spk_check, dr_suffix_check, dr_value_continuity_check,
+};
 use crate::contract::helpers::push_index;
 
 /// Opcode bytes used by the stablecoin body (named for readability; values
@@ -307,6 +309,35 @@ fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     b.extend_from_slice(&dr_output_spk_check(4, 1)); // Blake2b(new_rs) == P2SH(real successor SPK)
     b.push(DROP); // drop input_idx (net effect of the check above is 0
                   // otherwise -- see dr.rs's own depth-adjustment discipline)
+
+    // ---- Template authentication (CRITICAL fix, audit 2026-07-20 §E). ----
+    // `dr_output_spk_check` above only proves the spender's `new_rs` is the
+    // script the successor output pays to. It says NOTHING about what that
+    // script CONTAINS. Every role pubkey lives in the body, after the mutable
+    // state header, so without the check below a spender can hand over a
+    // successor that keeps the state fields this branch compares while baking
+    // an entirely different role set -- moving the coin into a covenant the
+    // real issuer has no keys for. FREEZE takes no owner signature at all, so
+    // there it was a single-key total takeover; TRANSFER reopened the exact
+    // governance exit the MIGRATE cold-quorum gate closed, at the lower price
+    // of a hot OPS key.
+    //
+    // `self_rs` is this coin's OWN redeem script, supplied by the sigscript as
+    // its deepest item (the same bytes it already pushes last for the P2SH
+    // wrapper, so no caller-visible field was added) and proven genuine here
+    // against this input's own SPK. Everything from `STATE_HEADER_LEN` onward
+    // must then match byte for byte -- the same template authentication
+    // kcc-0001 5.8.5 requires and the sibling KCC20 transfer covenant already
+    // performed. MIGRATE is deliberately exempt: its successor is an arbitrary
+    // new template by design, which is why that branch requires the cold quorum.
+    // Stack: epoch_copy(0), epoch(1), role_registry_root(2), new_rs(3),
+    // issuer_sig(4), self_rs(5).
+    b.extend_from_slice(&dr_input_spk_check(5)); // P2SH(self_rs) == this input's own SPK
+    // dr_suffix_check's SECOND depth must account for the one net item its own
+    // first half leaves behind -- new_rs is raw depth 3, hence 4 here.
+    b.extend_from_slice(&dr_suffix_check(5, 4, STATE_HEADER_LEN as u16));
+    e_roll(&mut b, 5); // self_rs -> top
+    b.push(DROP); // done with it; stack returns to the layout below
 
     // Stack: epoch_copy(0), epoch(1), role_registry_root(2), new_rs(3),
     // issuer_sig(4).
@@ -498,6 +529,34 @@ fn build_freeze_branch(freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     // issuer_sig(8).
     b.extend_from_slice(&dr_output_spk_check(7, 1)); // Blake2b(new_rs) == P2SH(real successor SPK)
     b.push(DROP); // drop input_idx
+
+    // ---- Template authentication (CRITICAL fix, audit 2026-07-20 §E). ----
+    // `dr_output_spk_check` above only proves the spender's `new_rs` is the
+    // script the successor output pays to. It says NOTHING about what that
+    // script CONTAINS. Every role pubkey lives in the body, after the mutable
+    // state header, so without the check below a spender can hand over a
+    // successor that keeps the state fields this branch compares while baking
+    // an entirely different role set -- moving the coin into a covenant the
+    // real issuer has no keys for. FREEZE takes no owner signature at all, so
+    // there it was a single-key total takeover; TRANSFER reopened the exact
+    // governance exit the MIGRATE cold-quorum gate closed, at the lower price
+    // of a hot OPS key.
+    //
+    // `self_rs` is this coin's OWN redeem script, supplied by the sigscript as
+    // its deepest item (the same bytes it already pushes last for the P2SH
+    // wrapper, so no caller-visible field was added) and proven genuine here
+    // against this input's own SPK. Everything from `STATE_HEADER_LEN` onward
+    // must then match byte for byte -- the same template authentication
+    // kcc-0001 5.8.5 requires and the sibling KCC20 transfer covenant already
+    // performed. MIGRATE is deliberately exempt: its successor is an arbitrary
+    // new template by design, which is why that branch requires the cold quorum.
+    // Stack: epoch_copy(0), epoch(1), root(2), identifier_type(3),
+    // owner_pubkey(4), new_frozen_flag(5), new_rs(6), issuer_sig(7),
+    // self_rs(8).
+    b.extend_from_slice(&dr_input_spk_check(8)); // P2SH(self_rs) == this input's own SPK
+    b.extend_from_slice(&dr_suffix_check(8, 7, STATE_HEADER_LEN as u16)); // new_rs raw depth 6 -> 7
+    e_roll(&mut b, 8); // self_rs -> top
+    b.push(DROP);
 
     // Stack: epoch_copy(0), epoch(1), root(2), identifier_type(3),
     // owner_pubkey(4), new_frozen_flag(5), new_rs(6), issuer_sig(7).
@@ -735,6 +794,34 @@ fn build_seize_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
     // sig3(9), sig2(10), sig1(11).
     b.extend_from_slice(&dr_output_spk_check(8, 1)); // Blake2b(new_rs) == P2SH(real successor SPK)
     b.push(DROP); // drop input_idx
+
+    // ---- Template authentication (CRITICAL fix, audit 2026-07-20 §E). ----
+    // `dr_output_spk_check` above only proves the spender's `new_rs` is the
+    // script the successor output pays to. It says NOTHING about what that
+    // script CONTAINS. Every role pubkey lives in the body, after the mutable
+    // state header, so without the check below a spender can hand over a
+    // successor that keeps the state fields this branch compares while baking
+    // an entirely different role set -- moving the coin into a covenant the
+    // real issuer has no keys for. FREEZE takes no owner signature at all, so
+    // there it was a single-key total takeover; TRANSFER reopened the exact
+    // governance exit the MIGRATE cold-quorum gate closed, at the lower price
+    // of a hot OPS key.
+    //
+    // `self_rs` is this coin's OWN redeem script, supplied by the sigscript as
+    // its deepest item (the same bytes it already pushes last for the P2SH
+    // wrapper, so no caller-visible field was added) and proven genuine here
+    // against this input's own SPK. Everything from `STATE_HEADER_LEN` onward
+    // must then match byte for byte -- the same template authentication
+    // kcc-0001 5.8.5 requires and the sibling KCC20 transfer covenant already
+    // performed. MIGRATE is deliberately exempt: its successor is an arbitrary
+    // new template by design, which is why that branch requires the cold quorum.
+    // Stack: epoch_copy(0), epoch(1), frozen_flag(2), root(3),
+    // identifier_type(4), owner_pubkey(5), new_owner_pubkey(6), new_rs(7),
+    // sig3(8), sig2(9), sig1(10), self_rs(11).
+    b.extend_from_slice(&dr_input_spk_check(11)); // P2SH(self_rs) == this input's own SPK
+    b.extend_from_slice(&dr_suffix_check(11, 8, STATE_HEADER_LEN as u16)); // new_rs raw depth 7 -> 8
+    e_roll(&mut b, 11); // self_rs -> top
+    b.push(DROP);
 
     // Stack: epoch_copy(0), epoch(1), frozen_flag(2), root(3),
     // identifier_type(4), owner_pubkey(5), new_owner_pubkey(6), new_rs(7),

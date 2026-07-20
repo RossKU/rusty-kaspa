@@ -169,7 +169,11 @@ Worth recording because two of that commit's three claims did not survive:
 
 ## E. CRITICAL (found 2026-07-20, post-hardening audit): successor template is not authenticated
 
-**Status: OPEN. Do not run further live operations until fixed.**
+**Status: FIXED.** Template authentication is wired into TRANSFER/FREEZE/SEIZE
+(`dr_input_spk_check` on a sigscript-supplied copy of this coin's own redeem
+script, then `dr_suffix_check` from `STATE_HEADER_LEN` onward). Proven
+load-bearing: removing just the TRANSFER suffix check makes exactly the two
+attack-reproduction tests fail and leaves the honest path passing.
 
 TRANSFER, FREEZE and SEIZE each let the spender supply the successor redeem
 script (`new_rs`) as plaintext and authenticate it ONLY against the output it

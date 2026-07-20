@@ -214,6 +214,7 @@ mod tests {
             pay_to: pay_to.to_string(),
             max_timeout_seconds: 60,
             extra,
+            additional: Default::default(),
         }
     }
 

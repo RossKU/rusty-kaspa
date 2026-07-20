@@ -2,17 +2,25 @@
 //! (elldeeone/kaspa-x402 @ 0345cbd7b8d26520b4dffe0fcc94d127acd1fcb0, vendored
 //! under `kob/x402/interop/vectors/`).
 //!
-//! Coverage note (matches the maintainer feedback we are sending upstream):
-//! `vectors/exact/consensus-profiles.json` publishes each transaction as JSON
-//! plus the EXPECTED `transactionId`/`transactionHash`/mass numbers, but not
-//! the byte-level serialization preimages those hashes are computed over
-//! (domain-separated blake2b over the canonical tx serialization, incl. the
-//! version-1 input mass-field variant), and the payload authorization vectors
-//! publish only the final digest/signature, not the digest preimage layout.
-//! Without those preimage bytes an independent (non-Rusty-Kaspa) stack can
-//! only cross-check the STRUCTURAL and accounting fields, which is what these
-//! tests do; txid recomputation and authorization digest verification stay
-//! blocked until upstream ships preimage vectors.
+//! Coverage note, updated 2026-07-20: upstream PR#3 (merged 07-19, released in
+//! alpha.9) shipped the preimage bytes the earlier note said were missing, as
+//! `vectors/exact/interop-v1.json` (vendored alongside the alpha.8 vectors).
+//! Both gaps that note described are now addressable:
+//!
+//! - **Authorization digest — DONE.** The vector publishes both canonical JSON
+//!   preimages, both SHA-256 results, the signer key and a valid signature.
+//!   [`crate::exact_authorization`] implements them and is tested against it
+//!   byte-for-byte; the facilitator now recomputes the digest and Schnorr-
+//!   verifies the signature instead of only checking their shapes.
+//! - **Transaction id — still open.** The vector also publishes the
+//!   `TransactionID` keyed-blake2b preimage per profile
+//!   (`transactionEncoding.profiles.*.txid.preimage`), so independent
+//!   recomputation is now possible; implementing the canonical serialization is
+//!   pending, and until then the facilitator reads the artifact's own `id`
+//!   field (see `exact_transaction_id`'s doc for the exposure that leaves).
+//!
+//! The tests below still cross-check the STRUCTURAL and accounting fields of
+//! the alpha.8 vectors.
 
 use crate::scheme_exact;
 use crate::wire_v2::{

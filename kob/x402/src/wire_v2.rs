@@ -107,6 +107,16 @@ pub struct PaymentRequirements {
     /// Scheme-specific; for exact it carries the profile + (for additive) the
     /// KIP-10 head fields.
     pub extra: serde_json::Value,
+    /// Any further top-level fields, preserved verbatim.
+    ///
+    /// `paymentRequirementsHash` is SHA-256 over the canonical JSON of the
+    /// COMPLETE selected requirements object, and the spec is explicit that
+    /// "implementations accepting additional fields MUST still include them in
+    /// this canonical object and hash". Without this catch-all, an offer
+    /// carrying a field we do not model would round-trip lossily and every
+    /// authorization digest computed from it would disagree with the payer's.
+    #[serde(flatten)]
+    pub additional: serde_json::Map<String, serde_json::Value>,
 }
 
 impl PaymentRequirements {
@@ -621,6 +631,7 @@ mod tests {
                 "assetKind": "native",
                 "assetDecimals": 8
             }),
+            additional: Default::default(),
         }
     }
 
@@ -641,6 +652,7 @@ mod tests {
                 "assetKind": "native",
                 "assetDecimals": 8
             }),
+            additional: Default::default(),
         }
     }
 

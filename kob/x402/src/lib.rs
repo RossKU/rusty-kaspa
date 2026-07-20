@@ -10,6 +10,8 @@
 //! - [`wire_v2`] — x402 v2 wire types (`PaymentRequirements`, PAYMENT-* headers,
 //!   verify/settle request+response, `/supported`), synced to upstream
 //!   v0.1.0-alpha.8 (profile split: `standard-native` default + `additive`).
+//! - [`exact_authorization`] — canonical JSON, the exact request-authorization
+//!   digest, and its Schnorr verification (upstream PR#3 / alpha.9).
 //! - [`fingerprint`] — request-fingerprint <-> payment binding.
 //! - [`scheme_native`] — KOB-native binding "exact" verification (pure).
 //! - [`scheme_exact`] — strict-interop `kaspa-exact-v2` verification for both
@@ -18,6 +20,7 @@
 //!   idempotent settlement, over a mockable [`facilitator::ChainBackend`].
 //! - [`server`] — axum HTTP server.
 
+pub mod exact_authorization;
 pub mod facilitator;
 pub mod fingerprint;
 #[cfg(test)]

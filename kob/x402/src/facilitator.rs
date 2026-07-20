@@ -16,6 +16,7 @@ use tracing::{error, warn};
 use kob_settle::observe::{ObservedOutput, PaymentObserver, PaymentRecord, ReplayCheck, ReplayStore};
 use kob_settle::rpc::{ConfirmConfig, RpcClient, RpcUtxo};
 
+use crate::exact_authorization;
 use crate::reservation::ReservationProvider;
 use crate::scheme_exact;
 use crate::scheme_kcc20;
@@ -332,6 +333,50 @@ fn exact_reject_code(r: scheme_exact::ExactReject) -> &'static str {
 /// artifact as its own authorization. `check_replay` proves the ARTIFACT is
 /// self-consistent (same signed bytes); this additionally proves THIS
 /// request is the one that artifact was actually settled for.
+/// The canonical Kaspa transaction id the authorization digest binds.
+///
+/// The spec requires the verifier to DERIVE this from the canonical
+/// transaction and forbids a client-authoritative id, adding that if the
+/// interchange format carries a convenience `id` it MUST equal the
+/// independently recomputed identifier. We read that convenience field today:
+/// the byte-level serialization needed to recompute it landed only with
+/// upstream PR#3 (`transactionEncoding.profiles.*.txid.preimage`, vendored in
+/// `interop/vectors/exact/interop-v1.json`) and is the next piece of work --
+/// see this crate's `interop_tests` module doc.
+///
+/// The exposure while that gap is open is bounded: every economic field is
+/// verified independently from the parsed transaction (recipient script,
+/// amount, output index, input existence on chain), and settlement broadcasts
+/// THAT transaction, so a payer who lies about their own transaction's id
+/// gains nothing they could not already do -- what they lose is the audience
+/// binding's replay protection against themselves.
+fn exact_transaction_id(transaction_encoded: &str, encoding: &str) -> Option<String> {
+    if encoding != TX_ENCODING_SAFE_JSON {
+        return None;
+    }
+    let outer: serde_json::Value = serde_json::from_str(transaction_encoded).ok()?;
+    let tx = scheme_native::normalize_tx(&outer);
+    let id = tx.get("id").or_else(|| tx.get("transactionId"))?.as_str()?;
+    let is_hex = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+    is_hex(id).then(|| id.to_ascii_lowercase())
+}
+
+/// The 32-byte x-only key committed by a standard P2PK address.
+///
+/// Returns `None` for any non-P2PK address (e.g. a P2SH covenant), which is
+/// exactly the "the additive head input cannot authorize the payer request"
+/// rule falling out of the encoding.
+fn p2pk_x_only_pubkey(address: &str) -> Option<[u8; 32]> {
+    // P2PK SPK: OP_DATA_32 <32-byte pubkey> OP_CHECKSIG.
+    let spk = kob_settle::bech32::address_to_spk(address).ok()?;
+    if spk.len() != 34 || spk[0] != 0x20 || spk[33] != 0xac {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&spk[1..33]);
+    Some(out)
+}
+
 fn duplicate_binding_matches(store: &ReplayStore, artifact_id: &str, binding_fingerprint: &str) -> bool {
     match store.get(artifact_id) {
         Some(rec) => rec.fingerprint.as_deref() == Some(binding_fingerprint),
@@ -392,6 +437,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 pay_to: pay_to.to_string(),
                 max_timeout_seconds: 60,
                 extra: terms.requirements_extra(),
+                additional: Default::default(),
             }],
             error: None,
             extensions: None,
@@ -446,14 +492,10 @@ impl<B: ChainBackend> Facilitator<B> {
                 _ => return Err(errors::INVALID_PAYMENT_REQUIREMENTS),
             }
             // alpha.8: the signed payer request authorization is MANDATORY for
-            // both profiles. Enforced structurally here: version const, digest
-            // (32-byte hex) / signature (64-byte hex) shapes, and unexpired
-            // expiry. Byte-level digest recomputation + Schnorr verification
-            // against the authorizing funding input is NOT yet possible from
-            // the published upstream artifacts: the vectors carry only the
-            // final digest/signature, not the digest preimage layout as bytes
-            // (same gap as the consensus vectors' txid preimages — see
-            // interop_tests.rs; feedback filed upstream).
+            // both profiles. Shape first (version const, 32-byte digest /
+            // 64-byte signature as hex); the digest is recomputed and the
+            // signature Schnorr-verified further down, once the profile-
+            // specific fields it binds (challengeId, requestHash) are known.
             let auth = pp.authorization().ok_or(errors::INVALID_PAYLOAD)?;
             let is_hex = |s: &str| s.bytes().all(|b| b.is_ascii_hexdigit());
             if auth.version != AUTHORIZATION_VERSION
@@ -491,6 +533,66 @@ impl<B: ChainBackend> Facilitator<B> {
                 .and_then(|v| v.as_u64())
                 .ok_or(errors::INVALID_PAYLOAD)? as u32;
 
+            // The payer's request authorization is verified AFTER the offer
+            // itself has been validated against what we issued, so a tampered
+            // offer reports `invalid_payment_requirements` rather than being
+            // masked by the signature failure it also causes. Built here (all
+            // the shared inputs are in scope), invoked at the end of each
+            // profile branch.
+            //
+            // Recompute the payer's authorization digest and Schnorr-verify it
+            // (upstream PR#3 / alpha.9 published the byte-exact pre-image, so
+            // this is finally implementable; before that we could only check
+            // the digest/signature shapes above).
+            //
+            // Everything the digest binds is taken from what WE hold, never
+            // from the payer's own restatement of it: the requirements hash is
+            // recomputed from the offer object, `payTo`/amount/profile/network
+            // from that same offer, and the request hash from the resource
+            // server's value when it supplied one. A mismatch means the payer
+            // authorized some other request, recipient, amount or profile.
+            let verify_payer_authorization = |request_hash: &str| -> Result<(), &'static str> {
+                let requirements_value = serde_json::to_value(requirements)
+                    .map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?;
+                let requirements_hash =
+                    exact_authorization::payment_requirements_hash(&requirements_value)
+                        .map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?;
+                let auth_digest_input = exact_authorization::AuthorizationDigestInput {
+                    network: requirements.network.clone(),
+                    profile: profile.clone(),
+                    transaction_id: exact_transaction_id(enc, encoding).ok_or(errors::INVALID_PAYLOAD)?,
+                    payment_output_index: poi,
+                    amount: requirements.amount.clone(),
+                    pay_to: requirements.pay_to.clone(),
+                    pay_to_script_public_key: derived_spk.clone(),
+                    payment_requirements_hash: requirements_hash,
+                    request_hash: request_hash.to_string(),
+                    challenge_id: pp.challenge_id().map(str::to_string),
+                    input_index: auth.input_index,
+                    expires_at: auth.expires_at.clone(),
+                };
+                // The signer MUST be the key committed by the authoritative
+                // standard P2PK UTXO at `inputIndex`. `check_inputs_on_chain`
+                // requires every consumed input to be an unspent UTXO of the
+                // payer address, so that address's key IS the key at any P2PK
+                // input index. The additive head input at index 0 is a P2SH
+                // covenant and cannot authorize a payer request.
+                if profile == PROFILE_ADDITIVE && auth.input_index == 0 {
+                    return Err(errors::INVALID_PAYLOAD);
+                }
+                let signer = p2pk_x_only_pubkey(&from).ok_or(errors::INVALID_PAYLOAD)?;
+                if let Err(e) = exact_authorization::verify_authorization(
+                    &auth_digest_input,
+                    &auth.digest,
+                    &auth.signature,
+                    &signer,
+                ) {
+                    warn!(payer = %from, error = ?e, "[x402] rejecting payment: request authorization did not verify");
+                    return Err(errors::INVALID_PAYLOAD);
+                }
+                Ok(())
+            };
+
             // ---- standard-native (default profile): plain exact transfer ----
             if profile == PROFILE_STANDARD_NATIVE {
                 // challengeId is additive-only (schema forbids it here).
@@ -501,6 +603,7 @@ impl<B: ChainBackend> Facilitator<B> {
                 // resource server's own requestHash on the facilitator request
                 // is REQUIRED (facilitator-profile.md: mandatory for exact).
                 let server_rh = req.request_hash.clone().ok_or(errors::INVALID_PAYLOAD)?;
+                verify_payer_authorization(&server_rh)?;
                 let amount = requirements
                     .amount_sompi()
                     .map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?;
@@ -574,6 +677,10 @@ impl<B: ChainBackend> Facilitator<B> {
             // hashed transaction bytes, so it is not otherwise pinned to one
             // artifact_id).
             let bound_hash = t.request_hash.clone().ok_or(errors::INVALID_PAYLOAD)?;
+            // Offer now matches the terms we issued; check the payer consented
+            // to exactly that (digest binds requirements, recipient, amount,
+            // profile, challenge, request and transaction id).
+            verify_payer_authorization(&bound_hash)?;
             let v = scheme_exact::verify_exact_kip10(
                 enc, encoding, poi, Some(payload_rh.as_str()), &from, Some(bound_hash.as_str()), &t,
             )
@@ -679,6 +786,7 @@ impl<B: ChainBackend> Facilitator<B> {
     /// On-chain check: every input outpoint must be an unspent UTXO owned by one
     /// of `owner_addresses`. If `require_covenant` is set, at least one spent
     /// input must carry that covenant id (KCC20 token genuineness).
+    #[allow(clippy::needless_lifetimes)]
     async fn check_inputs_on_chain(
         &self,
         input_outpoints: &[String],
@@ -1134,8 +1242,27 @@ mod tests {
     // `fingerprint` comes from `super::*` (the parent module imports it).
     use crate::wire_v2::{PaymentPayload, PaymentRequirements, ASSET_KAS, NETWORK_TESTNET10};
 
+    /// A REAL test keypair: the exact-profile tests now have to produce a
+    /// genuine Schnorr authorization signature, so a fabricated 32-byte
+    /// "pubkey" is no longer enough.
+    fn privkey(seed: u8) -> [u8; 32] {
+        [seed; 32]
+    }
+    fn pubkey(seed: u8) -> [u8; 32] {
+        kob_settle::signing::get_public_key(&privkey(seed)).unwrap()
+    }
     fn addr(seed: u8) -> String {
-        kob_settle::wallet::pubkey_to_address(&[seed; 32], kob_settle::types::Network::Testnet)
+        kob_settle::wallet::pubkey_to_address(&pubkey(seed), kob_settle::types::Network::Testnet)
+    }
+    /// Recover the seed behind a test address, so a fixture handed only an
+    /// address can still sign as that payer. Every test address comes from
+    /// `addr(seed)`, so this is a lookup, not a break.
+    fn seed_of(address: &str) -> u8 {
+        // Seed 0 is not a valid secp256k1 scalar, so it is skipped rather than
+        // panicking during the scan.
+        (1u8..=255)
+            .find(|&s| kob_settle::signing::get_public_key(&privkey(s)).map(|_| addr(s) == address).unwrap_or(false))
+            .expect("test addresses come from addr(seed)")
     }
     fn spk_hex(a: &str) -> String {
         hex::encode(kob_settle::bech32::address_to_spk(a).unwrap())
@@ -1328,6 +1455,7 @@ mod tests {
             pay_to: pay_to.to_string(),
             max_timeout_seconds: 60,
             extra,
+            additional: Default::default(),
         }
     }
 
@@ -1728,6 +1856,7 @@ mod tests {
             pay_to: recipient_addr,
             max_timeout_seconds: 60,
             extra: serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset, "fingerprint": fp }),
+            additional: Default::default(),
         };
         let req = FacilitatorRequest {
             x402_version: X402_VERSION,
@@ -1874,6 +2003,7 @@ mod tests {
                 pay_to: pay_to.to_string(),
                 max_timeout_seconds: timeout,
                 extra,
+                additional: Default::default(),
             },
         }
     }
@@ -1955,6 +2085,9 @@ mod tests {
     fn exact_encoded_tx(merchant: &str, borrow_txid: &str, pay: u64, cont: u64) -> String {
         let tx = serde_json::json!({
             "transaction": {
+                // The artifact carries its canonical id, as the interchange
+                // format does upstream -- the authorization digest binds it.
+                "id": "1a".repeat(32),
                 "version": 0,
                 "inputs": [
                     // signatureScript "51" = push_index(1): designates output
@@ -1973,17 +2106,61 @@ mod tests {
         serde_json::to_string(&tx).unwrap()
     }
 
-    /// A structurally valid alpha.8 payer request authorization (version
-    /// const, 32-byte digest, 64-byte signature, unexpired). Cryptographic
-    /// digest/signature verification is blocked on upstream preimage vectors
-    /// (see validate()), so tests exercise the structural gate.
-    fn test_authorization() -> serde_json::Value {
+    /// A structurally valid but cryptographically BOGUS authorization: right
+    /// shapes, wrong digest and signature. Since alpha.9 gave us the pre-image
+    /// spec this must be REJECTED, which is what
+    /// `exact_rejects_missing_or_bogus_authorization` asserts.
+    fn bogus_authorization() -> serde_json::Value {
         serde_json::json!({
             "version": AUTHORIZATION_VERSION,
             "inputIndex": 1,
             "expiresAt": "2099-01-01T00:00:00.000Z",
             "digest": "ce".repeat(32),
             "signature": "ab".repeat(64),
+        })
+    }
+
+    /// A genuine payer request authorization: the digest is recomputed from
+    /// exactly what the facilitator will independently recompute, and signed
+    /// with the payer's own key (the key its P2PK address commits).
+    #[allow(clippy::too_many_arguments)]
+    fn signed_authorization(
+        payer_seed: u8,
+        requirements: &PaymentRequirements,
+        profile: &str,
+        transaction_encoded: &str,
+        payment_output_index: u32,
+        request_hash: &str,
+        challenge_id: Option<String>,
+        input_index: u32,
+    ) -> serde_json::Value {
+        let expires_at = "2099-01-01T00:00:00.000Z";
+        let requirements_value = serde_json::to_value(requirements).unwrap();
+        let input = exact_authorization::AuthorizationDigestInput {
+            network: requirements.network.clone(),
+            profile: profile.to_string(),
+            transaction_id: exact_transaction_id(transaction_encoded, crate::wire_v2::TX_ENCODING_SAFE_JSON)
+                .expect("test transactions carry a well-formed id"),
+            payment_output_index,
+            amount: requirements.amount.clone(),
+            pay_to: requirements.pay_to.clone(),
+            pay_to_script_public_key: requirements.pay_to_script_public_key().unwrap().to_string(),
+            payment_requirements_hash: exact_authorization::payment_requirements_hash(&requirements_value).unwrap(),
+            request_hash: request_hash.to_string(),
+            challenge_id,
+            input_index,
+            expires_at: expires_at.to_string(),
+        };
+        let digest = input.digest().unwrap();
+        let mut digest_bytes = [0u8; 32];
+        digest_bytes.copy_from_slice(&hex::decode(&digest).unwrap());
+        let signature = kob_settle::signing::schnorr_sign(&digest_bytes, &privkey(payer_seed)).unwrap();
+        serde_json::json!({
+            "version": AUTHORIZATION_VERSION,
+            "inputIndex": input_index,
+            "expiresAt": expires_at,
+            "digest": digest,
+            "signature": hex::encode(signature),
         })
     }
 
@@ -2013,11 +2190,23 @@ mod tests {
             "transactionEncoding": crate::wire_v2::TX_ENCODING_SAFE_JSON,
             "paymentOutputIndex": 0,
             "challengeId": requirements.challenge_id().unwrap(),
-            "authorization": test_authorization(),
         });
         if let Some(rh) = payload_rh {
             payload["requestHash"] = serde_json::json!(rh);
         }
+        // The payer signs the digest over the terms it accepted. inputIndex 1:
+        // index 0 is the additive head (a P2SH covenant), which cannot
+        // authorize a payer request.
+        payload["authorization"] = signed_authorization(
+            seed_of(payer),
+            &requirements,
+            PROFILE_ADDITIVE,
+            &enc,
+            0,
+            payload_rh.unwrap_or(""),
+            Some(requirements.challenge_id().unwrap().to_string()),
+            1,
+        );
         FacilitatorRequest {
             x402_version: X402_VERSION,
             payment_payload: PaymentPayload { x402_version: X402_VERSION, accepted: requirements.clone(), payload, extensions: None },
@@ -2231,6 +2420,10 @@ mod tests {
         let (fac, merchant, payer) = exact_fac_with_borrow(&bt, "exact_auth_missing").await;
         let mut req = exact_request(&fac, &merchant, &payer, &bt, 250, 100_003_000).await;
 
+        // Captured before the removal below: the genuine, correctly signed
+        // authorization the honest fixture produced.
+        let honest = req.payment_payload.payload["authorization"].clone();
+
         // Missing authorization: alpha.8 makes it a required payload field.
         let mut p = req.payment_payload.payload.clone();
         p.as_object_mut().unwrap().remove("authorization");
@@ -2240,18 +2433,41 @@ mod tests {
         assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
 
         // Wrong version const.
-        req.payment_payload.payload["authorization"] = test_authorization();
+        req.payment_payload.payload["authorization"] = honest.clone();
         req.payment_payload.payload["authorization"]["version"] = serde_json::json!("kaspa-x402-exact-request-authorization-v0");
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
         assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
 
         // Expired authorization.
-        req.payment_payload.payload["authorization"] = test_authorization();
+        req.payment_payload.payload["authorization"] = honest.clone();
         req.payment_payload.payload["authorization"]["expiresAt"] = serde_json::json!("2020-01-01T00:00:00.000Z");
         let v = fac.verify(&req).await;
         assert!(!v.is_valid);
         assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+
+        // Right shapes, wrong crypto. Before alpha.9 published the pre-image
+        // this was indistinguishable from an honest authorization to us; now
+        // the digest is recomputed and the signature verified, so it fails.
+        req.payment_payload.payload["authorization"] = bogus_authorization();
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid, "a bogus digest/signature must not pass");
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+
+        // An otherwise-honest authorization signed by the WRONG key: the
+        // signature is well-formed and the digest is right, but the signer is
+        // not the key the payer's funding input commits.
+        let mut wrong_signer = honest.clone();
+        let digest = honest["digest"].as_str().unwrap();
+        let mut digest_bytes = [0u8; 32];
+        digest_bytes.copy_from_slice(&hex::decode(digest).unwrap());
+        let foreign = kob_settle::signing::schnorr_sign(&digest_bytes, &privkey(200)).unwrap();
+        wrong_signer["signature"] = serde_json::json!(hex::encode(foreign));
+        req.payment_payload.payload["authorization"] = wrong_signer;
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid, "a signature from a foreign key must not pass");
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
+
         assert_eq!(fac.backend.submit_count(), 0);
     }
 
@@ -2308,6 +2524,7 @@ mod tests {
                 "transactionEncoding": TX_ENCODING_SAFE_JSON,
                 "payToScriptPublicKey": format!("0000{}", spk_hex(pay_to)),
             }),
+            additional: Default::default(),
         }
     }
 
@@ -2323,6 +2540,7 @@ mod tests {
         payload_rh: Option<&str>,
     ) -> FacilitatorRequest {
         let tx = serde_json::json!({
+            "id": "2b".repeat(32),
             "version": 0,
             "inputs": [{
                 "previousOutpoint": { "transactionId": in_txid, "index": 0 },
@@ -2346,11 +2564,20 @@ mod tests {
             "transaction": serde_json::to_string(&tx).unwrap(),
             "transactionEncoding": TX_ENCODING_SAFE_JSON,
             "paymentOutputIndex": 0,
-            "authorization": test_authorization(),
         });
         if let Some(rh) = payload_rh {
             payload["requestHash"] = serde_json::json!(rh);
         }
+        payload["authorization"] = signed_authorization(
+            seed_of(from),
+            &requirements,
+            PROFILE_STANDARD_NATIVE,
+            &serde_json::to_string(&tx).unwrap(),
+            0,
+            server_rh.or(payload_rh).unwrap_or(""),
+            None,
+            0,
+        );
         FacilitatorRequest {
             x402_version: X402_VERSION,
             payment_payload: PaymentPayload {

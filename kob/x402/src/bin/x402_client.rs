@@ -200,6 +200,7 @@ fn facilitator_request(
         pay_to: pay_to.to_string(),
         max_timeout_seconds: 60,
         extra: serde_json::json!({ "binding": BINDING_NATIVE, "fingerprint": fingerprint_hex }),
+        additional: Default::default(),
     };
     let payload = PaymentPayload {
         x402_version: X402_VERSION,
@@ -624,6 +625,7 @@ mod kcc20 {
             pay_to: pay_to.to_string(),
             max_timeout_seconds: 60,
             extra: serde_json::json!({ "binding": BINDING_KCC20, "assetId": asset, "fingerprint": fingerprint_hex }),
+            additional: Default::default(),
         };
         let payload = PaymentPayload {
             x402_version: X402_VERSION,

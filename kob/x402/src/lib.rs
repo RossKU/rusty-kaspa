@@ -12,6 +12,8 @@
 //!   v0.1.0-alpha.8 (profile split: `standard-native` default + `additive`).
 //! - [`exact_authorization`] — canonical JSON, the exact request-authorization
 //!   digest, and its Schnorr verification (upstream PR#3 / alpha.9).
+//! - [`transaction_id`] — independent recomputation of the canonical Kaspa
+//!   transaction id from a safe-JSON artifact (upstream PR#3 / alpha.9).
 //! - [`fingerprint`] — request-fingerprint <-> payment binding.
 //! - [`scheme_native`] — KOB-native binding "exact" verification (pure).
 //! - [`scheme_exact`] — strict-interop `kaspa-exact-v2` verification for both
@@ -30,6 +32,7 @@ pub mod scheme_exact;
 pub mod scheme_kcc20;
 pub mod scheme_native;
 pub mod server;
+pub mod transaction_id;
 pub mod wire_v2;
 
 pub use facilitator::{ChainBackend, DiscoveredTx, Facilitator, FacilitatorConfig};

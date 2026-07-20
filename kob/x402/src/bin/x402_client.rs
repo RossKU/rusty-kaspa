@@ -880,26 +880,49 @@ mod exact {
         let envelope = to_rpc_payload(&tx, &final_ss);
         let encoded = serde_json::to_string(&envelope)?;
 
-        // alpha.8 mandatory signed payer request authorization. The digest
-        // binds the encoded artifact + request hash and is Schnorr-signed by
-        // the P2PK funding key (input 1 — the head input cannot authorize).
-        // NOTE: the facilitator's structural checks (version/expiry/shapes)
-        // are what an interop peer can verify today; upstream's exact digest
-        // preimage layout has no published byte-level vectors yet.
-        let rh_for_digest = a.request_hash.clone().unwrap_or_default();
-        let mut digest_preimage = encoded.as_bytes().to_vec();
-        digest_preimage.extend_from_slice(rh_for_digest.as_bytes());
-        let digest = kob_settle::blake2b_256(&digest_preimage);
-        let auth_sig = kob_settle::signing::schnorr_sign(&digest, &privkey)?;
+        // The mandatory signed payer request authorization, per the canonical
+        // digest upstream PR#3 / alpha.9 published. This used to be a KOB-local
+        // blake2b over the encoded artifact and request hash -- a self-consistent
+        // convention no interop peer could reproduce, and one the facilitator
+        // could only check the SHAPE of. It is now the spec object: the digest
+        // binds the recomputed transaction id, profile, output index, amount,
+        // recipient (address and script), the accepted requirements, the request
+        // hash, the challenge, the authorizing input index and the expiry.
+        //
+        // Signed by the P2PK funding key at input 1; input 0 is the additive
+        // head, a P2SH covenant that cannot authorize a payer request.
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
+        let expires_at = iso8601_from_unix_secs(now_secs + 3600);
+        let auth_input = kob_x402::exact_authorization::AuthorizationDigestInput {
+            network: req["network"].as_str().unwrap_or_default().to_string(),
+            profile: PROFILE_ADDITIVE.to_string(),
+            transaction_id: kob_x402::transaction_id::transaction_id_from_encoded(&encoded, TX_ENCODING_SAFE_JSON)
+                .map_err(|e| anyhow::anyhow!("cannot recompute transaction id: {e:?}"))?,
+            payment_output_index: 0,
+            amount: req["amount"].as_str().unwrap_or_default().to_string(),
+            pay_to: pay_to.clone(),
+            pay_to_script_public_key: extra["payToScriptPublicKey"].as_str().unwrap_or_default().to_string(),
+            payment_requirements_hash: kob_x402::exact_authorization::payment_requirements_hash(&req)
+                .map_err(|e| anyhow::anyhow!("cannot hash payment requirements: {e:?}"))?,
+            request_hash: a.request_hash.clone().unwrap_or_default(),
+            challenge_id: Some(challenge_id.clone()),
+            input_index: 1,
+            expires_at: expires_at.clone(),
+        };
+        let digest_hex = auth_input
+            .digest()
+            .map_err(|e| anyhow::anyhow!("cannot compute authorization digest: {e:?}"))?;
+        let mut digest = [0u8; 32];
+        digest.copy_from_slice(&hex::decode(&digest_hex)?);
+        let auth_sig = kob_settle::signing::schnorr_sign(&digest, &privkey)?;
         let authorization = serde_json::json!({
             "version": AUTHORIZATION_VERSION,
             "inputIndex": 1,
-            "expiresAt": iso8601_from_unix_secs(now_secs + 3600),
-            "digest": hex::encode(digest),
+            "expiresAt": expires_at,
+            "digest": digest_hex,
             "signature": hex::encode(auth_sig),
         });
 

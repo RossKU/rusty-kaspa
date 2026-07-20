@@ -335,30 +335,19 @@ fn exact_reject_code(r: scheme_exact::ExactReject) -> &'static str {
 /// request is the one that artifact was actually settled for.
 /// The canonical Kaspa transaction id the authorization digest binds.
 ///
-/// The spec requires the verifier to DERIVE this from the canonical
-/// transaction and forbids a client-authoritative id, adding that if the
-/// interchange format carries a convenience `id` it MUST equal the
-/// independently recomputed identifier. We read that convenience field today:
-/// the byte-level serialization needed to recompute it landed only with
-/// upstream PR#3 (`transactionEncoding.profiles.*.txid.preimage`, vendored in
-/// `interop/vectors/exact/interop-v1.json`) and is the next piece of work --
-/// see this crate's `interop_tests` module doc.
-///
-/// The exposure while that gap is open is bounded: every economic field is
-/// verified independently from the parsed transaction (recipient script,
-/// amount, output index, input existence on chain), and settlement broadcasts
-/// THAT transaction, so a payer who lies about their own transaction's id
-/// gains nothing they could not already do -- what they lose is the audience
-/// binding's replay protection against themselves.
+/// Recomputed from the artifact's own consensus projection -- the spec forbids
+/// a client-authoritative id, and if the interchange format carries a
+/// convenience `id` it must equal the recomputed one, which
+/// [`crate::transaction_id`] enforces. This became implementable with upstream
+/// PR#3 / alpha.9, which published the identifier pre-images for both profiles.
 fn exact_transaction_id(transaction_encoded: &str, encoding: &str) -> Option<String> {
-    if encoding != TX_ENCODING_SAFE_JSON {
-        return None;
+    match crate::transaction_id::transaction_id_from_encoded(transaction_encoded, encoding) {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(error = ?e, "[x402] rejecting payment: transaction id could not be recomputed");
+            None
+        }
     }
-    let outer: serde_json::Value = serde_json::from_str(transaction_encoded).ok()?;
-    let tx = scheme_native::normalize_tx(&outer);
-    let id = tx.get("id").or_else(|| tx.get("transactionId"))?.as_str()?;
-    let is_hex = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
-    is_hex(id).then(|| id.to_ascii_lowercase())
 }
 
 /// The 32-byte x-only key committed by a standard P2PK address.
@@ -2085,9 +2074,10 @@ mod tests {
     fn exact_encoded_tx(merchant: &str, borrow_txid: &str, pay: u64, cont: u64) -> String {
         let tx = serde_json::json!({
             "transaction": {
-                // The artifact carries its canonical id, as the interchange
-                // format does upstream -- the authorization digest binds it.
-                "id": "1a".repeat(32),
+                // No convenience `id`: the facilitator recomputes the
+                // canonical identifier from the artifact itself. A fixture
+                // that hardcoded one would now (correctly) be refused as
+                // client-authoritative unless it happened to be right.
                 "version": 0,
                 "inputs": [
                     // signatureScript "51" = push_index(1): designates output
@@ -2139,8 +2129,11 @@ mod tests {
         let input = exact_authorization::AuthorizationDigestInput {
             network: requirements.network.clone(),
             profile: profile.to_string(),
-            transaction_id: exact_transaction_id(transaction_encoded, crate::wire_v2::TX_ENCODING_SAFE_JSON)
-                .expect("test transactions carry a well-formed id"),
+            transaction_id: crate::transaction_id::transaction_id_from_encoded(
+                transaction_encoded,
+                crate::wire_v2::TX_ENCODING_SAFE_JSON,
+            )
+            .expect("test transactions project onto a consensus transaction"),
             payment_output_index,
             amount: requirements.amount.clone(),
             pay_to: requirements.pay_to.clone(),
@@ -2540,7 +2533,6 @@ mod tests {
         payload_rh: Option<&str>,
     ) -> FacilitatorRequest {
         let tx = serde_json::json!({
-            "id": "2b".repeat(32),
             "version": 0,
             "inputs": [{
                 "previousOutpoint": { "transactionId": in_txid, "index": 0 },

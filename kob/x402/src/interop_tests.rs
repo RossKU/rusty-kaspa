@@ -12,12 +12,13 @@
 //!   [`crate::exact_authorization`] implements them and is tested against it
 //!   byte-for-byte; the facilitator now recomputes the digest and Schnorr-
 //!   verifies the signature instead of only checking their shapes.
-//! - **Transaction id — still open.** The vector also publishes the
-//!   `TransactionID` keyed-blake2b preimage per profile
-//!   (`transactionEncoding.profiles.*.txid.preimage`), so independent
-//!   recomputation is now possible; implementing the canonical serialization is
-//!   pending, and until then the facilitator reads the artifact's own `id`
-//!   field (see `exact_transaction_id`'s doc for the exposure that leaves).
+//! - **Transaction id — DONE.** The vector publishes the identifier pre-images
+//!   for both profiles (version 0's keyed-BLAKE2b pre-image, and version 1's
+//!   payload/rest/id BLAKE3 stages). [`crate::transaction_id`] implements the
+//!   canonical serialization and both constructions, tested against them
+//!   byte-for-byte; the facilitator recomputes the id rather than reading the
+//!   artifact's own `id`, and refuses an artifact whose self-declared id
+//!   disagrees with its contents.
 //!
 //! The tests below still cross-check the STRUCTURAL and accounting fields of
 //! the alpha.8 vectors.

@@ -140,12 +140,15 @@ Worth recording because two of that commit's three claims did not survive:
 
 ## Pending work queue
 
-- [ ] **x402 transaction-id recomputation.** PR#3 published the `TransactionID`
-      keyed-blake2b preimage, so the canonical serialization is now implementable.
-      Until it lands, `exact_transaction_id()` reads the artifact's own `id` field;
-      its doc states the bounded exposure. Requires updating `x402_client.rs` too,
-      which still builds a non-spec blake2b digest of its own (L887-891) and does
-      not emit `id`.
+- [x] **x402 transaction-id recomputation — DONE.** `kob/x402/src/transaction_id.rs`
+      implements the canonical consensus serialization and both identifier
+      constructions (version 0: keyed BLAKE2b-256 `TransactionID`; version 1: the
+      `PayloadDigest`/`TransactionRest`/`TransactionV1Id` BLAKE3 stages), verified
+      byte-for-byte against the PR#3 pre-images for both profiles. The facilitator
+      now derives the id instead of reading the artifact's own, and refuses an
+      artifact whose self-declared `id` disagrees with its contents. `x402_client.rs`
+      was moved off its KOB-local blake2b digest onto the spec object as part of
+      the same change, so client and facilitator compute the same digest.
 - [ ] Descriptor wire format (ISSUE-6) — upstream-blocked.
 - [ ] Phase 2: CLI migration (all ops as kob-cli subcommands = Liquid-equivalent
       UTXO control), then re-verify offline → testnet-10. MIGRATE has still never

@@ -152,11 +152,11 @@ async fn main() {
                 c.node_url = node_url.clone();
             }
             // H-5: Apply and validate fee_bps from CLI
-            if cli.fee_bps > kob_engine::matcher::executor::MAX_FEE_BPS {
+            if cli.fee_bps > kob_engine::chain::executor::MAX_FEE_BPS {
                 error!(
                     "fee_bps={} exceeds maximum allowed value of {} (1.00%)",
                     cli.fee_bps,
-                    kob_engine::matcher::executor::MAX_FEE_BPS,
+                    kob_engine::chain::executor::MAX_FEE_BPS,
                 );
                 std::process::exit(1);
             }

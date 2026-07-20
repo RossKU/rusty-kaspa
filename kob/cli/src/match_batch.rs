@@ -19,7 +19,7 @@ use kob_core::sighash::compute_sighash;
 use kob_core::tx::{to_rpc_payload, CovenantBinding, TxOutput};
 use kob_core::types::{Network, Outpoint};
 use kob_core::wallet::WalletContext;
-use kob_engine::matcher::batch::{BatchOrder, OrderType, OutputPurpose};
+use kob_domain::batch::{BatchOrder, OrderType, OutputPurpose};
 use std::path::Path;
 use tracing::info;
 
@@ -487,7 +487,7 @@ pub async fn run(
         }
         println!("Partial (Op2): buy fills {} sell(s), residual continues", sells.len());
         if buy_is_decay(&buys[0]) {
-            kob_engine::matcher::batch::plan_decay_buy_partial_match(
+            kob_domain::batch::plan_decay_buy_partial_match(
                 &sells,
                 &buys[0],
                 tip_daa,
@@ -497,7 +497,7 @@ pub async fn run(
                 fee_bps,
             )?
         } else {
-            kob_engine::matcher::batch::plan_partial_match_at(
+            kob_domain::batch::plan_partial_match_at(
                 &sells,
                 &buys[0],
                 Some(wallet_utxo_info.clone()),
@@ -514,7 +514,7 @@ pub async fn run(
         if buys.len() == 1 && sells.len() >= 1 {
             println!("IOC direction: buy sweeps {} sells", sells.len());
             if buy_is_decay(&buys[0]) {
-                kob_engine::matcher::batch::plan_decay_buy_ioc_match(
+                kob_domain::batch::plan_decay_buy_ioc_match(
                     &sells,
                     &buys[0],
                     tip_daa,
@@ -524,7 +524,7 @@ pub async fn run(
                     fee_bps,
                 )?
             } else {
-                kob_engine::matcher::batch::plan_ioc_match_at(
+                kob_domain::batch::plan_ioc_match_at(
                     &sells,
                     &buys[0],
                     Some(wallet_utxo_info.clone()),
@@ -536,7 +536,7 @@ pub async fn run(
             }
         } else if sells.len() == 1 && buys.len() >= 1 {
             println!("IOC direction: sell sweeps {} buys", buys.len());
-            kob_engine::matcher::batch::plan_sell_ioc_match_at(
+            kob_domain::batch::plan_sell_ioc_match_at(
                 &sells[0],
                 &buys,
                 Some(wallet_utxo_info.clone()),
@@ -552,7 +552,7 @@ pub async fn run(
             );
         }
     } else if buys.len() == 1 && buy_is_decay(&buys[0]) {
-        kob_engine::matcher::batch::plan_decay_buy_match(
+        kob_domain::batch::plan_decay_buy_match(
             &sells,
             &buys[0],
             tip_daa,
@@ -562,7 +562,7 @@ pub async fn run(
             fee_bps,
         )?
     } else {
-        kob_engine::matcher::batch::plan_batch_match_at(
+        kob_domain::batch::plan_batch_match_at(
             &sells,
             &buys,
             Some(wallet_utxo_info.clone()),
@@ -596,7 +596,7 @@ pub async fn run(
     // binding authorized by the sell input that provides the tokens.
     let token_hash = kob_core::compat::parse_hash(&token_hex.to_string()).unwrap();
     for (idx, planned) in plan.outputs.iter().enumerate() {
-        use kob_engine::matcher::batch::OutputPurpose;
+        use kob_domain::batch::OutputPurpose;
         match planned.purpose {
             OutputPurpose::BuyerTokens => {
                 // v18 plans provide the per-output authorizing sell input
@@ -726,7 +726,7 @@ pub async fn run(
 
         // Re-set covenant bindings
         for (idx, planned) in plan.outputs.iter().enumerate() {
-            use kob_engine::matcher::batch::OutputPurpose;
+            use kob_domain::batch::OutputPurpose;
             match planned.purpose {
                 OutputPurpose::BuyerTokens => {
                     let authorizing_input = plan.output_auth_input
@@ -842,7 +842,7 @@ pub async fn run_ring(
     network: Network,
     leg_strs: &[String],
 ) -> anyhow::Result<()> {
-    use kob_engine::matcher::batch::{plan_ring_match, RingLegOrder};
+    use kob_domain::batch::{plan_ring_match, RingLegOrder};
 
     let wallet = WalletContext::load(wallet_path)?;
     let privkey = *wallet.privkey_bytes();

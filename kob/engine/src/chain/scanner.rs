@@ -1,6 +1,6 @@
 //! L1 block scanner for permissionless order discovery.
 
-use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide, TimeMeta};
+use kob_domain::order_book::{BookOrder, OrderBook, OrderSide, TimeMeta};
 
 
 // Parse types and functions imported from kob-core.

@@ -147,7 +147,7 @@ impl AppConfig {
             rpc_auth: node_config.rpc_auth,
             history: HistoryConfig::default(),
             zk_prover_enabled: false,
-            fee_bps: crate::matcher::executor::DEFAULT_FEE_BPS,
+            fee_bps: crate::chain::executor::DEFAULT_FEE_BPS,
             submit_lane: std::env::var("KOB_SUBMIT_LANE")
                 .ok()
                 .and_then(|v| crate::chain::submitter::TxLane::parse(&v))

@@ -3,7 +3,7 @@
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 
-use crate::matcher::trades::Trade;
+use crate::reporting::trades::Trade;
 
 /// Maximum candles per interval per pair.
 pub const MAX_CANDLES_PER_SERIES: usize = 1_000;
@@ -246,7 +246,7 @@ impl CandleAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::trades::Side;
+    use crate::reporting::trades::Side;
 
     fn make_trade(pair: &str, price_num: u64, price_den: u64, qty: u64, ts: u64) -> Trade {
         Trade {

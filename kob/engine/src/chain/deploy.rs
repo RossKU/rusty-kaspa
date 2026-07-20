@@ -6,9 +6,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::AppConfig;
 use kob_core::MIN_UTXO_VALUE;
-use crate::matcher::executor;
-use crate::matcher::matching;
-use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+use crate::chain::executor;
+use kob_domain::matching;
+use kob_domain::order_book::{BookOrder, OrderBook, OrderSide};
 use crate::rpc::RpcClient;
 
 // RPC transaction-payload builders moved to `kob-settle` (Phase 1
@@ -612,7 +612,7 @@ pub async fn run_deploy_test(
         .max_by_key(|u| u.utxo_entry.amount)
         .map(|u| (u.outpoint.transaction_id.clone(), u.outpoint.index, u.utxo_entry.amount));
 
-    let mut plan = match crate::matcher::batch::plan_batch_match(
+    let mut plan = match kob_domain::batch::plan_batch_match(
         &[sell_order], &[buy_order], wallet_utxo,
         &wallet_spk_script, wallet_spk_version,
         None,

@@ -18,7 +18,6 @@ pub mod chain;
 pub mod storage;
 pub mod api;
 pub mod reporting;
-pub mod matcher;
 pub mod mm;
 
 // RPC client and signing/address utils now live in `kob-settle` (Phase 1
@@ -32,19 +31,19 @@ use tokio::sync::{broadcast, Mutex, RwLock};
 use tracing::{error, info, warn};
 
 use config::AppConfig;
-use matcher::api::{AppState, SharedState};
-use matcher::dca_book::DcaBook;
-use matcher::ifd::IfdBook;
-use matcher::lending_book::LendingBook;
-use matcher::lending_tracker::LoanTracker;
-use matcher::order_book::OrderBook;
-use matcher::perp_book::PerpOrderBook;
-use matcher::perp_tracker::PositionTracker;
-use matcher::prediction_book::PredictionBook;
-use matcher::prediction_tracker::MarketTracker;
-use matcher::stop_book::StopOrderBook;
-use matcher::swap_book::SwapBook;
-use matcher::trailing_stop::TrailingStopBook;
+use api::{AppState, SharedState};
+use kob_domain::dca_book::DcaBook;
+use kob_domain::ifd::IfdBook;
+use kob_domain::lending_book::LendingBook;
+use kob_domain::lending_tracker::LoanTracker;
+use kob_domain::order_book::OrderBook;
+use kob_domain::perp_book::PerpOrderBook;
+use kob_domain::perp_tracker::PositionTracker;
+use kob_domain::prediction_book::PredictionBook;
+use kob_domain::prediction_tracker::MarketTracker;
+use kob_domain::stop_book::StopOrderBook;
+use kob_domain::swap_book::SwapBook;
+use kob_domain::trailing_stop::TrailingStopBook;
 use rpc::RpcClient;
 
 /// Connect to primary RPC node, falling back to secondary if primary fails.
@@ -145,7 +144,7 @@ async fn load_shared_books(
     let prediction_book_path = format!("{}.prediction.json", orderbook_path);
     let swap_book_path = format!("{}.swap.json", orderbook_path);
 
-    let stop = Arc::new(Mutex::new(match matcher::stop_book::load_stop_orders(&stop_orders_path) {
+    let stop = Arc::new(Mutex::new(match kob_domain::stop_book::load_stop_orders(&stop_orders_path) {
         Ok(b) => {
             if !b.is_empty() {
                 info!("[STOP BOOK] Loaded {} stop order(s)", b.len());
@@ -166,7 +165,7 @@ async fn load_shared_books(
         book
     }));
 
-    let ifd = Arc::new(Mutex::new(match matcher::ifd::load_ifd_rules(&ifd_path) {
+    let ifd = Arc::new(Mutex::new(match kob_domain::ifd::load_ifd_rules(&ifd_path) {
         Ok(b) => {
             if !b.is_empty() {
                 info!("[IFD BOOK] Loaded {} rule(s) ({} active)", b.len(), b.active_count());
@@ -179,7 +178,7 @@ async fn load_shared_books(
         }
     }));
 
-    let perp = Arc::new(Mutex::new(match matcher::persistence::load_perp_book(&perp_book_path) {
+    let perp = Arc::new(Mutex::new(match storage::persistence::load_perp_book(&perp_book_path) {
         Ok(b) => {
             if b.total_count() > 0 {
                 info!("[PERP BOOK] Loaded {} order(s) ({} longs, {} shorts)", b.total_count(), b.long_count(), b.short_count());
@@ -193,7 +192,7 @@ async fn load_shared_books(
     }));
     let perp_tracker = Arc::new(Mutex::new(PositionTracker::new()));
 
-    let lending = Arc::new(Mutex::new(match matcher::persistence::load_lending_book(&lending_book_path) {
+    let lending = Arc::new(Mutex::new(match storage::persistence::load_lending_book(&lending_book_path) {
         Ok(b) => {
             if b.offer_count() > 0 || b.request_count() > 0 {
                 info!("[LENDING BOOK] Loaded {} offer(s), {} request(s)", b.offer_count(), b.request_count());
@@ -207,7 +206,7 @@ async fn load_shared_books(
     }));
     let loan_tracker = Arc::new(Mutex::new(LoanTracker::new()));
 
-    let prediction = Arc::new(Mutex::new(match matcher::persistence::load_prediction_book(&prediction_book_path) {
+    let prediction = Arc::new(Mutex::new(match storage::persistence::load_prediction_book(&prediction_book_path) {
         Ok(b) => {
             if b.market_count() > 0 {
                 info!("[PREDICTION BOOK] Loaded {} market(s)", b.market_count());
@@ -222,7 +221,7 @@ async fn load_shared_books(
     let market_tracker = Arc::new(Mutex::new(MarketTracker::new()));
     let dca = Arc::new(Mutex::new(DcaBook::new()));
 
-    let swap = Arc::new(Mutex::new(match matcher::persistence::load_swap_book(&swap_book_path) {
+    let swap = Arc::new(Mutex::new(match storage::persistence::load_swap_book(&swap_book_path) {
         Ok(b) => {
             if b.len() > 0 {
                 info!("[SWAP BOOK] Loaded {} swap order(s)", b.len());
@@ -261,7 +260,7 @@ async fn setup_api_server(
     trades_file: &str,
     books: &SharedBooks,
     rpc: Arc<Mutex<RpcClient>>,
-) -> (Option<broadcast::Sender<matcher::api::WsEvent>>, Option<AppState>) {
+) -> (Option<broadcast::Sender<api::WsEvent>>, Option<AppState>) {
     if api_port == 0 {
         return (None, None);
     }
@@ -304,7 +303,7 @@ async fn setup_api_server(
     let executor_state = shared_state;
     let bind = api_bind.to_string();
     tokio::spawn(async move {
-        matcher::api::start_server(api_state, api_port, &bind).await;
+        api::start_server(api_state, api_port, &bind).await;
     });
     info!("[API] Server starting on {}:{}", api_bind, api_port);
     (Some(ws_tx_clone), Some(executor_state))
@@ -331,7 +330,7 @@ async fn init_history_store(
     };
     hc.db_path = db_path;
 
-    match matcher::history::HistoryStore::open(&hc) {
+    match storage::history::HistoryStore::open(&hc) {
         Ok(store) => {
             let store = Arc::new(store);
             executor_state.write().await.history = Some(store.clone());
@@ -413,11 +412,11 @@ async fn run_continuous_mode(
 ) {
     // Pre-load the primary order book and prune entries whose UTXOs have
     // already been spent on-chain.
-    if let Err(e) = matcher::persistence::load_order_book(params.orderbook_path, &order_book).await {
+    if let Err(e) = storage::persistence::load_order_book(params.orderbook_path, &order_book).await {
         warn!("Failed to load persisted order book: {}", e);
     } else {
         let rpc_lock = rpc.lock().await;
-        matcher::persistence::validate_and_prune_order_book(
+        storage::persistence::validate_and_prune_order_book(
             &rpc_lock,
             &order_book,
             &app_config.address,
@@ -434,7 +433,7 @@ async fn run_continuous_mode(
     // is for.
     if let Some(ref seed_path) = params.rescan_seed {
         let rpc_lock = rpc.lock().await;
-        matcher::persistence::rescan_from_seed(
+        storage::persistence::rescan_from_seed(
             &rpc_lock,
             &order_book,
             seed_path,
@@ -458,7 +457,7 @@ async fn run_continuous_mode(
 
     spawn_mm_bot(app_config, &params);
 
-    matcher::executor::run_continuous_with_ws(
+    chain::executor::run_continuous_with_ws(
         rpc,
         books.order.clone(),
         app_config,
@@ -491,11 +490,11 @@ async fn run_dry_run_mode(
     app_config: &AppConfig,
     orderbook_path: &str,
 ) {
-    if let Err(e) = matcher::persistence::load_order_book(orderbook_path, &order_book).await {
+    if let Err(e) = storage::persistence::load_order_book(orderbook_path, &order_book).await {
         warn!("Failed to load persisted order book: {}", e);
     } else {
         let rpc_lock = rpc.lock().await;
-        matcher::persistence::validate_and_prune_order_book(
+        storage::persistence::validate_and_prune_order_book(
             &rpc_lock,
             &order_book,
             &app_config.address,
@@ -503,7 +502,7 @@ async fn run_dry_run_mode(
         .await;
         drop(rpc_lock);
     }
-    matcher::executor::run_dry_run(rpc, order_book, app_config).await;
+    chain::executor::run_dry_run(rpc, order_book, app_config).await;
 }
 
 /// Run the KOB matching engine with the given configuration.
@@ -554,10 +553,10 @@ pub async fn run_engine(
             if tcid.is_empty() || tutxo.is_empty() {
                 anyhow::bail!("deploy-test requires --token and --token-utxo");
             }
-            matcher::deploy::run_deploy_test(rpc, order_book, app_config, tcid, tutxo).await;
+            chain::deploy::run_deploy_test(rpc, order_book, app_config, tcid, tutxo).await;
         }
         "deploy-test-multi" => {
-            matcher::deploy::run_deploy_test_multi(rpc, order_book, app_config).await;
+            chain::deploy::run_deploy_test_multi(rpc, order_book, app_config).await;
         }
         "continuous" => {
             let params = ContinuousParams {

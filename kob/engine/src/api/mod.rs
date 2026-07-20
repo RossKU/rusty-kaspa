@@ -21,17 +21,17 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, Mutex, RwLock};
 use tower_http::cors::{Any, CorsLayer};
 
-use crate::matcher::candle::{CandleAggregator, Interval};
-use crate::matcher::ifd::IfdBook;
-use crate::matcher::order_book::{OrderBook, OrderSide};
-use crate::matcher::lending_book::LendingBook;
-use crate::matcher::lending_tracker::LoanTracker;
-use crate::matcher::perp_book::PerpOrderBook;
-use crate::matcher::perp_tracker::PositionTracker;
-use crate::matcher::prediction_book::PredictionBook;
-use crate::matcher::prediction_tracker::MarketTracker;
-use crate::matcher::stop_book::StopOrderBook;
-use crate::matcher::trades::{PendingTrades, Side, TradeLog};
+use crate::reporting::candle::{CandleAggregator, Interval};
+use kob_domain::ifd::IfdBook;
+use kob_domain::order_book::{OrderBook, OrderSide};
+use kob_domain::lending_book::LendingBook;
+use kob_domain::lending_tracker::LoanTracker;
+use kob_domain::perp_book::PerpOrderBook;
+use kob_domain::perp_tracker::PositionTracker;
+use kob_domain::prediction_book::PredictionBook;
+use kob_domain::prediction_tracker::MarketTracker;
+use kob_domain::stop_book::StopOrderBook;
+use crate::reporting::trades::{PendingTrades, Side, TradeLog};
 
 /// Generate a random 64-char hex cancel secret using OS CSPRNG.
 fn generate_cancel_secret() -> String {
@@ -39,7 +39,7 @@ fn generate_cancel_secret() -> String {
     let bytes: [u8; 32] = rand::rngs::OsRng.gen();
     hex::encode(bytes)
 }
-use crate::matcher::trailing_stop::TrailingStopBook;
+use kob_domain::trailing_stop::TrailingStopBook;
 
 // Sync / liveness snapshot (H4-SYNC: GET /health, GET /sync)
 
@@ -162,7 +162,7 @@ pub struct SharedState {
     /// Shared trailing stop book (used by executor + REST API).
     pub trailing_stop_book: Arc<Mutex<TrailingStopBook>>,
     /// Optional SQLite history store for persistent trade/candle data.
-    pub history: Option<Arc<crate::matcher::history::HistoryStore>>,
+    pub history: Option<Arc<crate::storage::history::HistoryStore>>,
     /// Trades staged at submission time, awaiting confirmation before being
     /// written to `history`'s durable trade ledger (H3-TRADES).
     pub pending_trades: PendingTrades,
@@ -273,7 +273,7 @@ impl SharedState {
         ifd_book: Arc<Mutex<IfdBook>>,
     ) -> Self {
         let (trade_log, loaded_trades) =
-            TradeLog::new_with_file(trades_file, crate::matcher::trades::DEFAULT_MAX_TRADES);
+            TradeLog::new_with_file(trades_file, crate::reporting::trades::DEFAULT_MAX_TRADES);
         let mut candles = CandleAggregator::new();
         candles.replay_trades(&loaded_trades);
         SharedState {
@@ -827,10 +827,10 @@ struct OrderResponse {
 /// Time-contract response fields for a book order at `now_daa`
 /// (kind, effective price, pace, ratchet generation).
 fn time_fields_for(
-    order: &crate::matcher::order_book::BookOrder,
+    order: &kob_domain::order_book::BookOrder,
     now_daa: u64,
 ) -> (Option<&'static str>, Option<String>, Option<u64>, Option<u64>) {
-    use crate::matcher::order_book::TimeMeta;
+    use kob_domain::order_book::TimeMeta;
     match &order.time_meta {
         None => (None, None, None, None),
         Some(meta) => {
@@ -944,7 +944,7 @@ fn json_error(status: StatusCode, msg: &str) -> (StatusCode, Json<ErrorResponse>
 
 /// Aggregate bids at each price level (sum quantities at same price).
 fn aggregate_bids(
-    book: &crate::matcher::order_book::PairBook,
+    book: &kob_domain::order_book::PairBook,
     limit: usize,
 ) -> Vec<[String; 2]> {
     let mut levels: Vec<(u64, u64, u64)> = Vec::new(); // (price_num, price_den, total_value)
@@ -971,7 +971,7 @@ fn aggregate_bids(
 
 /// Aggregate asks at each price level (sum quantities at same price).
 fn aggregate_asks(
-    book: &crate::matcher::order_book::PairBook,
+    book: &kob_domain::order_book::PairBook,
     limit: usize,
 ) -> Vec<[String; 2]> {
     let mut levels: Vec<(u64, u64, u64)> = Vec::new();
@@ -1286,8 +1286,8 @@ async fn handle_order(
     let ob = s.order_book.lock().await;
     if let Some((pair, order)) = ob.get_order_by_txid(&params.txid) {
         let side = match order.side {
-            crate::matcher::order_book::OrderSide::Buy => "buy",
-            crate::matcher::order_book::OrderSide::Sell => "sell",
+            kob_domain::order_book::OrderSide::Buy => "buy",
+            kob_domain::order_book::OrderSide::Sell => "sell",
         };
         let (kind, effective_price, next_eligible_daa, ratchets_applied) =
             time_fields_for(order, now_daa);
@@ -1528,7 +1528,7 @@ fn default_max_matcher_fee() -> u64 {
 
 #[derive(Deserialize)]
 struct IfdOrderARequest {
-    side: crate::matcher::ifd::IfdSide,
+    side: kob_domain::ifd::IfdSide,
     token: String,
     price_num: u64,
     price_den: u64,
@@ -1540,7 +1540,7 @@ struct IfdOrderARequest {
 
 #[derive(Deserialize)]
 struct IfdOrderBRequest {
-    side: crate::matcher::ifd::IfdSide,
+    side: kob_domain::ifd::IfdSide,
     token: String,
     price_num: u64,
     price_den: u64,
@@ -1560,11 +1560,11 @@ struct SubmitIfoRequest {
     amount: u64,
     #[serde(default)]
     expiry_daa: u64,
-    tp_side: crate::matcher::ifd::IfdSide,
+    tp_side: kob_domain::ifd::IfdSide,
     tp_price_num: u64,
     tp_price_den: u64,
     tp_min_fill: u64,
-    sl_side: crate::matcher::ifd::IfdSide,
+    sl_side: kob_domain::ifd::IfdSide,
     sl_price_num: u64,
     sl_price_den: u64,
     sl_min_fill: u64,
@@ -1598,7 +1598,7 @@ async fn handle_list_ifd(
     let s = state.read().await;
     let book = s.ifd_book.lock().await;
 
-    let rules: Vec<&crate::matcher::ifd::IfdRule> = if let Some(ref owner) = params.owner_id {
+    let rules: Vec<&kob_domain::ifd::IfdRule> = if let Some(ref owner) = params.owner_id {
         book.list_by_owner(owner)
     } else {
         book.list_active()
@@ -1650,7 +1650,7 @@ async fn handle_submit_ifd(
     let otspkh = kob_core::contract::compute_token_unit_spk_hash(&owner_pubkey);
 
     // Compute order B's scripts
-    let b_params = crate::matcher::ifd::OrderBParams {
+    let b_params = kob_domain::ifd::OrderBParams {
         side: req.order_b.side,
         token: req.order_b.token.clone(),
         price_num: req.order_b.price_num,
@@ -1665,10 +1665,10 @@ async fn handle_submit_ifd(
     // legacy sompi-scale value); registration and trigger must agree on it
     // or the precomputed P2SH won't match the deployed order.
     let b_seat = match req.order_b.side {
-        crate::matcher::ifd::IfdSide::Buy => okspkh,
-        crate::matcher::ifd::IfdSide::Sell => otspkh,
+        kob_domain::ifd::IfdSide::Buy => okspkh,
+        kob_domain::ifd::IfdSide::Sell => otspkh,
     };
-    let (b_rs, b_p2sh_hex, b_spk_hash_hex) = match crate::matcher::ifd::compute_order_b_scripts(
+    let (b_rs, b_p2sh_hex, b_spk_hash_hex) = match kob_domain::ifd::compute_order_b_scripts(
         &b_params,
         &owner_hash,
         &owner_spk_hash,
@@ -1685,7 +1685,7 @@ async fn handle_submit_ifd(
 
     // Compute order A's P2SH (informational — the user deploys A themselves).
     // We need A's RS to compute its P2SH so we can detect it on L1.
-    let a_params_core = crate::matcher::ifd::OrderAParams {
+    let a_params_core = kob_domain::ifd::OrderAParams {
         side: req.order_a.side,
         token: req.order_a.token.clone(),
         price_num: req.order_a.price_num,
@@ -1696,8 +1696,8 @@ async fn handle_submit_ifd(
     };
 
     // Compute A's P2SH. For buy A -> sell B, A's bspkh = B's SPK hash.
-    let a_bspkh = if req.order_a.side == crate::matcher::ifd::IfdSide::Buy
-        && req.order_b.side == crate::matcher::ifd::IfdSide::Sell
+    let a_bspkh = if req.order_a.side == kob_domain::ifd::IfdSide::Buy
+        && req.order_b.side == kob_domain::ifd::IfdSide::Sell
     {
         // Tokens from buy A go to sell B's P2SH
         b_spk_hash_hex.clone()
@@ -1719,7 +1719,7 @@ async fn handle_submit_ifd(
     // Order A is deployed by the user as a v18 order (deploy paths are
     // v18-only); this P2SH must match that deploy byte-exact.
     let a_rs = match req.order_a.side {
-        crate::matcher::ifd::IfdSide::Buy => {
+        kob_domain::ifd::IfdSide::Buy => {
             match kob_core::contract::spot::order::build_buy_redeem_script(
                 &a_token_bytes,
                 req.order_a.price_num,
@@ -1733,7 +1733,7 @@ async fn handle_submit_ifd(
                 Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
-        crate::matcher::ifd::IfdSide::Sell => {
+        kob_domain::ifd::IfdSide::Sell => {
             match kob_core::contract::spot::order::build_sell_redeem_script(
                 req.order_a.price_num,
                 req.order_a.price_den,
@@ -1757,16 +1757,16 @@ async fn handle_submit_ifd(
         .as_secs();
 
     let cancel_secret = generate_cancel_secret();
-    let rule = crate::matcher::ifd::IfdRule {
+    let rule = kob_domain::ifd::IfdRule {
         id: 0,
         order_a_params: a_params_core,
         order_a_p2sh: a_p2sh_hex.clone(),
         order_a_outpoint: None,
-        order_b: crate::matcher::ifd::OrderBType::Simple(b_params),
+        order_b: kob_domain::ifd::OrderBType::Simple(b_params),
         order_b_rs_hex: hex::encode(&b_rs),
         order_b_p2sh: b_p2sh_hex.clone(),
         order_b_spk_hash: b_spk_hash_hex.clone(),
-        status: crate::matcher::ifd::IfdStatus::Pending,
+        status: kob_domain::ifd::IfdStatus::Pending,
         trigger_tx_id: None,
         created_at: now_unix,
         owner_id: req.owner_id,
@@ -1836,7 +1836,7 @@ async fn handle_submit_ifo(
     let okspkh = kob_core::compute_p2pk_spk_hash(&owner_pubkey);
     let otspkh = kob_core::contract::compute_token_unit_spk_hash(&owner_pubkey);
 
-    let oco_params = crate::matcher::ifd::IfoOcoParams {
+    let oco_params = kob_domain::ifd::IfoOcoParams {
         tp_side: req.tp_side,
         tp_price_num: req.tp_price_num,
         tp_price_den: req.tp_price_den,
@@ -1849,7 +1849,7 @@ async fn handle_submit_ifo(
 
     // Compute OCO B script (single v18 oco_sell with TP + SL paths — both
     // branches sweep-eligible via the canonical attestation)
-    let (oco_rs, oco_p2sh_hex) = match crate::matcher::ifd::compute_oco_b_scripts(
+    let (oco_rs, oco_p2sh_hex) = match kob_domain::ifd::compute_oco_b_scripts(
         &req.token,
         &oco_params,
         &owner_hash,
@@ -1872,14 +1872,14 @@ async fn handle_submit_ifo(
     };
 
     // For buy A -> OCO B: A's bspkh = oco_sell's SPK hash (tokens flow to oco_sell)
-    let a_bspkh = if req.order_a.side == crate::matcher::ifd::IfdSide::Buy {
+    let a_bspkh = if req.order_a.side == kob_domain::ifd::IfdSide::Buy {
         oco_spk_hash
     } else {
         owner_spk_hash
     };
 
     let a_rs = match req.order_a.side {
-        crate::matcher::ifd::IfdSide::Buy => {
+        kob_domain::ifd::IfdSide::Buy => {
             match kob_core::contract::spot::order::build_buy_redeem_script(
                 &a_token_bytes,
                 req.order_a.price_num,
@@ -1893,7 +1893,7 @@ async fn handle_submit_ifo(
                 Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({ "error": e.to_string() }))),
             }
         }
-        crate::matcher::ifd::IfdSide::Sell => {
+        kob_domain::ifd::IfdSide::Sell => {
             match kob_core::contract::spot::order::build_sell_redeem_script(
                 req.order_a.price_num,
                 req.order_a.price_den,
@@ -1916,7 +1916,7 @@ async fn handle_submit_ifo(
         .unwrap_or_default()
         .as_secs();
 
-    let a_params_core = crate::matcher::ifd::OrderAParams {
+    let a_params_core = kob_domain::ifd::OrderAParams {
         side: req.order_a.side,
         token: req.order_a.token.clone(),
         price_num: req.order_a.price_num,
@@ -1927,12 +1927,12 @@ async fn handle_submit_ifo(
     };
 
     let cancel_secret = generate_cancel_secret();
-    let rule = crate::matcher::ifd::IfdRule {
+    let rule = kob_domain::ifd::IfdRule {
         id: 0,
         order_a_params: a_params_core,
         order_a_p2sh: a_p2sh_hex.clone(),
         order_a_outpoint: None,
-        order_b: crate::matcher::ifd::OrderBType::Oco {
+        order_b: kob_domain::ifd::OrderBType::Oco {
             token: req.token.clone(),
             amount: req.amount,
             expiry_daa: req.expiry_daa,
@@ -1941,7 +1941,7 @@ async fn handle_submit_ifo(
         order_b_rs_hex: hex::encode(&oco_rs),
         order_b_p2sh: oco_p2sh_hex.clone(),
         order_b_spk_hash: oco_spk_hash_hex.clone(),
-        status: crate::matcher::ifd::IfdStatus::Pending,
+        status: kob_domain::ifd::IfdStatus::Pending,
         trigger_tx_id: None,
         created_at: now_unix,
         owner_id: req.owner_id,
@@ -2022,10 +2022,10 @@ fn parse_hex_32_api(hex_str: &str) -> Result<[u8; 32], String> {
 #[derive(Deserialize)]
 struct SubmitStopOrderRequest {
     pair: String,
-    side: crate::matcher::stop_book::StopSide,
+    side: kob_domain::stop_book::StopSide,
     stop_price_num: u64,
     stop_price_den: u64,
-    order_type: crate::matcher::stop_book::StopOrderType,
+    order_type: kob_domain::stop_book::StopOrderType,
     signed_tx_json: String,
     owner_id: String,
     #[serde(default)]
@@ -2058,7 +2058,7 @@ async fn handle_list_stop_orders(
     let s = state.read().await;
     let book = s.stop_book.lock().await;
 
-    let orders: Vec<&crate::matcher::stop_book::StopOrder> = if let Some(ref owner) = params.owner_id {
+    let orders: Vec<&kob_domain::stop_book::StopOrder> = if let Some(ref owner) = params.owner_id {
         book.list_by_owner(owner)
     } else if let Some(ref pair) = params.pair {
         book.list_by_pair(pair).iter().collect()
@@ -2101,7 +2101,7 @@ async fn handle_submit_stop_order(
         .as_secs();
 
     let cancel_secret = generate_cancel_secret();
-    let order = crate::matcher::stop_book::StopOrder {
+    let order = kob_domain::stop_book::StopOrder {
         id: 0,
         pair: req.pair,
         side: req.side,
@@ -2156,8 +2156,8 @@ async fn handle_cancel_stop_order(
 #[derive(Deserialize)]
 struct SubmitTrailingStopRequest {
     pair_id: String,
-    side: crate::matcher::trailing_stop::TrailingStopSide,
-    trail_spec: crate::matcher::trailing_stop::TrailSpec,
+    side: kob_domain::trailing_stop::TrailingStopSide,
+    trail_spec: kob_domain::trailing_stop::TrailSpec,
     signed_tx_hex: String,
     initial_price_num: u64,
     initial_price_den: u64,
@@ -2753,7 +2753,7 @@ pub fn emit_order_detected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::matcher::order_book::{BookOrder, OrderSide};
+    use kob_domain::order_book::{BookOrder, OrderSide};
 
     fn make_state() -> AppState {
         let (tx, _) = broadcast::channel(100);
@@ -2827,7 +2827,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_bids() {
-        let mut book = crate::matcher::order_book::PairBook::new();
+        let mut book = kob_domain::order_book::PairBook::new();
         // Two bids at same price, one at different
         book.add_bid(make_buy_order("tx1", "pair", 100, 1, 5_000_000));
         book.add_bid(make_buy_order("tx2", "pair", 100, 1, 3_000_000));
@@ -2843,7 +2843,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_asks() {
-        let mut book = crate::matcher::order_book::PairBook::new();
+        let mut book = kob_domain::order_book::PairBook::new();
         book.add_ask(make_sell_order("tx1", "pair", 110, 1, 2_000_000));
         book.add_ask(make_sell_order("tx2", "pair", 120, 1, 6_000_000));
 
@@ -2855,7 +2855,7 @@ mod tests {
 
     #[test]
     fn test_depth_limit() {
-        let mut book = crate::matcher::order_book::PairBook::new();
+        let mut book = kob_domain::order_book::PairBook::new();
         for i in 0..50 {
             book.add_bid(make_buy_order(
                 &format!("tx{}", i),
@@ -3341,7 +3341,7 @@ mod tests {
 
     // Cross-pair trades endpoint tests
 
-    use crate::matcher::trades::{RoutingInfo, Trade};
+    use crate::reporting::trades::{RoutingInfo, Trade};
 
     fn make_normal_trade(txid: &str, pair: &str, daa: u64) -> Trade {
         Trade {
@@ -3633,7 +3633,7 @@ mod tests {
 
         {
             let mut s = state.write().await;
-            let trade = crate::matcher::trades::Trade {
+            let trade = crate::reporting::trades::Trade {
                 txid: "match1".to_string(),
                 leg_index: 0,
                 pair_id: "TOKEN_A/KAS".to_string(),

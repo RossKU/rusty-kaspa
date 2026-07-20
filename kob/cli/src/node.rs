@@ -336,7 +336,7 @@ impl NodeClient {
 // Engine HTTP helpers (stdlib-only)
 
 /// Engine endpoint response row for `/api/v1/wallet/utxos` (see
-/// `kob_engine::matcher::api::WalletUtxoResponse`).
+/// `kob_engine::api::WalletUtxoResponse`).
 #[derive(serde::Deserialize)]
 struct EngineWalletUtxo {
     #[serde(rename = "transactionId")]

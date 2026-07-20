@@ -8,16 +8,16 @@ use zeroize::Zeroize;
 
 use crate::config::AppConfig;
 use kob_core::MIN_UTXO_VALUE;
-use crate::matcher::batch::OutputPurpose;
-use crate::matcher::deploy;
-use crate::matcher::matching::{self, MatchType};
-use crate::matcher::order_book::{OrderBook, OrderSide};
-use crate::matcher::persistence;
-use crate::matcher::api::{AppState, WsEvent};
-use crate::matcher::trades::{Trade, Side};
-use crate::matcher::candle::Interval;
+use kob_domain::batch::OutputPurpose;
+use crate::chain::deploy;
+use kob_domain::matching::{self, MatchType};
+use kob_domain::order_book::{OrderBook, OrderSide};
+use crate::storage::persistence;
+use crate::api::{AppState, WsEvent};
+use crate::reporting::trades::{Trade, Side};
+use crate::reporting::candle::Interval;
 use crate::rpc::{RpcClient, RpcUtxo};
-use crate::matcher::scanner::{
+use crate::chain::scanner::{
     BlockScanner, TransactionData, ScanResult,
     PerpDeploySide, LendingOrderType, PredictionItemType,
 };
@@ -90,10 +90,10 @@ pub struct ReorgTracker {
 struct BlockProvenance {
     /// Orders that were added to the book from this block's transactions.
     /// On reorg, these must be removed.
-    orders_added: Vec<crate::matcher::order_book::BookOrder>,
+    orders_added: Vec<kob_domain::order_book::BookOrder>,
     /// Orders that were spent (removed from book) by this block's transactions.
     /// On reorg, these must be restored. Stored as (outpoint_key, order_snapshot).
-    orders_spent: Vec<(String, crate::matcher::order_book::BookOrder)>,
+    orders_spent: Vec<(String, kob_domain::order_book::BookOrder)>,
     /// All TX IDs seen in this block (for SpentTracker cleanup).
     txids: HashSet<String>,
 }
@@ -115,8 +115,8 @@ impl ReorgTracker {
     pub fn record_block(
         &mut self,
         block_hash: String,
-        orders_added: Vec<crate::matcher::order_book::BookOrder>,
-        orders_spent: Vec<(String, crate::matcher::order_book::BookOrder)>,
+        orders_added: Vec<kob_domain::order_book::BookOrder>,
+        orders_spent: Vec<(String, kob_domain::order_book::BookOrder)>,
         txids: HashSet<String>,
     ) {
         // Avoid duplicates (same block hash seen twice, e.g. from retransmission)
@@ -154,7 +154,7 @@ impl ReorgTracker {
     pub fn handle_removed_blocks(
         &mut self,
         removed_hashes: &[String],
-        order_book: &mut crate::matcher::order_book::OrderBook,
+        order_book: &mut kob_domain::order_book::OrderBook,
         spent_tracker: &mut SpentTracker,
     ) -> (usize, usize, usize, usize) {
         let mut total_restored = 0usize;
@@ -301,7 +301,7 @@ pub struct IfdFillContext {
 /// Covenant outputs (BuyerTokens, SellRemainder) carry a 32-byte covenant ID
 /// that increases storage occupancy.  The formula mirrors
 /// `kaspa_consensus_core::mass::utxo_plurality`.
-fn planned_output_plurality(out: &crate::matcher::batch::PlannedOutput) -> u64 {
+fn planned_output_plurality(out: &kob_domain::batch::PlannedOutput) -> u64 {
     // UTXO fixed overhead: 32 (txid) + 4 (index) + 8 (amount) + 8 (daa) + 1 (coinbase) + 2 (spk ver) + 8 (spk len) = 63
     const UTXO_CONST_STORAGE: usize = 63;
     const UTXO_UNIT_SIZE: usize = 100;
@@ -349,8 +349,8 @@ pub struct BatchMatchResult {
 /// Covenant inputs show the full sigscript structure (args + selector + RS).
 /// Wallet inputs show `P2PK(sig)`.
 fn trace_batch_inputs(
-    batch_tx: &crate::matcher::batch::BatchTx,
-    plan: &crate::matcher::batch::BatchPlan,
+    batch_tx: &kob_domain::batch::BatchTx,
+    plan: &kob_domain::batch::BatchPlan,
 ) {
     use kob_core::contract::opcodes::format_script;
 
@@ -415,7 +415,7 @@ fn trace_batch_inputs(
 pub(crate) fn pair_to_batch_orders(
     pair: &matching::CrossingPair,
     label: &str,
-) -> Option<(crate::matcher::batch::BatchOrder, crate::matcher::batch::BatchOrder)> {
+) -> Option<(kob_domain::batch::BatchOrder, kob_domain::batch::BatchOrder)> {
     let token_bytes: [u8; 32] = match hex::decode(&pair.sell.token_cov_id) {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32];
@@ -466,9 +466,9 @@ pub(crate) fn pair_to_batch_orders(
     // generation (the sell/OCO length gate above already rejected anything
     // else).
     let sell_version = kob_core::contract::spot::SPOT_GENERATION as u8;
-    let sell_order = crate::matcher::batch::BatchOrder {
+    let sell_order = kob_domain::batch::BatchOrder {
         outpoint: (pair.sell.tx_id.clone(), pair.sell.index),
-        order_type: crate::matcher::batch::OrderType::Sell,
+        order_type: kob_domain::batch::OrderType::Sell,
         version: sell_version,
         token_cov_id: token_bytes,
         price_num: pair.sell.price_num,
@@ -498,9 +498,9 @@ pub(crate) fn pair_to_batch_orders(
     } else {
         None
     };
-    let buy_order = crate::matcher::batch::BatchOrder {
+    let buy_order = kob_domain::batch::BatchOrder {
         outpoint: (pair.buy.tx_id.clone(), pair.buy.index),
-        order_type: crate::matcher::batch::OrderType::Buy,
+        order_type: kob_domain::batch::OrderType::Buy,
         version: buy_version,
         token_cov_id: token_bytes,
         price_num: pair.buy.price_num,
@@ -523,9 +523,9 @@ pub(crate) fn pair_to_batch_orders(
 /// Returns None if the order has invalid token_cov_id hex, unsupported RS size,
 /// or missing counterparty SPK.
 pub(crate) fn book_order_to_batch_order(
-    order: &crate::matcher::order_book::BookOrder,
+    order: &kob_domain::order_book::BookOrder,
     label: &str,
-) -> Option<crate::matcher::batch::BatchOrder> {
+) -> Option<kob_domain::batch::BatchOrder> {
     let token_bytes: [u8; 32] = match hex::decode(&order.token_cov_id) {
         Ok(v) if v.len() == 32 => {
             let mut arr = [0u8; 32];
@@ -542,7 +542,7 @@ pub(crate) fn book_order_to_batch_order(
 
     // v18-only RS-length gates (pre-v18 generations removed in Stage E).
     match order.side {
-        crate::matcher::order_book::OrderSide::Sell => {
+        kob_domain::order_book::OrderSide::Sell => {
             if rs.len() != SELL_ORDER_RS_EXPECTED_LEN
                 && rs.len() != OCO_SELL_RS_SIZE
             {
@@ -550,7 +550,7 @@ pub(crate) fn book_order_to_batch_order(
                 return None;
             }
         }
-        crate::matcher::order_book::OrderSide::Buy => {
+        kob_domain::order_book::OrderSide::Buy => {
             if rs.len() != BUY_ORDER_RS_EXPECTED_LEN
                 && rs.len() != BRACKET_RS_SIZE
             {
@@ -569,8 +569,8 @@ pub(crate) fn book_order_to_batch_order(
     };
 
     let order_type = match order.side {
-        crate::matcher::order_book::OrderSide::Buy => crate::matcher::batch::OrderType::Buy,
-        crate::matcher::order_book::OrderSide::Sell => crate::matcher::batch::OrderType::Sell,
+        kob_domain::order_book::OrderSide::Buy => kob_domain::batch::OrderType::Buy,
+        kob_domain::order_book::OrderSide::Sell => kob_domain::batch::OrderType::Sell,
     };
 
     let version = if rs.len() == BRACKET_RS_SIZE {
@@ -584,7 +584,7 @@ pub(crate) fn book_order_to_batch_order(
     } else {
         None
     };
-    Some(crate::matcher::batch::BatchOrder {
+    Some(kob_domain::batch::BatchOrder {
         outpoint: (order.tx_id.clone(), order.index),
         order_type,
         version,
@@ -614,7 +614,7 @@ pub(crate) fn book_order_to_batch_order(
 ///   [0x08][min_fill 8B]          = bytes 107..116
 ///   [0x08][min_receipt_val 8B]   = bytes 116..125
 ///   [0x20][receipt_cov_id 32B]   = bytes 125..158
-fn extract_bracket_meta(rs: &[u8]) -> Option<crate::matcher::batch::BracketMeta> {
+fn extract_bracket_meta(rs: &[u8]) -> Option<kob_domain::batch::BracketMeta> {
     // v1 (365B) and v18 (372B) brackets share the identical 224B state
     // layout — only the body differs — so one extractor serves both.
     if rs.len() != BRACKET_RS_SIZE {
@@ -637,7 +637,7 @@ fn extract_bracket_meta(rs: &[u8]) -> Option<crate::matcher::batch::BracketMeta>
     let mut receipt_cov_id = [0u8; 32];
     receipt_cov_id.copy_from_slice(&rs[126..158]);
 
-    Some(crate::matcher::batch::BracketMeta {
+    Some(kob_domain::batch::BracketMeta {
         receipt_cov_id,
         min_receipt_val,
         oco_spk,
@@ -730,7 +730,7 @@ pub(crate) fn is_race_lost_error(err_str: &str) -> bool {
 fn mark_submit_failure(
     err_str: &str,
     tag: &str,
-    plan: &crate::matcher::batch::BatchPlan,
+    plan: &kob_domain::batch::BatchPlan,
     spent_tracker: &mut SpentTracker,
 ) {
     let is_transient = err_str.contains("sequence locks");
@@ -795,7 +795,7 @@ fn resolve_fee_rebuild_needed(phase1_est: u64, exact_fee: u64, floor_bound: bool
 /// TX version = 1 (required for covenant output bindings on buyer token outputs).
 pub async fn execute_batch_match(
     rpc: &RpcClient,
-    plan: &mut crate::matcher::batch::BatchPlan,
+    plan: &mut kob_domain::batch::BatchPlan,
     config: &AppConfig,
     spent_tracker: &mut SpentTracker,
     ifd_payload: Option<String>,
@@ -1419,7 +1419,7 @@ pub enum RatchetExecOutcome {
 /// being settled cannot also ratchet in the same tx).
 fn find_ratchet_advance_candidate(
     order_book: &OrderBook,
-    plan: &crate::matcher::batch::BatchPlan,
+    plan: &kob_domain::batch::BatchPlan,
     spent_tracker: &SpentTracker,
     tip_daa: u64,
 ) -> Option<kob_domain::time_planner::RatchetOrderRef> {
@@ -1436,7 +1436,7 @@ fn find_ratchet_advance_candidate(
     for order in pair.asks.values() {
         if !matches!(
             order.time_meta,
-            Some(crate::matcher::order_book::TimeMeta::RatchetOco { .. })
+            Some(kob_domain::order_book::TimeMeta::RatchetOco { .. })
         ) {
             continue;
         }
@@ -1481,7 +1481,7 @@ fn find_ratchet_advance_candidate(
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_oco_ratchet(
     rpc: &RpcClient,
-    plan: &crate::matcher::batch::BatchPlan,
+    plan: &kob_domain::batch::BatchPlan,
     oco: &kob_domain::time_planner::RatchetOrderRef,
     tip_daa: u64,
     config: &AppConfig,
@@ -1665,7 +1665,7 @@ pub async fn execute_oco_ratchet(
             in_cells.push((*wv, 1u64));
         }
         let out_cells: Vec<(u64, u64)> = batch_tx.outputs.iter().enumerate().map(|(i, o)| {
-            let po = crate::matcher::batch::PlannedOutput {
+            let po = kob_domain::batch::PlannedOutput {
                 value: sighash_tx.outputs[i].value,
                 script_public_key: o.script_public_key.clone(),
                 spk_version: o.spk_version,
@@ -1815,7 +1815,7 @@ pub async fn execute_oco_ratchet(
 ///
 /// Returns `(sighash_tx, rpc_inputs_covenant_only, rpc_outputs)`.
 pub(crate) fn build_ring_fill_tx(
-    plan: &crate::matcher::batch::RingPlan,
+    plan: &kob_domain::batch::RingPlan,
 ) -> Result<(kob_core::tx::Transaction, Vec<serde_json::Value>, Vec<serde_json::Value>), String> {
     let batch_tx = plan.build_tx().map_err(|e| e.to_string())?;
     let n = plan.legs.len();
@@ -1917,7 +1917,7 @@ pub(crate) fn build_ring_fill_tx(
 /// fee paid by the matcher's wallet input.
 pub async fn execute_ring_fill(
     rpc: &RpcClient,
-    legs: &[crate::matcher::batch::RingLegOrder],
+    legs: &[kob_domain::batch::RingLegOrder],
     wallet_utxo: Option<(String, u32, u64)>,
     wallet_spk: &[u8],
     wallet_spk_version: u16,
@@ -1939,7 +1939,7 @@ pub async fn execute_ring_fill(
     };
 
     // Plan (re-validates every leg RS + F2/F3/F4 feasibility exactly).
-    let plan = match crate::matcher::batch::plan_ring_match(
+    let plan = match kob_domain::batch::plan_ring_match(
         legs, Some(wallet.clone()), wallet_spk, wallet_spk_version,
     ) {
         Ok(p) => p,
@@ -2091,7 +2091,7 @@ fn process_block_txs_inner(
     txs: &[TransactionData],
     order_book: &mut OrderBook,
     scanner: &BlockScanner,
-    ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
+    ws_tx: Option<&tokio::sync::broadcast::Sender<crate::api::WsEvent>>,
 ) -> (usize, usize) {
     let mut added = 0;
     let mut removed = 0;
@@ -2105,7 +2105,7 @@ fn process_block_txs_inner(
             // Capture order info before removal for WS event emission.
             if let Some(ws) = ws_tx {
                 if let Some(order) = order_book.get_order(key) {
-                    crate::matcher::api::emit_order_cancelled(
+                    crate::api::emit_order_cancelled(
                         ws,
                         &order.owner_hash,
                         key,
@@ -2192,7 +2192,7 @@ fn process_block_txs_inner(
                 OrderSide::Buy => {
                     // Emit OrderDetected before adding (book_order will be moved)
                     if let Some(ws) = ws_tx {
-                        crate::matcher::api::emit_order_detected(
+                        crate::api::emit_order_detected(
                             ws,
                             &book_order.owner_hash,
                             &outpoint_key,
@@ -2217,7 +2217,7 @@ fn process_block_txs_inner(
                         continue;
                     }
                     if let Some(ws) = ws_tx {
-                        crate::matcher::api::emit_order_detected(
+                        crate::api::emit_order_detected(
                             ws,
                             &book_order.owner_hash,
                             &outpoint_key,
@@ -2274,8 +2274,8 @@ pub struct ScanCounters {
 ///
 /// After processing, the caller can commit this data to the `ReorgTracker`.
 struct ReorgCollector {
-    orders_added: Vec<crate::matcher::order_book::BookOrder>,
-    orders_spent: Vec<(String, crate::matcher::order_book::BookOrder)>,
+    orders_added: Vec<kob_domain::order_book::BookOrder>,
+    orders_spent: Vec<(String, kob_domain::order_book::BookOrder)>,
     txids: HashSet<String>,
 }
 
@@ -2306,7 +2306,7 @@ const UNMATCHABLE_LOGGED_MAX: usize = 10_000;
 /// Defense-in-depth pair for the per-offender cooldown: this prevents the
 /// stale deploy from entering the book at all, avoiding the recycle cost
 /// of re-triggering the planner every 30s via the cooldown path.
-fn skip_if_no_counterparty_spk(order: &crate::matcher::order_book::BookOrder) -> bool {
+fn skip_if_no_counterparty_spk(order: &kob_domain::order_book::BookOrder) -> bool {
     if order.counterparty_spk.as_deref().map_or(true, str::is_empty) {
         let key = order.outpoint_key();
         let first_time = UNMATCHABLE_LOGGED
@@ -2336,15 +2336,15 @@ fn process_block_txs_all(
     txs: &[TransactionData],
     order_book: &mut OrderBook,
     scanner: &BlockScanner,
-    perp_book: &mut crate::matcher::perp_book::PerpOrderBook,
-    lending_book: &mut crate::matcher::lending_book::LendingBook,
-    prediction_book: &mut crate::matcher::prediction_book::PredictionBook,
+    perp_book: &mut kob_domain::perp_book::PerpOrderBook,
+    lending_book: &mut kob_domain::lending_book::LendingBook,
+    prediction_book: &mut kob_domain::prediction_book::PredictionBook,
     mut covenant_cache: Option<&mut CovenantCache>,
-    ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
+    ws_tx: Option<&tokio::sync::broadcast::Sender<crate::api::WsEvent>>,
     current_daa: u64,
-    mut ifd_book: Option<&mut crate::matcher::ifd::IfdBook>,
-    mut dca_book: Option<&mut crate::matcher::dca_book::DcaBook>,
-    mut swap_book: Option<&mut crate::matcher::swap_book::SwapBook>,
+    mut ifd_book: Option<&mut kob_domain::ifd::IfdBook>,
+    mut dca_book: Option<&mut kob_domain::dca_book::DcaBook>,
+    mut swap_book: Option<&mut kob_domain::swap_book::SwapBook>,
     mut reorg_collector: Option<&mut ReorgCollector>,
 ) -> ScanCounters {
     let mut counters = ScanCounters::default();
@@ -2423,7 +2423,7 @@ fn process_block_txs_all(
 
             if let Some(ws) = ws_tx {
                 if let Some(order) = order_book.get_order(key) {
-                    crate::matcher::api::emit_order_cancelled(
+                    crate::api::emit_order_cancelled(
                         ws,
                         &order.owner_hash,
                         key,
@@ -2464,7 +2464,7 @@ fn process_block_txs_all(
                 cont.ratchets_applied,
             );
             if let Some(ws) = ws_tx {
-                crate::matcher::api::emit_order_detected(
+                crate::api::emit_order_detected(
                     ws, &tp_order.owner_hash, &tp_key,
                     OrderSide::Sell, tp_order.price_num, tp_order.price_den,
                     tp_order.value, &tp_order.token_cov_id,
@@ -2585,7 +2585,7 @@ fn process_block_txs_all(
                     let p2sh_hex = &book_order.p2sh_script_hex;
                     if let Some(rule) = ifd.find_by_a_p2sh(p2sh_hex) {
                         let rule_id = rule.id;
-                        if rule.status == crate::matcher::ifd::IfdStatus::Pending {
+                        if rule.status == kob_domain::ifd::IfdStatus::Pending {
                             // Compute order B's P2SH SPK as counterparty_spk
                             if let Ok(b_rs_bytes) = hex::decode(&rule.order_b_rs_hex) {
                                 let b_p2sh_spk = kob_core::build_p2sh(&b_rs_bytes);
@@ -2649,7 +2649,7 @@ fn process_block_txs_all(
                 match parsed.order_type {
                     OrderSide::Buy => {
                         if let Some(ws) = ws_tx {
-                            crate::matcher::api::emit_order_detected(
+                            crate::api::emit_order_detected(
                                 ws, &book_order.owner_hash, &outpoint_key,
                                 OrderSide::Buy, book_order.price_num, book_order.price_den,
                                 book_order.value, &book_order.token_cov_id,
@@ -2670,7 +2670,7 @@ fn process_block_txs_all(
                             continue;
                         }
                         if let Some(ws) = ws_tx {
-                            crate::matcher::api::emit_order_detected(
+                            crate::api::emit_order_detected(
                                 ws, &book_order.owner_hash, &outpoint_key,
                                 OrderSide::Sell, book_order.price_num, book_order.price_den,
                                 book_order.value, &book_order.token_cov_id,
@@ -2694,16 +2694,16 @@ fn process_block_txs_all(
 
                 // Convert ParsedPerpOrder -> PerpOrder
                 let side = match parsed.side {
-                    PerpDeploySide::Long => crate::matcher::perp_book::PerpSide::Long,
-                    PerpDeploySide::Short => crate::matcher::perp_book::PerpSide::Short,
+                    PerpDeploySide::Long => kob_domain::perp_book::PerpSide::Long,
+                    PerpDeploySide::Short => kob_domain::perp_book::PerpSide::Short,
                 };
                 let rs_hex = hex::encode(&parsed.redeem_script);
                 let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
                 let p2sh_hex = hex::encode(&p2sh_spk.script());
                 // Extract owner_spk from TX outputs (same pattern as lending)
-                let owner_spk = crate::matcher::scanner::extract_owner_spk(tx, &parsed.owner_spk_hash);
+                let owner_spk = crate::chain::scanner::extract_owner_spk(tx, &parsed.owner_spk_hash);
 
-                let perp_order = crate::matcher::perp_book::PerpOrder {
+                let perp_order = kob_domain::perp_book::PerpOrder {
                     tx_id: tx.tx_id.clone(),
                     index: p2sh_idx,
                     side,
@@ -2725,8 +2725,8 @@ fn process_block_txs_all(
                 };
 
                 let side_str = match perp_order.side {
-                    crate::matcher::perp_book::PerpSide::Long => "LONG",
-                    crate::matcher::perp_book::PerpSide::Short => "SHORT",
+                    kob_domain::perp_book::PerpSide::Long => "LONG",
+                    kob_domain::perp_book::PerpSide::Short => "SHORT",
                 };
                 info!(
                     "[SCANNER-ALL] Discovered {} perp order: {}:{} margin={} price={}/{}",
@@ -2747,7 +2747,7 @@ fn process_block_txs_all(
 
                 match parsed.order_type {
                     LendingOrderType::Offer => {
-                        let offer = crate::matcher::lending_book::LendingOffer {
+                        let offer = kob_domain::lending_book::LendingOffer {
                             outpoint: outpoint_key.clone(),
                             value: p2sh_value,
                             rate_num: parsed.rate_num,
@@ -2771,7 +2771,7 @@ fn process_block_txs_all(
                         lending_book.add_offer(offer);
                     }
                     LendingOrderType::Request => {
-                        let request = crate::matcher::lending_book::BorrowRequest {
+                        let request = kob_domain::lending_book::BorrowRequest {
                             outpoint: outpoint_key.clone(),
                             value: p2sh_value,
                             desired_principal: parsed.amount,
@@ -2868,12 +2868,12 @@ fn process_block_txs_all(
                 );
 
                 if let Some(ws) = ws_tx {
-                    crate::matcher::api::emit_order_detected(
+                    crate::api::emit_order_detected(
                         ws, &tp_order.owner_hash, &tp_key,
                         OrderSide::Sell, tp_order.price_num, tp_order.price_den,
                         tp_order.value, &tp_order.token_cov_id,
                     );
-                    crate::matcher::api::emit_order_detected(
+                    crate::api::emit_order_detected(
                         ws, &sl_order.owner_hash, &sl_key,
                         OrderSide::Sell, sl_order.price_num, sl_order.price_den,
                         sl_order.value, &sl_order.token_cov_id,
@@ -2931,12 +2931,12 @@ fn process_block_txs_all(
                 );
 
                 if let Some(ws) = ws_tx {
-                    crate::matcher::api::emit_order_detected(
+                    crate::api::emit_order_detected(
                         ws, &tp_order.owner_hash, &tp_key,
                         OrderSide::Sell, tp_order.price_num, tp_order.price_den,
                         tp_order.value, &tp_order.token_cov_id,
                     );
-                    crate::matcher::api::emit_order_detected(
+                    crate::api::emit_order_detected(
                         ws, &sl_order.owner_hash, &sl_key,
                         OrderSide::Sell, sl_order.price_num, sl_order.price_den,
                         sl_order.value, &sl_order.token_cov_id,
@@ -2962,14 +2962,14 @@ fn process_block_txs_all(
                     // Extract buyer SPK from the deploy TX outputs.
                     // The DCA contract stores buyer_spk_hash = blake2b(buyer_spk).
                     // We scan TX outputs for a non-P2SH output whose SPK hash matches.
-                    let buyer_spk = crate::matcher::scanner::extract_owner_spk(tx, &parsed.buyer_spk_hash);
+                    let buyer_spk = crate::chain::scanner::extract_owner_spk(tx, &parsed.buyer_spk_hash);
                     if buyer_spk.is_none() {
                         debug!(
                             "[DCA] buyer_spk not found in deploy TX for {}:{} — fill will be deferred",
                             &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
                         );
                     }
-                    let entry = crate::matcher::dca_book::DcaEntry {
+                    let entry = kob_domain::dca_book::DcaEntry {
                         tx_id: tx.tx_id.clone(),
                         index: p2sh_idx,
                         value: p2sh_value,
@@ -3009,14 +3009,14 @@ fn process_block_txs_all(
                         continue; // dedup
                     }
                     let p2sh_spk = kob_core::build_p2sh(&parsed.redeem_script);
-                    let owner_spk = crate::matcher::scanner::extract_owner_spk(tx, &parsed.owner_spk_hash);
+                    let owner_spk = crate::chain::scanner::extract_owner_spk(tx, &parsed.owner_spk_hash);
                     if owner_spk.is_none() {
                         debug!(
                             "[SWAP-V18] owner_spk not found in deploy TX for {}:{} — ring fill will be deferred",
                             &tx.tx_id[..tx.tx_id.len().min(16)], p2sh_idx,
                         );
                     }
-                    let entry = crate::matcher::swap_book::SwapEntry {
+                    let entry = kob_domain::swap_book::SwapEntry {
                         tx_id: tx.tx_id.clone(),
                         index: p2sh_idx,
                         value: p2sh_value,
@@ -3086,9 +3086,9 @@ impl<'a> ScanCheckpointPaths<'a> {
         &self,
         tip_hash: &str,
         order_book: &OrderBook,
-        perp_book: &crate::matcher::perp_book::PerpOrderBook,
-        lending_book: &crate::matcher::lending_book::LendingBook,
-        prediction_book: &crate::matcher::prediction_book::PredictionBook,
+        perp_book: &kob_domain::perp_book::PerpOrderBook,
+        lending_book: &kob_domain::lending_book::LendingBook,
+        prediction_book: &kob_domain::prediction_book::PredictionBook,
     ) {
         if let Err(e) = persistence::save_order_book(self.orderbook_path, order_book) {
             warn!("[CATCHUP-CHECKPOINT] Failed to save order book: {}", e);
@@ -3139,7 +3139,7 @@ async fn update_sync_snapshot(
             cursor_block_hash.to_string(),
             sink_daa,
             node_connected,
-            crate::matcher::api::DEFAULT_CAUGHT_UP_THRESHOLD,
+            crate::api::DEFAULT_CAUGHT_UP_THRESHOLD,
         );
     }
 }
@@ -3148,11 +3148,11 @@ async fn update_sync_snapshot(
 async fn scan_new_blocks(
     rpc: &RpcClient,
     order_book: &mut OrderBook,
-    perp_book: &mut crate::matcher::perp_book::PerpOrderBook,
-    lending_book: &mut crate::matcher::lending_book::LendingBook,
-    prediction_book: &mut crate::matcher::prediction_book::PredictionBook,
+    perp_book: &mut kob_domain::perp_book::PerpOrderBook,
+    lending_book: &mut kob_domain::lending_book::LendingBook,
+    prediction_book: &mut kob_domain::prediction_book::PredictionBook,
     last_chain_hash: &str,
-    ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
+    ws_tx: Option<&tokio::sync::broadcast::Sender<crate::api::WsEvent>>,
     current_daa: u64,
     checkpoint: Option<ScanCheckpointPaths<'_>>,
     shared_state: Option<&AppState>,
@@ -3403,7 +3403,7 @@ async fn record_trade(
     price_den: u64,
     quantity: u64,
     side: Side,
-    routing: Option<crate::matcher::trades::RoutingInfo>,
+    routing: Option<crate::reporting::trades::RoutingInfo>,
 ) {
     let shared_state = match shared_state {
         Some(s) => s,
@@ -3417,7 +3417,7 @@ async fn record_trade(
 
     // P0 fix: pair_id must match the order book's pair_books key exactly
     // (the full token_cov_id) -- see `canonical_pair_id` doc comment.
-    let pair_id = crate::matcher::trades::canonical_pair_id(token_cov_id);
+    let pair_id = crate::reporting::trades::canonical_pair_id(token_cov_id);
 
     let trade = Trade {
         txid: txid.to_string(),
@@ -3450,7 +3450,7 @@ async fn record_trade(
 
     // Persist M1 candle to SQLite (MT5 style: only M1 stored, higher TFs aggregated on read)
     if let Some(ref history) = state.history {
-        if let Some(candle) = state.candles.latest_candle(&trade.pair_id, crate::matcher::candle::Interval::M1) {
+        if let Some(candle) = state.candles.latest_candle(&trade.pair_id, crate::reporting::candle::Interval::M1) {
             if let Err(e) = history.upsert_m1(&trade.pair_id, candle) {
                 tracing::warn!("History DB M1 upsert failed: {}", e);
             }
@@ -3489,7 +3489,7 @@ async fn record_trade(
 /// Default horizon after which a staged (never-confirmed) trade is dropped.
 /// Mirrors `SPENT_PRUNE_AGE_SECS`'s mempool-dwell reasoning: a self-submitted
 /// TX that hasn't confirmed within this window is treated as evicted.
-const PENDING_TRADE_MAX_AGE_SECS: u64 = crate::matcher::trades::DEFAULT_PENDING_TRADE_MAX_AGE_SECS;
+const PENDING_TRADE_MAX_AGE_SECS: u64 = crate::reporting::trades::DEFAULT_PENDING_TRADE_MAX_AGE_SECS;
 
 /// H3-TRADES confirmation hook: promote every staged trade whose txid
 /// appears in `confirmed_txids` (a just-processed confirmed block's TX set)
@@ -3576,11 +3576,11 @@ async fn retract_reorged_trades(shared_state: &AppState, removed_block_hashes: &
 /// (the owner can always self-expire via the CLI).
 async fn expire_orders(
     rpc: &RpcClient,
-    expired_orders: &[crate::matcher::order_book::BookOrder],
+    expired_orders: &[kob_domain::order_book::BookOrder],
     current_daa: u64,
     config: &AppConfig,
 ) -> u32 {
-    use crate::matcher::order_book::OrderSide;
+    use kob_domain::order_book::OrderSide;
 
     let mut expired_count = 0u32;
 
@@ -3847,17 +3847,17 @@ async fn run_scan_cycle(
     spent_tracker: &mut SpentTracker,
     _enable_cross_pair: bool,
     allow_self_trade: bool,
-    ws_tx: Option<&tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
+    ws_tx: Option<&tokio::sync::broadcast::Sender<crate::api::WsEvent>>,
     shared_state: Option<&AppState>,
-    ifd_book: &Arc<Mutex<crate::matcher::ifd::IfdBook>>,
-    perp_book: &Arc<Mutex<crate::matcher::perp_book::PerpOrderBook>>,
-    perp_tracker: &Arc<Mutex<crate::matcher::perp_tracker::PositionTracker>>,
-    lending_book: &Arc<Mutex<crate::matcher::lending_book::LendingBook>>,
-    loan_tracker: &Arc<Mutex<crate::matcher::lending_tracker::LoanTracker>>,
-    prediction_book: &Arc<Mutex<crate::matcher::prediction_book::PredictionBook>>,
-    market_tracker: &Arc<Mutex<crate::matcher::prediction_tracker::MarketTracker>>,
-    dca_book: &Arc<Mutex<crate::matcher::dca_book::DcaBook>>,
-    swap_book: &Arc<Mutex<crate::matcher::swap_book::SwapBook>>,
+    ifd_book: &Arc<Mutex<kob_domain::ifd::IfdBook>>,
+    perp_book: &Arc<Mutex<kob_domain::perp_book::PerpOrderBook>>,
+    perp_tracker: &Arc<Mutex<kob_domain::perp_tracker::PositionTracker>>,
+    lending_book: &Arc<Mutex<kob_domain::lending_book::LendingBook>>,
+    loan_tracker: &Arc<Mutex<kob_domain::lending_tracker::LoanTracker>>,
+    prediction_book: &Arc<Mutex<kob_domain::prediction_book::PredictionBook>>,
+    market_tracker: &Arc<Mutex<kob_domain::prediction_tracker::MarketTracker>>,
+    dca_book: &Arc<Mutex<kob_domain::dca_book::DcaBook>>,
+    swap_book: &Arc<Mutex<kob_domain::swap_book::SwapBook>>,
 ) -> Vec<MatchResult> {
     let mut results = Vec::new();
 
@@ -3929,7 +3929,7 @@ async fn run_scan_cycle(
 
                 // SwapEntry -> RingLegOrder (owner_spk presence is guaranteed
                 // by find_rings; decode defensively anyway).
-                let mut leg_orders: Vec<crate::matcher::batch::RingLegOrder> = Vec::new();
+                let mut leg_orders: Vec<kob_domain::batch::RingLegOrder> = Vec::new();
                 let mut convert_ok = true;
                 for e in ring {
                     let rs = match hex::decode(&e.redeem_script_hex) {
@@ -3940,7 +3940,7 @@ async fn run_scan_cycle(
                         Some(Ok(v)) if v.len() > 2 => v,
                         _ => { convert_ok = false; break; }
                     };
-                    leg_orders.push(crate::matcher::batch::RingLegOrder {
+                    leg_orders.push(kob_domain::batch::RingLegOrder {
                         outpoint: (e.tx_id.clone(), e.index),
                         redeem_script: rs,
                         utxo_value: e.value,
@@ -4038,7 +4038,7 @@ async fn run_scan_cycle(
         for o in pair.asks.values() {
             if matches!(
                 o.time_meta,
-                Some(crate::matcher::order_book::TimeMeta::RatchetOco { .. })
+                Some(kob_domain::order_book::TimeMeta::RatchetOco { .. })
             ) {
                 spent_keys.insert(o.outpoint_key());
             }
@@ -4214,12 +4214,12 @@ async fn run_scan_cycle(
                 // 1 v18 buy (in buys[0]) sweeps N sells via the per-sell-
                 // output IOC planner (per-term OpAuthOutputIdx binding).
                 if buy_is_decay {
-                    crate::matcher::batch::plan_decay_buy_ioc_match(
+                    kob_domain::batch::plan_decay_buy_ioc_match(
                         &sells, &buys[0], plan_lock_time, wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                     )
                 } else {
-                    crate::matcher::batch::plan_ioc_match_at(
+                    kob_domain::batch::plan_ioc_match_at(
                         &sells, &buys[0], wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                         plan_lock_time,
@@ -4234,7 +4234,7 @@ async fn run_scan_cycle(
                 // selection or reports SellResidualUnsupported). Admits the
                 // time-sell anchors and decay_buy absorbers (Stage-B
                 // residuals 1+2).
-                crate::matcher::batch::plan_sell_ioc_match_at(
+                kob_domain::batch::plan_sell_ioc_match_at(
                     &sells[0], &buys, wallet_utxo,
                     &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                     plan_lock_time,
@@ -4245,12 +4245,12 @@ async fn run_scan_cycle(
                 // part of its KAS and keeps a byte-exact self-SPK residual
                 // UTXO (item C).
                 if buy_is_decay {
-                    crate::matcher::batch::plan_decay_buy_partial_match(
+                    kob_domain::batch::plan_decay_buy_partial_match(
                         &sells, &buys[0], plan_lock_time, wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                     )
                 } else {
-                    crate::matcher::batch::plan_partial_match_at(
+                    kob_domain::batch::plan_partial_match_at(
                         &sells, &buys[0], wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                         plan_lock_time,
@@ -4266,12 +4266,12 @@ async fn run_scan_cycle(
                 // the sweep grouper only emits GTC multi-fill when total
                 // fill tokens >= expected_tokens.
                 if buy_is_decay && buys.len() == 1 {
-                    crate::matcher::batch::plan_decay_buy_match(
+                    kob_domain::batch::plan_decay_buy_match(
                         &sells, &buys[0], plan_lock_time, wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                     )
                 } else {
-                    crate::matcher::batch::plan_batch_match_at(
+                    kob_domain::batch::plan_batch_match_at(
                         &sells, &buys, wallet_utxo,
                         &wallet_spk_script, wallet_spk_version, Some(config.fee_bps),
                         plan_lock_time,
@@ -4287,14 +4287,14 @@ async fn run_scan_cycle(
 
         let mut plan = match plan_result {
             Ok(p) => p,
-            Err(ref e) if matches!(e, crate::matcher::batch::BatchError::MinFillViolation { .. }) => {
+            Err(ref e) if matches!(e, kob_domain::batch::BatchError::MinFillViolation { .. }) => {
                 // MinFillViolation is a pairing issue, not a permanent order fault.
                 // The orders may match with a different counterparty, so don't
                 // mark them as failed. Just skip this group.
                 info!("[UNIFIED] MinFill violation (skipping, will retry): {}", e);
                 continue;
             }
-            Err(ref e) if matches!(e, crate::matcher::batch::BatchError::OcoRemainderUnsupported { .. }) => {
+            Err(ref e) if matches!(e, kob_domain::batch::BatchError::OcoRemainderUnsupported { .. }) => {
                 // OCO v1 covenant has no IOC path. A sweep/batch that leaves
                 // any OCO token remainder is structurally unexecutable — the
                 // planner would otherwise emit a TX using selector=5, which
@@ -4309,16 +4309,16 @@ async fn run_scan_cycle(
                 continue;
             }
             Err(ref e) if matches!(e,
-                crate::matcher::batch::BatchError::SellResidualUnsupported { .. }
-                | crate::matcher::batch::BatchError::CapInfeasible { .. }
+                kob_domain::batch::BatchError::SellResidualUnsupported { .. }
+                | kob_domain::batch::BatchError::CapInfeasible { .. }
                 // Time-contracts (Stage C): lock-time / pacing gates are
                 // timing or pairing conditions, not order faults — the same
                 // group may become feasible at a later DAA (decay window,
                 // twap age) or with different counterparties. No cooldown.
-                | crate::matcher::batch::BatchError::LockTimePastExpiry { .. }
-                | crate::matcher::batch::BatchError::LockTimeTooEarly { .. }
-                | crate::matcher::batch::BatchError::LockTimeWindowEmpty { .. }
-                | crate::matcher::batch::BatchError::TwapVolumeExceedsMpw { .. }) => {
+                | kob_domain::batch::BatchError::LockTimePastExpiry { .. }
+                | kob_domain::batch::BatchError::LockTimeTooEarly { .. }
+                | kob_domain::batch::BatchError::LockTimeWindowEmpty { .. }
+                | kob_domain::batch::BatchError::TwapVolumeExceedsMpw { .. }) => {
                 // Structural v18 pairing issues, not order faults: a v18
                 // partial sell can't compose with a v18 buy in one tx, and
                 // the surplus cap depends on WHICH counterparty is chosen.
@@ -4367,7 +4367,7 @@ async fn run_scan_cycle(
                     let rule = ifd.find_by_a_outpoint(&buy_outpoint)
                         .or_else(|| ifd.find_by_a_outpoint(&sell_outpoint));
                     rule.and_then(|r| {
-                        if r.status == crate::matcher::ifd::IfdStatus::Active {
+                        if r.status == kob_domain::ifd::IfdStatus::Active {
                             match hex::decode(&r.order_b_rs_hex) {
                                 Ok(rs_bytes) => Some(IfdFillContext {
                                     rule_id: r.id,
@@ -4468,7 +4468,7 @@ async fn run_scan_cycle(
                 for sell in &group.sells {
                     let sk = sell.outpoint_key();
                     if let Some(ws) = ws_tx {
-                        crate::matcher::api::emit_order_filled(
+                        crate::api::emit_order_filled(
                             ws, &sell.owner_hash, &sk,
                             &batch_result.tx_id,
                             sell.price_num, sell.price_den,
@@ -4504,7 +4504,7 @@ async fn run_scan_cycle(
                 for buy in &group.buys {
                     let bk = buy.outpoint_key();
                     if let Some(ws) = ws_tx {
-                        crate::matcher::api::emit_order_filled(
+                        crate::api::emit_order_filled(
                             ws, &buy.owner_hash, &bk,
                             &batch_result.tx_id,
                             buy.price_num, buy.price_den,
@@ -4749,7 +4749,7 @@ async fn run_scan_cycle(
                 // Size = minimum of both margins (equal-size matching).
                 let size = crossing.long_order.margin.min(crossing.short_order.margin);
                 let total_margin = crossing.long_order.margin.saturating_add(crossing.short_order.margin);
-                let params = crate::matcher::perp_executor::OpenPositionParams::from_crossing_pair(
+                let params = kob_domain::perp_executor::OpenPositionParams::from_crossing_pair(
                     crossing,
                     size,
                     crossing.long_order.margin,        // split_num (long's share)
@@ -4768,7 +4768,7 @@ async fn run_scan_cycle(
                     spot_buy_spkh,
                 );
 
-                match crate::matcher::perp_executor::build_open_position_tx(&params) {
+                match kob_domain::perp_executor::build_open_position_tx(&params) {
                     Ok((mut blueprint, position_rs)) => {
                         info!(
                             "[PERP] Built open-position TX blueprint: {} inputs, {} outputs",
@@ -4856,7 +4856,7 @@ async fn run_scan_cycle(
                                 );
 
                                 // Create PerpPosition and add to tracker
-                                let position = crate::matcher::perp_tracker::PerpPosition {
+                                let position = kob_domain::perp_tracker::PerpPosition {
                                     tx_id: tx_id.clone(),
                                     index: 0, // Position is output[0]
                                     long_spk_hash: crossing.long_order.owner_spk_hash,
@@ -5047,7 +5047,7 @@ async fn run_scan_cycle(
                 };
 
                 // Build lending match params
-                let lending_params = crate::matcher::lending_executor::LendingMatchParams::from_match(
+                let lending_params = kob_domain::lending_executor::LendingMatchParams::from_match(
                     lm,
                     lending_current_daa,                // B-2: real DAA score from RPC
                     lm.offer.rate_mode,                 // rate_mode from offer
@@ -5059,7 +5059,7 @@ async fn run_scan_cycle(
                     borrower_spk,                        // borrower_spk
                 );
 
-                match crate::matcher::lending_executor::build_lending_match_tx(&lending_params) {
+                match kob_domain::lending_executor::build_lending_match_tx(&lending_params) {
                     Ok((blueprint, loan_rs)) => {
                         info!(
                             "[LENDING] Built match TX blueprint: {} inputs, {} outputs",
@@ -5119,7 +5119,7 @@ async fn run_scan_cycle(
                                 );
 
                                 // Create LoanPosition and add to tracker
-                                let loan = crate::matcher::lending_tracker::LoanPosition {
+                                let loan = kob_domain::lending_tracker::LoanPosition {
                                     outpoint: format!("{}:0", tx_id),
                                     principal: lm.principal,
                                     collateral: lm.request.value,
@@ -5819,19 +5819,19 @@ pub async fn run_continuous_with_ws(
     orderbook_path: &str,
     enable_cross_pair: bool,
     allow_self_trade: bool,
-    ws_tx: Option<tokio::sync::broadcast::Sender<crate::matcher::api::WsEvent>>,
-    shared_stop_book: Arc<Mutex<crate::matcher::stop_book::StopOrderBook>>,
-    shared_trailing_stop_book: Arc<Mutex<crate::matcher::trailing_stop::TrailingStopBook>>,
+    ws_tx: Option<tokio::sync::broadcast::Sender<crate::api::WsEvent>>,
+    shared_stop_book: Arc<Mutex<kob_domain::stop_book::StopOrderBook>>,
+    shared_trailing_stop_book: Arc<Mutex<kob_domain::trailing_stop::TrailingStopBook>>,
     shared_state: Option<AppState>,
-    shared_ifd_book: Arc<Mutex<crate::matcher::ifd::IfdBook>>,
-    shared_perp_book: Arc<Mutex<crate::matcher::perp_book::PerpOrderBook>>,
-    shared_perp_tracker: Arc<Mutex<crate::matcher::perp_tracker::PositionTracker>>,
-    shared_lending_book: Arc<Mutex<crate::matcher::lending_book::LendingBook>>,
-    shared_loan_tracker: Arc<Mutex<crate::matcher::lending_tracker::LoanTracker>>,
-    shared_prediction_book: Arc<Mutex<crate::matcher::prediction_book::PredictionBook>>,
-    shared_market_tracker: Arc<Mutex<crate::matcher::prediction_tracker::MarketTracker>>,
-    shared_dca_book: Arc<Mutex<crate::matcher::dca_book::DcaBook>>,
-    shared_swap_book: Arc<Mutex<crate::matcher::swap_book::SwapBook>>,
+    shared_ifd_book: Arc<Mutex<kob_domain::ifd::IfdBook>>,
+    shared_perp_book: Arc<Mutex<kob_domain::perp_book::PerpOrderBook>>,
+    shared_perp_tracker: Arc<Mutex<kob_domain::perp_tracker::PositionTracker>>,
+    shared_lending_book: Arc<Mutex<kob_domain::lending_book::LendingBook>>,
+    shared_loan_tracker: Arc<Mutex<kob_domain::lending_tracker::LoanTracker>>,
+    shared_prediction_book: Arc<Mutex<kob_domain::prediction_book::PredictionBook>>,
+    shared_market_tracker: Arc<Mutex<kob_domain::prediction_tracker::MarketTracker>>,
+    shared_dca_book: Arc<Mutex<kob_domain::dca_book::DcaBook>>,
+    shared_swap_book: Arc<Mutex<kob_domain::swap_book::SwapBook>>,
 ) {
     info!("======================================================================");
     info!("KOB MATCHER BOT -- CONTINUOUS MODE (HARDENED)");
@@ -6561,7 +6561,7 @@ pub async fn run_continuous_with_ws(
                                     // Fee UTXO was consumed — retry up to MAX_BROADCAST_RETRIES
                                     let mut sb = shared_stop_book.lock().await;
                                     let attempts = sb.increment_broadcast_attempts(*stop_id).unwrap_or(0);
-                                    if attempts >= crate::matcher::stop_book::MAX_BROADCAST_RETRIES {
+                                    if attempts >= kob_domain::stop_book::MAX_BROADCAST_RETRIES {
                                         warn!(
                                             "[STOP] Stop order #{} exhausted {} retries (fee UTXO stale: {}). Giving up.",
                                             stop_id, attempts, err_str,
@@ -6570,7 +6570,7 @@ pub async fn run_continuous_with_ws(
                                     } else {
                                         warn!(
                                             "[STOP] Stop order #{} broadcast failed (attempt {}/{}): {} — will retry",
-                                            stop_id, attempts, crate::matcher::stop_book::MAX_BROADCAST_RETRIES, err_str,
+                                            stop_id, attempts, kob_domain::stop_book::MAX_BROADCAST_RETRIES, err_str,
                                         );
                                     }
                                 } else {
@@ -6654,7 +6654,7 @@ pub async fn run_continuous_with_ws(
             {
                 let sb = shared_stop_book.lock().await;
                 if !sb.is_empty() {
-                    if let Err(e) = crate::matcher::stop_book::save_stop_orders(&stop_orders_path, &sb) {
+                    if let Err(e) = kob_domain::stop_book::save_stop_orders(&stop_orders_path, &sb) {
                         warn!("Failed to save stop orders: {}", e);
                     }
                 }
@@ -6670,7 +6670,7 @@ pub async fn run_continuous_with_ws(
             {
                 let ib = shared_ifd_book.lock().await;
                 if !ib.is_empty() {
-                    if let Err(e) = crate::matcher::ifd::save_ifd_rules(&ifd_path, &ib) {
+                    if let Err(e) = kob_domain::ifd::save_ifd_rules(&ifd_path, &ib) {
                         warn!("Failed to save IFD rules: {}", e);
                     }
                 }
@@ -6722,7 +6722,7 @@ pub async fn run_continuous_with_ws(
     {
         let sb = shared_stop_book.lock().await;
         if !sb.is_empty() {
-            if let Err(e) = crate::matcher::stop_book::save_stop_orders(&stop_orders_path, &sb) {
+            if let Err(e) = kob_domain::stop_book::save_stop_orders(&stop_orders_path, &sb) {
                 warn!("Failed to save stop orders on shutdown: {}", e);
             }
         }
@@ -6738,7 +6738,7 @@ pub async fn run_continuous_with_ws(
     {
         let ib = shared_ifd_book.lock().await;
         if !ib.is_empty() {
-            if let Err(e) = crate::matcher::ifd::save_ifd_rules(&ifd_path, &ib) {
+            if let Err(e) = kob_domain::ifd::save_ifd_rules(&ifd_path, &ib) {
                 warn!("Failed to save IFD rules on shutdown: {}", e);
             }
         }
@@ -7029,8 +7029,8 @@ mod tests {
 
     // L1 Scanner Integration Tests
 
-    use crate::matcher::order_book::BookOrder;
-    use crate::matcher::scanner::{TxInputData, TxOutputData};
+    use kob_domain::order_book::BookOrder;
+    use crate::chain::scanner::{TxInputData, TxOutputData};
 
     /// Build a mock deploy TX with P2SH + payload for a KOB order.
     fn make_deploy_tx(tx_id: &str, rs: &[u8], p2sh_value: u64) -> TransactionData {
@@ -7490,7 +7490,7 @@ mod tests {
     // stale v0-style deploys from recycling through per-offender cooldown.
     #[test]
     fn indexer_filter_skips_order_without_counterparty_spk() {
-        let make = |spk: Option<String>| crate::matcher::order_book::BookOrder {
+        let make = |spk: Option<String>| kob_domain::order_book::BookOrder {
             tx_id: "a".repeat(64),
             index: 0,
             value: 10_000_000,
@@ -7532,10 +7532,10 @@ mod tests {
     /// (simulating a client following `/pairs` -> `/trades?pair=...`).
     #[tokio::test]
     async fn pair_id_from_order_book_resolves_in_trade_log() {
-        use crate::matcher::api::SharedState;
-        use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
-        use crate::matcher::stop_book::StopOrderBook;
-        use crate::matcher::trailing_stop::TrailingStopBook;
+        use crate::api::SharedState;
+        use kob_domain::order_book::{BookOrder, OrderBook, OrderSide};
+        use kob_domain::stop_book::StopOrderBook;
+        use kob_domain::trailing_stop::TrailingStopBook;
 
         let token_cov_id = "ab".repeat(32); // 64-hex, matches a real token_cov_id shape
 
@@ -7608,11 +7608,11 @@ mod tests {
 
     #[tokio::test]
     async fn record_trade_populates_trade_log_and_candles() {
-        use crate::matcher::api::SharedState;
-        use crate::matcher::candle::Interval;
-        use crate::matcher::order_book::OrderBook;
-        use crate::matcher::stop_book::StopOrderBook;
-        use crate::matcher::trailing_stop::TrailingStopBook;
+        use crate::api::SharedState;
+        use crate::reporting::candle::Interval;
+        use kob_domain::order_book::OrderBook;
+        use kob_domain::stop_book::StopOrderBook;
+        use kob_domain::trailing_stop::TrailingStopBook;
 
         let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
         let ob = Arc::new(Mutex::new(OrderBook::new()));
@@ -7665,10 +7665,10 @@ mod tests {
 
     #[tokio::test]
     async fn record_trade_broadcasts_ws_events() {
-        use crate::matcher::api::SharedState;
-        use crate::matcher::order_book::OrderBook;
-        use crate::matcher::stop_book::StopOrderBook;
-        use crate::matcher::trailing_stop::TrailingStopBook;
+        use crate::api::SharedState;
+        use kob_domain::order_book::OrderBook;
+        use kob_domain::stop_book::StopOrderBook;
+        use kob_domain::trailing_stop::TrailingStopBook;
 
         let (ws_tx, mut ws_rx) = tokio::sync::broadcast::channel(100);
         let ob = Arc::new(Mutex::new(OrderBook::new()));
@@ -7729,10 +7729,10 @@ mod tests {
     /// counter across the sells loop, continued into the buys loop.
     #[tokio::test]
     async fn v17_sweep_n_legs_yield_n_distinct_trade_ids() {
-        use crate::matcher::api::SharedState;
-        use crate::matcher::order_book::OrderBook;
-        use crate::matcher::stop_book::StopOrderBook;
-        use crate::matcher::trailing_stop::TrailingStopBook;
+        use crate::api::SharedState;
+        use kob_domain::order_book::OrderBook;
+        use kob_domain::stop_book::StopOrderBook;
+        use kob_domain::trailing_stop::TrailingStopBook;
 
         let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
         let ob = Arc::new(Mutex::new(OrderBook::new()));
@@ -7779,10 +7779,10 @@ mod tests {
     /// agree on the same snapshot.
     #[tokio::test]
     async fn update_sync_snapshot_writes_state_the_api_can_read() {
-        use crate::matcher::api::SharedState;
-        use crate::matcher::order_book::OrderBook;
-        use crate::matcher::stop_book::StopOrderBook;
-        use crate::matcher::trailing_stop::TrailingStopBook;
+        use crate::api::SharedState;
+        use kob_domain::order_book::OrderBook;
+        use kob_domain::stop_book::StopOrderBook;
+        use kob_domain::trailing_stop::TrailingStopBook;
 
         let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
         let ob = Arc::new(Mutex::new(OrderBook::new()));
@@ -7805,10 +7805,10 @@ mod tests {
     /// have flagged the documented catch-up-hangs failure mode.
     #[tokio::test]
     async fn update_sync_snapshot_reports_large_lag_as_not_caught_up() {
-        use crate::matcher::api::SharedState;
-        use crate::matcher::order_book::OrderBook;
-        use crate::matcher::stop_book::StopOrderBook;
-        use crate::matcher::trailing_stop::TrailingStopBook;
+        use crate::api::SharedState;
+        use kob_domain::order_book::OrderBook;
+        use kob_domain::stop_book::StopOrderBook;
+        use kob_domain::trailing_stop::TrailingStopBook;
 
         let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
         let ob = Arc::new(Mutex::new(OrderBook::new()));
@@ -7822,14 +7822,14 @@ mod tests {
             let s = shared.read().await;
             assert_eq!(s.sync.lag_blocks(), 4900);
             assert!(!s.sync.caught_up(10));
-            assert_eq!(s.sync.scanning_state, crate::matcher::api::ScanningState::CatchingUp);
+            assert_eq!(s.sync.scanning_state, crate::api::ScanningState::CatchingUp);
         }
 
         // A second update with the SAME cursor (no progress) must flip to
         // Stalled -- the exact signal for a hung getBlocks catch-up.
         update_sync_snapshot(Some(&shared), 100, "stuck_hash", 5000, true).await;
         let s = shared.read().await;
-        assert_eq!(s.sync.scanning_state, crate::matcher::api::ScanningState::Stalled);
+        assert_eq!(s.sync.scanning_state, crate::api::ScanningState::Stalled);
     }
 
     #[tokio::test]
@@ -7840,12 +7840,12 @@ mod tests {
 
     // H3-TRADES: confirmation-time durable persistence + reorg-retract
 
-    fn h3_test_shared_state_with_history() -> (AppState, Arc<crate::matcher::history::HistoryStore>) {
-        use crate::matcher::api::SharedState;
-        use crate::matcher::order_book::OrderBook;
-        use crate::matcher::stop_book::StopOrderBook;
-        use crate::matcher::trailing_stop::TrailingStopBook;
-        use crate::matcher::history::HistoryStore;
+    fn h3_test_shared_state_with_history() -> (AppState, Arc<crate::storage::history::HistoryStore>) {
+        use crate::api::SharedState;
+        use kob_domain::order_book::OrderBook;
+        use kob_domain::stop_book::StopOrderBook;
+        use kob_domain::trailing_stop::TrailingStopBook;
+        use crate::storage::history::HistoryStore;
 
         let (ws_tx, _ws_rx) = tokio::sync::broadcast::channel(100);
         let ob = Arc::new(Mutex::new(OrderBook::new()));
@@ -7861,7 +7861,7 @@ mod tests {
     }
 
     fn h3_pair_id(token_cov_id: &str) -> String {
-        crate::matcher::trades::canonical_pair_id(token_cov_id)
+        crate::reporting::trades::canonical_pair_id(token_cov_id)
     }
 
     /// Submission-time `record_trade` must NOT write to the durable ledger:
@@ -7975,7 +7975,7 @@ mod tests {
 
     #[test]
     fn ifd_fill_context_creation_from_active_rule() {
-        use crate::matcher::ifd::*;
+        use kob_domain::ifd::*;
 
         let mut book = IfdBook::new();
         let rule = IfdRule {
@@ -8031,7 +8031,7 @@ mod tests {
 
     #[test]
     fn ifd_fill_context_none_when_no_rule() {
-        use crate::matcher::ifd::*;
+        use kob_domain::ifd::*;
 
         let book = IfdBook::new();
         let result = book.find_by_a_outpoint("nonexistent:0");
@@ -8040,7 +8040,7 @@ mod tests {
 
     #[test]
     fn ifd_fill_context_none_when_pending() {
-        use crate::matcher::ifd::*;
+        use kob_domain::ifd::*;
 
         let mut book = IfdBook::new();
         let rule = IfdRule {
@@ -8083,7 +8083,7 @@ mod tests {
 
     #[test]
     fn ifd_trigger_after_fill() {
-        use crate::matcher::ifd::*;
+        use kob_domain::ifd::*;
 
         let mut book = IfdBook::new();
         let rule = IfdRule {
@@ -8184,7 +8184,7 @@ mod tests {
 
     #[test]
     fn ifd_submit_payload_includes_tx_payload() {
-        use crate::matcher::deploy;
+        use crate::chain::deploy;
 
         let rs_hex = hex::encode(&[0xde, 0xad]);
         let kob_payload = kob_core::contract::build_order_payload_full(
@@ -8212,7 +8212,7 @@ mod tests {
 
     #[test]
     fn ifd_submit_payload_empty_when_no_ifd() {
-        use crate::matcher::deploy;
+        use crate::chain::deploy;
 
         let outputs = vec![
             deploy::build_rpc_output(100_000, 0, &"aa".repeat(35)),
@@ -8231,7 +8231,7 @@ mod tests {
 
     #[test]
     fn ifd_fill_context_skips_triggered_rule() {
-        use crate::matcher::ifd::*;
+        use kob_domain::ifd::*;
 
         let mut book = IfdBook::new();
         let rule = IfdRule {
@@ -8279,7 +8279,7 @@ mod tests {
 
     #[test]
     fn ifd_sell_side_lookup_by_outpoint() {
-        use crate::matcher::ifd::*;
+        use kob_domain::ifd::*;
 
         // Test that IFD works for sell-side orders too (sell A -> buy B)
         let mut book = IfdBook::new();
@@ -8336,7 +8336,7 @@ mod tests {
 
     #[test]
     fn reorg_tracker_basic_record_and_rollback() {
-        use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+        use kob_domain::order_book::{BookOrder, OrderBook, OrderSide};
 
         let mut tracker = ReorgTracker::new();
         let mut ob = OrderBook::new();
@@ -8394,7 +8394,7 @@ mod tests {
 
     #[test]
     fn reorg_tracker_restores_spent_orders() {
-        use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+        use kob_domain::order_book::{BookOrder, OrderBook, OrderSide};
 
         let mut tracker = ReorgTracker::new();
         let mut ob = OrderBook::new();
@@ -8540,7 +8540,7 @@ mod tests {
 
     #[test]
     fn reorg_tracker_deep_reorg_multiple_blocks() {
-        use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+        use kob_domain::order_book::{BookOrder, OrderBook, OrderSide};
 
         let mut tracker = ReorgTracker::new();
         let mut ob = OrderBook::new();
@@ -8647,8 +8647,8 @@ mod tests {
     // v18 wiring: version mapping, bracket meta, planner routing, ring TX
     // ===================================================================
 
-    fn book_order(side: OrderSide, rs: Vec<u8>, value: u64) -> crate::matcher::order_book::BookOrder {
-        crate::matcher::order_book::BookOrder {
+    fn book_order(side: OrderSide, rs: Vec<u8>, value: u64) -> kob_domain::order_book::BookOrder {
+        kob_domain::order_book::BookOrder {
             tx_id: "ab".repeat(32),
             index: 0,
             value,
@@ -8729,7 +8729,7 @@ mod tests {
         let sell = book_order_to_batch_order(&sell_bo, "TEST").unwrap();
         assert_eq!(buy.version, 18);
         assert_eq!(sell.version, 18);
-        let plan = crate::matcher::batch::plan_ioc_match(
+        let plan = kob_domain::batch::plan_ioc_match(
             &[sell], &buy, Some(("77".repeat(32), 0, 10_000_000)),
             &vec![0xBB; 34], 0, Some(30),
         ).expect("v18 IOC plan from engine-converted orders");
@@ -8756,7 +8756,7 @@ mod tests {
             let rs = kob_core::contract::spot::swap::build_swap_redeem_script(
                 &src, &tgt, 1_000_000, &[0xBB; 32], &spk_hash, &[0xEE; 32], 1000,
             ).unwrap();
-            crate::matcher::batch::RingLegOrder {
+            kob_domain::batch::RingLegOrder {
                 outpoint: (hex::encode([id; 32]), 0),
                 redeem_script: rs,
                 utxo_value: amount,
@@ -8770,7 +8770,7 @@ mod tests {
             make_leg(0x01, tok_a, tok_b, 50_000_000, 0x71),
             make_leg(0x02, tok_b, tok_a, 60_000_000, 0x72),
         ];
-        let plan = crate::matcher::batch::plan_ring_match(
+        let plan = kob_domain::batch::plan_ring_match(
             &legs, Some(("99".repeat(32), 1, 5_000_000)), &vec![0xCC; 34], 0,
         ).expect("ring plan");
         assert!(plan.matcher_surplus > 0, "cap-100bps legs must yield a skim");
@@ -8960,7 +8960,7 @@ mod tests {
     // H-3: Sell orders with zero token_cov_id are skipped in process_block_txs
     #[test]
     fn process_block_txs_skips_sell_with_zero_token_cov_id() {
-        use crate::matcher::scanner::{BlockScanner, TransactionData, TxInputData, TxOutputData};
+        use crate::chain::scanner::{BlockScanner, TransactionData, TxInputData, TxOutputData};
 
         // Build a real sell v13 RS (token_cov_id not in RS -> parsed as [0;32])
         let pnum: u64 = 5;
@@ -9007,7 +9007,7 @@ mod tests {
 
     #[test]
     fn m7_process_block_txs_dedup_prevents_double_add() {
-        use crate::matcher::scanner::{BlockScanner, TransactionData, TxInputData, TxOutputData};
+        use crate::chain::scanner::{BlockScanner, TransactionData, TxInputData, TxOutputData};
 
         // Build a real buy v8 RS
         let tcid = [0xAA; 32];

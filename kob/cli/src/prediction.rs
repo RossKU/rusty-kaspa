@@ -24,10 +24,10 @@ use kob_core::MIN_UTXO_VALUE;
 use std::path::Path;
 use tracing::info;
 
-use kob_engine::matcher::prediction_book::{
+use kob_domain::prediction_book::{
     BallotBoxEntry, BallotSide, RedemptionEntry, SplitMergeEntry,
 };
-use kob_engine::matcher::prediction_executor::{
+use kob_domain::prediction_executor::{
     build_create_market_tx, build_deploy_redemption_tx, build_expire_ballot_tx,
     build_merge_tx, build_redeem_tx, build_refund_redemption_tx,
     build_refund_split_merge_tx, build_settle_tx, build_split_tx, build_vote_tx,

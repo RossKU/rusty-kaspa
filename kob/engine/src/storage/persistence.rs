@@ -5,7 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use crate::matcher::order_book::{BookOrder, OrderBook, OrderSide};
+use kob_domain::order_book::{BookOrder, OrderBook, OrderSide};
 use crate::rpc::RpcClient;
 use serde::{Deserialize, Serialize};
 
@@ -502,7 +502,7 @@ fn p2sh_to_address(spk: &[u8], prefix: &str) -> String {
 // Perp book persistence
 
 /// Save the perp order book to a JSON file (atomic write).
-pub fn save_perp_book(path: &str, book: &crate::matcher::perp_book::PerpOrderBook) -> Result<(), String> {
+pub fn save_perp_book(path: &str, book: &kob_domain::perp_book::PerpOrderBook) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&book.to_json()).map_err(|e| e.to_string())?;
     let tmp_path = format!("{}.tmp", path);
     std::fs::write(&tmp_path, &json)
@@ -514,17 +514,17 @@ pub fn save_perp_book(path: &str, book: &crate::matcher::perp_book::PerpOrderBoo
 }
 
 /// Load the perp order book from a JSON file.
-pub fn load_perp_book(path: &str) -> Result<crate::matcher::perp_book::PerpOrderBook, String> {
+pub fn load_perp_book(path: &str) -> Result<kob_domain::perp_book::PerpOrderBook, String> {
     let path_ref = std::path::Path::new(path);
     if !path_ref.exists() {
         info!("[PERP BOOK] No persisted file found at {}", path);
-        return Ok(crate::matcher::perp_book::PerpOrderBook::new());
+        return Ok(kob_domain::perp_book::PerpOrderBook::new());
     }
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path, e))?;
     let json: serde_json::Value = serde_json::from_str(&data)
         .map_err(|e| format!("Failed to parse {}: {}", path, e))?;
-    let book = crate::matcher::perp_book::PerpOrderBook::from_json(&json)
+    let book = kob_domain::perp_book::PerpOrderBook::from_json(&json)
         .ok_or_else(|| format!("Invalid perp book JSON structure in {}", path))?;
     info!("[PERP BOOK] Loaded from {} ({} longs, {} shorts)", path, book.long_count(), book.short_count());
     Ok(book)
@@ -533,7 +533,7 @@ pub fn load_perp_book(path: &str) -> Result<crate::matcher::perp_book::PerpOrder
 // Lending book persistence
 
 /// Save the lending order book to a JSON file (atomic write).
-pub fn save_lending_book(path: &str, book: &crate::matcher::lending_book::LendingBook) -> Result<(), String> {
+pub fn save_lending_book(path: &str, book: &kob_domain::lending_book::LendingBook) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&book.to_json()).map_err(|e| e.to_string())?;
     let tmp_path = format!("{}.tmp", path);
     std::fs::write(&tmp_path, &json)
@@ -545,17 +545,17 @@ pub fn save_lending_book(path: &str, book: &crate::matcher::lending_book::Lendin
 }
 
 /// Load the lending order book from a JSON file.
-pub fn load_lending_book(path: &str) -> Result<crate::matcher::lending_book::LendingBook, String> {
+pub fn load_lending_book(path: &str) -> Result<kob_domain::lending_book::LendingBook, String> {
     let path_ref = std::path::Path::new(path);
     if !path_ref.exists() {
         info!("[LENDING BOOK] No persisted file found at {}", path);
-        return Ok(crate::matcher::lending_book::LendingBook::new());
+        return Ok(kob_domain::lending_book::LendingBook::new());
     }
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path, e))?;
     let json: serde_json::Value = serde_json::from_str(&data)
         .map_err(|e| format!("Failed to parse {}: {}", path, e))?;
-    let book = crate::matcher::lending_book::LendingBook::from_json(&json)
+    let book = kob_domain::lending_book::LendingBook::from_json(&json)
         .ok_or_else(|| format!("Invalid lending book JSON structure in {}", path))?;
     info!("[LENDING BOOK] Loaded from {} ({} offers, {} requests)", path, book.offer_count(), book.request_count());
     Ok(book)
@@ -564,7 +564,7 @@ pub fn load_lending_book(path: &str) -> Result<crate::matcher::lending_book::Len
 // Prediction book persistence
 
 /// Save the prediction book to a JSON file (atomic write).
-pub fn save_prediction_book(path: &str, book: &crate::matcher::prediction_book::PredictionBook) -> Result<(), String> {
+pub fn save_prediction_book(path: &str, book: &kob_domain::prediction_book::PredictionBook) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&book.to_json()).map_err(|e| e.to_string())?;
     let tmp_path = format!("{}.tmp", path);
     std::fs::write(&tmp_path, &json)
@@ -576,17 +576,17 @@ pub fn save_prediction_book(path: &str, book: &crate::matcher::prediction_book::
 }
 
 /// Load the prediction book from a JSON file.
-pub fn load_prediction_book(path: &str) -> Result<crate::matcher::prediction_book::PredictionBook, String> {
+pub fn load_prediction_book(path: &str) -> Result<kob_domain::prediction_book::PredictionBook, String> {
     let path_ref = std::path::Path::new(path);
     if !path_ref.exists() {
         info!("[PREDICTION BOOK] No persisted file found at {}", path);
-        return Ok(crate::matcher::prediction_book::PredictionBook::new());
+        return Ok(kob_domain::prediction_book::PredictionBook::new());
     }
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path, e))?;
     let json: serde_json::Value = serde_json::from_str(&data)
         .map_err(|e| format!("Failed to parse {}: {}", path, e))?;
-    let book = crate::matcher::prediction_book::PredictionBook::from_json(&json)
+    let book = kob_domain::prediction_book::PredictionBook::from_json(&json)
         .ok_or_else(|| format!("Invalid prediction book JSON structure in {}", path))?;
     info!("[PREDICTION BOOK] Loaded from {} ({} markets)", path, book.market_count());
     Ok(book)
@@ -595,7 +595,7 @@ pub fn load_prediction_book(path: &str) -> Result<crate::matcher::prediction_boo
 // Swap book persistence
 
 /// Save the swap book to a JSON file (atomic write).
-pub fn save_swap_book(path: &str, book: &crate::matcher::swap_book::SwapBook) -> Result<(), String> {
+pub fn save_swap_book(path: &str, book: &kob_domain::swap_book::SwapBook) -> Result<(), String> {
     let json = serde_json::to_string_pretty(&book.to_json()).map_err(|e| e.to_string())?;
     let tmp_path = format!("{}.tmp", path);
     std::fs::write(&tmp_path, &json)
@@ -607,17 +607,17 @@ pub fn save_swap_book(path: &str, book: &crate::matcher::swap_book::SwapBook) ->
 }
 
 /// Load the swap book from a JSON file.
-pub fn load_swap_book(path: &str) -> Result<crate::matcher::swap_book::SwapBook, String> {
+pub fn load_swap_book(path: &str) -> Result<kob_domain::swap_book::SwapBook, String> {
     let path_ref = std::path::Path::new(path);
     if !path_ref.exists() {
         info!("[SWAP BOOK] No persisted file found at {}", path);
-        return Ok(crate::matcher::swap_book::SwapBook::new());
+        return Ok(kob_domain::swap_book::SwapBook::new());
     }
     let data = std::fs::read_to_string(path)
         .map_err(|e| format!("Failed to read {}: {}", path, e))?;
     let json: serde_json::Value = serde_json::from_str(&data)
         .map_err(|e| format!("Failed to parse {}: {}", path, e))?;
-    let book = crate::matcher::swap_book::SwapBook::from_json(&json)
+    let book = kob_domain::swap_book::SwapBook::from_json(&json)
         .ok_or_else(|| format!("Invalid swap book JSON structure in {}", path))?;
     info!("[SWAP BOOK] Loaded from {} ({} entries)", path, book.len());
     Ok(book)

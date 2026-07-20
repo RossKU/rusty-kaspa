@@ -143,6 +143,11 @@ struct MintCfg {
     current_cap: u64,
     minted_this_epoch: u64,
     epoch_start_daa: u64,
+    // FIX 1 (2026-07-20, timelock-griefing hardening): this coin's own live
+    // pending_since_daa. Honest default is the sentinel 0 (no announcement
+    // pending, matching pending_cap == current_cap above) -- MINT must carry
+    // it forward unchanged, exactly like pending_cap.
+    pending_since_daa: u64,
 
     // The DAA score OpTxInputDaaScore reads for "now" -- the spent UTXO
     // entry's own recorded block_daa_score (see this module's top doc).
@@ -161,6 +166,7 @@ struct MintCfg {
     successor_running_supply: Option<u64>,   // None == running_supply + mint_amount
     successor_cap: Option<u64>,              // None == current_cap (unchanged)
     successor_pending_cap: Option<u64>,      // None == current_cap (unchanged, sentinel)
+    successor_pending_since_daa: Option<u64>, // None == pending_since_daa (unchanged, FIX 1)
     successor_minted_this_epoch: Option<u64>, // None == honest G5 formula
     successor_epoch_start_daa: Option<u64>,  // None == honest G5 formula
     successor_ops_seed: Option<u8>,          // None == ops_seed (tampers the baked body/suffix)
@@ -218,6 +224,7 @@ impl MintCfg {
             current_cap: 1_000_000_000,
             minted_this_epoch: 0,
             epoch_start_daa: 0,
+            pending_since_daa: 0, // sentinel: no announcement pending
             input_daa_score: 0,
             mint_amount: MIN_MINT_AMOUNT, // exactly the G5 dust floor
             recipient_seed: 30,
@@ -226,6 +233,7 @@ impl MintCfg {
             successor_running_supply: None,
             successor_cap: None,
             successor_pending_cap: None,
+            successor_pending_since_daa: None,
             successor_minted_this_epoch: None,
             successor_epoch_start_daa: None,
             successor_ops_seed: None,
@@ -265,6 +273,7 @@ fn build(cfg: &MintCfg) -> Built {
         cfg.epoch_start_daa,
         cfg.current_cap,
         cfg.current_cap, // pending_cap sentinel (no announcement pending)
+        cfg.pending_since_daa,
         &mint_pub,
         &cap_pubs,
         &ops_pub,
@@ -285,6 +294,10 @@ fn build(cfg: &MintCfg) -> Built {
     let new_running_supply = cfg.successor_running_supply.unwrap_or(honest_new_running_supply);
     let successor_cap = cfg.successor_cap.unwrap_or(cfg.current_cap);
     let successor_pending_cap = cfg.successor_pending_cap.unwrap_or(cfg.current_cap);
+    // FIX 1: MINT must carry pending_since_daa forward UNCHANGED (this is
+    // the invariant that makes interleaved mints unable to reset
+    // ACTIVATE_CAP's timelock clock).
+    let successor_pending_since_daa = cfg.successor_pending_since_daa.unwrap_or(cfg.pending_since_daa);
 
     // Honest G5 epoch-budget formula (mirrors epoch_budget_block's on-chain
     // logic exactly, so any cfg combination self-consistently produces the
@@ -303,6 +316,7 @@ fn build(cfg: &MintCfg) -> Built {
         new_epoch_start_daa,
         successor_cap,
         successor_pending_cap,
+        successor_pending_since_daa,
         &mint_pub,
         &cap_pubs,
         &successor_ops_pub,
@@ -498,6 +512,25 @@ fn mint_pending_cap_altered_rejected() {
     // the 2026-07-20 5-field state layout.
     let honest = MintCfg::honest();
     let cfg = MintCfg { successor_pending_cap: Some(honest.current_cap + 1), ..honest };
+    let res = run(&build(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn mint_pending_since_daa_altered_rejected() {
+    // FIX 1 (2026-07-20 timelock-griefing hardening) regression: MINT must
+    // carry pending_since_daa forward BYTE-IDENTICAL too, exactly like
+    // pending_cap -- this is the on-chain proof that a hot mint_pubkey
+    // holder cannot reset ACTIVATE_CAP's timelock clock by minting: even a
+    // successor that changes pending_since_daa by exactly 1 (from a
+    // realistic nonzero starting value, simulating "a MINT happening after
+    // an ANNOUNCE_CAP") must be REJECTED. Combined with
+    // `activate_cap_rejects_after_interleaved_mint_within_window` (which
+    // proves ACTIVATE_CAP measures its deadline purely from old_rs's
+    // pending_since_daa field), this composes into the full griefing-fix
+    // proof.
+    let honest = MintCfg { pending_since_daa: 500, ..MintCfg::honest() };
+    let cfg = MintCfg { successor_pending_since_daa: Some(honest.pending_since_daa + 1), ..honest };
     let res = run(&build(&cfg));
     assert_rejected_with(&res, "VerifyError");
 }
@@ -730,10 +763,22 @@ struct AnnounceCapCfg {
     minted_this_epoch: u64,
     epoch_start_daa: u64,
     current_cap: u64,
+    // FIX 1 (2026-07-20): this coin's own live pending_since_daa. Honest
+    // default is the sentinel 0 (matches pending_cap == current_cap above).
+    pending_since_daa: u64,
 
     // The announcement itself: the new ceiling both pushed via the sigscript
     // and folded into the attested pre-image.
     new_pending_cap: u64,
+
+    // FIX 1: the DAA score OpTxInputDaaScore reads for this ANNOUNCE_CAP
+    // input's own UTXO entry -- the branch stamps the successor's
+    // pending_since_daa with exactly this value. Nonzero by default (500)
+    // deliberately, so it is textually distinguishable from the sentinel 0
+    // in test failure output/derived fixtures (see
+    // `activate_cap_rejects_after_interleaved_mint_within_window`'s doc for
+    // why the sentinel/real-DAA-score-0 ambiguity matters).
+    announce_input_daa_score: u64,
 
     self_in_value: u64,
     self_out_value: u64,
@@ -742,6 +787,7 @@ struct AnnounceCapCfg {
     successor_running_supply: Option<u64>,
     successor_current_cap: Option<u64>,   // None == current_cap (unchanged)
     successor_pending_cap: Option<u64>,   // None == new_pending_cap (the honest announcement)
+    successor_pending_since_daa: Option<u64>, // None == announce_input_daa_score (the honest G4 stamp, FIX 1)
     successor_ops_seed: Option<u8>,
 
     attest_outpoint_txid_seed: Option<u8>,
@@ -771,12 +817,15 @@ impl AnnounceCapCfg {
             minted_this_epoch: 0,
             epoch_start_daa: 0,
             current_cap: 1_000_000,
+            pending_since_daa: 0, // sentinel: no prior announcement
             new_pending_cap: 2_000_000, // == current_cap * DEFAULT_K exactly (the G4 ceiling boundary)
+            announce_input_daa_score: 500,
             self_in_value: IN_AMOUNT,
             self_out_value: IN_AMOUNT,
             successor_running_supply: None,
             successor_current_cap: None,
             successor_pending_cap: None,
+            successor_pending_since_daa: None,
             successor_ops_seed: None,
             attest_outpoint_txid_seed: None,
             signer_seeds: [Some(70), Some(71), Some(72)],
@@ -801,6 +850,7 @@ fn build_announce_cap(cfg: &AnnounceCapCfg) -> Built {
         cfg.epoch_start_daa,
         cfg.current_cap,
         cfg.current_cap, // pending_cap sentinel
+        cfg.pending_since_daa,
         &mint_pub,
         &cap_pubs,
         &ops_pub,
@@ -820,11 +870,13 @@ fn build_announce_cap(cfg: &AnnounceCapCfg) -> Built {
     // 1:1 successor: running_supply/minted_this_epoch/epoch_start_daa/
     // current_cap all carried forward UNCHANGED (unless a test overrides
     // them), pending_cap raised to new_pending_cap (unless a test overrides
-    // it), the baked body untouched (unless a test overrides ops_pubkey to
-    // probe the suffix check).
+    // it), pending_since_daa stamped to this input's own real DAA score
+    // (FIX 1 -- unless a test overrides it), the baked body untouched
+    // (unless a test overrides ops_pubkey to probe the suffix check).
     let successor_running_supply = cfg.successor_running_supply.unwrap_or(cfg.running_supply);
     let successor_current_cap = cfg.successor_current_cap.unwrap_or(cfg.current_cap);
     let successor_pending_cap = cfg.successor_pending_cap.unwrap_or(cfg.new_pending_cap);
+    let successor_pending_since_daa = cfg.successor_pending_since_daa.unwrap_or(cfg.announce_input_daa_score);
     let successor_ops_pub = cfg.successor_ops_seed.map(pubkey).unwrap_or(ops_pub);
     let new_rs = build_mint_authority_redeem_script(
         successor_running_supply,
@@ -832,6 +884,7 @@ fn build_announce_cap(cfg: &AnnounceCapCfg) -> Built {
         cfg.epoch_start_daa,
         successor_current_cap,
         successor_pending_cap,
+        successor_pending_since_daa,
         &mint_pub,
         &cap_pubs,
         &successor_ops_pub,
@@ -853,7 +906,9 @@ fn build_announce_cap(cfg: &AnnounceCapCfg) -> Built {
     let entries = vec![UtxoEntry {
         amount: cfg.self_in_value,
         script_public_key: input_spk,
-        block_daa_score: 0,
+        // FIX 1: OpTxInputDaaScore reads this -- the ANNOUNCE_CAP branch
+        // stamps the successor's pending_since_daa with exactly this value.
+        block_daa_score: cfg.announce_input_daa_score,
         is_coinbase: false,
         covenant_id: Some(cfg.input_cov_id),
     }];
@@ -966,6 +1021,21 @@ fn announce_cap_new_pending_cap_mismatch_attestation_rejected() {
 }
 
 #[test]
+fn announce_cap_pending_since_daa_mismatch_rejected() {
+    // FIX 1 (2026-07-20 timelock-griefing hardening) regression: the
+    // successor's pending_since_daa must equal THIS input's own real
+    // OpTxInputDaaScore (announce_input_daa_score) exactly -- neither a
+    // stale/arbitrary value nor the sentinel 0 (pretending no announcement
+    // happened) is accepted once a real announcement is in flight.
+    let honest = AnnounceCapCfg::honest();
+    let off_by_one = AnnounceCapCfg { successor_pending_since_daa: Some(honest.announce_input_daa_score + 1), ..honest.clone() };
+    assert_rejected_with(&run(&build_announce_cap(&off_by_one)), "VerifyError");
+
+    let sentinel = AnnounceCapCfg { successor_pending_since_daa: Some(0), ..honest };
+    assert_rejected_with(&run(&build_announce_cap(&sentinel)), "VerifyError");
+}
+
+#[test]
 fn announce_cap_baked_body_tampered_rejected() {
     let cfg = AnnounceCapCfg { successor_ops_seed: Some(199), ..AnnounceCapCfg::honest() };
     let res = run(&build_announce_cap(&cfg));
@@ -1032,7 +1102,7 @@ fn announce_cap_new_pending_cap_at_or_above_2pow63_rejected() {
     let genesis_cov_id: [u8; 32] = input_cov_id.as_bytes();
 
     let old_rs = build_mint_authority_redeem_script(
-        running_supply, 0, 0, current_cap, current_cap, &mint_pub, &cap_pubs, &ops_pub, &freeze_pub, &seize_pubs, &recovery_pubs,
+        running_supply, 0, 0, current_cap, current_cap, 0, &mint_pub, &cap_pubs, &ops_pub, &freeze_pub, &seize_pubs, &recovery_pubs,
         &role_registry_root, identifier_type, &genesis_cov_id, DEFAULT_K, DEFAULT_EPOCH_LEN, DEFAULT_EPOCH_BUDGET, DEFAULT_MIN_ACTIVATION_DELAY,
     );
     let input_spk = build_p2sh(&old_rs);
@@ -1041,7 +1111,13 @@ fn announce_cap_new_pending_cap_at_or_above_2pow63_rejected() {
     // the raw 2^63 pattern under test -- constructed directly via
     // `MintAuthorityStateHeader`'s public fields, bypassing `new`'s
     // debug_assert (mirrors a real attacker crafting raw wire bytes).
-    let new_state = MintAuthorityStateHeader { running_supply, minted_this_epoch: 0, epoch_start_daa: 0, current_cap, pending_cap: new_pending_cap_raw };
+    // pending_since_daa honestly matches entries[0]'s block_daa_score (0)
+    // below -- not itself under test here (FIX 1's own mismatch coverage
+    // lives in `announce_cap_pending_since_daa_mismatch_rejected`), so it's
+    // set to whatever the real ANNOUNCE_CAP branch would independently
+    // compute, keeping this test isolated to the pre-existing 2^63 check.
+    let new_state =
+        MintAuthorityStateHeader { running_supply, minted_this_epoch: 0, epoch_start_daa: 0, current_cap, pending_cap: new_pending_cap_raw, pending_since_daa: 0 };
     let mut new_rs = new_state.encode_script();
     new_rs.extend_from_slice(&build_mint_authority_body(
         &mint_pub, &cap_pubs, &ops_pub, &freeze_pub, &seize_pubs, &recovery_pubs, &role_registry_root, identifier_type, &genesis_cov_id,
@@ -1087,10 +1163,16 @@ fn announce_cap_new_pending_cap_at_or_above_2pow63_rejected() {
 // ============================================================================
 // 4. ACTIVATE_CAP (`op_type = 0x02`, new 2026-07-20) -- happy path +
 //    adversarial batch. PERMISSIONLESS (no signatures at all,
-//    `sig_op_count = 0`): gated purely by a CSV timelock
-//    (`OpCheckSequenceVerify`) and the on-chain checks that the successor's
-//    `current_cap` AND `pending_cap` both equal this coin's own
-//    already-announced `pending_cap`.
+//    `sig_op_count = 0`): gated by FIX 1's STATE-ANCHORED timelock
+//    (`old_rs.pending_since_daa + min_activation_delay_daa <=
+//    OpTxInputDaaScore` of the activating input -- REPLACING an earlier CSV
+//    `OpCheckSequenceVerify` design that was griefable: CSV enforces its
+//    floor against the SELF-CONTINUING UTXO's own `block_daa_score`, which
+//    every routine MINT re-stamps, so a hot mint key could mint dust once
+//    per window to reset the clock and block activation forever) and the
+//    on-chain checks that the successor's `current_cap` AND `pending_cap`
+//    both equal this coin's own already-announced `pending_cap`, with
+//    `pending_since_daa` reset to the sentinel `0`.
 // ============================================================================
 
 #[derive(Clone)]
@@ -1120,18 +1202,31 @@ struct ActivateCapCfg {
     epoch_start_daa: u64,
     current_cap: u64,
     pending_cap: u64,
+    // FIX 1: the DAA score at which the (already-landed) ANNOUNCE_CAP this
+    // is promoting really happened -- old_rs's own pending_since_daa.
+    // Nonzero by default (500) deliberately: 0 is also the sentinel "no
+    // announcement pending" value, so using a real nonzero DAA score here
+    // keeps this fixture unambiguous (an announcement genuinely IS
+    // pending), and lets `activate_cap_rejects_after_interleaved_mint_within_window`
+    // simulate "one or more MINTs happened between the announce and now"
+    // without colliding with the sentinel.
+    pending_since_daa: u64,
 
     self_in_value: u64,
     self_out_value: u64,
 
-    // Successor (new_rs) overrides. `None` == honest promotion (both fields
-    // become the OLD pending_cap).
+    // Successor (new_rs) overrides. `None` == honest promotion (current_cap/
+    // pending_cap both become the OLD pending_cap; pending_since_daa resets
+    // to the sentinel 0).
     successor_current_cap: Option<u64>,
     successor_pending_cap: Option<u64>,
+    successor_pending_since_daa: Option<u64>,
     successor_running_supply: Option<u64>,
 
-    // This input's sequence field -- the CSV lever under test.
-    sequence: u64,
+    // FIX 1: the DAA score OpTxInputDaaScore reads for THIS activating
+    // input's own UTXO entry -- i.e. "now". The state-anchored timelock
+    // requires `pending_since_daa + min_activation_delay_daa <= this value`.
+    activate_input_daa_score: u64,
 }
 
 impl ActivateCapCfg {
@@ -1157,12 +1252,14 @@ impl ActivateCapCfg {
             epoch_start_daa: 0,
             current_cap: 1_000_000,
             pending_cap: 2_000_000, // an ANNOUNCE_CAP already landed
+            pending_since_daa: 500, // ...at DAA 500
             self_in_value: IN_AMOUNT,
             self_out_value: IN_AMOUNT,
             successor_current_cap: None,
             successor_pending_cap: None,
+            successor_pending_since_daa: None,
             successor_running_supply: None,
-            sequence: DEFAULT_MIN_ACTIVATION_DELAY, // exactly at the CSV floor
+            activate_input_daa_score: 500 + DEFAULT_MIN_ACTIVATION_DELAY, // exactly at the timelock floor
         }
     }
 }
@@ -1186,6 +1283,7 @@ fn build_activate_cap(cfg: &ActivateCapCfg) -> Built {
         cfg.epoch_start_daa,
         cfg.current_cap,
         cfg.pending_cap,
+        cfg.pending_since_daa,
         &mint_pub,
         &cap_pubs,
         &ops_pub,
@@ -1203,16 +1301,19 @@ fn build_activate_cap(cfg: &ActivateCapCfg) -> Built {
     let input_spk = build_p2sh(&old_rs);
 
     // Honest promotion: BOTH current_cap and pending_cap become the OLD
-    // pending_cap (the sentinel invariant restored: current_cap == pending_cap).
+    // pending_cap (the sentinel invariant restored: current_cap ==
+    // pending_cap), and pending_since_daa resets to the sentinel 0.
     let successor_running_supply = cfg.successor_running_supply.unwrap_or(cfg.running_supply);
     let successor_current_cap = cfg.successor_current_cap.unwrap_or(cfg.pending_cap);
     let successor_pending_cap = cfg.successor_pending_cap.unwrap_or(cfg.pending_cap);
+    let successor_pending_since_daa = cfg.successor_pending_since_daa.unwrap_or(0);
     let new_rs = build_mint_authority_redeem_script(
         successor_running_supply,
         cfg.minted_this_epoch,
         cfg.epoch_start_daa,
         successor_current_cap,
         successor_pending_cap,
+        successor_pending_since_daa,
         &mint_pub,
         &cap_pubs,
         &ops_pub,
@@ -1234,42 +1335,91 @@ fn build_activate_cap(cfg: &ActivateCapCfg) -> Built {
     let entries = vec![UtxoEntry {
         amount: cfg.self_in_value,
         script_public_key: input_spk,
-        block_daa_score: 0,
+        // FIX 1: OpTxInputDaaScore reads this -- "now" for the
+        // state-anchored timelock check.
+        block_daa_score: cfg.activate_input_daa_score,
         is_coinbase: false,
         covenant_id: Some(cfg.input_cov_id),
     }];
 
-    // No signatures at all -- permissionless.
+    // No signatures at all -- permissionless. sequence is irrelevant to this
+    // branch's verification since FIX 1 (the state-anchored timelock
+    // replaces CSV entirely, see this section's top comment) -- hardcoded 0.
     let ss = build_mint_authority_activate_cap_sigscript(&old_rs, &new_rs, &old_rs);
     // sig_op_count = 0: no OpCheckSigFromStack calls in this branch.
-    let final_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), ss, cfg.sequence, 0);
+    let final_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), ss, 0, 0);
     let tx = Transaction::new(0, vec![final_input], vec![self_output], 0, Default::default(), 0, vec![]);
     Built { tx, entries }
 }
 
 #[test]
 fn activate_cap_promotes_pending_into_current_and_resets_sentinel() {
-    // sequence at the CSV floor (== min_activation_delay_daa) must be
-    // ACCEPTED: the successor's current_cap AND pending_cap both become the
-    // OLD pending_cap (2_000_000), restoring the "no pending announcement"
-    // sentinel (current_cap == pending_cap).
+    // activate_input_daa_score at the timelock floor
+    // (pending_since_daa + min_activation_delay_daa) must be ACCEPTED: the
+    // successor's current_cap AND pending_cap both become the OLD
+    // pending_cap (2_000_000), restoring the "no pending announcement"
+    // sentinel (current_cap == pending_cap), and pending_since_daa resets to
+    // 0.
     let cfg = ActivateCapCfg::honest();
     let res = run(&build_activate_cap(&cfg));
-    assert!(res.is_ok(), "honest ACTIVATE_CAP at the CSV floor must be accepted: {res:?}");
+    assert!(res.is_ok(), "honest ACTIVATE_CAP at the timelock floor must be accepted: {res:?}");
 }
 
 #[test]
-fn activate_cap_rejects_premature_sequence() {
-    // sequence below min_activation_delay_daa must be REJECTED by
-    // OpCheckSequenceVerify at the SCRIPT level -- this is the half of the
-    // timelock guarantee exercisable in this harness (a bare TxScriptEngine
-    // with no consensus UTXO/DAA-score context); consensus's own
-    // check_sequence_lock (re-deriving the relative lock time against the
-    // spent UTXO's real, unforgeable block_daa_score) is the OTHER,
-    // out-of-scope-for-this-harness half -- see this module's top doc.
-    let cfg = ActivateCapCfg { sequence: DEFAULT_MIN_ACTIVATION_DELAY - 1, ..ActivateCapCfg::honest() };
+fn activate_cap_rejects_premature_activation() {
+    // FIX 1 regression: activate_input_daa_score one short of
+    // pending_since_daa + min_activation_delay_daa must be REJECTED by the
+    // state-anchored `OpLessThanOrEqual OpVerify` check -- the direct
+    // replacement for the old CSV `OpCheckSequenceVerify`'s
+    // `UnsatisfiedLockTime` boundary (now a generic `VerifyError`, since
+    // this is ordinary script-level arithmetic, not a dedicated timelock
+    // opcode).
+    let honest = ActivateCapCfg::honest();
+    let cfg = ActivateCapCfg { activate_input_daa_score: honest.pending_since_daa + honest.min_activation_delay_daa - 1, ..honest };
     let res = run(&build_activate_cap(&cfg));
-    assert_rejected_with(&res, "UnsatisfiedLockTime");
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn activate_cap_rejects_after_interleaved_mint_within_window() {
+    // *** THE griefing-fix proof (FIX 1, 2026-07-20). ***
+    //
+    // Scenario: ANNOUNCE_CAP happened at DAA D (old_rs.pending_since_daa ==
+    // D). A MINT then landed at D+1 -- and `mint_pending_since_daa_altered_rejected`
+    // (this file) already proves ON-CHAIN that MINT is FORCED to carry
+    // pending_since_daa forward byte-identical, so any real chain of one or
+    // more mints after the announce leaves old_rs.pending_since_daa == D
+    // untouched, regardless of the mints' own DAA scores. This fixture
+    // constructs that "post-interleaved-mint" old_rs directly (D unchanged),
+    // then activates with activate_input_daa_score == D + min_delay - 1 --
+    // one short of the window measured from D.
+    //
+    // Pre-fix (CSV), the timelock would have measured its floor against the
+    // SELF-CONTINUING UTXO's own block_daa_score, i.e. the interleaved
+    // MINT's re-stamp (~D+1), not the original announce D -- so a hot
+    // mint_pubkey holder could keep the window perpetually "just reset" by
+    // minting dust. Post-fix, the deadline is D + min_delay regardless of
+    // how many mints happened in between, so this must still be REJECTED.
+    let honest = ActivateCapCfg::honest();
+    let d = honest.pending_since_daa; // 500
+    let cfg = ActivateCapCfg { activate_input_daa_score: d + honest.min_activation_delay_daa - 1, ..honest };
+    let res = run(&build_activate_cap(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn activate_cap_accepts_after_window_despite_interleaved_mint() {
+    // Companion to `activate_cap_rejects_after_interleaved_mint_within_window`:
+    // the SAME post-interleaved-mint old_rs (pending_since_daa == D,
+    // unchanged), but activate_input_daa_score == D + min_delay exactly --
+    // must ACCEPT. Together these two tests pin that the window is measured
+    // from D (the original announce), never reset by whatever DAA an
+    // interleaved MINT actually landed at.
+    let honest = ActivateCapCfg::honest();
+    let d = honest.pending_since_daa;
+    let cfg = ActivateCapCfg { activate_input_daa_score: d + honest.min_activation_delay_daa, ..honest };
+    let res = run(&build_activate_cap(&cfg));
+    assert!(res.is_ok(), "ACTIVATE_CAP at exactly the D-anchored floor must be accepted despite an interleaved mint: {res:?}");
 }
 
 #[test]
@@ -1289,6 +1439,18 @@ fn activate_cap_pending_cap_not_reset_rejected() {
     // be rejected.
     let honest = ActivateCapCfg::honest();
     let cfg = ActivateCapCfg { successor_pending_cap: Some(honest.pending_cap + 1), ..honest };
+    let res = run(&build_activate_cap(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn activate_cap_pending_since_daa_not_reset_rejected() {
+    // FIX 1 regression: the successor's pending_since_daa must reset to the
+    // sentinel 0 -- a successor that leaves it at the old announce DAA (or
+    // any other nonzero value) violates the "no announcement pending"
+    // sentinel invariant and must be rejected.
+    let honest = ActivateCapCfg::honest();
+    let cfg = ActivateCapCfg { successor_pending_since_daa: Some(honest.pending_since_daa), ..honest };
     let res = run(&build_activate_cap(&cfg));
     assert_rejected_with(&res, "VerifyError");
 }

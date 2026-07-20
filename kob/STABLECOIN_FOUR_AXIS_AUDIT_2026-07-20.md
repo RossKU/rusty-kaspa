@@ -501,6 +501,36 @@ facilitator/online issuer oracle が **各支払いを co-sign** できる必要
 > 実装は §7.6 の推奨順で進行。各項目は実 `TxScriptEngine` 回帰テスト green を landing gate とする。
 > ビルドは `CARGO_TARGET_DIR=/root/kob-target`(exec fs、/storage は noexec)、編集後 `touch` 必須(sdcardfs stale mtime)。
 
+### 監査後是正(00/0/1/2 を landing 後の敵対監査、3面 Sonnet + 発行者 file:line/PoC 裏取り)
+実装済み 4 項目に対し **branch が見ないフィールドは何か?** メタ手法 + fund-security 観点で再監査。cross-item
+リグレッション(dispatch 6→8・mint state 18→45 relayout・N:M op_type 追加)は **3面とも clean**(engine 105 独立再走含む)。
+発見と処置:
+
+- **🔴 CRITICAL(N:M delegator OPS-gate bypass)— 修正済・push 済(`a1d71f46`)**。delegator(0x08)は owner 署名のみで
+  通り、OPS attestation も「leader が実在するか」の検証も無い(per-input 検証ゆえ position 0 の op_type は他入力から不可視)。
+  攻撃= position 0 に単一 TRANSFER(自コイン+narrow OPS)を囮、position 1 に delegator を乗せて別コインを OPS 承認なしで
+  covenant 外へ。修正= **全単一枝(TRANSFER/FREEZE/SEIZE/BURN/MIGRATE)に `OpCovInputCount(own cid)==1` を強制**
+  (net-zero)→ 同一 lineage の多入力 spend は必ず leader/delegator 経路(position 0=leader が全 sibling を会計・OPS attest)に
+  一本化。**merge 温存**(利用者提案の方式、私の split-only 案より優)。回帰テスト `transfer_nm_delegator_decoy_attack_is_rejected`
+  で囮攻撃を実 engine 再現し、guard 有効で reject・無効で ACCEPT(=攻撃実在)を確認。
+- **🟠 HIGH(ACTIVATE_CAP timelock を hot MINT 鍵で無限 grief)— 修正中**。MINT が self-continue UTXO の block_daa_score を
+  毎回更新→CSV 時計が reset され、cap-authority 承認の raise を hot 鍵単独で恒久ブロック可。修正= **activation height を state に
+  焼く**(`pending_since_daa` 新設、ANNOUNCE が OpTxInputDaaScore を刻印、MINT は不変 carry、ACTIVATE は
+  `pending_since_daa + min_delay <= now` を state 参照で判定)→ MINT は窓を後ろへ押せない。要 compromised hot 鍵ゆえ影響は限定だが
+  G4 の窓保証を破るため修正。
+- **🟡 MEDIUM(owner ≠ role 鍵を on-chain 未強制)— 記録・on-chain 強制は defer**。genesis assert のみで per-spend 未検証。
+  ただし **発行者が全経路をトレースし具体 exploit 無しと確認**: owner==role 鍵でも各操作は依然その role 鍵自身の権限を要し
+  (MIGRATE は 2 recovery 秘密が依然必要、owner==role は「発行者が自コインを所有」に帰着)、盗取・越権に至らない。role-hygiene の
+  defense-in-depth。honest deploy は genesis assert が防ぐ。on-chain per-spend 強制(8-9 baked 鍵との不一致検査×4枝)は
+  コスト対効果で次段へ。
+- **🟡 MEDIUM(N:M `outputs_digest` が SPK のみで amount 非束縛)— 記録**。OPS 単一署名は「どの SPK が group 成員か」は縛るが
+  各 successor の受領額は縛らない。ただし acc==0 conservation(実オンチェーン値・正確)+ 全署名者の SIGHASH_ALL が最終額を固定するので
+  script 単独では不正取得不能。value-split の正しさは owner 署名側の性質であって OPS attestation の性質でない旨を明記(過信防止)。
+- **🟡 MEDIUM(G5 epoch 予算は固定窓ゆえ境界跨ぎで最大 2×burst 可)— 記録**。hard cap(current_cap)は不変ゆえ上限突破でなく
+  throttle 平滑性の弱み。sliding-window 化は高コストゆえ限界として明記。
+- 安手修正(mint 側、CSV 修正と同エージェントで実施中): `build_mint_authority_body` に pairwise-distinct assert 複製 /
+  genesis `pending_cap==current_cap` assert / `min_activation_delay_daa` 上限 assert / MINT module doc の stale layout 訂正。
+
 ### ✅ 00. header opcode 認証(§6.2 新 HIGH)— **完了・live 確認済**
 - 修正: `stablecoin/body.rs` に共有ヘルパ `emit_header_opcode_authentication(b, new_rs_depth)` を新設し、
   TRANSFER(new_rs depth 3)/FREEZE(depth 6)/SEIZE(depth 7)の各枝から呼ぶ。5 つの header push-opcode

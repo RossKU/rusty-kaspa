@@ -106,7 +106,7 @@ use kob_core::contract::stablecoin::attestation::op_type as coin_op_type;
 use kob_core::contract::stablecoin::mint_authority::attestation::{
     build_announce_cap_attestation_message, build_mint_attestation_message, check_mint_amount_floor,
 };
-use kob_core::contract::stablecoin::mint_authority::body::build_mint_authority_redeem_script;
+use kob_core::contract::stablecoin::mint_authority::body::{build_mint_authority_genesis_redeem_script, build_mint_authority_redeem_script};
 use kob_core::contract::stablecoin::mint_authority::sigscript::{
     build_mint_authority_announce_cap_sigscript, build_mint_authority_mint_sigscript,
 };
@@ -646,6 +646,13 @@ impl RoleCtx {
     /// (DEPLOY genesis, MINT, and every op in this harness's flow that runs
     /// BEFORE `op_announce_cap`) pass `pending_cap == current_cap` (the "no
     /// announcement pending" sentinel -- see `state.rs`).
+    /// `pending_since_daa` (FIX 1, 2026-07-20 timelock-griefing hardening) is
+    /// the state-anchored G4 ACTIVATE_CAP timelock's announce-DAA stamp;
+    /// callers with no announcement in flight pass `0` (the sentinel,
+    /// matching `pending_cap == current_cap` above); `op_raise_cap` passes
+    /// the announcing input's own REAL, node-tracked `block_daa_score`
+    /// (fetched via RPC, see that fn) since it must match exactly what
+    /// `OpTxInputDaaScore` reads on-chain.
     /// `epoch_start_daa`/`minted_this_epoch` (G5 epoch budget) always start
     /// at 0 for a fresh epoch window; this harness's MINT step recomputes
     /// them honestly per spend (see `op_mint`).
@@ -657,6 +664,7 @@ impl RoleCtx {
         epoch_start_daa: u64,
         current_cap: u64,
         pending_cap: u64,
+        pending_since_daa: u64,
         genesis_covenant_id: &[u8; 32],
     ) -> Vec<u8> {
         build_mint_authority_redeem_script(
@@ -665,6 +673,34 @@ impl RoleCtx {
             epoch_start_daa,
             current_cap,
             pending_cap,
+            pending_since_daa,
+            &self.mint_pk,
+            &self.cap_authority_pk,
+            &self.ops_pk,
+            &self.freeze_pk,
+            &self.seize_pk,
+            &self.migrate_quorum_pk,
+            &self.root,
+            id_type::PUBKEY,
+            genesis_covenant_id,
+            CAP_RAISE_MULTIPLIER_K,
+            EPOCH_LENGTH_DAA,
+            EPOCH_MINT_BUDGET,
+            MIN_ACTIVATION_DELAY_DAA,
+        )
+    }
+
+    /// Genesis-only variant (FIX 3, 2026-07-20 audit): routes through
+    /// [`build_mint_authority_genesis_redeem_script`], which structurally
+    /// cannot express `pending_cap != current_cap` or a nonzero
+    /// `pending_since_daa` at deploy time (see that fn's doc). Used ONLY by
+    /// `deploy_tx2_authority`'s actual genesis construction -- every other
+    /// call site in this harness predicts a non-genesis (post-mint/
+    /// post-announce) successor state and must keep using [`Self::authority_rs`].
+    fn authority_genesis_rs(&self, current_cap: u64, genesis_covenant_id: &[u8; 32]) -> Vec<u8> {
+        build_mint_authority_genesis_redeem_script(
+            0, // running_supply
+            current_cap,
             &self.mint_pk,
             &self.cap_authority_pk,
             &self.ops_pk,
@@ -696,7 +732,9 @@ const EPOCH_LENGTH_DAA: u64 = 100_000_000;
 /// G5 MINT epoch sompi budget (constructor param) -- generous default so
 /// this harness's single-MINT-per-run flow never trips it.
 const EPOCH_MINT_BUDGET: u64 = u64::MAX / 4;
-/// G4 ACTIVATE_CAP CSV timelock floor in DAA blocks (constructor param).
+/// G4 ACTIVATE_CAP state-anchored timelock floor in DAA blocks (constructor
+/// param; FIX 1 2026-07-20 -- no longer a CSV floor, see
+/// `build_activate_cap_branch`'s doc).
 const MIN_ACTIVATION_DELAY_DAA: u64 = 100;
 
 // ---------------------------------------------------------------------
@@ -813,8 +851,11 @@ async fn deploy_tx2_authority(
     let wallet_spk = p2pk_script(&wallet.pubkey);
 
     // Genesis: fresh epoch window (epoch_start_daa=0, minted_this_epoch=0),
-    // pending_cap == current_cap (no ANNOUNCE_CAP in flight).
-    let authority_rs = roles.authority_rs(0, 0, 0, cap, cap, genesis_covenant_id);
+    // pending_cap == current_cap and pending_since_daa == 0 (no ANNOUNCE_CAP
+    // in flight) -- routed through the genesis-only constructor (FIX 3,
+    // 2026-07-20), which structurally guarantees this rather than merely
+    // asserting it.
+    let authority_rs = roles.authority_genesis_rs(cap, genesis_covenant_id);
     let authority_p2sh = build_p2sh(&authority_rs);
     let authority_addr = kob_cli::cancel::p2sh_to_address(authority_p2sh.script(), "kaspatest");
     println!("Mint-authority P2SH address: {}", authority_addr);
@@ -933,7 +974,17 @@ async fn op_mint(
     // either).
     let new_minted_this_epoch = mint_amount;
     let new_epoch_start_daa = 0u64;
-    let new_authority_rs = roles.authority_rs(new_running_supply, new_minted_this_epoch, new_epoch_start_daa, cap, cap, genesis_cov_id);
+    // FIX 1 (2026-07-20 timelock-griefing hardening): MINT must carry
+    // pending_since_daa forward BYTE-IDENTICAL (this is the invariant that
+    // stops a hot mint key from resetting ACTIVATE_CAP's timelock clock) --
+    // decoded from authority_rs_old's own bytes rather than assumed 0, so
+    // this stays correct even if MINT ever runs against an authority with a
+    // real announcement already in flight.
+    let old_pending_since_daa = MintAuthorityStateHeader::decode(authority_rs_old)
+        .ok_or_else(|| anyhow::anyhow!("MINT: authority_rs_old failed to decode a state header"))?
+        .pending_since_daa;
+    let new_authority_rs =
+        roles.authority_rs(new_running_supply, new_minted_this_epoch, new_epoch_start_daa, cap, cap, old_pending_since_daa, genesis_cov_id);
     let new_authority_p2sh = build_p2sh(&new_authority_rs);
     let authority_addr = kob_cli::cancel::p2sh_to_address(new_authority_p2sh.script(), "kaspatest");
     let coin_addr = kob_cli::cancel::p2sh_to_address(coin_p2sh.script(), "kaspatest");
@@ -1703,15 +1754,17 @@ struct RaiseCapResult {
     authority_value: u64,
     /// The ceiling just ANNOUNCED into `pending_cap` (G4) -- NOT yet the
     /// active `current_cap`; that promotion is a separate, permissionless,
-    /// CSV-timelocked ACTIVATE_CAP spend this harness does not submit live.
+    /// state-anchored-timelocked (FIX 1) ACTIVATE_CAP spend this harness
+    /// does not submit live.
     announced_pending_cap: u64,
 }
 
 /// RAISE_CAP (2026-07-20 G4 hardening: this is now ANNOUNCE_CAP under the
 /// hood -- `op_type = 0x01` still, but it writes `pending_cap`, NOT
 /// `current_cap`; promoting `pending_cap` into `current_cap` is a SEPARATE,
-/// permissionless, CSV-timelocked `ACTIVATE_CAP` spend this harness does not
-/// (yet) submit live -- see `MIN_ACTIVATION_DELAY_DAA`'s doc): a cold 2-of-3
+/// permissionless, state-anchored-timelocked (FIX 1) `ACTIVATE_CAP` spend
+/// this harness does not (yet) submit live -- see `MIN_ACTIVATION_DELAY_DAA`'s
+/// doc): a cold 2-of-3
 /// `cap_authority` quorum announces a new ceiling (STRICT increase over
 /// `current_cap`, AND `<= current_cap * CAP_RAISE_MULTIPLIER_K`);
 /// `running_supply`/`minted_this_epoch`/`epoch_start_daa`/`current_cap` and
@@ -1776,14 +1829,36 @@ async fn op_raise_cap(
     debug_assert_eq!(old_state.running_supply, running_supply, "caller-supplied running_supply must match authority_rs_old's own encoded value");
 
     let old_authority_p2sh = build_p2sh(authority_rs_old);
+
+    // FIX 1 (2026-07-20 timelock-griefing hardening): the successor's
+    // pending_since_daa must equal THIS input's own real, node-tracked
+    // `block_daa_score` exactly -- that is what `OpTxInputDaaScore` reads
+    // on-chain. Fetched fresh via RPC (mirrors `verify_utxo`'s own
+    // `get_utxos_by_addresses` usage above in this file) rather than
+    // predicted locally, since (unlike the epoch-window fields, which this
+    // harness's single-MINT-then-RAISE_CAP flow can safely over-approximate)
+    // the timelock stamp must match consensus's view of this UTXO exactly or
+    // the spend will be rejected on-chain.
+    let old_authority_addr = kob_cli::cancel::p2sh_to_address(old_authority_p2sh.script(), "kaspatest");
+    let announce_input_daa_score = rpc
+        .get_utxos_by_addresses(&[old_authority_addr.as_str()])
+        .await
+        .ok()
+        .and_then(|utxos| utxos.into_iter().find(|u| u.outpoint.transaction_id == authority_txid && u.outpoint.index == 0))
+        .map(|u| u.utxo_entry.block_daa_score)
+        .ok_or_else(|| anyhow::anyhow!("RAISE_CAP: failed to fetch the authority UTXO's real block_daa_score for the G4 pending_since_daa stamp"))?;
+    println!("RAISE_CAP: announcing input's real block_daa_score (-> new pending_since_daa): {announce_input_daa_score}");
+
     // ANNOUNCE_CAP semantics (G4): current_cap/running_supply/epoch fields
-    // are all carried forward UNCHANGED; new_cap becomes pending_cap.
+    // are all carried forward UNCHANGED; new_cap becomes pending_cap;
+    // pending_since_daa becomes this input's own real DAA score (FIX 1).
     let new_authority_rs = roles.authority_rs(
         old_state.running_supply,
         old_state.minted_this_epoch,
         old_state.epoch_start_daa,
         old_state.current_cap,
         new_cap,
+        announce_input_daa_score,
         genesis_cov_id,
     );
     let new_authority_p2sh = build_p2sh(&new_authority_rs);
@@ -2025,7 +2100,7 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!(
         "RAISE_CAP (ANNOUNCE_CAP) complete. Authority live at {}:0, pending_cap={} (NOT yet active -- \
-         requires a separate, permissionless ACTIVATE_CAP spend after the CSV timelock clears; not \
+         requires a separate, permissionless ACTIVATE_CAP spend after the state-anchored timelock clears; not \
          submitted by this harness).",
         raise_cap.txid, raise_cap.announced_pending_cap
     );

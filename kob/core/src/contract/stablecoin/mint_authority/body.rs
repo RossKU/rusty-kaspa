@@ -46,7 +46,7 @@
 //!
 //! # Redeem script shape
 //!
-//! `state (45B, see state.rs) || body`. The body is a 3-way `op_type`
+//! `state (54B, see state.rs) || body`. The body is a 3-way `op_type`
 //! dispatch: `0x00 MINT` / `0x01 ANNOUNCE_CAP` / `0x02 ACTIVATE_CAP`, all
 //! real bytecode; the cold `cap_authority_pubkeys` are baked into the
 //! ANNOUNCE_CAP branch.
@@ -75,13 +75,14 @@
 //!
 //! # Entry stack once the dispatch delivers control to the MINT branch
 //!
-//! State header pushes 2 fields (`current_cap` then `running_supply` --
-//! `state.rs`'s "own state" pushes are always current_cap on top since it's
-//! pushed LAST), then the dispatch consumes+drops the `op_type` selector:
+//! State header pushes 6 fields (`state.rs`'s "own state" pushes are always
+//! `pending_since_daa` on top since it's pushed LAST), then the dispatch
+//! consumes+drops the `op_type` selector:
 //!
 //! ```text
-//! current_cap(0), running_supply(1), recipient_pubkey(2), mint_amount(3),
-//! new_rs(4), old_rs(5), mint_sig(6)
+//! pending_since_daa(0), pending_cap(1), current_cap(2), epoch_start_daa(3),
+//! minted_this_epoch(4), running_supply(5), recipient_pubkey(6),
+//! mint_amount(7), new_rs(8), old_rs(9), mint_sig(10)
 //! ```
 //!
 //! # Coin-shape reconstruction + recipient binding (the anti-backdoor +
@@ -440,11 +441,14 @@ fn epoch_budget_block(epoch_length_daa: u64, epoch_mint_budget: u64) -> Vec<u8> 
 /// hardening: authorized by cold 2-of-3 `cap_authority`, self-continue with
 /// `pending_cap' = new_pending_cap` where `OpVerify(new_pending_cap >
 /// current_cap)` AND `OpVerify(new_pending_cap <= current_cap *
-/// cap_raise_multiplier_k)` -- `running_supply`/`minted_this_epoch`/
+/// cap_raise_multiplier_k)`, AND `pending_since_daa' = OpTxInputDaaScore`
+/// (FIX 1, 2026-07-20 timelock-griefing hardening: stamps WHEN this
+/// announcement happened, in state, so a later interleaved MINT cannot reset
+/// `ACTIVATE_CAP`'s timelock clock) -- `running_supply`/`minted_this_epoch`/
 /// `epoch_start_daa`/`current_cap` all unchanged in the successor; no coin
 /// emitted). `current_cap` itself is NOT touched here -- only
-/// `ACTIVATE_CAP` (below), gated by a CSV timelock, promotes `pending_cap`
-/// into it.
+/// `ACTIVATE_CAP` (below), gated by the state-anchored timelock, promotes
+/// `pending_cap` into it.
 ///
 /// # What is mirrored from where
 ///
@@ -458,27 +462,28 @@ fn epoch_budget_block(epoch_length_daa: u64, epoch_mint_budget: u64) -> Vec<u8> 
 ///   [`build_mint_branch`] uses (`dr_input_spk_check`/`dr_field_extract`),
 ///   but with the mutable/fixed regions SWAPPED relative to MINT: MINT's
 ///   mutable prefix is `[0..27)` (`running_supply`/`minted_this_epoch`/
-///   `epoch_start_daa`) with `current_cap`+`pending_cap`+the baked body
-///   carried forward as one contiguous suffix `[27..end)`. ANNOUNCE_CAP
-///   mutates only the TRAILING field `pending_cap` instead, so it needs BOTH
-///   a [`dr_prefix_check`] over `[0..36)` (everything up through
-///   `current_cap` — UNCHANGED) AND a [`dr_suffix_check`] over
-///   `[STATE_HEADER_LEN..end)` (the baked body UNCHANGED), leaving exactly
-///   the `pending_cap` byte range `[36..45)` uncovered by either check — the
-///   one region this branch is allowed, and required, to change (the same
-///   prefix+suffix-leaves-a-gap shape the pre-2026-07-20 RAISE_CAP branch
-///   already used for `current_cap`, just with the gap moved to the new
-///   layout's trailing field).
+///   `epoch_start_daa`) with `current_cap`+`pending_cap`+`pending_since_daa`+
+///   the baked body carried forward as one contiguous suffix `[27..end)`.
+///   ANNOUNCE_CAP mutates only the TRAILING PAIR `pending_cap`+
+///   `pending_since_daa` instead, so it needs BOTH a [`dr_prefix_check`] over
+///   `[0..36)` (everything up through `current_cap` — UNCHANGED) AND a
+///   [`dr_suffix_check`] over `[STATE_HEADER_LEN..end)` (the baked body
+///   UNCHANGED), leaving exactly the `pending_cap`+`pending_since_daa` byte
+///   range `[36..54)` uncovered by either check — the one region this branch
+///   is allowed, and required, to change (the same prefix+suffix-leaves-a-gap
+///   shape the pre-2026-07-20 RAISE_CAP branch already used for
+///   `current_cap`, just with the gap moved to the new layout's trailing
+///   fields).
 ///
 /// # Entry stack once the dispatch delivers control to the ANNOUNCE_CAP branch
 ///
-/// State header pushes 5 fields (`state.rs`), then the dispatch
+/// State header pushes 6 fields (`state.rs`), then the dispatch
 /// consumes+drops the `op_type` selector:
 ///
 /// ```text
-/// pending_cap(0), current_cap(1), epoch_start_daa(2), minted_this_epoch(3),
-/// running_supply(4), new_pending_cap(5), new_rs(6), old_rs(7), sig3(8),
-/// sig2(9), sig1(10)
+/// pending_since_daa(0), pending_cap(1), current_cap(2), epoch_start_daa(3),
+/// minted_this_epoch(4), running_supply(5), new_pending_cap(6), new_rs(7),
+/// old_rs(8), sig3(9), sig2(10), sig1(11)
 /// ```
 ///
 /// This is the sigscript layout callers must produce (push order,
@@ -506,14 +511,18 @@ fn build_announce_cap_branch(cap_authority_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3
     assert!(cap_raise_multiplier_k >= 2, "cap_raise_multiplier_k must be >= 2 (a ceiling of < 2x would forbid ANY strict increase for cap doublings this small)");
     let mut b = Vec::with_capacity(280);
 
-    // ---- Step 0: this coin's own (live-pushed) pending_cap/epoch_start_daa/
-    // minted_this_epoch/running_supply are all unused -- ANNOUNCE_CAP
-    // re-authenticates their unchanged-ness via the prefix check below (over
-    // the AUTHENTICATED old_rs/new_rs blobs) instead of trusting these live
-    // pushes directly, mirroring build_mint_branch's Step 0 discipline. Only
-    // current_cap survives this step (needed live for the ceiling/strict-
-    // increase checks below). ----
-    b.push(DROP); // pending_cap (already at depth0)
+    // ---- Step 0: this coin's own (live-pushed) pending_since_daa/
+    // pending_cap/epoch_start_daa/minted_this_epoch/running_supply are all
+    // unused -- ANNOUNCE_CAP re-authenticates their unchanged-ness via the
+    // prefix check below (over the AUTHENTICATED old_rs/new_rs blobs)
+    // instead of trusting these live pushes directly, mirroring
+    // build_mint_branch's Step 0 discipline. Only current_cap survives this
+    // step (needed live for the ceiling/strict-increase checks below). ----
+    b.push(DROP); // pending_since_daa (already at depth0, FIX 1)
+    // Stack: pending_cap(0), current_cap(1), epoch_start_daa(2),
+    // minted_this_epoch(3), running_supply(4), new_pending_cap(5), new_rs(6),
+    // old_rs(7), sig3(8), sig2(9), sig1(10).
+    b.push(DROP); // pending_cap (now at depth0)
     // Stack: current_cap(0), epoch_start_daa(1), minted_this_epoch(2),
     // running_supply(3), new_pending_cap(4), new_rs(5), old_rs(6), sig3(7),
     // sig2(8), sig1(9).
@@ -566,11 +575,12 @@ fn build_announce_cap_branch(cap_authority_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3
     // Stack unchanged (dr_prefix_check nets to 0): current_cap(0), new_pending_cap(1),
     // new_rs(2), old_rs(3), sig3(4), sig2(5), sig1(6).
 
-    // ---- Step 3: the baked body (everything after the 45B state header)
-    // must be byte-identical between old_rs and new_rs -- pending_cap
-    // (bytes [36..45)) is deliberately EXCLUDED from both this and the
-    // Step 2 prefix check above: it is the one region this branch is
-    // allowed, and required, to change. ----
+    // ---- Step 3: the baked body (everything after the 54B state header)
+    // must be byte-identical between old_rs and new_rs -- pending_cap AND
+    // pending_since_daa (bytes [36..54)) are deliberately EXCLUDED from both
+    // this and the Step 2 prefix check above: they are the region this
+    // branch is allowed, and required, to change (FIX 1 extends the gap
+    // from [36..45) to [36..54) automatically via STATE_HEADER_LEN). ----
     b.extend_from_slice(&dr_suffix_check(3, 3, super::state::STATE_HEADER_LEN as u16));
     // Stack unchanged: current_cap(0), new_pending_cap(1), new_rs(2), old_rs(3),
     // sig3(4), sig2(5), sig1(6).
@@ -606,6 +616,35 @@ fn build_announce_cap_branch(cap_authority_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3
     // new_rs(4), sig3(5), sig2(6), sig1(7).
     b.push(EQUAL);
     b.push(VERIFY);
+    // Stack: current_cap(0), new_pending_cap(1), new_rs(2), sig3(3), sig2(4), sig1(5).
+
+    // ---- Step 6b (FIX 1, 2026-07-20 timelock-griefing hardening):
+    // push-opcode sanity check -- new_rs[45] (pending_since_daa) must still
+    // be the 0x08 (OpData8) push opcode (mirrors Step 4's check for
+    // pending_cap's opcode). ----
+    b.extend_from_slice(&dr_field_extract(2, super::state::PENDING_SINCE_DAA_OPCODE_OFFSET as u16, (super::state::PENDING_SINCE_DAA_OPCODE_OFFSET + 1) as u16));
+    b.push(DATA1);
+    b.push(0x08);
+    b.push(EQUAL);
+    b.push(VERIFY);
+    // Stack: current_cap(0), new_pending_cap(1), new_rs(2), sig3(3), sig2(4), sig1(5).
+
+    // ---- Step 6c (FIX 1): stamp the successor's pending_since_daa with
+    // THIS input's own real, unforgeable OpTxInputDaaScore -- i.e. WHEN this
+    // announcement happened. This is the field MINT is forced to carry
+    // forward byte-identical (see build_mint_branch's Step 0 doc), which is
+    // what stops a later interleaved MINT from resetting ACTIVATE_CAP's
+    // timelock clock: the clock is anchored to this value, not to whatever
+    // UTXO's block_daa_score happens to be current when ACTIVATE_CAP runs. ----
+    let pending_since_daa_off = super::state::PENDING_SINCE_DAA_PAYLOAD_OFFSET as u16;
+    b.extend_from_slice(&dr_field_extract(2, pending_since_daa_off, pending_since_daa_off + 8)); // succ_pending_since_daa, from new_rs (depth2)
+    // Stack: succ_psd(0), current_cap(1), new_pending_cap(2), new_rs(3), sig3(4),
+    // sig2(5), sig1(6).
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTDAASCORE); // now (this announcing input's own UTXO block_daa_score)
+    // Stack: now(0), succ_psd(1), current_cap(2), new_pending_cap(3), new_rs(4),
+    // sig3(5), sig2(6), sig1(7).
+    b.push(NUMEQUALVERIFY); // succ_psd(deeper) == now(shallower) -- arithmetic result, not a raw 8-byte compare
     // Stack: current_cap(0), new_pending_cap(1), new_rs(2), sig3(3), sig2(4), sig1(5).
 
     // ---- Step 7 (G4 hardening): STRICT increase (new_pending_cap >
@@ -834,10 +873,10 @@ fn build_fixed_mid(
 }
 
 /// Emit the MINT (`op_type = 0x00`) branch bytecode. See this module's top
-/// doc for the full derivation. Entry stack (top to bottom): `pending_cap(0),
-/// current_cap(1), epoch_start_daa(2), minted_this_epoch(3),
-/// running_supply(4), recipient_pubkey(5), mint_amount(6), new_rs(7),
-/// old_rs(8), mint_sig(9)`.
+/// doc for the full derivation. Entry stack (top to bottom):
+/// `pending_since_daa(0), pending_cap(1), current_cap(2), epoch_start_daa(3),
+/// minted_this_epoch(4), running_supply(5), recipient_pubkey(6),
+/// mint_amount(7), new_rs(8), old_rs(9), mint_sig(10)`.
 fn build_mint_branch(
     mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
     fixed_mid: &[u8],
@@ -848,17 +887,27 @@ fn build_mint_branch(
     use op::*;
     let mut b = Vec::with_capacity(500 + fixed_mid.len());
 
-    // ---- Step 0: this coin's own (live-pushed) pending_cap and
-    // running_supply are unused -- MINT never touches pending_cap at all
-    // (its unchanged-ness is covered wholesale by Step 2's suffix check
-    // below) and reads old_running_supply from the AUTHENTICATED old_rs blob
-    // instead (Step 4), per this task's spec ("mirror dca.rs's counter-update
-    // pattern"). epoch_start_daa/minted_this_epoch stay live (needed by the
-    // G5 epoch-budget block below, which owns their lifecycle and drops them
-    // itself). Drop pending_cap (already on top) then running_supply,
-    // mirroring build_freeze_branch's discipline of immediately dropping
-    // unused own-state fields. ----
-    b.push(DROP); // pending_cap (already at depth0)
+    // ---- Step 0: this coin's own (live-pushed) pending_since_daa,
+    // pending_cap and running_supply are unused -- MINT never touches
+    // pending_cap/pending_since_daa at all (their unchanged-ness is covered
+    // wholesale by Step 2's suffix check below, which -- because
+    // pending_since_daa sits immediately after pending_cap, both inside the
+    // suffix `dr_suffix_check` already anchors at CURRENT_CAP_OPCODE_OFFSET
+    // -- extends automatically to carry the FIX 1 griefing-hardening field
+    // forward too: this is exactly what stops a hot mint_pubkey holder from
+    // resetting ACTIVATE_CAP's timelock clock by minting) and reads
+    // old_running_supply from the AUTHENTICATED old_rs blob instead (Step 4),
+    // per this task's spec ("mirror dca.rs's counter-update pattern").
+    // epoch_start_daa/minted_this_epoch stay live (needed by the G5
+    // epoch-budget block below, which owns their lifecycle and drops them
+    // itself). Drop pending_since_daa (already on top), then pending_cap,
+    // then running_supply, mirroring build_freeze_branch's discipline of
+    // immediately dropping unused own-state fields. ----
+    b.push(DROP); // pending_since_daa (already at depth0, FIX 1)
+    // Stack: pending_cap(0), current_cap(1), epoch_start_daa(2),
+    // minted_this_epoch(3), running_supply(4), recipient_pubkey(5),
+    // mint_amount(6), new_rs(7), old_rs(8), mint_sig(9).
+    b.push(DROP); // pending_cap (now at depth0)
     // Stack: current_cap(0), epoch_start_daa(1), minted_this_epoch(2),
     // running_supply(3), recipient_pubkey(4), mint_amount(5), new_rs(6),
     // old_rs(7), mint_sig(8).
@@ -1139,28 +1188,44 @@ fn build_mint_branch(
 /// Emit the `ACTIVATE_CAP` (`op_type = 0x02`, new 2026-07-20) branch
 /// bytecode: PERMISSIONLESS (no signatures at all, `sig_op_count = 0`)
 /// promotion of an already-announced `pending_cap` into `current_cap`, gated
-/// purely by a CSV timelock (`OpCheckSequenceVerify`,
-/// `crypto/txscript/src/opcodes/mod.rs`'s `OpCheckSequenceVerify` enforces
-/// `input.sequence >= min_activation_delay_daa`, masked by
-/// `SEQUENCE_LOCK_TIME_MASK` -- consensus's own `check_sequence_lock`,
-/// `consensus/src/processes/transaction_validator/tx_validation_in_utxo_context.rs`,
-/// separately enforces this against the SPENT UTXO's real, unforgeable
-/// `block_daa_score`, which is the OTHER, out-of-scope-for-this-harness half
-/// of the timelock guarantee -- see this module's top doc / the task's KEY
-/// DESIGN DECISIONS for why CSV, not CLTV, is used here).
+/// by a STATE-ANCHORED timelock (FIX 1, 2026-07-20 timelock-griefing
+/// hardening -- see `state.rs`'s module doc for the full rationale):
+///
+/// ```text
+/// old_pending_since_daa + min_activation_delay_daa <= OpTxInputDaaScore
+/// ```
+///
+/// where `old_pending_since_daa` is extracted from the AUTHENTICATED
+/// `old_rs` (i.e. `ANNOUNCE_CAP`'s stamp of WHEN this announcement really
+/// happened) and `OpTxInputDaaScore` is THIS (activating) input's own real,
+/// unforgeable UTXO `block_daa_score`.
+///
+/// This REPLACES an earlier `push(min_activation_delay_daa)
+/// OpCheckSequenceVerify` design (`OpCheckSequenceVerify` enforces
+/// `input.sequence >= min_activation_delay_daa`, but consensus's own
+/// `check_sequence_lock` separately re-derives the relative lock time
+/// against the SELF-CONTINUING UTXO's own `block_daa_score` -- which every
+/// routine MINT re-stamps, since MINT recreates the authority UTXO on every
+/// spend. That reset the CSV clock on every mint, so a hot `mint_pubkey`
+/// holder could mint dust once per window to block a cap-authority-approved
+/// activation forever). Storing the announce height IN STATE instead means
+/// MINT (forced to carry `pending_since_daa` forward byte-identical, see
+/// `build_mint_branch`'s Step 0 doc) cannot push it, so interleaved mints no
+/// longer widen the window.
 ///
 /// # What is mirrored from where
 ///
 /// - **Self-continuation D&R shape**: the SAME `crate::contract::dr` helpers
 ///   [`build_mint_branch`]/[`build_announce_cap_branch`] use. The mutated
-///   region is the TRAILING PAIR `current_cap`+`pending_cap` (`[27..45)`,
-///   both promoted to the OLD `pending_cap` value), so ACTIVATE_CAP needs a
-///   [`dr_prefix_check`] over `[0..27)` (`running_supply`/
-///   `minted_this_epoch`/`epoch_start_daa` -- UNCHANGED) AND a
-///   [`dr_suffix_check`] over `[STATE_HEADER_LEN..end)` (the baked body
-///   UNCHANGED) -- exactly the prefix+suffix-leaves-a-gap shape
-///   [`build_announce_cap_branch`] uses, just with the gap covering BOTH
-///   trailing fields instead of one.
+///   region is the TRAILING TRIPLE `current_cap`+`pending_cap`+
+///   `pending_since_daa` (`[27..54)`: `current_cap`/`pending_cap` both
+///   promoted to the OLD `pending_cap` value, `pending_since_daa` reset to
+///   `0`), so ACTIVATE_CAP needs a [`dr_prefix_check`] over `[0..27)`
+///   (`running_supply`/`minted_this_epoch`/`epoch_start_daa` -- UNCHANGED)
+///   AND a [`dr_suffix_check`] over `[STATE_HEADER_LEN..end)` (the baked
+///   body UNCHANGED) -- exactly the prefix+suffix-leaves-a-gap shape
+///   [`build_announce_cap_branch`] uses, just with the gap covering all
+///   three trailing fields instead of two.
 /// - **Value continuity**: the SAME [`value_continuity_check_output0`] every
 ///   other branch uses -- CRITICAL here specifically because this branch is
 ///   permissionless: without it, ANY third party (no key required at all)
@@ -1177,31 +1242,35 @@ fn build_mint_branch(
 ///
 /// # Entry stack once the dispatch delivers control to the ACTIVATE_CAP branch
 ///
-/// State header pushes 5 fields (`state.rs`), then the dispatch
+/// State header pushes 6 fields (`state.rs`), then the dispatch
 /// consumes+drops the `op_type` selector:
 ///
 /// ```text
-/// pending_cap(0), current_cap(1), epoch_start_daa(2), minted_this_epoch(3),
-/// running_supply(4), new_rs(5), old_rs(6)
+/// pending_since_daa(0), pending_cap(1), current_cap(2), epoch_start_daa(3),
+/// minted_this_epoch(4), running_supply(5), new_rs(6), old_rs(7)
 /// ```
 ///
 /// This is the sigscript layout callers must produce (push order,
 /// first==deepest): `old_rs, new_rs, op_type_selector(0x02)`, then the
-/// redeem script. `sig_op_count` MUST be **0** -- no signatures at all.
-/// Callers MUST also set this input's `sequence` field to a value
-/// `>= min_activation_delay_daa` (masked by `SEQUENCE_LOCK_TIME_MASK`,
-/// `crypto/txscript/src/lib.rs`).
+/// redeem script. `sig_op_count` MUST be **0** -- no signatures at all. The
+/// timelock is now enforced purely from state + `OpTxInputDaaScore`, so
+/// (unlike the earlier CSV design) callers need not set this input's
+/// `sequence` field to anything in particular.
 fn build_activate_cap_branch(min_activation_delay_daa: u64) -> Vec<u8> {
     use op::*;
-    let mut b = Vec::with_capacity(130);
+    let mut b = Vec::with_capacity(170);
 
-    // ---- Step 0: this coin's own (live-pushed) current_cap/epoch_start_daa/
-    // minted_this_epoch/running_supply are all unused -- ACTIVATE_CAP
-    // re-authenticates their unchanged-ness via the prefix check below (over
-    // the AUTHENTICATED old_rs/new_rs blobs) instead of trusting these live
-    // pushes directly. Only pending_cap survives this step (already at
-    // depth0; it is the OLD ceiling being promoted, needed live for BOTH of
-    // Step 6/7's successor-equality checks). ----
+    // ---- Step 0: this coin's own (live-pushed) pending_since_daa/
+    // current_cap/epoch_start_daa/minted_this_epoch/running_supply are all
+    // unused -- ACTIVATE_CAP re-authenticates their unchanged-ness via the
+    // prefix check below (over the AUTHENTICATED old_rs/new_rs blobs)
+    // instead of trusting these live pushes directly, and reads
+    // pending_since_daa fresh from the AUTHENTICATED old_rs below (Step 4b)
+    // rather than from this live push. Only pending_cap survives this step
+    // (needed live for Step 6/7's successor-equality checks). ----
+    b.push(DROP); // pending_since_daa (already at depth0, FIX 1)
+    // Stack: pending_cap(0), current_cap(1), epoch_start_daa(2),
+    // minted_this_epoch(3), running_supply(4), new_rs(5), old_rs(6).
     e_roll(&mut b, 1);
     b.push(DROP); // current_cap (item now at depth1)
     // Stack: pending_cap(0), epoch_start_daa(1), minted_this_epoch(2),
@@ -1227,17 +1296,18 @@ fn build_activate_cap_branch(min_activation_delay_daa: u64) -> Vec<u8> {
     b.extend_from_slice(&dr_prefix_check(2, 2, super::state::CURRENT_CAP_OPCODE_OFFSET as u16));
     // Stack unchanged (dr_prefix_check nets to 0): pending_cap(0), new_rs(1), old_rs(2).
 
-    // ---- Step 3: the baked body (everything after the 45B state header)
-    // must be byte-identical between old_rs and new_rs -- current_cap AND
-    // pending_cap (bytes [27..45)) are deliberately EXCLUDED from both this
-    // and the Step 2 prefix check above: they are the region this branch is
-    // allowed, and required, to change. ----
+    // ---- Step 3: the baked body (everything after the 54B state header)
+    // must be byte-identical between old_rs and new_rs -- current_cap,
+    // pending_cap AND pending_since_daa (bytes [27..54)) are deliberately
+    // EXCLUDED from both this and the Step 2 prefix check above: they are
+    // the region this branch is allowed, and required, to change. ----
     b.extend_from_slice(&dr_suffix_check(2, 2, super::state::STATE_HEADER_LEN as u16));
     // Stack unchanged: pending_cap(0), new_rs(1), old_rs(2).
 
-    // ---- Step 4: push-opcode sanity checks -- new_rs[27] (current_cap) and
-    // new_rs[36] (pending_cap) must both still be 0x08 (OpData8), so the
-    // successor's fields parse the same way they do here. ----
+    // ---- Step 4: push-opcode sanity checks -- new_rs[27] (current_cap),
+    // new_rs[36] (pending_cap), and new_rs[45] (pending_since_daa, FIX 1)
+    // must all still be 0x08 (OpData8), so the successor's fields parse the
+    // same way they do here. ----
     b.extend_from_slice(&dr_field_extract(1, super::state::CURRENT_CAP_OPCODE_OFFSET as u16, (super::state::CURRENT_CAP_OPCODE_OFFSET + 1) as u16));
     b.push(DATA1);
     b.push(0x08);
@@ -1248,7 +1318,36 @@ fn build_activate_cap_branch(min_activation_delay_daa: u64) -> Vec<u8> {
     b.push(0x08);
     b.push(EQUAL);
     b.push(VERIFY);
+    b.extend_from_slice(&dr_field_extract(1, super::state::PENDING_SINCE_DAA_OPCODE_OFFSET as u16, (super::state::PENDING_SINCE_DAA_OPCODE_OFFSET + 1) as u16));
+    b.push(DATA1);
+    b.push(0x08);
+    b.push(EQUAL);
+    b.push(VERIFY);
     // Stack unchanged: pending_cap(0), new_rs(1), old_rs(2).
+
+    // ---- Step 4b (FIX 1, 2026-07-20 timelock-griefing hardening):
+    // state-anchored timelock -- REPLACES the earlier
+    // `push(min_activation_delay_daa) OpCheckSequenceVerify` design (see
+    // this fn's doc). old_rs is still live at depth2 here (dropped next, in
+    // Step 5), so extract pending_since_daa from it (the AUTHENTICATED
+    // announce stamp) while it's available, add the baked
+    // min_activation_delay_daa (checked OpAdd, hard-aborts on i64 overflow
+    // per OpAdd's existing precedent), and assert the resulting deadline is
+    // `<=` THIS input's own OpTxInputDaaScore. Self-contained: nets to 0
+    // against the surrounding stack. ----
+    b.extend_from_slice(&dr_field_extract(2, super::state::PENDING_SINCE_DAA_PAYLOAD_OFFSET as u16, (super::state::PENDING_SINCE_DAA_PAYLOAD_OFFSET + 8) as u16)); // old_pending_since_daa, from old_rs (depth2)
+    // Stack: old_psd(0), pending_cap(1), new_rs(2), old_rs(3).
+    b.push(DATA8);
+    b.extend_from_slice(&min_activation_delay_daa.to_le_bytes());
+    // Stack: mad(0), old_psd(1), pending_cap(2), new_rs(3), old_rs(4).
+    b.push(ADD); // deadline = old_psd + mad
+    // Stack: deadline(0), pending_cap(1), new_rs(2), old_rs(3).
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTDAASCORE); // now (this activating input's own UTXO block_daa_score)
+    // Stack: now(0), deadline(1), pending_cap(2), new_rs(3), old_rs(4).
+    b.push(LESSTHANOREQUAL); // deadline(deeper) <= now(shallower)
+    b.push(VERIFY);
+    // Stack: pending_cap(0), new_rs(1), old_rs(2).
 
     // ---- Step 5: old_rs no longer needed -- drop it. ----
     e_roll(&mut b, 2);
@@ -1277,6 +1376,20 @@ fn build_activate_cap_branch(min_activation_delay_daa: u64) -> Vec<u8> {
     b.push(VERIFY);
     // Stack: new_rs(0).
 
+    // ---- Step 7b (FIX 1): extract the successor's pending_since_daa
+    // payload (8B) from new_rs, and assert it is RESET to the sentinel `0`
+    // -- the other half of the sentinel invariant (Step 7 restores
+    // current_cap == pending_cap; this restores "no announcement pending").
+    // NUMEQUALVERIFY (not raw OpEqual): OP0 pushes an EMPTY byte string,
+    // which would never raw-byte-equal an 8-byte zero payload, so this must
+    // deserialize both sides as script numbers before comparing. ----
+    b.extend_from_slice(&dr_field_extract(0, super::state::PENDING_SINCE_DAA_PAYLOAD_OFFSET as u16, (super::state::PENDING_SINCE_DAA_PAYLOAD_OFFSET + 8) as u16));
+    // Stack: succ_psd(0), new_rs(1).
+    b.push(OP0);
+    // Stack: lit0(0), succ_psd(1), new_rs(2).
+    b.push(NUMEQUALVERIFY); // succ_psd(deeper) == lit0(shallower)
+    // Stack: new_rs(0).
+
     // ---- Step 8: self-continuation (b) -- output[0].spk == P2SH(new_rs), at
     // the FIXED index 0 (this contract always emits its self-continuation
     // successor at output[0]; ACTIVATE_CAP emits NO other output -- no coin). ----
@@ -1295,20 +1408,10 @@ fn build_activate_cap_branch(min_activation_delay_daa: u64) -> Vec<u8> {
     // Stack unchanged (net 0): new_rs(0).
 
     // ---- Step 9: new_rs no longer needed -- drop it. No attestation to
-    // build (permissionless, no signature check at all). ----
+    // build (permissionless, no signature check at all). The state-anchored
+    // timelock (Step 4b) already gated this branch above -- nothing left to
+    // check. ----
     b.push(DROP);
-    // Stack: EMPTY.
-
-    // ---- Step 10 (G4 hardening): CSV timelock -- push the baked
-    // min_activation_delay_daa and OpCheckSequenceVerify. Non-destructive on
-    // net (push +1, OpCheckSequenceVerify pops its operand and pushes
-    // nothing -- consensus never lets you "fail closed but still finish";
-    // OpCheckSequenceVerify itself, on failure, aborts the WHOLE script via
-    // Err, not by leaving a falsy value to be OpVerify'd, so no trailing
-    // OpVerify is needed or correct here). ----
-    b.push(DATA8);
-    b.extend_from_slice(&min_activation_delay_daa.to_le_bytes());
-    b.push(CHECKSEQUENCEVERIFY);
     // Stack: EMPTY.
 
     b.push(OP1);
@@ -1321,7 +1424,7 @@ fn build_activate_cap_branch(min_activation_delay_daa: u64) -> Vec<u8> {
 /// (`crate::contract::stablecoin::dispatch::build_op_type_dispatch`'s
 /// roll/DUP/compare/IF/ELSE/ENDIF shape), generalized down to 3 branches.
 /// `tag_depth` is the stack depth of the `op_type` selector once the state
-/// header has finished pushing its five fields -- see [`OP_TYPE_TAG_DEPTH`].
+/// header has finished pushing its six fields -- see [`OP_TYPE_TAG_DEPTH`].
 fn build_op_type_dispatch(tag_depth: u16, mint_branch: &[u8], announce_cap_branch: &[u8], activate_cap_branch: &[u8]) -> Vec<u8> {
     use op::*;
     let mut b = Vec::with_capacity(24 + mint_branch.len() + announce_cap_branch.len() + activate_cap_branch.len());
@@ -1370,14 +1473,26 @@ fn build_op_type_dispatch(tag_depth: u16, mint_branch: &[u8], announce_cap_branc
 }
 
 /// Stack depth of the `op_type` selector once the state header has finished
-/// pushing its five fields (`running_supply`, `minted_this_epoch`,
-/// `epoch_start_daa`, `current_cap`, `pending_cap`) -- with the sigscript
-/// layout documented in this module's top doc (`op_type_selector` as the
-/// LAST sigscript push before the redeem script), that depth is always `5`.
-pub const OP_TYPE_TAG_DEPTH: u16 = 5;
+/// pushing its six fields (`running_supply`, `minted_this_epoch`,
+/// `epoch_start_daa`, `current_cap`, `pending_cap`, `pending_since_daa`) --
+/// with the sigscript layout documented in this module's top doc
+/// (`op_type_selector` as the LAST sigscript push before the redeem
+/// script), that depth is always `6`.
+pub const OP_TYPE_TAG_DEPTH: u16 = 6;
 
 /// Emit the mint-authority covenant body: state header's fields are already
 /// on the stack; the body is the 3-way `op_type` dispatch.
+///
+/// FIX 2 (2026-07-20 mint-authority hardening audit, MEDIUM): the 12-key
+/// pairwise-distinctness assert used to live ONLY in the wrapper
+/// [`build_mint_authority_redeem_script`], not here -- so a future caller
+/// composing state manually (bypassing that wrapper, e.g. to build a
+/// redeem script whose state header is supplied by some other means) could
+/// collapse the cap-authority 2-of-3 quorum (or let `mint_pubkey` cast one
+/// of its votes) without ever tripping the guard. Duplicated here, mirroring
+/// how `stablecoin::body::build_stablecoin_body` carries its own copy of the
+/// analogous check for the same stated reason (defense at the actual
+/// bytecode-emitting layer, not just its most common caller).
 #[allow(clippy::too_many_arguments)]
 pub fn build_mint_authority_body(
     mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
@@ -1394,6 +1509,33 @@ pub fn build_mint_authority_body(
     epoch_mint_budget: u64,
     min_activation_delay_daa: u64,
 ) -> Vec<u8> {
+    // FIX 2: role pubkeys MUST be pairwise distinct (mirrors
+    // build_mint_authority_redeem_script's copy of this same assert -- see
+    // that function's doc for the full rationale per slot).
+    {
+        let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 12] = [
+            mint_pubkey,
+            &cap_authority_pubkeys[0], &cap_authority_pubkeys[1], &cap_authority_pubkeys[2],
+            ops_pubkey, freeze_pubkey,
+            &seize_pubkeys[0], &seize_pubkeys[1], &seize_pubkeys[2],
+            &recovery_pubkeys[0], &recovery_pubkeys[1], &recovery_pubkeys[2],
+        ];
+        for i in 0..role_keys.len() {
+            for j in (i + 1)..role_keys.len() {
+                assert!(role_keys[i] != role_keys[j], "mint-authority role pubkeys must be pairwise distinct (slot {i} == slot {j})");
+            }
+        }
+    }
+    assert!(cap_raise_multiplier_k >= 2, "cap_raise_multiplier_k must be >= 2");
+    // FIX 4 (LOW, 2026-07-20 audit): sanity bound on min_activation_delay_daa.
+    // The now-removed CSV mechanism masked to 32 bits (SEQUENCE_LOCK_TIME_MASK);
+    // FIX 1's state-anchored timelock instead compares against
+    // OpTxInputDaaScore directly (checked i64 arithmetic, no 32-bit mask), so
+    // the truncation concern this bound originally guarded against no longer
+    // strictly applies -- kept anyway (mirroring the k>=2 code-level guard
+    // above) to catch a silently-huge/mis-keyed delay at construction time
+    // rather than deploying a covenant whose ACTIVATE_CAP could never clear.
+    assert!(min_activation_delay_daa < (1u64 << 32), "min_activation_delay_daa must be < 2^32 (sanity bound; see FIX 4)");
     let fixed_mid =
         build_fixed_mid(identifier_type, role_registry_root, mint_pubkey, ops_pubkey, freeze_pubkey, seize_pubkeys, recovery_pubkeys);
     let mint_branch = build_mint_branch(mint_pubkey, &fixed_mid, genesis_covenant_id, epoch_length_daa, epoch_mint_budget);
@@ -1404,9 +1546,19 @@ pub fn build_mint_authority_body(
 
 /// Build the complete mint-authority redeem script (state header + dispatch
 /// body). `running_supply`/`minted_this_epoch`/`epoch_start_daa`/
-/// `current_cap`/`pending_cap` go into the mutable state header
-/// (`state.rs`); the rest are baked bytecode literals (option B, matching
-/// the stablecoin covenant's own Decision 2026-07-19 convention):
+/// `current_cap`/`pending_cap`/`pending_since_daa` go into the mutable state
+/// header (`state.rs`); the rest are baked bytecode literals (option B,
+/// matching the stablecoin covenant's own Decision 2026-07-19 convention):
+///
+/// NOTE: this function is GENERIC -- used both to build a genuinely fresh
+/// GENESIS deploy AND, throughout this module's tests/the CLI, to predict
+/// arbitrary intermediate/successor state headers (e.g. an
+/// already-announced `pending_cap != current_cap` state, needed to express
+/// `ANNOUNCE_CAP`/`ACTIVATE_CAP` test fixtures and successors). Because of
+/// that reuse it deliberately does NOT assert `pending_cap == current_cap`
+/// -- prefer [`build_mint_authority_genesis_redeem_script`] for an actual
+/// genesis deploy, which structurally cannot express that misconfiguration
+/// (FIX 3, 2026-07-20 audit).
 /// `mint_pubkey` is the mint-authority's own hot MINT-role key (also reused
 /// as the stablecoin covenant's MINT-role BURN-authorizer key, per §2's role
 /// table); `cap_authority_pubkeys` are the cold 2-of-3 keys for the
@@ -1437,7 +1589,9 @@ pub fn build_mint_authority_body(
 /// `cap_raise_multiplier_k` (G4): ANNOUNCE_CAP's ceiling multiplier -- MUST
 /// be `>= 2` (asserted below). `epoch_length_daa`/`epoch_mint_budget` (G5):
 /// MINT's epoch window length (DAA) and per-window sompi budget.
-/// `min_activation_delay_daa` (G4): ACTIVATE_CAP's CSV timelock floor.
+/// `min_activation_delay_daa` (G4): ACTIVATE_CAP's state-anchored timelock
+/// floor (FIX 1, 2026-07-20: no longer a CSV floor -- see
+/// `build_activate_cap_branch`'s doc).
 #[allow(clippy::too_many_arguments)]
 pub fn build_mint_authority_redeem_script(
     running_supply: u64,
@@ -1445,6 +1599,7 @@ pub fn build_mint_authority_redeem_script(
     epoch_start_daa: u64,
     current_cap: u64,
     pending_cap: u64,
+    pending_since_daa: u64,
     mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
     cap_authority_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
     ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
@@ -1465,6 +1620,10 @@ pub fn build_mint_authority_redeem_script(
     // construction. (seize/ops/freeze/recovery are also baked here for emitted-coin
     // reconstruction and must match the covenant's own distinct set -- recovery_pubkeys
     // in particular must be independent of seize_pubkeys, Decision 2026-07-20-G0.)
+    // (FIX 2: this same assert is duplicated in build_mint_authority_body
+    // itself, which this function calls below -- kept here too as the
+    // earliest-possible-failure copy, mirroring stablecoin::body's
+    // build_stablecoin_body/build_stablecoin_redeem_script precedent.)
     {
         let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 12] = [
             mint_pubkey,
@@ -1480,7 +1639,7 @@ pub fn build_mint_authority_redeem_script(
         }
     }
     assert!(cap_raise_multiplier_k >= 2, "cap_raise_multiplier_k must be >= 2");
-    let state = super::state::MintAuthorityStateHeader::new(running_supply, minted_this_epoch, epoch_start_daa, current_cap, pending_cap);
+    let state = super::state::MintAuthorityStateHeader::new(running_supply, minted_this_epoch, epoch_start_daa, current_cap, pending_cap, pending_since_daa);
     let mut rs = state.encode_script();
     debug_assert_eq!(rs.len(), super::state::STATE_HEADER_LEN);
     rs.extend_from_slice(&build_mint_authority_body(
@@ -1499,6 +1658,64 @@ pub fn build_mint_authority_redeem_script(
         min_activation_delay_daa,
     ));
     rs
+}
+
+/// Genesis-only wrapper around [`build_mint_authority_redeem_script`] (FIX 3,
+/// 2026-07-20 audit, "genesis pending_cap==current_cap not enforced"). A
+/// fresh deploy has no `MINT`/`ANNOUNCE_CAP`/`ACTIVATE_CAP` history yet, so
+/// `minted_this_epoch`/`epoch_start_daa` start at `0` and
+/// `pending_cap`/`pending_since_daa` start at the sentinel "no announcement
+/// pending" values (`current_cap`/`0`) -- see
+/// [`super::state::MintAuthorityStateHeader::new_genesis`]'s doc for the
+/// full rationale (since `ACTIVATE_CAP` is PERMISSIONLESS, a deploy-time
+/// misconfiguration setting `pending_cap > current_cap` would let ANYONE
+/// promote an unvetted cap that never went through `ANNOUNCE_CAP`'s cold
+/// quorum). Callers deploying a genuinely new authority should prefer this
+/// over the generic constructor, which stays available (and does NOT carry
+/// this guard) for predicting arbitrary non-genesis state headers.
+#[allow(clippy::too_many_arguments)]
+pub fn build_mint_authority_genesis_redeem_script(
+    running_supply: u64,
+    current_cap: u64,
+    mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+    cap_authority_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
+    ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+    freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
+    seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
+    recovery_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
+    role_registry_root: &[u8; 32],
+    identifier_type: u8,
+    genesis_covenant_id: &[u8; 32],
+    cap_raise_multiplier_k: u64,
+    epoch_length_daa: u64,
+    epoch_mint_budget: u64,
+    min_activation_delay_daa: u64,
+) -> Vec<u8> {
+    // Structural guard (asserts are trivially true by construction here --
+    // see new_genesis's doc for why they're kept as a refactor tripwire
+    // rather than dropped).
+    let genesis_state = super::state::MintAuthorityStateHeader::new_genesis(running_supply, current_cap);
+    build_mint_authority_redeem_script(
+        genesis_state.running_supply,
+        genesis_state.minted_this_epoch,
+        genesis_state.epoch_start_daa,
+        genesis_state.current_cap,
+        genesis_state.pending_cap,
+        genesis_state.pending_since_daa,
+        mint_pubkey,
+        cap_authority_pubkeys,
+        ops_pubkey,
+        freeze_pubkey,
+        seize_pubkeys,
+        recovery_pubkeys,
+        role_registry_root,
+        identifier_type,
+        genesis_covenant_id,
+        cap_raise_multiplier_k,
+        epoch_length_daa,
+        epoch_mint_budget,
+        min_activation_delay_daa,
+    )
 }
 
 /// Off-chain convenience: reconstruct the emitted coin's redeem script
@@ -1561,6 +1778,7 @@ mod tests {
             0,
             current_cap,
             current_cap,
+            0, // pending_since_daa sentinel (no announcement pending)
             &MINT,
             &CAP_AUTH,
             &OPS,
@@ -1592,6 +1810,8 @@ mod tests {
         assert_eq!(&script[28..36], &5_000u64.to_le_bytes());
         assert_eq!(script[36], 0x08); // pending_cap
         assert_eq!(&script[37..45], &5_000u64.to_le_bytes());
+        assert_eq!(script[45], 0x08); // pending_since_daa (FIX 1)
+        assert_eq!(&script[46..54], &0u64.to_le_bytes());
         assert!(script.len() > super::super::state::STATE_HEADER_LEN);
     }
 
@@ -1641,8 +1861,8 @@ mod tests {
         // hardcoded/ignored) -- the whole point of SUB-FIX B is that these
         // two scripts behave differently on-chain despite sharing every
         // other baked key.
-        let a = build_mint_authority_redeem_script(0, 0, 0, 5_000, 5_000, &MINT, &CAP_AUTH, &OPS, &FREEZE, &SEIZE, &RECOVERY, &ROOT, 0x00, &GENESIS, K, EPOCH_LEN, EPOCH_BUDGET, MIN_ACTIVATION_DELAY);
-        let b = build_mint_authority_redeem_script(0, 0, 0, 5_000, 5_000, &MINT, &CAP_AUTH, &OPS, &FREEZE, &SEIZE, &RECOVERY, &ROOT, 0x00, &[0x99; 32], K, EPOCH_LEN, EPOCH_BUDGET, MIN_ACTIVATION_DELAY);
+        let a = build_mint_authority_redeem_script(0, 0, 0, 5_000, 5_000, 0, &MINT, &CAP_AUTH, &OPS, &FREEZE, &SEIZE, &RECOVERY, &ROOT, 0x00, &GENESIS, K, EPOCH_LEN, EPOCH_BUDGET, MIN_ACTIVATION_DELAY);
+        let b = build_mint_authority_redeem_script(0, 0, 0, 5_000, 5_000, 0, &MINT, &CAP_AUTH, &OPS, &FREEZE, &SEIZE, &RECOVERY, &ROOT, 0x00, &[0x99; 32], K, EPOCH_LEN, EPOCH_BUDGET, MIN_ACTIVATION_DELAY);
         assert_ne!(a, b);
         // The mutable state header (unaffected by G) stays identical.
         assert_eq!(&a[..super::super::state::STATE_HEADER_LEN], &b[..super::super::state::STATE_HEADER_LEN]);
@@ -1669,8 +1889,40 @@ mod tests {
         assert!(body.contains(&op::GREATERTHAN), "expected ANNOUNCE_CAP's strict-increase OpGreaterThan to appear in the body");
         // And the G4 ceiling check's OpMul must appear (checked multiplication).
         assert!(body.contains(&op::MUL), "expected ANNOUNCE_CAP's G4 ceiling OpMul to appear in the body");
-        // And ACTIVATE_CAP's CSV timelock must appear.
-        assert!(body.contains(&op::CHECKSEQUENCEVERIFY), "expected ACTIVATE_CAP's OpCheckSequenceVerify to appear in the body");
+        // And ACTIVATE_CAP's FIX 1 state-anchored timelock (OpTxInputDaaScore
+        // compared via OpLessThanOrEqual+OpVerify, replacing the old CSV
+        // OpCheckSequenceVerify) must appear -- this specific 4-byte window
+        // (TxInputIndex TxInputDaaScore LessThanOrEqual Verify) is unique to
+        // Step 4b's `deadline <= now` check (MINT's epoch-budget block and
+        // ANNOUNCE_CAP's own pending_since_daa stamp both read
+        // OpTxInputDaaScore too, but neither is immediately followed by
+        // LessThanOrEqual+Verify).
+        assert!(
+            body.windows(4).any(|w| w == [op::TXINPUTINDEX, op::TXINPUTDAASCORE, op::LESSTHANOREQUAL, op::VERIFY]),
+            "expected ACTIVATE_CAP's FIX 1 state-anchored timelock check to appear in the body"
+        );
+        // Note: a companion check that OpCheckSequenceVerify (0xb1) is
+        // "gone" would be unreliable here via a raw byte-contains scan --
+        // RECOVERY[0] == [0xB1; 32] is baked into this same body (as part of
+        // the emitted-coin reconstruction constants) and would make a naive
+        // `body.contains(&0xb1)` trivially true regardless of CSV's actual
+        // presence. See `activate_cap_branch_no_longer_ends_in_csv_tail`
+        // below (isolates `build_activate_cap_branch`'s own output, with no
+        // such baked-pubkey collision) for that regression instead.
+    }
+
+    #[test]
+    fn activate_cap_branch_no_longer_ends_in_csv_tail() {
+        // FIX 1 regression: the old Step 10 ended every ACTIVATE_CAP branch
+        // in `[..., DATA8, <8 bytes of min_activation_delay_daa>,
+        // OpCheckSequenceVerify, OP1]`. The new state-anchored timelock
+        // moves the check earlier (Step 4b) and the branch now ends in a
+        // plain `[..., DROP, OP1]` (Step 9's stack-empty DROP immediately
+        // before the branch's uniform OP1 success return) -- CSV is REPLACED,
+        // not merely supplemented.
+        let branch = build_activate_cap_branch(MIN_ACTIVATION_DELAY);
+        assert!(!branch.contains(&op::CHECKSEQUENCEVERIFY), "OpCheckSequenceVerify must no longer appear in ACTIVATE_CAP's own branch bytecode at all");
+        assert_eq!(&branch[branch.len() - 2..], &[op::DROP, op::OP1], "branch must end in a plain DROP OP1 (no trailing CSV push+opcode)");
     }
 
     #[test]
@@ -1741,7 +1993,7 @@ mod tests {
     #[test]
     fn distinct_mint_keys_yield_distinct_redeem_scripts() {
         let a = rs(0, 5_000);
-        let b = build_mint_authority_redeem_script(0, 0, 0, 5_000, 5_000, &[0x01; 32], &CAP_AUTH, &OPS, &FREEZE, &SEIZE, &RECOVERY, &ROOT, 0x00, &GENESIS, K, EPOCH_LEN, EPOCH_BUDGET, MIN_ACTIVATION_DELAY);
+        let b = build_mint_authority_redeem_script(0, 0, 0, 5_000, 5_000, 0, &[0x01; 32], &CAP_AUTH, &OPS, &FREEZE, &SEIZE, &RECOVERY, &ROOT, 0x00, &GENESIS, K, EPOCH_LEN, EPOCH_BUDGET, MIN_ACTIVATION_DELAY);
         assert_ne!(a, b);
         assert_eq!(&a[..super::super::state::STATE_HEADER_LEN], &b[..super::super::state::STATE_HEADER_LEN]);
     }

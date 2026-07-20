@@ -15,8 +15,9 @@
 //!
 //! Per [`super::body::build_mint_branch`]'s module doc, the entry stack once
 //! the dispatch delivers control to the MINT branch is (top-to-bottom):
-//! `current_cap(0), running_supply(1), recipient_pubkey(2), mint_amount(3),
-//! new_rs(4), old_rs(5), mint_sig(6)` — `current_cap`/`running_supply` are
+//! `pending_since_daa(0), pending_cap(1), current_cap(2), epoch_start_daa(3),
+//! minted_this_epoch(4), running_supply(5), recipient_pubkey(6),
+//! mint_amount(7), new_rs(8), old_rs(9), mint_sig(10)` — the first six are
 //! pushed by the redeem script's own state header (`state.rs`), not the
 //! sigscript. Because a sigscript is push-only and the *emission* order is
 //! the reverse of stack depth (the first push ends up deepest), the sigscript
@@ -55,11 +56,12 @@
 //!
 //! Per [`super::body::build_announce_cap_branch`]'s module doc, the entry
 //! stack once the dispatch delivers control to the ANNOUNCE_CAP branch is
-//! (top-to-bottom): `pending_cap(0), current_cap(1), epoch_start_daa(2),
-//! minted_this_epoch(3), running_supply(4), new_pending_cap(5), new_rs(6),
-//! old_rs(7), sig3(8), sig2(9), sig1(10)` — the first five are the state
-//! header's own live pushes (`state.rs`), not the sigscript. The sigscript
-//! this builder emits (first push == deepest) is:
+//! (top-to-bottom): `pending_since_daa(0), pending_cap(1), current_cap(2),
+//! epoch_start_daa(3), minted_this_epoch(4), running_supply(5),
+//! new_pending_cap(6), new_rs(7), old_rs(8), sig3(9), sig2(10), sig1(11)` —
+//! the first six are the state header's own live pushes (`state.rs`), not
+//! the sigscript. The sigscript this builder emits (first push == deepest)
+//! is:
 //!
 //! ```text
 //! push sig1(64B) -> push sig2(64B) -> push sig3(64B) -> push old_rs
@@ -83,7 +85,12 @@
 //!   attestation pre-image, checked against the G4 ceiling
 //!   (`<= current_cap * K`), and checked against the successor's actual
 //!   `pending_cap` field (NOT `current_cap`, which must stay unchanged until
-//!   `ACTIVATE_CAP`'s CSV timelock clears).
+//!   `ACTIVATE_CAP`'s state-anchored timelock clears, FIX 1 2026-07-20). The
+//!   successor's `pending_since_daa` is NOT a separate sigscript push -- the
+//!   branch stamps it on-chain from this input's own `OpTxInputDaaScore`
+//!   (see `build_announce_cap_branch`'s Step 6c), so a caller's `new_rs`
+//!   must set that field to whatever DAA score this specific spend will
+//!   actually execute at.
 //!
 //! This input's `sig_op_count` MUST be **3** (three `OpCheckSigFromStack`
 //! calls for the 2-of-3 `cap_authority` quorum — no owner signature, no
@@ -93,9 +100,9 @@
 //!
 //! Per [`super::body::build_activate_cap_branch`]'s module doc, the entry
 //! stack once the dispatch delivers control to the ACTIVATE_CAP branch is
-//! (top-to-bottom): `pending_cap(0), current_cap(1), epoch_start_daa(2),
-//! minted_this_epoch(3), running_supply(4), new_rs(5), old_rs(6)`. The
-//! sigscript this builder emits (first push == deepest) is:
+//! (top-to-bottom): `pending_since_daa(0), pending_cap(1), current_cap(2),
+//! epoch_start_daa(3), minted_this_epoch(4), running_supply(5), new_rs(6),
+//! old_rs(7)`. The sigscript this builder emits (first push == deepest) is:
 //!
 //! ```text
 //! push old_rs -> push new_rs -> push op_type_selector(1B, 0x02)
@@ -103,10 +110,13 @@
 //! ```
 //!
 //! No signatures at all: this branch is PERMISSIONLESS (gated only by the
-//! CSV timelock, `input.sequence >= min_activation_delay_daa`, and the
-//! on-chain checks that the successor's `current_cap`/`pending_cap` both
-//! equal this coin's own already-announced `pending_cap`). This input's
-//! `sig_op_count` MUST be **0**.
+//! FIX 1 state-anchored timelock -- `old_rs`'s own `pending_since_daa` +
+//! `min_activation_delay_daa` `<=` this input's `OpTxInputDaaScore`,
+//! REPLACING the earlier CSV `input.sequence >= min_activation_delay_daa`
+//! design, see `build_activate_cap_branch`'s doc for why -- and the on-chain
+//! checks that the successor's `current_cap`/`pending_cap` both equal this
+//! coin's own already-announced `pending_cap`, and `pending_since_daa` is
+//! reset to `0`). This input's `sig_op_count` MUST be **0**.
 
 use crate::primitives::push_data;
 
@@ -221,11 +231,13 @@ pub fn build_mint_authority_announce_cap_sigscript(
 /// See this module's top doc for the derivation of the push order from
 /// [`super::body::build_activate_cap_branch`]'s entry-stack layout.
 ///
-/// PERMISSIONLESS: no signatures at all -- gated purely by the CSV timelock
-/// (`input.sequence >= min_activation_delay_daa`, enforced by the redeem
-/// script itself via `OpCheckSequenceVerify`) and the on-chain checks that
-/// the successor's `current_cap`/`pending_cap` both equal this coin's own
-/// already-announced `pending_cap`.
+/// PERMISSIONLESS: no signatures at all -- gated purely by FIX 1's (2026-07-20
+/// timelock-griefing hardening) state-anchored timelock (`old_rs`'s own
+/// `pending_since_daa` + `min_activation_delay_daa` `<=` this input's
+/// `OpTxInputDaaScore`, enforced by the redeem script itself) and the
+/// on-chain checks that the successor's `current_cap`/`pending_cap` both
+/// equal this coin's own already-announced `pending_cap`, with
+/// `pending_since_daa` reset to `0`.
 ///
 /// `old_rs` — this input's own current redeemScript (authenticated via
 /// `dr_input_spk_check` on-chain).
@@ -236,9 +248,10 @@ pub fn build_mint_authority_announce_cap_sigscript(
 /// The returned bytes are push-only and pop in the order
 /// `build_activate_cap_branch` (`body.rs`) expects: `old_rs` deepest, then
 /// `new_rs`, then the `op_type_selector` (`0x02 == ACTIVATE_CAP`), then the
-/// redeem script last. Callers MUST also set this input's `sequence` field
-/// to a value `>= min_activation_delay_daa` (masked by
-/// `SEQUENCE_LOCK_TIME_MASK`) and `sig_op_count` to `0`.
+/// redeem script last. `sig_op_count` MUST be `0`; unlike the earlier CSV
+/// design, callers need not set this input's `sequence` field to anything
+/// in particular (the timelock is enforced purely from state +
+/// `OpTxInputDaaScore` now).
 pub fn build_mint_authority_activate_cap_sigscript(old_rs: &[u8], new_rs: &[u8], redeem_script: &[u8]) -> Vec<u8> {
     let mut ss = Vec::with_capacity(3 + old_rs.len() + 3 + new_rs.len() + 2 + 3 + redeem_script.len());
     // Emitted first -> ends up deepest on the stack: this input's own
@@ -281,6 +294,7 @@ mod tests {
             0,   // epoch_start_daa
             current_cap,
             current_cap, // pending_cap (sentinel: no announcement pending)
+            0,           // pending_since_daa (sentinel: no announcement pending)
             &MINT_PK,
             &CAP_AUTH,
             &OPS_PK,

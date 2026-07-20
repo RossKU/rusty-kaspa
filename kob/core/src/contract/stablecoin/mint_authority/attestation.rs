@@ -93,9 +93,12 @@ pub mod op_type {
     pub const MINT: u8 = 0x00;
     pub const ANNOUNCE_CAP: u8 = 0x01;
     /// Permissionless: promotes an already-announced `pending_cap` into
-    /// `current_cap` once `min_activation_delay_daa` (CSV) has elapsed since
-    /// the input became spendable. Has NO attestation message of its own --
-    /// there is no signature at all in this branch (sig_op_count = 0).
+    /// `current_cap` once `min_activation_delay_daa` has elapsed since the
+    /// announcement (a state-anchored timelock, FIX 1 2026-07-20 --
+    /// `pending_since_daa + min_activation_delay_daa <= OpTxInputDaaScore`,
+    /// not CSV; see `body::build_activate_cap_branch`'s doc for why the
+    /// earlier CSV design was replaced). Has NO attestation message of its
+    /// own -- there is no signature at all in this branch (sig_op_count = 0).
     pub const ACTIVATE_CAP: u8 = 0x02;
 }
 

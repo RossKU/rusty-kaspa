@@ -113,6 +113,14 @@ pub mod op_type {
     // 0x04 reserved -- separate mint-authority contract, not this covenant.
     pub const ROTATE: u8 = 0x05;
     pub const MIGRATE: u8 = 0x06;
+    /// N:M transfer (G1, split/merge) leader -- does ALL group bookkeeping
+    /// for its covenant-id lineage. See `super::dispatch`'s module doc and
+    /// the N:M design note above [`build_transfer_nm_attestation_preimage`].
+    pub const TRANSFER_NM: u8 = 0x07;
+    /// N:M transfer (G1) delegator -- self-authorizes only; does not
+    /// re-verify the group attestation (the leader's script, unavoidably
+    /// present in the same tx, carries it).
+    pub const TRANSFER_NM_DELEGATOR: u8 = 0x08;
 }
 
 /// Exclusive upper bound on `outpoint_index` for which the little-endian
@@ -406,6 +414,123 @@ pub fn build_migrate_attestation_message(
     let preimage =
         build_migrate_attestation_preimage(covenant_id, epoch, outpoint_txid, outpoint_index, successor_spk, amount, new_template_hash);
     *blake3::hash(&preimage).as_bytes()
+}
+
+/// Width, in bytes, of TRANSFER_NM's `n_in`/`n_out` group-cardinality fields
+/// (§ N:M design -- the ACTUAL `OpCovInputCount`/`OpCovOutputCount` values,
+/// i.e. `n_in` counts the leader AND every sibling, `n_out` counts every
+/// successor).
+pub const N_IN_LEN: usize = 1;
+pub const N_OUT_LEN: usize = 1;
+/// Width, in bytes, of each TRANSFER_NM group digest field
+/// (`inputs_digest`/`outputs_digest`).
+pub const GROUP_DIGEST_LEN: usize = 32;
+
+/// Byte offsets inside the TRANSFER_NM (`0x07`) pre-image. This is **not**
+/// [`build_attestation_preimage`]'s BASE layout plus a tail: BASE's
+/// single-successor replay fields (`outpoint_txid`/`outpoint_index`/
+/// `successor_spk_hash`/`amount`) have no well-defined meaning for a group of
+/// up to `MAX_N+1` inputs and `MAX_N` outputs, so TRANSFER_NM REPLACES them
+/// (starting right after `epoch`) with `n_in`/`n_out`/`inputs_digest`/
+/// `outputs_digest` instead. Only the leading 45 bytes (`DOMAIN_TAG ||
+/// covenant_id || op_type || epoch`) share BASE's field order/widths.
+///
+/// The leader's own outpoint/amount are deliberately NOT folded into
+/// `inputs_digest` (siblings only, see [`build_transfer_nm_attestation_preimage`]'s
+/// doc): the leader's own coin identity is already authenticated on-chain by
+/// `dr_input_spk_check` (against `self_rs`) and by the owner's SIGHASH_ALL
+/// signature (which commits the whole transaction, including this input's own
+/// outpoint), so nothing about the OPS attestation needs to re-pin it.
+pub const OFFSET_N_IN: usize = OFFSET_EPOCH + EPOCH_LEN; // 45
+pub const OFFSET_N_OUT: usize = OFFSET_N_IN + N_IN_LEN; // 46
+pub const OFFSET_INPUTS_DIGEST: usize = OFFSET_N_OUT + N_OUT_LEN; // 47
+pub const OFFSET_OUTPUTS_DIGEST: usize = OFFSET_INPUTS_DIGEST + GROUP_DIGEST_LEN; // 79
+
+/// Total TRANSFER_NM pre-image length: `45 + 1 + 1 + 32 + 32 = 111` bytes.
+pub const TRANSFER_NM_PREIMAGE_LEN: usize = OFFSET_OUTPUTS_DIGEST + GROUP_DIGEST_LEN;
+
+/// Build the 111-byte TRANSFER_NM issuer-attestation pre-image (see the
+/// `OFFSET_*` constants' doc for the field layout). `inputs_digest` is
+/// `Blake3` of the concatenation, in ascending sibling-slot order
+/// (`s = 1..MAX_N`, guarded by `s < OpCovInputCount`), of each sibling's
+/// `outpoint_txid(32B) || outpoint_index(4B LE) || amount(8B LE)` --
+/// mirroring exactly what the on-chain leader body folds via `OpCat` before
+/// `OpBlake3` (see [`fold_transfer_nm_inputs_digest`] for the off-chain
+/// equivalent). `outputs_digest` is `Blake3` of the concatenation, in
+/// ascending successor-slot order (`j = 1..MAX_N`, guarded by
+/// `j <= OpCovOutputCount`), of each successor's raw SPK bytes
+/// (`ScriptPublicKey::to_bytes()` form -- version(2B BE) || script; every
+/// successor here is a P2SH stablecoin covenant so each entry is always
+/// exactly 37 bytes, which is what makes concatenation-then-hash
+/// boundary-safe) -- see [`fold_transfer_nm_outputs_digest`].
+pub fn build_transfer_nm_attestation_preimage(
+    covenant_id: &[u8; COVENANT_ID_LEN],
+    epoch: u32,
+    n_in: u8,
+    n_out: u8,
+    inputs_digest: &[u8; GROUP_DIGEST_LEN],
+    outputs_digest: &[u8; GROUP_DIGEST_LEN],
+) -> [u8; TRANSFER_NM_PREIMAGE_LEN] {
+    let mut out = [0u8; TRANSFER_NM_PREIMAGE_LEN];
+    out[OFFSET_DOMAIN_TAG..OFFSET_DOMAIN_TAG + DOMAIN_TAG_LEN].copy_from_slice(&DOMAIN_TAG);
+    out[OFFSET_COVENANT_ID..OFFSET_COVENANT_ID + COVENANT_ID_LEN].copy_from_slice(covenant_id);
+    out[OFFSET_OP_TYPE] = op_type::TRANSFER_NM;
+    out[OFFSET_EPOCH..OFFSET_EPOCH + EPOCH_LEN].copy_from_slice(&epoch.to_le_bytes());
+    out[OFFSET_N_IN] = n_in;
+    out[OFFSET_N_OUT] = n_out;
+    out[OFFSET_INPUTS_DIGEST..OFFSET_INPUTS_DIGEST + GROUP_DIGEST_LEN].copy_from_slice(inputs_digest);
+    out[OFFSET_OUTPUTS_DIGEST..OFFSET_OUTPUTS_DIGEST + GROUP_DIGEST_LEN].copy_from_slice(outputs_digest);
+    out
+}
+
+/// Build the 32-byte TRANSFER_NM attestation message: `Blake3(pre-image)`.
+/// This is exactly the digest the leader body's TRANSFER_NM branch
+/// reconstructs and feeds to `OpCheckSigFromStack`; the OPS role signs this
+/// with a raw (message-hash) Schnorr signature over the WHOLE group in one
+/// signature (delegators do not re-verify it -- see the branch's doc in
+/// `body.rs`).
+#[allow(clippy::too_many_arguments)]
+pub fn build_transfer_nm_attestation_message(
+    covenant_id: &[u8; COVENANT_ID_LEN],
+    epoch: u32,
+    n_in: u8,
+    n_out: u8,
+    inputs_digest: &[u8; GROUP_DIGEST_LEN],
+    outputs_digest: &[u8; GROUP_DIGEST_LEN],
+) -> [u8; 32] {
+    let preimage = build_transfer_nm_attestation_preimage(covenant_id, epoch, n_in, n_out, inputs_digest, outputs_digest);
+    *blake3::hash(&preimage).as_bytes()
+}
+
+/// Off-chain equivalent of the on-chain leader body's sibling-input folding
+/// (see [`build_transfer_nm_attestation_preimage`]'s doc): `Blake3` of the
+/// concatenation, in order, of each sibling's `outpoint_txid(32B) ||
+/// outpoint_index(4B LE) || amount(8B LE)`. Callers pass siblings in the SAME
+/// ascending covenant-input-slot order (`s = 1..`) the on-chain body
+/// enumerates via `OpCovInputIdx` -- i.e. NOT including the leader's own
+/// input.
+pub fn fold_transfer_nm_inputs_digest(siblings: &[([u8; 32], u32, u64)]) -> [u8; GROUP_DIGEST_LEN] {
+    let mut acc = Vec::with_capacity(siblings.len() * 44);
+    for (outpoint_txid, outpoint_index, amount) in siblings {
+        acc.extend_from_slice(outpoint_txid);
+        acc.extend_from_slice(&outpoint_index.to_le_bytes());
+        acc.extend_from_slice(&amount.to_le_bytes());
+    }
+    *blake3::hash(&acc).as_bytes()
+}
+
+/// Off-chain equivalent of the on-chain leader body's successor-output
+/// folding (see [`build_transfer_nm_attestation_preimage`]'s doc): `Blake3`
+/// of the concatenation, in order, of each successor's raw SPK bytes
+/// (`ScriptPublicKey::to_bytes()` form). Callers pass successors in the SAME
+/// ascending covenant-output-slot order (`j = 1..`) the on-chain body
+/// enumerates via `OpCovOutputIdx`.
+pub fn fold_transfer_nm_outputs_digest(successor_spks: &[Vec<u8>]) -> [u8; GROUP_DIGEST_LEN] {
+    let mut acc = Vec::new();
+    for spk in successor_spks {
+        acc.extend_from_slice(spk);
+    }
+    *blake3::hash(&acc).as_bytes()
 }
 
 /// Decode a 121-byte BASE pre-image back into its fields (the *Reader* side
@@ -703,7 +828,92 @@ mod tests {
         // 0x04 is reserved for the separate mint-authority contract (§9) and
         // must never appear as a named constant in this covenant's op_type
         // set.
-        let defined = [op_type::TRANSFER, op_type::FREEZE, op_type::SEIZE, op_type::BURN, op_type::ROTATE, op_type::MIGRATE];
+        let defined = [
+            op_type::TRANSFER,
+            op_type::FREEZE,
+            op_type::SEIZE,
+            op_type::BURN,
+            op_type::ROTATE,
+            op_type::MIGRATE,
+            op_type::TRANSFER_NM,
+            op_type::TRANSFER_NM_DELEGATOR,
+        ];
         assert!(!defined.contains(&0x04));
+        assert_eq!(op_type::TRANSFER_NM, 0x07);
+        assert_eq!(op_type::TRANSFER_NM_DELEGATOR, 0x08);
+    }
+
+    #[test]
+    fn transfer_nm_preimage_len_and_offsets() {
+        assert_eq!(TRANSFER_NM_PREIMAGE_LEN, 111);
+        assert_eq!(OFFSET_N_IN, 45);
+        assert_eq!(OFFSET_N_OUT, 46);
+        assert_eq!(OFFSET_INPUTS_DIGEST, 47);
+        assert_eq!(OFFSET_OUTPUTS_DIGEST, 79);
+        assert_eq!(OFFSET_OUTPUTS_DIGEST + GROUP_DIGEST_LEN, TRANSFER_NM_PREIMAGE_LEN);
+    }
+
+    #[test]
+    fn transfer_nm_preimage_field_placement() {
+        let cov = [0x11u8; 32];
+        let inputs_digest = [0x22u8; 32];
+        let outputs_digest = [0x33u8; 32];
+        let pre = build_transfer_nm_attestation_preimage(&cov, 7, 3, 2, &inputs_digest, &outputs_digest);
+        assert_eq!(pre.len(), 111);
+        assert_eq!(&pre[0..8], &DOMAIN_TAG);
+        assert_eq!(&pre[OFFSET_COVENANT_ID..OFFSET_COVENANT_ID + 32], &cov);
+        assert_eq!(pre[OFFSET_OP_TYPE], op_type::TRANSFER_NM);
+        assert_eq!(&pre[OFFSET_EPOCH..OFFSET_EPOCH + 4], &7u32.to_le_bytes());
+        assert_eq!(pre[OFFSET_N_IN], 3);
+        assert_eq!(pre[OFFSET_N_OUT], 2);
+        assert_eq!(&pre[OFFSET_INPUTS_DIGEST..OFFSET_INPUTS_DIGEST + 32], &inputs_digest);
+        assert_eq!(&pre[OFFSET_OUTPUTS_DIGEST..OFFSET_OUTPUTS_DIGEST + 32], &outputs_digest);
+    }
+
+    #[test]
+    fn transfer_nm_message_is_blake3_of_preimage_and_field_sensitive() {
+        let cov = [0x44u8; 32];
+        let din = [0x55u8; 32];
+        let dout = [0x66u8; 32];
+        let pre = build_transfer_nm_attestation_preimage(&cov, 1, 2, 1, &din, &dout);
+        let msg = build_transfer_nm_attestation_message(&cov, 1, 2, 1, &din, &dout);
+        assert_eq!(msg, *blake3::hash(&pre).as_bytes());
+
+        assert_ne!(msg, build_transfer_nm_attestation_message(&cov, 2, 2, 1, &din, &dout)); // epoch
+        assert_ne!(msg, build_transfer_nm_attestation_message(&cov, 1, 3, 1, &din, &dout)); // n_in
+        assert_ne!(msg, build_transfer_nm_attestation_message(&cov, 1, 2, 2, &din, &dout)); // n_out
+        let mut din2 = din;
+        din2[0] ^= 0xff;
+        assert_ne!(msg, build_transfer_nm_attestation_message(&cov, 1, 2, 1, &din2, &dout));
+        let mut dout2 = dout;
+        dout2[0] ^= 0xff;
+        assert_ne!(msg, build_transfer_nm_attestation_message(&cov, 1, 2, 1, &din, &dout2));
+    }
+
+    #[test]
+    fn fold_transfer_nm_inputs_digest_matches_manual_concatenation() {
+        let sib1 = ([0x01u8; 32], 5u32, 1_000u64);
+        let sib2 = ([0x02u8; 32], 7u32, 2_000u64);
+        let digest = fold_transfer_nm_inputs_digest(&[sib1, sib2]);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&sib1.0);
+        expected.extend_from_slice(&sib1.1.to_le_bytes());
+        expected.extend_from_slice(&sib1.2.to_le_bytes());
+        expected.extend_from_slice(&sib2.0);
+        expected.extend_from_slice(&sib2.1.to_le_bytes());
+        expected.extend_from_slice(&sib2.2.to_le_bytes());
+        assert_eq!(digest, *blake3::hash(&expected).as_bytes());
+        assert_eq!(fold_transfer_nm_inputs_digest(&[]), *blake3::hash(&[]).as_bytes());
+    }
+
+    #[test]
+    fn fold_transfer_nm_outputs_digest_matches_manual_concatenation() {
+        let spk1 = vec![0xAAu8; 37];
+        let spk2 = vec![0xBBu8; 37];
+        let digest = fold_transfer_nm_outputs_digest(&[spk1.clone(), spk2.clone()]);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&spk1);
+        expected.extend_from_slice(&spk2);
+        assert_eq!(digest, *blake3::hash(&expected).as_bytes());
     }
 }

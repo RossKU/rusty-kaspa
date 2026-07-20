@@ -7,16 +7,22 @@
 //! `core/src/contract/token.rs:164-238`, generalized on top of the
 //! `spot::dca`/`dr.rs` D&R self-continuation template — see [`body`]'s module
 //! doc for exactly which pieces are mirrored from where). It carries its own
-//! **running-supply counter** and **raisable supply cap** as mutable state
-//! ([`state`]), and — on every honest MINT spend — emits a newly-minted
-//! stablecoin UTXO paying to the (separate) stablecoin covenant's P2SH,
-//! alongside its own self-continuation successor.
+//! **running-supply counter**, **G5 epoch mint budget**, and **raisable
+//! supply cap (G4, timelocked)** as mutable state ([`state`]), and — on
+//! every honest MINT spend — emits a newly-minted stablecoin UTXO paying to
+//! the (separate) stablecoin covenant's P2SH, alongside its own
+//! self-continuation successor.
 //!
-//! Both mini-dispatch operations are wired: **MINT** (`op_type 0x00`) and
-//! **RAISE_CAP** (`op_type 0x01`, `STABLECOIN_ROBUST_DESIGN.md` §9: cold
-//! 2-of-3 `cap_authority_pubkeys` authorization, self-continuing with
-//! `current_cap` strictly increased and `running_supply` unchanged, no coin
-//! emitted).
+//! All three mini-dispatch operations are wired (2026-07-20 mint-authority
+//! hardening, G4/G5): **MINT** (`op_type 0x00`; `running_supply` +=
+//! `mint_amount`, gated by the G5 per-epoch budget and dust floor),
+//! **ANNOUNCE_CAP** (`op_type 0x01`, renamed from `RAISE_CAP`; cold 2-of-3
+//! `cap_authority_pubkeys` authorization, self-continuing with
+//! `pending_cap` strictly increased -- and bounded by the G4 ceiling
+//! `<= current_cap * K` -- while `running_supply`/`current_cap` stay
+//! unchanged, no coin emitted), and **ACTIVATE_CAP** (`op_type 0x02`, new;
+//! PERMISSIONLESS, CSV-timelocked promotion of `pending_cap` into
+//! `current_cap`).
 //!
 //! This covenant is intentionally NOT the stablecoin covenant
 //! (`super::body`/`super::state`/`super::attestation`) — see this crate's

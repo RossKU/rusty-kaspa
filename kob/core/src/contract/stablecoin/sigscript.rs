@@ -151,6 +151,12 @@ pub fn build_stablecoin_freeze_sigscript(issuer_sig: &[u8; 64], new_frozen_flag:
 /// the third -- `OpCheckSigFromStack` parses any 64 bytes as a structurally
 /// valid Schnorr signature and simply evaluates to `false` on a non-matching
 /// key.
+///
+/// NOTE (Decision 2026-07-20-G0): MIGRATE's quorum is now a DIFFERENT
+/// (independent `recovery_pubkeys`) key set from this SEIZE quorum --
+/// they share only the `emit_2of3_threshold` bytecode SHAPE, not key
+/// material, so `seize_pubkeys` signatures no longer authorize MIGRATE (see
+/// [`build_stablecoin_migrate_sigscript`]'s doc).
 /// `new_owner_pubkey` -- the attested target owner (§5's op-specific preimage
 /// tail field); pushed as a 32-byte sigscript data item so the body can both
 /// fold it into the on-chain preimage reconstruction AND compare it against
@@ -249,11 +255,16 @@ pub fn build_stablecoin_burn_sigscript(owner_sig: &[u8; 64], issuer_sig: &[u8; 6
 /// Build the robust stablecoin MIGRATE (`op_type = 0x06`) sigscript.
 ///
 /// Owner `OpCheckSigVerify` PLUS a cold 2-of-3 quorum over the three baked
-/// SEIZE keys (Decision 2026-07-20: MIGRATE moves the coin to an arbitrary
-/// template, so a hot-key authorizer made it a governance-exit hole -- see
-/// `super::body::build_migrate_branch`'s "Authorizer" doc section). The
+/// **recovery** keys (Decision 2026-07-20-G0: MIGRATE moves the coin to an
+/// arbitrary template, so a hot-key authorizer made it a governance-exit
+/// hole -- see `super::body::build_migrate_branch`'s "Authorizer" doc
+/// section). An earlier revision (Decision 2026-07-20) gated MIGRATE behind
+/// the SAME `seize_pubkeys` quorum SEIZE uses; that was a G0-CRITICAL bug
+/// (a leaked SEIZE quorum also destroyed the recovery path) fixed by giving
+/// MIGRATE its OWN independent `recovery_pubkeys` cold 2-of-3 set. The
 /// quorum uses the SAME fixed positional convention and the SAME bytecode
-/// segment as SEIZE. There is NO `new_rs` field at all (unlike TRANSFER/FREEZE/SEIZE):
+/// SHAPE as SEIZE (`emit_2of3_threshold`), but different, independent KEY
+/// MATERIAL. There is NO `new_rs` field at all (unlike TRANSFER/FREEZE/SEIZE):
 /// MIGRATE's successor is an ARBITRARY new covenant template whose fields
 /// this covenant never reads or carries forward (§4: "coin moves to new
 /// redeem-script template"), so the body only needs the successor's SPK
@@ -261,11 +272,13 @@ pub fn build_stablecoin_burn_sigscript(owner_sig: &[u8; 64], issuer_sig: &[u8; 6
 ///
 /// `owner_sig` -- the owner's raw 64-byte Schnorr signature over the
 /// transaction's SIGHASH_ALL sighash (the `0x01` type byte is appended here).
-/// `sig1`/`sig2`/`sig3` -- the SEIZE-quorum members' raw 64-byte Schnorr
-/// signatures over [`super::attestation::build_migrate_attestation_message`]
-/// (no type byte), in fixed positional correspondence with the baked
-/// `seize_pubkeys[0]`/`[1]`/`[2]`. Any TWO must be valid; the unused slot
-/// takes a 64-byte filler (e.g. all-zero), exactly as SEIZE does.
+/// `sig1`/`sig2`/`sig3` -- the independent recovery-quorum members' raw
+/// 64-byte Schnorr signatures over
+/// [`super::attestation::build_migrate_attestation_message`] (no type byte),
+/// in fixed positional correspondence with the baked
+/// `recovery_pubkeys[0]`/`[1]`/`[2]` (NOT `seize_pubkeys` -- see this fn's
+/// doc above). Any TWO must be valid; the unused slot takes a 64-byte filler
+/// (e.g. all-zero), exactly as SEIZE does.
 /// `new_template_hash` -- the attested `Blake3` hash of the successor
 /// output's SPK (§5's op-specific preimage tail field); pushed as a 32-byte
 /// sigscript data item so the body can both fold it into the on-chain
@@ -292,9 +305,10 @@ pub fn build_stablecoin_migrate_sigscript(
     owner_sig_with_type.push(SIGHASH_ALL);
 
     let mut ss = Vec::with_capacity(3 * (2 + 64) + 2 + 32 + 2 + 65 + 2 + 3 + redeem_script.len());
-    // Emitted first -> ends up deepest on the stack: the three SEIZE-quorum
-    // attestation sigs, in the SAME fixed positional order SEIZE uses
-    // (sig1<->seize_pubkeys[0], sig2<->[1], sig3<->[2]).
+    // Emitted first -> ends up deepest on the stack: the three independent
+    // recovery-quorum attestation sigs, in the SAME fixed positional SHAPE
+    // SEIZE uses (sig1<->recovery_pubkeys[0], sig2<->[1], sig3<->[2]) but
+    // over DIFFERENT, independent key material (Decision 2026-07-20-G0).
     ss.extend_from_slice(&push_data(sig1));
     ss.extend_from_slice(&push_data(sig2));
     ss.extend_from_slice(&push_data(sig3));
@@ -305,6 +319,76 @@ pub fn build_stablecoin_migrate_sigscript(
     // Then the op_type selector (0x06 == MIGRATE).
     ss.extend_from_slice(&push_data(&[super::attestation::op_type::MIGRATE]));
     // Redeem script last: the P2SH wrapper pops it first, before the body runs.
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build the robust stablecoin TRANSFER_NM (`op_type = 0x07`, N:M leader)
+/// sigscript. See `super::body::build_transfer_nm_branch`'s doc for the
+/// group design/scope.
+///
+/// `self_rs` -- this coin's OWN redeem script (template-authentication copy,
+/// same convention as every other branch's `self_rs`).
+/// `issuer_sig` -- the OPS role's raw 64-byte Schnorr signature over
+/// [`super::attestation::build_transfer_nm_attestation_message`] (no type
+/// byte), covering the WHOLE group (leader + siblings + successors) in one
+/// signature.
+/// `new_rs_slots` -- `new_rs_slots[0]` is successor slot 1 (`new_rs_1`), ..,
+/// `new_rs_slots[MAX_N-1]` is successor slot `MAX_N` (`new_rs_MAX_N`); pad
+/// unused (beyond the real successor count) slots with an empty `Vec` --
+/// they are never read on-chain (guarded by `j <= OpCovOutputCount`).
+/// `owner_sig` -- the leader's own owner's raw 64-byte Schnorr signature over
+/// the transaction's SIGHASH_ALL sighash (the `0x01` type byte is appended
+/// here).
+/// `redeem_script` -- the full stablecoin redeem script from
+/// [`super::body::build_stablecoin_redeem_script`].
+///
+/// The returned bytes are push-only and pop in the order
+/// `build_transfer_nm_branch` (`body.rs`) expects: `self_rs` deepest, then
+/// `issuer_sig`, then `new_rs_MAX_N`, .., `new_rs_1`, then `owner_sig`, then
+/// the `op_type_selector` (`0x07 == TRANSFER_NM`), then the redeem script
+/// last.
+pub fn build_stablecoin_transfer_nm_leader_sigscript(
+    self_rs: &[u8],
+    issuer_sig: &[u8; 64],
+    new_rs_slots: &[Vec<u8>; super::body::TRANSFER_NM_MAX_N],
+    owner_sig: &[u8; 64],
+    redeem_script: &[u8],
+) -> Vec<u8> {
+    let mut owner_sig_with_type = Vec::with_capacity(65);
+    owner_sig_with_type.extend_from_slice(owner_sig);
+    owner_sig_with_type.push(SIGHASH_ALL);
+
+    let mut ss = Vec::new();
+    ss.extend_from_slice(&push_data(self_rs));
+    ss.extend_from_slice(&push_data(issuer_sig));
+    for slot in new_rs_slots.iter().rev() {
+        // rev(): new_rs_MAX_N (slots[MAX_N-1]) pushed first (deepest), ..,
+        // new_rs_1 (slots[0]) pushed last (shallowest, right before owner_sig).
+        ss.extend_from_slice(&push_data(slot));
+    }
+    ss.extend_from_slice(&push_data(&owner_sig_with_type));
+    ss.extend_from_slice(&push_data(&[super::attestation::op_type::TRANSFER_NM]));
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build the robust stablecoin TRANSFER_NM_DELEGATOR (`op_type = 0x08`)
+/// sigscript: `self_sig, op_type_selector`. Self-authorizes only -- does not
+/// re-verify the group attestation (see `build_transfer_nm_branch`'s doc).
+///
+/// `self_sig` -- this delegator's OWN raw 64-byte Schnorr signature over the
+/// transaction's SIGHASH_ALL sighash (the `0x01` type byte is appended here).
+/// `redeem_script` -- the full stablecoin redeem script from
+/// [`super::body::build_stablecoin_redeem_script`].
+pub fn build_stablecoin_transfer_nm_delegator_sigscript(self_sig: &[u8; 64], redeem_script: &[u8]) -> Vec<u8> {
+    let mut self_sig_with_type = Vec::with_capacity(65);
+    self_sig_with_type.extend_from_slice(self_sig);
+    self_sig_with_type.push(SIGHASH_ALL);
+
+    let mut ss = Vec::new();
+    ss.extend_from_slice(&push_data(&self_sig_with_type));
+    ss.extend_from_slice(&push_data(&[super::attestation::op_type::TRANSFER_NM_DELEGATOR]));
     ss.extend_from_slice(&push_data(redeem_script));
     ss
 }
@@ -320,6 +404,7 @@ mod tests {
     const ISSUER_SIG: [u8; 64] = [0x22; 64];
     const FREEZE_PK: [u8; 32] = [0xDD; 32];
     const SEIZE_PKS: [[u8; 32]; 3] = [[0x91; 32], [0x92; 32], [0x93; 32]];
+    const RECOVERY_PKS: [[u8; 32]; 3] = [[0xA1; 32], [0xA2; 32], [0xA3; 32]];
     const MINT_PK: [u8; 32] = [0xFA; 32];
 
     fn rs() -> Vec<u8> {
@@ -332,6 +417,7 @@ mod tests {
             &[0xBB; 32],
             &FREEZE_PK,
             &SEIZE_PKS,
+            &RECOVERY_PKS,
             &MINT_PK,
         )
     }
@@ -346,6 +432,7 @@ mod tests {
             &[0xBB; 32],
             &FREEZE_PK,
             &SEIZE_PKS,
+            &RECOVERY_PKS,
             &MINT_PK,
         )
     }
@@ -403,6 +490,7 @@ mod tests {
             &[0xBB; 32],
             &FREEZE_PK,
             &SEIZE_PKS,
+            &RECOVERY_PKS,
             &MINT_PK,
         );
         let ss = build_stablecoin_freeze_sigscript(&ISSUER_SIG, frozen_flag::SET, &new_rs, &rs);
@@ -445,6 +533,7 @@ mod tests {
             &[0xBB; 32],
             &FREEZE_PK,
             &SEIZE_PKS,
+            &RECOVERY_PKS,
             &MINT_PK,
         );
         let ss = build_stablecoin_seize_sigscript(&SIG1, &SIG2, &SIG3, &NEW_OWNER, &new_rs, &rs);
@@ -502,8 +591,11 @@ mod tests {
         // MIGRATE has NO new_rs field (like BURN, unlike TRANSFER/FREEZE/
         // SEIZE): the successor is an arbitrary new template identified only
         // by its attested SPK hash, not a spender-supplied plaintext blob.
-        // Since Decision 2026-07-20 the authorizer is the cold 2-of-3 SEIZE
-        // quorum, so three sig slots are emitted (SEIZE's positional order).
+        // Since Decision 2026-07-20-G0 the authorizer is MIGRATE's OWN
+        // independent cold 2-of-3 recovery quorum (NOT seize_pubkeys), so
+        // three sig slots are still emitted (SEIZE's positional SHAPE, over
+        // different key material -- this builder itself is signature-agnostic,
+        // so the change is invisible at this call site).
         let rs = rs();
         const OWNER_SIG3: [u8; 64] = [0x51; 64];
         const MIG_SIG1: [u8; 64] = [0x52; 64];

@@ -117,24 +117,25 @@
 //!     just renamed to the spec's OPS role terminology).
 //! 11. `Op1` -- success.
 //!
-//! # Omission flagged for human review: `frozen_flag` is not pinned across
-//! TRANSFER
+//! # `frozen_flag` IS pinned across TRANSFER (resolved -- see below)
 //!
-//! §4's TRANSFER invariant list names only `role_registry_root` and `epoch`
-//! as required to carry forward unchanged; it does not require
-//! `frozen_flag` continuity. This body implements exactly that (no
-//! `frozen_flag` comparison against the successor), so an OPS-signed
-//! TRANSFER could in principle also flip `frozen_flag` in the successor
-//! without going through the (Phase II) FREEZE branch's dedicated gate.
-//! Since FREEZE doesn't exist yet in Phase I this has no operational effect
-//! today, but it's worth a deliberate Phase II decision (pin it, or
-//! document it as intentionally OPS-mutable via TRANSFER).
+//! An earlier draft of this branch left the successor's `frozen_flag` byte
+//! completely unconstrained (matching §4's invariant list, which names only
+//! `role_registry_root`/`epoch` as required to carry forward unchanged and is
+//! silent on `frozen_flag`). That gap is CLOSED: this body now requires
+//! `successor.frozen_flag == CLEAR` (see the "successor.frozen_flag == CLEAR"
+//! block below, audit fix, final round 2026-07-20) -- an OPS-signed TRANSFER
+//! can no longer flip `frozen_flag` in the successor, hand the coin forward
+//! already frozen, or write an out-of-domain byte. Only the FREEZE branch may
+//! write a non-CLEAR `frozen_flag`.
 
 use super::attestation::{op_type, AMOUNT_LEN, OUTPOINT_INDEX_LEN, X_ONLY_PUBKEY_LEN};
 use super::dispatch::{build_op_type_dispatch, OpTypeBranches, UNIMPLEMENTED_BRANCH_STUB};
 use super::state::{
-    frozen_flag, StablecoinStateHeader, EPOCH_PAYLOAD_OFFSET, FROZEN_FLAG_PAYLOAD_OFFSET, IDENTIFIER_TYPE_PAYLOAD_OFFSET,
-    OWNER_PUBKEY_PAYLOAD_OFFSET, ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET, STATE_HEADER_LEN,
+    frozen_flag, StablecoinStateHeader, EPOCH_OPCODE_OFFSET, EPOCH_PAYLOAD_OFFSET, FROZEN_FLAG_OPCODE_OFFSET,
+    FROZEN_FLAG_PAYLOAD_OFFSET, IDENTIFIER_TYPE_OPCODE_OFFSET, IDENTIFIER_TYPE_PAYLOAD_OFFSET,
+    OWNER_PUBKEY_OPCODE_OFFSET, OWNER_PUBKEY_PAYLOAD_OFFSET, ROLE_REGISTRY_ROOT_OPCODE_OFFSET,
+    ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET, STATE_HEADER_LEN,
 };
 use super::DOMAIN_TAG;
 use crate::contract::dr::{
@@ -171,6 +172,23 @@ mod op {
     pub const DATA32: u8 = 0x20;
     pub const ADD: u8 = 0x93;
     pub const GREATERTHANOREQUAL: u8 = 0xa2;
+    // -- N:M (TRANSFER_NM / TRANSFER_NM_DELEGATOR) additions below; all
+    // additive, no existing constant's value changed. --
+    pub const OP0: u8 = 0x00;
+    pub const TWO_DROP: u8 = 0x6d;
+    pub const SWAP: u8 = 0x7c;
+    pub const IF: u8 = 0x63;
+    pub const ENDIF: u8 = 0x68;
+    pub const NOT: u8 = 0x91;
+    pub const SUB: u8 = 0x94;
+    pub const NUMEQUALVERIFY: u8 = 0x9d;
+    pub const LT: u8 = 0x9f;
+    pub const LTE: u8 = 0xa1;
+    pub const TXOUTPUTAMOUNT: u8 = 0xc2;
+    pub const COVINPUTCOUNT: u8 = 0xd0;
+    pub const COVINPUTIDX: u8 = 0xd1;
+    pub const COVOUTPUTCOUNT: u8 = 0xd2;
+    pub const COVOUTPUTIDX: u8 = 0xd3;
 }
 
 // Compile-time guards tying the `OpNum2Bin` width literals to the encoder's
@@ -266,9 +284,66 @@ fn e_roll(b: &mut Vec<u8>, depth: u16) {
     b.push(op::ROLL);
 }
 
+/// Push a small literal number (used for N:M loop counters/slot indices --
+/// mirrors `kcc20::transfer`'s `e_num`).
+fn e_num(b: &mut Vec<u8>, n: u16) {
+    push_index(b, n);
+}
+
+/// Push this input's own `covenant_id`: `OpTxInputIndex OpInputCovenantId`.
+/// Net stack effect: +1. Cheap enough (2 opcodes) to recompute fresh at
+/// every use site instead of caching a copy at a tracked depth -- mirrors
+/// `kcc20::transfer`'s `e_own_covenant_id` (same rationale: keeps N:M's
+/// unrolled-loop depth bookkeeping tractable).
+fn e_own_covenant_id(b: &mut Vec<u8>) {
+    b.push(op::TXINPUTINDEX);
+    b.push(op::INPUTCOVENANTID);
+}
+
 fn e_pick(b: &mut Vec<u8>, depth: u16) {
     push_index(b, depth);
     b.push(op::PICK);
+}
+
+/// Pin all five of the successor's mutable-state-header push-opcode bytes to
+/// their canonical values (audit 2026-07-20 §6.2 -- the "new HIGH").
+///
+/// `dr_suffix_check` authenticates the successor body (`[STATE_HEADER_LEN..]`)
+/// and each `dr_field_extract` authenticates a field's PAYLOAD range, but
+/// NOTHING here reads the five push-opcode bytes that frame the header
+/// (offsets 0/33/35/68/70 = `0x20 0x01 0x20 0x01 0x04`). A spender able to
+/// satisfy a successor-producing branch -- in the worst case the single FREEZE
+/// key -- could hand over an otherwise-honest `new_rs` with ONE opcode byte
+/// corrupted: every on-chain check still passes (none reads those offsets),
+/// yet the coin's P2SH commits to a header that re-parses at a different stack
+/// depth, so no future spend (owner/FREEZE/SEIZE/BURN) can execute -- the coin
+/// is permanently bricked, and `running_supply` (BURN-decremented only) still
+/// counts it as outstanding. This is exactly the hole `mint_authority/body.rs`
+/// already closes for its own `current_cap`/`running_supply` opcodes (its
+/// "Step 3/4 push-opcode sanity check"); TRANSFER/FREEZE/SEIZE merely never
+/// inherited the sibling pattern. Emitting it from ONE shared helper keeps the
+/// three branches from drifting apart again -- which is how the gap arose.
+///
+/// `new_rs_depth` is where `new_rs` currently sits on the data stack. Each of
+/// the five checks nets zero (extract +1, `DATA1`+byte +1, `EQUAL` -1,
+/// `VERIFY` -1), so `new_rs`'s depth is unchanged on return and the caller's
+/// downstream depth comments stay valid.
+fn emit_header_opcode_authentication(b: &mut Vec<u8>, new_rs_depth: u16) {
+    use op::*;
+    const HEADER_OPCODES: [(usize, u8); 5] = [
+        (OWNER_PUBKEY_OPCODE_OFFSET, 0x20),
+        (IDENTIFIER_TYPE_OPCODE_OFFSET, 0x01),
+        (ROLE_REGISTRY_ROOT_OPCODE_OFFSET, 0x20),
+        (FROZEN_FLAG_OPCODE_OFFSET, 0x01),
+        (EPOCH_OPCODE_OFFSET, 0x04),
+    ];
+    for (opcode_off, canonical) in HEADER_OPCODES {
+        b.extend_from_slice(&dr_field_extract(new_rs_depth, opcode_off as u16, (opcode_off + 1) as u16));
+        b.push(DATA1);
+        b.push(canonical);
+        b.push(EQUAL);
+        b.push(VERIFY);
+    }
 }
 
 /// Emit the TRANSFER (`0x00`) branch bytecode. See the module doc's "TRANSFER
@@ -356,6 +431,9 @@ fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 
     // Stack: epoch_copy(0), epoch(1), role_registry_root(2), new_rs(3),
     // issuer_sig(4).
+    // ---- Header push-opcode authentication (§6.2 fix): new_rs at depth 3;
+    // net-zero, so the layout above is unchanged on return. ----
+    emit_header_opcode_authentication(&mut b, 3);
     b.extend_from_slice(&dr_field_extract(3, ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET as u16, (ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET + 32) as u16));
     // Stack: new_root(0), epoch_copy(1), epoch(2), role_registry_root(3),
     // new_rs(4), issuer_sig(5).
@@ -610,6 +688,10 @@ fn build_freeze_branch(freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     // stack effect, no depth argument), so it can be spliced in here without
     // touching any of the depth comments above/below.
     b.extend_from_slice(&dr_value_continuity_check());
+
+    // ---- Header push-opcode authentication (§6.2 fix): new_rs at depth 6;
+    // net-zero, so every depth comment below is unaffected. ----
+    emit_header_opcode_authentication(&mut b, 6);
 
     // ---- Successor must be identical EXCEPT frozen_flag (task spec). ----
     // owner_pubkey unchanged.
@@ -870,6 +952,11 @@ fn build_seize_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
     // ---- Value continuity (security fix, cross-branch invariant, see this
     // fn's doc). ----
     b.extend_from_slice(&dr_value_continuity_check());
+
+    // ---- Header push-opcode authentication (§6.2 fix): new_rs at depth 7
+    // (before the unused-owner_pubkey drop below); net-zero, so the layout
+    // above is unchanged on return. ----
+    emit_header_opcode_authentication(&mut b, 7);
 
     // ---- Successor checks: owner_pubkey REPLACED by the attested
     // new_owner_pubkey; identifier_type/role_registry_root/epoch/frozen_flag
@@ -1269,7 +1356,8 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 /// TRANSFER's/BURN's (owner `OpCheckSigVerify`, SIGHASH_ALL, PLUS an
 /// `OpCheckSigFromStack` attestation) -- but see the authorizer note below.
 ///
-/// # Authorizer: cold 2-of-3 SEIZE quorum (Decision 2026-07-20)
+/// # Authorizer: cold 2-of-3 INDEPENDENT recovery quorum (Decision
+/// 2026-07-20-G0)
 ///
 /// §4's branch table specifies MIGRATE authorization as "OWNER + (ROTATE or
 /// OPS)". Under Decision 2026-07-19 (option B, baked keys), `ROTATE` (`0x05`)
@@ -1284,12 +1372,21 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 /// template (see the next section), so owner + a compromised HOT ops key
 /// could walk an unfrozen coin out of FREEZE/SEIZE/BURN reach entirely --
 /// contradicting §11's "a stolen OPS key cannot redirect funds". **Decision
-/// 2026-07-20: gate MIGRATE behind the same cold 2-of-3 quorum SEIZE uses**
-/// (the SAME three baked `seize_pubkeys` -- no new key material, and the
-/// quorum bytecode is literally the shared [`emit_2of3_threshold`] segment,
-/// so the two gates cannot drift). Escaping governance now costs the owner
-/// key AND two of the three cold keys -- i.e. exactly what it costs to seize
-/// the coin outright, which is the intended equivalence.
+/// 2026-07-20: gate MIGRATE behind a cold 2-of-3 quorum** (the SAME shape as
+/// SEIZE's, built from the same shared [`emit_2of3_threshold`] bytecode
+/// segment). A follow-up G0-CRITICAL fix (Decision 2026-07-20-G0) then found
+/// that reusing the LITERAL `seize_pubkeys` key material for that quorum made
+/// MIGRATE co-fail with SEIZE: a leak of the SEIZE cold keys destroyed the
+/// recovery path too, at exactly the moment recovery is most needed. MIGRATE
+/// is therefore now gated by its OWN **independent** `recovery_pubkeys` cold
+/// 2-of-3 set -- pairwise-distinct from `seize_pubkeys` and every other role
+/// key by construction (see [`build_stablecoin_body`]'s/
+/// [`build_stablecoin_redeem_script`]'s `role_keys` distinctness assertions).
+/// Only the quorum bytecode SHAPE is shared with SEIZE (both call
+/// [`emit_2of3_threshold`]); the KEY MATERIAL is independent. Escaping
+/// governance now costs the owner key AND two of the three cold recovery
+/// keys, which are a disjoint set from the two SEIZE keys a seizure would
+/// cost.
 ///
 /// `frozen_flag == 0` is retained on top of the quorum: it is the cheap gate
 /// that stops a routine owner-initiated migration of a sanctioned coin
@@ -1375,7 +1472,7 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 /// see `super::sigscript::build_stablecoin_migrate_sigscript`. The three
 /// quorum sigs sit BELOW every field this branch rolls, so all roll/pick
 /// depths are unchanged from the single-authorizer version.)
-fn build_migrate_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
+fn build_migrate_branch(recovery_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
     use op::*;
     let mut b = Vec::with_capacity(300);
 
@@ -1465,10 +1562,490 @@ fn build_migrate_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8>
     // is why the quorum segment below is shared verbatim.
     b.push(BLAKE3);
 
-    // ---- Cold 2-of-3 SEIZE-quorum attestation (see fn doc "Authorizer"). ----
-    emit_2of3_threshold(&mut b, seize_pubkeys);
+    // ---- Cold 2-of-3 INDEPENDENT recovery-quorum attestation (see fn doc
+    // "Authorizer"; Decision 2026-07-20-G0). ----
+    emit_2of3_threshold(&mut b, recovery_pubkeys);
 
     b.push(OP1);
+    b
+}
+
+// ============================================================================
+// TRANSFER_NM (0x07 leader) / TRANSFER_NM_DELEGATOR (0x08) -- N:M transfer
+// (G1, split/merge), item 1 of this wave's work.
+// ============================================================================
+//
+// Mirrors `crate::contract::kcc20::transfer`'s leader/delegator split (that
+// module's doc explicitly warns unrolled-loop depths must be pinned by
+// real-engine round-trip tests, not paper derivation -- heeded here too).
+// The one structural difference: this covenant's `amount` is the UTXO's
+// NATIVE sompi value (not script-encoded), so conservation reads values
+// directly via `OpTxInputAmount`/`OpTxOutputAmount` -- there is no sigscript
+// amount-fishing dance like kcc20's `SiblingFieldOffsets`.
+//
+// # Scope (kcc-0020-equivalent limitation, stated explicitly)
+//
+// N:M works WITHIN one MINT lineage: every input/output enumerated here
+// shares ONE `covenant_id` (hash-derived at genesis, not forgeable). It
+// covers arbitrary-amount payment + change + self-consolidation. It does
+// NOT merge coins minted under two INDEPENDENT MINT events (different
+// `covenant_id`s) -- the same scope `kcc20::transfer`'s own N:M transfer has
+// (that module's "ISSUE-15" doc section).
+//
+// # Attestation binds the WHOLE group, once
+//
+// The OPS attestation ([`super::attestation::build_transfer_nm_attestation_message`])
+// is a SINGLE signature covering the entire group (leader + every sibling +
+// every successor), reconstructed and verified only in the LEADER's branch.
+// Delegators do NOT re-verify it: the leader's script is unavoidably present
+// in the same transaction (the whole point of `OpCovInputIdx`/
+// `OpCovOutputIdx` enumeration), scoped to the SAME `covenant_id` lineage, so
+// a delegator that trusts "some input at covenant-position 0 ran the leader
+// body and it accepted" is sound -- exactly the trust delegators already
+// place in the leader for TRANSFER/kcc20's own delegator role.
+
+/// Sibling (delegator) covenant inputs / successor covenant outputs the
+/// TRANSFER_NM leader unrolls up to. Mirrors `KCC20_TRANSFER_MAX_N`'s
+/// precedent (same bound, same mass-justification: kcc-0020-equivalent N:M
+/// shapes rarely need more than a handful of legs in one transaction).
+pub const TRANSFER_NM_MAX_N: usize = 4;
+
+/// Emit the TRANSFER_NM_DELEGATOR (`0x08`) branch bytecode -- self-authorizes
+/// only; does not re-verify the group attestation (see this section's module
+/// doc "Attestation binds the WHOLE group, once").
+///
+/// Sigscript: `self_sig, op_type_selector` (mirrors `kcc20::transfer`'s
+/// `transfer_delegator()`, which is *also* a documented, necessary deviation
+/// from a literal zero-argument delegator entrypoint -- see that module's
+/// doc for why a delegator's own authorization has to come from somewhere).
+///
+/// Entry (top-to-bottom), once the dispatch skeleton's `op_type` compare
+/// delivers control here:
+/// ```text
+/// epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
+/// owner_pubkey(4), self_sig(5)
+/// ```
+fn build_transfer_nm_delegator_branch() -> Vec<u8> {
+    use op::*;
+    let mut b = Vec::with_capacity(64);
+
+    // ---- Reject-if-leader (kcc-0001 §9.1-style "each path MUST reject the
+    // opposite position", mirrors kcc20::transfer's delegator exactly). Net 0. ----
+    e_own_covenant_id(&mut b);
+    e_num(&mut b, 0);
+    b.push(COVINPUTIDX); // leader_idx (covenant-position 0)
+    b.push(TXINPUTINDEX); // own_idx
+    b.push(EQUAL);
+    b.push(NOT);
+    b.push(VERIFY);
+
+    // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
+    // identifier_type(3), owner_pubkey(4), self_sig(5).
+    // ---- frozen_flag == CLEAR, fail-closed on THIS delegator's OWN coin --
+    // the one thing beyond kcc20's delegator (task spec): per-coin freeze
+    // must survive grouping. Without this, a frozen coin could be smuggled
+    // into an otherwise-honest N:M group merely by not being the leader (the
+    // leader only ever checks ITS OWN frozen_flag, never a sibling's). ----
+    e_roll(&mut b, 1); // frozen_flag -> top
+    b.push(DATA1);
+    b.push(frozen_flag::CLEAR);
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch(0), role_registry_root(1), identifier_type(2),
+    // owner_pubkey(3), self_sig(4).
+    // ---- Owner self-authorization (identical mechanics to
+    // kcc20::transfer's delegator / token::TOKEN_UNIT_BODY: owner_pubkey
+    // already on the state stack as the OpCheckSigVerify pubkey, self_sig
+    // supplied by this input's own sigScript). No successor to compare
+    // against here -- the leader does ALL group bookkeeping -- so the
+    // remaining state fields are simply dropped, unused (mirrors BURN's
+    // "no successor" drops). ----
+    e_roll(&mut b, 4); // self_sig -> top
+    e_roll(&mut b, 4); // owner_pubkey -> top (self_sig now depth1)
+    b.push(CHECKSIGVERIFY); // pubkey(top) x sig(next), SIGHASH_ALL
+
+    // Stack: epoch(0), role_registry_root(1), identifier_type(2).
+    b.push(TWO_DROP); // drop epoch, role_registry_root
+    b.push(DROP); // drop identifier_type
+
+    b.push(OP1);
+    b
+}
+
+/// Emit the TRANSFER_NM (`0x07`) leader branch bytecode -- does ALL group
+/// bookkeeping for its covenant-id lineage (cardinality, per-sibling
+/// conservation, per-successor template/continuity auth, and the single
+/// group-wide OPS attestation). See this section's module doc for scope and
+/// the attestation-sharing design.
+///
+/// # Sigscript (leader)
+///
+/// Push order (deepest -> shallowest, mirrors `kcc20::transfer`'s leader):
+/// `self_rs, issuer_sig, new_rs_{MAX_N}, .., new_rs_1, owner_sig,
+/// op_type_selector`. Unused successor slots (beyond the real successor
+/// count) are padded with an empty `Vec` -- never read on-chain, guarded by
+/// `j <= OpCovOutputCount`.
+///
+/// Entry (top-to-bottom), once the dispatch skeleton delivers control here
+/// (`n` = [`TRANSFER_NM_MAX_N`]):
+/// ```text
+/// epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
+/// owner_pubkey(4), owner_sig(5), new_rs_1(6), .., new_rs_n(5+n),
+/// issuer_sig(6+n), self_rs(7+n)
+/// ```
+///
+/// # Stack-shape discipline (why this compiles down the way it does)
+///
+/// After the one-time owner-authorization/frozen_flag/self-template-auth
+/// prologue, the body maintains a fixed "BASE invariant" region at the TOP
+/// of the stack across BOTH unrolled loops:
+/// ```text
+/// acc(0), inputs_acc(1), outputs_acc(2), epoch(3), root(4),
+/// identifier_type(5), new_rs_1(6), .., new_rs_n(5+n), issuer_sig(6+n),
+/// self_rs(7+n)
+/// ```
+/// `acc` is the running native-value conservation accumulator (`OpAdd` in
+/// the sibling pass, `OpSub` in the successor pass, always ending back at
+/// depth 0). `inputs_acc`/`outputs_acc` are the running byte-string
+/// accumulators folded (via `OpCat`) into the group attestation's two
+/// digests. `epoch`/`root`/`identifier_type` are the LEADER's own values,
+/// read (never consumed) via `OpPick` for each successor's continuity
+/// check. Every guarded loop iteration below is written to return to this
+/// EXACT layout (only `acc`/`inputs_acc`/`outputs_acc`'s VALUES change) --
+/// this is what keeps `new_rs_j`'s depth (`5+j`) and `self_rs`'s depth
+/// (`7+n`) constant across the whole unroll, exactly like
+/// `kcc20::transfer::build_transfer_body`'s DIGEST_DEPTH/OWNER_DEPTH
+/// invariant.
+fn build_transfer_nm_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
+    use op::*;
+    let n = TRANSFER_NM_MAX_N;
+    let mut b = Vec::with_capacity(8192);
+
+    // ---- Leader position check: own_idx == OpCovInputIdx(covenant_id, 0).
+    // Net 0. ----
+    e_own_covenant_id(&mut b);
+    e_num(&mut b, 0);
+    b.push(COVINPUTIDX); // leader_idx
+    b.push(TXINPUTINDEX); // own_idx
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // ---- Cardinality caps: consumed inputs (leader + siblings) and
+    // produced outputs must fit the unroll bound. Without this, extra
+    // consumed/produced covenant members beyond MAX_N would silently escape
+    // the conservation loops below. Net 0 each. ----
+    e_own_covenant_id(&mut b);
+    b.push(COVINPUTCOUNT);
+    e_num(&mut b, (n + 1) as u16);
+    b.push(LTE);
+    b.push(VERIFY);
+
+    e_own_covenant_id(&mut b);
+    b.push(COVOUTPUTCOUNT);
+    e_num(&mut b, n as u16);
+    b.push(LTE);
+    b.push(VERIFY);
+
+    // ---- Owner authorization (leader's own coin; identical mechanics to
+    // TRANSFER's stage 1). ----
+    e_roll(&mut b, 5); // owner_sig -> top
+    e_roll(&mut b, 5); // owner_pubkey -> top (owner_sig now depth1)
+    b.push(CHECKSIGVERIFY); // pubkey(top) x sig(next), SIGHASH_ALL
+
+    // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
+    // identifier_type(3), new_rs_1(4), .., new_rs_n(3+n), issuer_sig(4+n),
+    // self_rs(5+n).
+    // ---- frozen_flag == CLEAR on the LEADER's own coin. ----
+    e_roll(&mut b, 1); // frozen_flag -> top
+    b.push(DATA1);
+    b.push(frozen_flag::CLEAR);
+    b.push(EQUAL);
+    b.push(VERIFY);
+
+    // Stack: epoch(0), role_registry_root(1), identifier_type(2),
+    // new_rs_1(3), .., new_rs_n(2+n), issuer_sig(3+n), self_rs(4+n).
+    // ---- Self-template auth: self_rs is genuine (Blake2b(self_rs) == this
+    // input's own committed P2SH SPK). Per-successor template authentication
+    // (dr_suffix_check against self_rs) happens INSIDE the successor loop
+    // below, once per active successor -- see the loop body. ----
+    let self_rs_depth_pre_loop = (4 + n) as u16;
+    b.extend_from_slice(&dr_input_spk_check(self_rs_depth_pre_loop));
+
+    // ---- Seed the three group accumulators. Pushed in THIS order so the
+    // final BASE-invariant layout (see fn doc) is acc(0), inputs_acc(1),
+    // outputs_acc(2), epoch(3), root(4), identifier_type(5), new_rs_1(6), ..
+    // -- chosen so the per-successor `outputs_acc` fold (which needs to
+    // reach past BOTH acc and inputs_acc) and the per-sibling `inputs_acc`
+    // fold (which needs to reach past only acc) each resolve with the
+    // fewest swaps; see the loop bodies below for the exact roll/swap/cat
+    // sequences this depends on. ----
+    b.push(OP0); // outputs_acc = "" (empty byte string)
+    b.push(OP0); // inputs_acc = ""
+    b.push(TXINPUTINDEX);
+    b.push(TXINPUTAMOUNT); // acc = leader's own native amount
+
+    // BASE invariant depths (constant across both loops below -- see fn doc).
+    let new_rs_depth = |j: usize| (5 + j) as u16; // valid for j = 1..=n
+    let issuer_sig_depth = (6 + n) as u16;
+    let self_rs_depth = (7 + n) as u16;
+
+    // ---- Sibling (delegator) input pass: fold each active sibling's
+    // native amount into `acc` (OpAdd) and its `outpoint_txid(32B) ||
+    // outpoint_index(4B LE) || amount(8B LE)` into `inputs_acc` (OpCat).
+    // Every iteration is net-0 aside from acc/inputs_acc's VALUES, so
+    // outputs_acc/epoch/root/identifier_type/new_rs_*/issuer_sig/self_rs
+    // stay at their BASE-invariant depths regardless of which iterations'
+    // guards fire. ----
+    for s in 1..=n {
+        e_num(&mut b, s as u16);
+        e_own_covenant_id(&mut b);
+        b.push(COVINPUTCOUNT);
+        b.push(LT); // s < N_in (sibling slot s exists iff s < total consumed count)
+        b.push(IF);
+        {
+            // acc += sibling.amount. Entry: acc(0), inputs_acc(1),
+            // outputs_acc(2), .. Exit: SAME layout, acc updated.
+            e_own_covenant_id(&mut b);
+            e_num(&mut b, s as u16);
+            b.push(COVINPUTIDX); // sibling_idx
+            b.push(TXINPUTAMOUNT); // replaces sibling_idx with its amount (net 0)
+            b.push(ADD); // acc(depth1,deeper) + amount(depth0,top) -> acc
+
+            // inputs_acc || (outpoint_txid || outpoint_index(4LE) ||
+            // amount(8LE)). Entry: acc(0)[updated], inputs_acc(1),
+            // outputs_acc(2), ..
+            e_own_covenant_id(&mut b);
+            e_num(&mut b, s as u16);
+            b.push(COVINPUTIDX);
+            b.push(OUTPOINTTXID); // txid(32B)
+
+            e_own_covenant_id(&mut b);
+            e_num(&mut b, s as u16);
+            b.push(COVINPUTIDX);
+            b.push(OUTPOINTINDEX); // raw index (script number)
+            b.push(OP4);
+            b.push(NUM2BIN); // idx_bytes(4B)
+            b.push(CAT); // txid || idx_bytes = blob36 (a=txid deeper, b=idx_bytes top)
+
+            e_own_covenant_id(&mut b);
+            e_num(&mut b, s as u16);
+            b.push(COVINPUTIDX);
+            b.push(TXINPUTAMOUNT);
+            b.push(OP8);
+            b.push(NUM2BIN); // amount_bytes(8B)
+            b.push(CAT); // blob36 || amount_bytes = blob44 (44B)
+
+            // Merge blob44 into inputs_acc. Entry here: blob44(0), acc(1),
+            // inputs_acc(2), outputs_acc(3), ..
+            e_roll(&mut b, 2); // inputs_acc -> top: inputs_acc(0), blob44(1), acc(2), ..
+            b.push(SWAP); // blob44(0), inputs_acc(1), acc(2), ..
+            b.push(CAT); // a=inputs_acc(deeper), b=blob44(top) -> inputs_acc||blob44
+            b.push(SWAP); // restore canonical acc(0), inputs_acc(1) order
+        }
+        b.push(ENDIF);
+    }
+
+    // ---- Successor output pass: for each active successor slot j,
+    // authenticate the claimed `new_rs_j` against the REAL output at its
+    // covenant-output position, prove it is template-authentic (dr_suffix_check
+    // against self_rs) and header-opcode-authentic (item-00's
+    // emit_header_opcode_authentication -- applied HERE, per successor, from
+    // day one; this is NOT the pre-item-00 vulnerable pattern), enforce
+    // role_registry_root/epoch/identifier_type continuity and
+    // successor.frozen_flag == CLEAR (mirrors existing TRANSFER's
+    // invariants), then fold its value out of `acc` (OpSub) and its SPK into
+    // `outputs_acc` (OpCat). ----
+    for j in 1..=n {
+        let nrd = new_rs_depth(j); // new_rs_j's BASE-invariant depth (5+j)
+
+        e_num(&mut b, j as u16);
+        e_own_covenant_id(&mut b);
+        b.push(COVOUTPUTCOUNT);
+        b.push(LTE); // j <= N_out
+        b.push(IF);
+        {
+            // ---- Resolve out_idx (EXTENDED invariant: out_idx(0), acc(1),
+            // inputs_acc(2), outputs_acc(3), epoch(4), root(5),
+            // identifier_type(6), new_rs_1(7), .., new_rs_n(6+n),
+            // issuer_sig(7+n), self_rs(8+n) -- i.e. every BASE depth +1
+            // while out_idx is alive). ----
+            e_own_covenant_id(&mut b);
+            e_num(&mut b, (j - 1) as u16);
+            b.push(COVOUTPUTIDX); // out_idx
+
+            // dr_output_spk_check: Blake2b(new_rs_j) == P2SH(real output at
+            // out_idx). PICK-based (both args), net 0 -- out_idx and
+            // new_rs_j both survive at their EXTENDED depths. NOTE: the
+            // SECOND depth arg (`output_idx_depth`) must already account for
+            // the stack growth caused by the EARLIER half of this SAME
+            // helper call (its own new_rs pick-then-hash dance leaves one
+            // net extra item behind before it reaches the output_idx pick)
+            // -- confirmed against `kcc20::transfer`'s identical
+            // `dr_output_spk_check((new_rs_depth + 1) as u16, 1)` usage.
+            // out_idx sits at depth 0 on entry, so it is depth 1 by the time
+            // dr_output_spk_check's own second half reads it.
+            b.extend_from_slice(&dr_output_spk_check(nrd + 1, 1));
+
+            // Consume out_idx for conservation: acc -= output.amount. This
+            // collapses the EXTENDED invariant back to BASE (out_idx
+            // replaced by amount, then combined with acc via OpSub -- acc
+            // was already adjacent at depth1, no roll needed, mirrors the
+            // sibling pass's amount-fold).
+            b.push(TXOUTPUTAMOUNT); // pops out_idx(depth0), pushes output.amount
+            b.push(SUB); // a=acc(depth1,deeper), b=amount(depth0,top) -> acc-amount
+
+            // Back to BASE invariant: acc(0)[updated], inputs_acc(1),
+            // outputs_acc(2), epoch(3), root(4), identifier_type(5),
+            // new_rs_1(6), .., new_rs_n(5+n), issuer_sig(6+n), self_rs(7+n).
+
+            // ---- Template authentication (item-00 discipline, applied per
+            // successor from day one -- NOT the pre-item-00 vulnerable
+            // pattern that skipped header-opcode authentication). NOTE:
+            // dr_suffix_check's SECOND depth arg must likewise account for
+            // its OWN first half's transient growth (old_suffix, built from
+            // self_rs, sits on top before the second pick reads new_rs) --
+            // same discipline as dr_output_spk_check above. self_rs_depth
+            // needs no adjustment (picked first); nrd needs +1. ----
+            b.extend_from_slice(&dr_suffix_check(self_rs_depth, nrd + 1, STATE_HEADER_LEN as u16));
+            emit_header_opcode_authentication(&mut b, nrd);
+
+            // ---- Continuity: successor.identifier_type ==
+            // leader's own identifier_type (BASE depth 5). Each
+            // extract+compare is net 0 (dr_field_extract nets +1, the
+            // trailing pick+equal+verify nets -1). ----
+            b.extend_from_slice(&dr_field_extract(nrd, IDENTIFIER_TYPE_PAYLOAD_OFFSET as u16, (IDENTIFIER_TYPE_PAYLOAD_OFFSET + 1) as u16));
+            e_pick(&mut b, 6); // leader's own identifier_type (was depth5, now 6 after the extract's +1 push)
+            b.push(EQUAL);
+            b.push(VERIFY);
+
+            // ---- Continuity: successor.role_registry_root == leader's own
+            // (BASE depth 4). ----
+            b.extend_from_slice(&dr_field_extract(nrd, ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET as u16, (ROLE_REGISTRY_ROOT_PAYLOAD_OFFSET + 32) as u16));
+            e_pick(&mut b, 5); // depth4 + 1
+            b.push(EQUAL);
+            b.push(VERIFY);
+
+            // ---- Continuity: successor.epoch == leader's own (BASE depth 3). ----
+            b.extend_from_slice(&dr_field_extract(nrd, EPOCH_PAYLOAD_OFFSET as u16, (EPOCH_PAYLOAD_OFFSET + 4) as u16));
+            e_pick(&mut b, 4); // depth3 + 1
+            b.push(EQUAL);
+            b.push(VERIFY);
+
+            // ---- successor.frozen_flag == CLEAR (literal, mirrors
+            // TRANSFER's "successor.frozen_flag == CLEAR" invariant -- NOT
+            // compared against the leader's own, since TRANSFER_NM (like
+            // TRANSFER) may only ever produce clear successors). ----
+            b.extend_from_slice(&dr_field_extract(nrd, FROZEN_FLAG_PAYLOAD_OFFSET as u16, (FROZEN_FLAG_PAYLOAD_OFFSET + 1) as u16));
+            b.push(DATA1);
+            b.push(frozen_flag::CLEAR);
+            b.push(EQUAL);
+            b.push(VERIFY);
+
+            // ---- outputs_acc || OpTxOutputSpk(out_idx). Recompute out_idx
+            // fresh (consumed above): EXTENDED invariant again, out_idx(0),
+            // acc(1), inputs_acc(2), outputs_acc(3), epoch(4), ..
+            e_own_covenant_id(&mut b);
+            e_num(&mut b, (j - 1) as u16);
+            b.push(COVOUTPUTIDX);
+            b.push(TXOUTPUTSPK); // replaces out_idx with the output's raw SPK bytes (net 0)
+
+            // Entry: spk(0), acc(1), inputs_acc(2), outputs_acc(3), epoch(4), ..
+            e_roll(&mut b, 3); // outputs_acc -> top: outputs_acc(0), spk(1), acc(2), inputs_acc(3), ..
+            b.push(SWAP); // spk(0), outputs_acc(1), acc(2), inputs_acc(3), ..
+            b.push(CAT); // a=outputs_acc(deeper), b=spk(top) -> outputs_acc||spk
+            // Entry: new_outputs_acc(0), acc(1), inputs_acc(2), epoch(3), ..
+            // Restore canonical (acc, inputs_acc, outputs_acc) order via two
+            // roll(2)s (a 3-cycle rotation -- see fn doc's roll/swap/cat
+            // derivation).
+            e_roll(&mut b, 2); // inputs_acc(0), new_outputs_acc(1), acc(2), ..
+            e_roll(&mut b, 2); // acc(0), inputs_acc(1), new_outputs_acc(2), epoch(3), ..
+        }
+        b.push(ENDIF);
+    }
+
+    // ---- Conservation: acc == 0 (exact, not merely non-inflationary --
+    // mirrors kcc20::transfer's conservation check). ----
+    b.push(OP0);
+    b.push(NUMEQUALVERIFY);
+
+    // Stack: inputs_acc(0), outputs_acc(1), epoch(2), root(3),
+    // identifier_type(4), new_rs_1(5), .., new_rs_n(4+n), issuer_sig(5+n),
+    // self_rs(6+n).
+    // ---- Drop the now-dead reference/successor-slot region (root,
+    // identifier_type, new_rs_1..new_rs_n -- n+2 items), leaving inputs_acc,
+    // outputs_acc, epoch, issuer_sig, self_rs. Each iteration rolls the
+    // SAME depth (3, right after epoch) to top and drops it, because
+    // removing a contiguous run's shallowest item always shifts the next
+    // one into that same slot. ----
+    for _ in 0..(n + 2) {
+        e_roll(&mut b, 3);
+        b.push(DROP);
+    }
+
+    // Stack: inputs_acc(0), outputs_acc(1), epoch(2), issuer_sig(3), self_rs(4).
+    // ---- Attestation: inputs_digest = Blake3(inputs_acc), outputs_digest =
+    // Blake3(outputs_acc); assemble the 111B TRANSFER_NM preimage (DOMAIN_TAG
+    // || covenant_id || op_type(0x07) || epoch(4LE) || n_in(1) || n_out(1) ||
+    // inputs_digest(32) || outputs_digest(32)); Blake3 -> msg_hash; verify
+    // against the OPS pubkey. Mirrors existing TRANSFER's attestation-assembly
+    // shape (see build_transfer_branch), with the two group digests replacing
+    // the single outpoint/spk_hash/amount fields. ----
+    b.push(BLAKE3); // inputs_acc(depth0) -> inputs_digest
+    // Stack: inputs_digest(0), outputs_acc(1), epoch(2), issuer_sig(3), self_rs(4).
+    e_roll(&mut b, 1); // outputs_acc -> top
+    b.push(BLAKE3); // outputs_acc -> outputs_digest
+    // Stack: outputs_digest(0), inputs_digest(1), epoch(2), issuer_sig(3), self_rs(4).
+
+    b.push(DATA8);
+    b.extend_from_slice(&DOMAIN_TAG);
+    // Stack: domain_tag(0), outputs_digest(1), inputs_digest(2), epoch(3), issuer_sig(4), self_rs(5).
+    b.push(TXINPUTINDEX);
+    b.push(INPUTCOVENANTID);
+    b.push(CAT); // acc = domain_tag || covenant_id
+    // Stack: acc(0), outputs_digest(1), inputs_digest(2), epoch(3), issuer_sig(4), self_rs(5).
+    b.push(DATA1);
+    b.push(op_type::TRANSFER_NM);
+    b.push(CAT); // acc || op_type
+    // Stack: acc(0), outputs_digest(1), inputs_digest(2), epoch(3), issuer_sig(4), self_rs(5).
+    e_roll(&mut b, 3); // epoch -> top (raw 4B LE payload, already in OpNum2Bin(4)-equivalent form)
+    b.push(CAT); // acc || epoch
+    // Stack: acc(0), outputs_digest(1), inputs_digest(2), issuer_sig(3), self_rs(4).
+
+    e_own_covenant_id(&mut b);
+    b.push(COVINPUTCOUNT);
+    b.push(OP1);
+    b.push(NUM2BIN); // n_in as a fixed 1-byte value
+    b.push(CAT); // acc || n_in
+    // Stack: acc(0), outputs_digest(1), inputs_digest(2), issuer_sig(3), self_rs(4).
+
+    e_own_covenant_id(&mut b);
+    b.push(COVOUTPUTCOUNT);
+    b.push(OP1);
+    b.push(NUM2BIN); // n_out as a fixed 1-byte value
+    b.push(CAT); // acc || n_out
+    // Stack: acc(0), outputs_digest(1), inputs_digest(2), issuer_sig(3), self_rs(4).
+
+    e_roll(&mut b, 2); // inputs_digest -> top
+    b.push(CAT); // acc || inputs_digest
+    // Stack: acc(0), outputs_digest(1), issuer_sig(2), self_rs(3).
+    b.push(SWAP); // outputs_digest(0), acc(1), issuer_sig(2), self_rs(3)
+    b.push(CAT); // acc || outputs_digest == full 111B preimage
+    // Stack: preimage(0), issuer_sig(1), self_rs(2).
+
+    b.push(BLAKE3); // msg_hash
+    // Stack: msg_hash(0), issuer_sig(1), self_rs(2).
+    b.push(DATA32);
+    b.extend_from_slice(ops_pubkey);
+    // Stack: pubkey(0), msg_hash(1), issuer_sig(2), self_rs(3).
+    b.push(CHECKSIGFROMSTACK);
+    b.push(VERIFY);
+
+    // Stack: self_rs(0). Cleanup.
+    b.push(DROP);
+
+    b.push(OP1);
+    let _ = issuer_sig_depth; // (documents the pre-cleanup depth; consumed via the bulk-drop loop above)
     b
 }
 
@@ -1485,19 +2062,32 @@ pub fn build_stablecoin_body(
     ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
     freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
     seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
+    recovery_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
     mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
 ) -> Vec<u8> {
-    // Role keys MUST be pairwise distinct: a duplicated SEIZE key collapses the
-    // SEIZE (and MIGRATE) 2-of-3 threshold (one key satisfies two fixed
-    // positional slots, sum>=2), and a shared ops/freeze/mint key erodes role
-    // separation. The check lives HERE (not only in the
-    // `build_stablecoin_redeem_script` wrapper) because this is the function
-    // that actually emits the threshold bytecode and is itself `pub` -- a
-    // caller must not be able to route around the assertion by composing the
-    // state header manually.
+    // Role keys MUST be pairwise distinct: a duplicated SEIZE/recovery key
+    // collapses the corresponding 2-of-3 threshold (one key satisfies two
+    // fixed positional slots, sum>=2), and a shared ops/freeze/mint/recovery
+    // key erodes role separation -- in particular `recovery_pubkeys` MUST be
+    // distinct from `seize_pubkeys` (Decision 2026-07-20-G0): MIGRATE's
+    // recovery quorum must be an INDEPENDENT cold set, or a SEIZE-key leak
+    // would also compromise the recovery path it is meant to survive. The
+    // check lives HERE (not only in the `build_stablecoin_redeem_script`
+    // wrapper) because this is the function that actually emits the
+    // threshold bytecode and is itself `pub` -- a caller must not be able to
+    // route around the assertion by composing the state header manually.
     {
-        let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 6] =
-            [ops_pubkey, freeze_pubkey, &seize_pubkeys[0], &seize_pubkeys[1], &seize_pubkeys[2], mint_pubkey];
+        let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 9] = [
+            ops_pubkey,
+            freeze_pubkey,
+            &seize_pubkeys[0],
+            &seize_pubkeys[1],
+            &seize_pubkeys[2],
+            &recovery_pubkeys[0],
+            &recovery_pubkeys[1],
+            &recovery_pubkeys[2],
+            mint_pubkey,
+        ];
         for i in 0..role_keys.len() {
             for j in (i + 1)..role_keys.len() {
                 assert!(role_keys[i] != role_keys[j], "stablecoin role pubkeys must be pairwise distinct (slot {i} == slot {j})");
@@ -1508,7 +2098,9 @@ pub fn build_stablecoin_body(
     let freeze = build_freeze_branch(freeze_pubkey);
     let seize = build_seize_branch(seize_pubkeys);
     let burn = build_burn_branch(mint_pubkey);
-    let migrate = build_migrate_branch(seize_pubkeys); // cold 2-of-3 quorum, Decision 2026-07-20 -- see build_migrate_branch's doc
+    let migrate = build_migrate_branch(recovery_pubkeys); // independent cold 2-of-3 quorum, Decision 2026-07-20-G0 -- see build_migrate_branch's doc
+    let transfer_nm = build_transfer_nm_branch(ops_pubkey); // N:M leader; SAME OPS role key as TRANSFER, see that fn's module doc
+    let transfer_nm_delegator = build_transfer_nm_delegator_branch();
     build_op_type_dispatch(
         OP_TYPE_TAG_DEPTH,
         OpTypeBranches {
@@ -1518,6 +2110,8 @@ pub fn build_stablecoin_body(
             burn: &burn,
             rotate: UNIMPLEMENTED_BRANCH_STUB, // DEFERRED (post-Live): ROTATE, see this module's top doc
             migrate: &migrate,
+            transfer_nm: &transfer_nm,
+            transfer_nm_delegator: &transfer_nm_delegator,
         },
     )
 }
@@ -1536,10 +2130,12 @@ pub fn build_stablecoin_body(
 /// pubkeys are not yet individually verified against `role_registry_root`
 /// on-chain in this phase); `mint_pubkey` is baked into the body as the BURN
 /// branch's `OpCheckSigFromStack` key (§2 MINT role -- "the mint-authority's
-/// supply key ... authorizes BURN (issuer side) in this covenant"). `ops_pubkey`
-/// is ALSO baked into the body as the MIGRATE branch's `OpCheckSigFromStack`
-/// key (§4: MIGRATE authorization is "OWNER + (ROTATE or OPS)"; OPS stands in
-/// since ROTATE is deferred to post-Live -- see `build_migrate_branch`'s doc).
+/// supply key ... authorizes BURN (issuer side) in this covenant").
+/// `recovery_pubkeys` are baked into the body as the MIGRATE branch's own
+/// **independent** cold 2-of-3 `OpCheckSigFromStack` quorum (Decision
+/// 2026-07-20-G0 -- see `build_migrate_branch`'s doc): pairwise-distinct from
+/// `seize_pubkeys` and every other role key by construction, so a leaked
+/// SEIZE quorum cannot also destroy the MIGRATE recovery path.
 #[allow(clippy::too_many_arguments)]
 pub fn build_stablecoin_redeem_script(
     owner_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
@@ -1550,20 +2146,30 @@ pub fn build_stablecoin_redeem_script(
     ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
     freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
     seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
+    recovery_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
     mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
 ) -> Vec<u8> {
     // The owner key must ALSO be distinct from every baked role key. Role-vs-role
     // distinctness is asserted one layer down, in `build_stablecoin_body` (so no
     // caller can route around it); the owner key never reaches that function, so
     // it is checked here. This matters because MIGRATE requires an owner
-    // `OpCheckSigVerify` AND a 2-of-3 SEIZE quorum over the same message: if the
-    // owner key were also a SEIZE slot key, the owner's own keypair could cast
-    // one of the three quorum votes, degrading "owner + 2 independent cold
+    // `OpCheckSigVerify` AND a 2-of-3 recovery quorum over the same message: if
+    // the owner key were also a recovery slot key, the owner's own keypair could
+    // cast one of the three quorum votes, degrading "owner + 2 independent cold
     // signers" to "owner + 1". `owner == ops` would likewise let one party
     // satisfy both the owner signature and the OPS attestation in TRANSFER.
     {
-        let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 6] =
-            [ops_pubkey, freeze_pubkey, &seize_pubkeys[0], &seize_pubkeys[1], &seize_pubkeys[2], mint_pubkey];
+        let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 9] = [
+            ops_pubkey,
+            freeze_pubkey,
+            &seize_pubkeys[0],
+            &seize_pubkeys[1],
+            &seize_pubkeys[2],
+            &recovery_pubkeys[0],
+            &recovery_pubkeys[1],
+            &recovery_pubkeys[2],
+            mint_pubkey,
+        ];
         for (i, role_key) in role_keys.iter().enumerate() {
             assert!(*role_key != owner_pubkey, "stablecoin owner pubkey must differ from every role pubkey (role slot {i})");
         }
@@ -1571,7 +2177,7 @@ pub fn build_stablecoin_redeem_script(
     let state = StablecoinStateHeader::new(*owner_pubkey, identifier_type, *role_registry_root, frozen_flag_value, epoch, 0);
     let mut rs = state.encode_script();
     debug_assert_eq!(rs.len(), STATE_HEADER_LEN);
-    rs.extend_from_slice(&build_stablecoin_body(ops_pubkey, freeze_pubkey, seize_pubkeys, mint_pubkey));
+    rs.extend_from_slice(&build_stablecoin_body(ops_pubkey, freeze_pubkey, seize_pubkeys, recovery_pubkeys, mint_pubkey));
     rs
 }
 
@@ -1585,11 +2191,12 @@ mod tests {
     const ROOT: [u8; 32] = [0xCC; 32];
     const FREEZE: [u8; 32] = [0xDD; 32];
     const SEIZE: [[u8; 32]; 3] = [[0x91; 32], [0x92; 32], [0x93; 32]];
+    const RECOVERY: [[u8; 32]; 3] = [[0xA1; 32], [0xA2; 32], [0xA3; 32]];
     const MINT: [u8; 32] = [0xEF; 32];
 
     #[test]
     fn redeem_script_starts_with_state_header() {
-        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         assert_eq!(rs[0], 0x20);
         assert_eq!(&rs[1..33], &OWNER);
         assert_eq!(rs[33], 0x01);
@@ -1605,7 +2212,7 @@ mod tests {
 
     #[test]
     fn ops_pubkey_is_baked_into_transfer_branch() {
-        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         // The OPS pubkey must appear somewhere in the body (exact offset is
         // load-bearing on the dispatch/branch bytecode's fixed shape, so we
         // search rather than hardcode a brittle constant here).
@@ -1617,25 +2224,25 @@ mod tests {
     fn duplicated_seize_key_rejected() {
         // seize[0] == seize[1] would let one key satisfy two 2-of-3 slots.
         let dup_seize: [[u8; 32]; 3] = [[0x91; 32], [0x91; 32], [0x93; 32]];
-        let _ = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &dup_seize, &MINT);
+        let _ = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &dup_seize, &RECOVERY, &MINT);
     }
 
     #[test]
     #[should_panic(expected = "pairwise distinct")]
     fn shared_ops_mint_key_rejected() {
         // mint == ops erodes role separation.
-        let _ = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &OPS);
+        let _ = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &OPS);
     }
 
     #[test]
     fn freeze_pubkey_is_baked_into_freeze_branch() {
-        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         assert!(rs.windows(32).any(|w| w == FREEZE));
     }
 
     #[test]
     fn seize_pubkeys_are_baked_into_seize_branch() {
-        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         // All three SEIZE pubkeys must appear somewhere in the body (exact
         // offsets are load-bearing on the dispatch/branch bytecode's fixed
         // shape, so we search rather than hardcode brittle constants here).
@@ -1646,44 +2253,44 @@ mod tests {
 
     #[test]
     fn mint_pubkey_is_baked_into_burn_branch() {
-        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let rs = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         assert!(rs.windows(32).any(|w| w == MINT));
     }
 
     #[test]
     fn distinct_ops_keys_yield_distinct_redeem_scripts() {
-        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         let b =
-            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &[0xCD; 32], &FREEZE, &SEIZE, &MINT);
+            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &[0xCD; 32], &FREEZE, &SEIZE, &RECOVERY, &MINT);
         assert_ne!(a, b);
         assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
     }
 
     #[test]
     fn distinct_freeze_keys_yield_distinct_redeem_scripts() {
-        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         let b =
-            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &[0xCD; 32], &SEIZE, &MINT);
+            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &[0xCD; 32], &SEIZE, &RECOVERY, &MINT);
         assert_ne!(a, b);
         assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
     }
 
     #[test]
     fn distinct_seize_keys_yield_distinct_redeem_scripts() {
-        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         let mut other_seize = SEIZE;
         other_seize[1] = [0xCD; 32];
         let b =
-            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &other_seize, &MINT);
+            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &other_seize, &RECOVERY, &MINT);
         assert_ne!(a, b);
         assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
     }
 
     #[test]
     fn distinct_mint_keys_yield_distinct_redeem_scripts() {
-        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &MINT);
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         let b =
-            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &[0xCD; 32]);
+            build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &[0xCD; 32]);
         assert_ne!(a, b);
         assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
     }
@@ -1694,14 +2301,14 @@ mod tests {
         // freeze_pubkey/seize_pubkeys/mint_pubkey are baked in), so its length
         // must be identical across different owner/root/epoch/frozen_flag
         // choices for the same keys.
-        let a = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &MINT);
-        let b = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &MINT);
+        let a = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
+        let b = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         assert_eq!(a, b);
     }
 
     #[test]
     fn dispatch_stub_branches_are_all_present_and_unimplemented() {
-        let body = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &MINT);
+        let body = build_stablecoin_body(&OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
         // ROTATE is the only remaining not-yet-implemented branch (deferred
         // to post-Live, see this module's top doc); its OP_0 stub byte must
         // still appear -- a loose but real smoke check that we didn't forget
@@ -1846,15 +2453,19 @@ mod tests {
     }
 
     #[test]
-    fn seize_quorum_keys_baked_via_checksigfromstack_in_migrate_branch() {
-        // Decision 2026-07-20: MIGRATE's authorizer is the cold 2-of-3 SEIZE
-        // quorum, NOT the hot OPS key (governance-exit hole, see
-        // `build_migrate_branch`'s "Authorizer" doc section).
-        let migrate = build_migrate_branch(&SEIZE);
-        for (i, pk) in SEIZE.iter().enumerate() {
-            assert!(migrate.windows(32).any(|w| w == pk), "SEIZE quorum key {i} must be baked into the MIGRATE branch");
+    fn recovery_quorum_keys_baked_via_checksigfromstack_in_migrate_branch() {
+        // Decision 2026-07-20-G0: MIGRATE's authorizer is its OWN independent
+        // cold 2-of-3 recovery quorum, NOT the hot OPS key and NOT the SEIZE
+        // quorum (a SEIZE-key leak must not also destroy the recovery path --
+        // see `build_migrate_branch`'s "Authorizer" doc section).
+        let migrate = build_migrate_branch(&RECOVERY);
+        for (i, pk) in RECOVERY.iter().enumerate() {
+            assert!(migrate.windows(32).any(|w| w == pk), "recovery quorum key {i} must be baked into the MIGRATE branch");
         }
         assert!(!migrate.windows(32).any(|w| w == OPS), "the hot OPS key must NOT authorize MIGRATE any more");
+        for (i, pk) in SEIZE.iter().enumerate() {
+            assert!(!migrate.windows(32).any(|w| w == pk), "SEIZE quorum key {i} must NOT authorize MIGRATE (independent quorum, G0)");
+        }
         // Exactly three OpCheckSigFromStack (0xd7) calls -- the same 2-of-3
         // quorum shape SEIZE uses (shared `emit_2of3_threshold` segment).
         let checksigfromstack_count = migrate.iter().filter(|&&byte| byte == 0xd7).count();
@@ -1862,16 +2473,24 @@ mod tests {
     }
 
     #[test]
-    fn migrate_and_seize_share_the_same_quorum_segment() {
-        // The two quorum gates must not drift: both are emitted by
-        // `emit_2of3_threshold`, so MIGRATE's tail (from the first quorum
-        // opcode through the threshold VERIFY) must appear verbatim in SEIZE.
-        let mut expected = Vec::new();
-        emit_2of3_threshold(&mut expected, &SEIZE);
-        let migrate = build_migrate_branch(&SEIZE);
+    fn migrate_and_seize_use_the_shared_quorum_codegen_with_independent_keys() {
+        // Decision 2026-07-20-G0: MIGRATE and SEIZE share the quorum bytecode
+        // SHAPE (both call `emit_2of3_threshold`), but their KEY MATERIAL is
+        // now independent -- so the two emitted segments must NOT be
+        // byte-identical, and MIGRATE's segment must not appear inside SEIZE.
+        let mut expected_migrate = Vec::new();
+        emit_2of3_threshold(&mut expected_migrate, &RECOVERY);
+        let mut expected_seize = Vec::new();
+        emit_2of3_threshold(&mut expected_seize, &SEIZE);
+        let migrate = build_migrate_branch(&RECOVERY);
         let seize = build_seize_branch(&SEIZE);
-        assert!(migrate.windows(expected.len()).any(|w| w == expected), "MIGRATE must use the shared 2-of-3 segment");
-        assert!(seize.windows(expected.len()).any(|w| w == expected), "SEIZE must use the shared 2-of-3 segment");
+        assert!(migrate.windows(expected_migrate.len()).any(|w| w == expected_migrate), "MIGRATE must bake the RECOVERY-keyed quorum segment");
+        assert!(seize.windows(expected_seize.len()).any(|w| w == expected_seize), "SEIZE must bake the SEIZE-keyed quorum segment");
+        assert!(
+            !migrate.windows(expected_seize.len()).any(|w| w == expected_seize),
+            "MIGRATE must NOT bake the SEIZE-keyed quorum segment (independent quorum, G0)"
+        );
+        assert_ne!(expected_migrate, expected_seize, "the two emitted quorum segments must differ (independent key material)");
     }
 
     #[test]
@@ -1882,7 +2501,7 @@ mod tests {
         // (that helper is only needed by branches with no owner signature at
         // all, FREEZE/SEIZE). Regression guard on the deliberate omission
         // documented in `build_migrate_branch`'s doc.
-        let migrate = build_migrate_branch(&SEIZE);
+        let migrate = build_migrate_branch(&RECOVERY);
         let needle: &[u8] = &[0xb9, 0xbe, 0xb9, 0xc2, 0x87, 0x69];
         assert!(
             !migrate.windows(needle.len()).any(|w| w == needle),
@@ -1898,7 +2517,49 @@ mod tests {
         // mechanism TRANSFER/FREEZE/SEIZE rely on -- it only ever needs the
         // successor SPK's hash (OpTxOutputSpk + OpBlake3), never OpSubstr
         // (0x7f, dr_field_extract's/dr_output_spk_check's slicing opcode).
-        let migrate = build_migrate_branch(&SEIZE);
+        let migrate = build_migrate_branch(&RECOVERY);
         assert!(!migrate.contains(&0x7f), "MIGRATE branch must not contain OpSubstr (0x7f) -- no new_rs field/extraction expected");
+    }
+
+    #[test]
+    #[should_panic(expected = "pairwise distinct")]
+    fn duplicated_recovery_key_rejected() {
+        // recovery[0] == recovery[1] would let one key satisfy two 2-of-3
+        // slots (mirrors `duplicated_seize_key_rejected`).
+        let dup_recovery: [[u8; 32]; 3] = [[0xA1; 32], [0xA1; 32], [0xA3; 32]];
+        let _ = build_stablecoin_redeem_script(
+            &OWNER,
+            id_type::PUBKEY,
+            &ROOT,
+            frozen_flag::CLEAR,
+            0,
+            &OPS,
+            &FREEZE,
+            &SEIZE,
+            &dup_recovery,
+            &MINT,
+        );
+    }
+
+    #[test]
+    fn distinct_recovery_keys_yield_distinct_redeem_scripts() {
+        // Mirrors `distinct_seize_keys_yield_distinct_redeem_scripts`.
+        let a = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &RECOVERY, &MINT);
+        let mut other_recovery = RECOVERY;
+        other_recovery[1] = [0xCD; 32];
+        let b = build_stablecoin_redeem_script(
+            &OWNER,
+            id_type::PUBKEY,
+            &ROOT,
+            frozen_flag::CLEAR,
+            0,
+            &OPS,
+            &FREEZE,
+            &SEIZE,
+            &other_recovery,
+            &MINT,
+        );
+        assert_ne!(a, b);
+        assert_eq!(&a[..STATE_HEADER_LEN], &b[..STATE_HEADER_LEN]); // state unaffected
     }
 }

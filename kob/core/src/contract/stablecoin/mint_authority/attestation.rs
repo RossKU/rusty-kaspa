@@ -82,11 +82,21 @@ pub const MINT_ATTESTATION_PREIMAGE_LEN: usize = OFFSET_RECIPIENT_SPK_HASH + REC
 pub const X_ONLY_PUBKEY_LEN: usize = 32;
 
 /// `op_type` discriminant byte values for the mint-authority contract's own
-/// (separate, 2-way) dispatch. Both `MINT` and `RAISE_CAP` are wired (see
-/// `super::body::build_mint_branch`/`super::body::build_raise_cap_branch`).
+/// (separate, 3-way) dispatch. `MINT`, `ANNOUNCE_CAP` (renamed 2026-07-20
+/// from `RAISE_CAP` -- SAME byte value, now writes `pending_cap` instead of
+/// `current_cap`, see `state.rs`'s field-ownership table) and `ACTIVATE_CAP`
+/// (new 2026-07-20: permissionless, CSV-timelocked promotion of
+/// `pending_cap` into `current_cap`) are all wired -- see
+/// `super::body::build_mint_branch`/`super::body::build_announce_cap_branch`/
+/// `super::body::build_activate_cap_branch`.
 pub mod op_type {
     pub const MINT: u8 = 0x00;
-    pub const RAISE_CAP: u8 = 0x01;
+    pub const ANNOUNCE_CAP: u8 = 0x01;
+    /// Permissionless: promotes an already-announced `pending_cap` into
+    /// `current_cap` once `min_activation_delay_daa` (CSV) has elapsed since
+    /// the input became spendable. Has NO attestation message of its own --
+    /// there is no signature at all in this branch (sig_op_count = 0).
+    pub const ACTIVATE_CAP: u8 = 0x02;
 }
 
 /// Exclusive upper bound on `outpoint_index` for which the little-endian
@@ -249,65 +259,66 @@ pub fn build_mint_attestation_message(
     *blake3::hash(&preimage).as_bytes()
 }
 
-/// Width, in bytes, of the `new_cap` field (RAISE_CAP's preimage tail).
+/// Width, in bytes, of the `new_pending_cap` field (ANNOUNCE_CAP's preimage tail).
 pub const NEW_CAP_LEN: usize = 8;
 
-/// Byte offsets inside the RAISE_CAP pre-image (§9: "`RAISE_CAP`'s attestation
-/// preimage follows the same prefix with a `new_cap(8,LE)` tail in place of
-/// the MINT-specific fields"). Shares the `DOMAIN_TAG_MINT || covenant_id ||
-/// outpoint_txid || outpoint_index` prefix byte-for-byte with the MINT
-/// pre-image above, then a `new_cap(8,LE)` tail instead of MINT's
-/// `mint_amount || new_running_supply || recipient_spk_hash` tail. No
-/// `op_type` byte: §9 states the RAISE_CAP pre-image is `DOMAIN_TAG_MINT ||
-/// covenant_id || outpoint_txid || outpoint_index || new_cap(8,LE)`, 84B
-/// total -- cross-op replay is "structurally impossible regardless" per that
-/// same paragraph, since MINT and RAISE_CAP are authorized by entirely
-/// different keys (`mint_pubkey` vs. the `cap_authority` quorum) and the two
-/// pre-image shapes/lengths already differ (124B vs. 84B), so an extra
-/// `op_type` disambiguator byte would be redundant -- this also matches the
-/// already-implemented MINT pre-image's own precedent of NOT including an
-/// `op_type` byte.
-pub const RAISE_CAP_OFFSET_DOMAIN_TAG: usize = 0;
-pub const RAISE_CAP_OFFSET_COVENANT_ID: usize = RAISE_CAP_OFFSET_DOMAIN_TAG + DOMAIN_TAG_LEN; // 8
-pub const RAISE_CAP_OFFSET_OUTPOINT_TXID: usize = RAISE_CAP_OFFSET_COVENANT_ID + COVENANT_ID_LEN; // 40
-pub const RAISE_CAP_OFFSET_OUTPOINT_INDEX: usize = RAISE_CAP_OFFSET_OUTPOINT_TXID + OUTPOINT_TXID_LEN; // 72
-pub const RAISE_CAP_OFFSET_NEW_CAP: usize = RAISE_CAP_OFFSET_OUTPOINT_INDEX + OUTPOINT_INDEX_LEN; // 76
+/// Byte offsets inside the ANNOUNCE_CAP pre-image (§9, renamed 2026-07-20
+/// from RAISE_CAP: "the attestation preimage follows the same prefix with a
+/// `new_pending_cap(8,LE)` tail in place of the MINT-specific fields").
+/// Shares the `DOMAIN_TAG_MINT || covenant_id || outpoint_txid ||
+/// outpoint_index` prefix byte-for-byte with the MINT pre-image above, then
+/// a `new_pending_cap(8,LE)` tail instead of MINT's `mint_amount ||
+/// new_running_supply || recipient_spk_hash` tail. No `op_type` byte: the
+/// ANNOUNCE_CAP pre-image is `DOMAIN_TAG_MINT || covenant_id ||
+/// outpoint_txid || outpoint_index || new_pending_cap(8,LE)`, 84B total --
+/// cross-op replay is structurally impossible regardless, since MINT and
+/// ANNOUNCE_CAP are authorized by entirely different keys (`mint_pubkey` vs.
+/// the `cap_authority` quorum) and the two pre-image shapes/lengths already
+/// differ (124B vs. 84B), so an extra `op_type` disambiguator byte would be
+/// redundant -- this also matches the already-implemented MINT pre-image's
+/// own precedent of NOT including an `op_type` byte. (ACTIVATE_CAP has no
+/// preimage at all -- it is permissionless, no signature.)
+pub const ANNOUNCE_CAP_OFFSET_DOMAIN_TAG: usize = 0;
+pub const ANNOUNCE_CAP_OFFSET_COVENANT_ID: usize = ANNOUNCE_CAP_OFFSET_DOMAIN_TAG + DOMAIN_TAG_LEN; // 8
+pub const ANNOUNCE_CAP_OFFSET_OUTPOINT_TXID: usize = ANNOUNCE_CAP_OFFSET_COVENANT_ID + COVENANT_ID_LEN; // 40
+pub const ANNOUNCE_CAP_OFFSET_OUTPOINT_INDEX: usize = ANNOUNCE_CAP_OFFSET_OUTPOINT_TXID + OUTPOINT_TXID_LEN; // 72
+pub const ANNOUNCE_CAP_OFFSET_NEW_PENDING_CAP: usize = ANNOUNCE_CAP_OFFSET_OUTPOINT_INDEX + OUTPOINT_INDEX_LEN; // 76
 
-/// Total RAISE_CAP pre-image length: `8+32+32+4+8 = 84` bytes (§9).
-pub const RAISE_CAP_ATTESTATION_PREIMAGE_LEN: usize = RAISE_CAP_OFFSET_NEW_CAP + NEW_CAP_LEN;
+/// Total ANNOUNCE_CAP pre-image length: `8+32+32+4+8 = 84` bytes (§9).
+pub const ANNOUNCE_CAP_ATTESTATION_PREIMAGE_LEN: usize = ANNOUNCE_CAP_OFFSET_NEW_PENDING_CAP + NEW_CAP_LEN;
 
-/// Build the 84-byte RAISE_CAP attestation pre-image (see the constants'
+/// Build the 84-byte ANNOUNCE_CAP attestation pre-image (see the constants'
 /// module doc above for the exact layout/rationale).
-pub fn build_raise_cap_attestation_preimage(
+pub fn build_announce_cap_attestation_preimage(
     covenant_id: &[u8; COVENANT_ID_LEN],
     outpoint_txid: &[u8; OUTPOINT_TXID_LEN],
     outpoint_index: u32,
-    new_cap: u64,
-) -> [u8; RAISE_CAP_ATTESTATION_PREIMAGE_LEN] {
+    new_pending_cap: u64,
+) -> [u8; ANNOUNCE_CAP_ATTESTATION_PREIMAGE_LEN] {
     debug_assert!(u64::from(outpoint_index) < MAX_OUTPOINT_INDEX_EXCLUSIVE, "outpoint_index must be < 2^31 to match on-chain OpNum2Bin(4)");
-    debug_assert!(new_cap < MAX_AMOUNT_EXCLUSIVE, "new_cap must be < 2^63 to match the on-chain sign-magnitude script-number domain");
+    debug_assert!(new_pending_cap < MAX_AMOUNT_EXCLUSIVE, "new_pending_cap must be < 2^63 to match the on-chain sign-magnitude script-number domain");
 
-    let mut out = [0u8; RAISE_CAP_ATTESTATION_PREIMAGE_LEN];
-    out[RAISE_CAP_OFFSET_DOMAIN_TAG..RAISE_CAP_OFFSET_DOMAIN_TAG + DOMAIN_TAG_LEN].copy_from_slice(&DOMAIN_TAG_MINT);
-    out[RAISE_CAP_OFFSET_COVENANT_ID..RAISE_CAP_OFFSET_COVENANT_ID + COVENANT_ID_LEN].copy_from_slice(covenant_id);
-    out[RAISE_CAP_OFFSET_OUTPOINT_TXID..RAISE_CAP_OFFSET_OUTPOINT_TXID + OUTPOINT_TXID_LEN].copy_from_slice(outpoint_txid);
-    out[RAISE_CAP_OFFSET_OUTPOINT_INDEX..RAISE_CAP_OFFSET_OUTPOINT_INDEX + OUTPOINT_INDEX_LEN].copy_from_slice(&outpoint_index.to_le_bytes());
-    out[RAISE_CAP_OFFSET_NEW_CAP..RAISE_CAP_OFFSET_NEW_CAP + NEW_CAP_LEN].copy_from_slice(&new_cap.to_le_bytes());
+    let mut out = [0u8; ANNOUNCE_CAP_ATTESTATION_PREIMAGE_LEN];
+    out[ANNOUNCE_CAP_OFFSET_DOMAIN_TAG..ANNOUNCE_CAP_OFFSET_DOMAIN_TAG + DOMAIN_TAG_LEN].copy_from_slice(&DOMAIN_TAG_MINT);
+    out[ANNOUNCE_CAP_OFFSET_COVENANT_ID..ANNOUNCE_CAP_OFFSET_COVENANT_ID + COVENANT_ID_LEN].copy_from_slice(covenant_id);
+    out[ANNOUNCE_CAP_OFFSET_OUTPOINT_TXID..ANNOUNCE_CAP_OFFSET_OUTPOINT_TXID + OUTPOINT_TXID_LEN].copy_from_slice(outpoint_txid);
+    out[ANNOUNCE_CAP_OFFSET_OUTPOINT_INDEX..ANNOUNCE_CAP_OFFSET_OUTPOINT_INDEX + OUTPOINT_INDEX_LEN].copy_from_slice(&outpoint_index.to_le_bytes());
+    out[ANNOUNCE_CAP_OFFSET_NEW_PENDING_CAP..ANNOUNCE_CAP_OFFSET_NEW_PENDING_CAP + NEW_CAP_LEN].copy_from_slice(&new_pending_cap.to_le_bytes());
     out
 }
 
-/// Build the 32-byte RAISE_CAP attestation message: `Blake3(pre-image)`. The
-/// cold 2-of-3 `cap_authority` quorum signs this (each signer producing a raw
-/// message-hash Schnorr signature, no SIGHASH type byte) over the pre-image
-/// binding the specific new ceiling (`new_cap`) to this exact spend
-/// (`covenant_id`/`outpoint_txid`/`outpoint_index`).
-pub fn build_raise_cap_attestation_message(
+/// Build the 32-byte ANNOUNCE_CAP attestation message: `Blake3(pre-image)`.
+/// The cold 2-of-3 `cap_authority` quorum signs this (each signer producing
+/// a raw message-hash Schnorr signature, no SIGHASH type byte) over the
+/// pre-image binding the specific new ceiling (`new_pending_cap`) to this
+/// exact spend (`covenant_id`/`outpoint_txid`/`outpoint_index`).
+pub fn build_announce_cap_attestation_message(
     covenant_id: &[u8; COVENANT_ID_LEN],
     outpoint_txid: &[u8; OUTPOINT_TXID_LEN],
     outpoint_index: u32,
-    new_cap: u64,
+    new_pending_cap: u64,
 ) -> [u8; 32] {
-    let preimage = build_raise_cap_attestation_preimage(covenant_id, outpoint_txid, outpoint_index, new_cap);
+    let preimage = build_announce_cap_attestation_preimage(covenant_id, outpoint_txid, outpoint_index, new_pending_cap);
     *blake3::hash(&preimage).as_bytes()
 }
 
@@ -395,41 +406,41 @@ mod tests {
     }
 
     #[test]
-    fn raise_cap_preimage_length_is_84() {
-        let preimage = build_raise_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_000);
-        assert_eq!(preimage.len(), RAISE_CAP_ATTESTATION_PREIMAGE_LEN);
-        assert_eq!(RAISE_CAP_ATTESTATION_PREIMAGE_LEN, 84);
+    fn announce_cap_preimage_length_is_84() {
+        let preimage = build_announce_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_000);
+        assert_eq!(preimage.len(), ANNOUNCE_CAP_ATTESTATION_PREIMAGE_LEN);
+        assert_eq!(ANNOUNCE_CAP_ATTESTATION_PREIMAGE_LEN, 84);
     }
 
     #[test]
-    fn raise_cap_preimage_shares_prefix_with_mint_preimage() {
+    fn announce_cap_preimage_shares_prefix_with_mint_preimage() {
         // Both preimages start with DOMAIN_TAG_MINT || covenant_id ||
         // outpoint_txid || outpoint_index -- the same 76-byte prefix,
         // byte-for-byte, before diverging into their op-specific tails.
         let mint_preimage = build_mint_attestation_preimage(&COV_ID, &TXID, 3, 1000, 2000, &SPK);
-        let raise_cap_preimage = build_raise_cap_attestation_preimage(&COV_ID, &TXID, 3, 1_000_000);
-        assert_eq!(&mint_preimage[..76], &raise_cap_preimage[..76]);
+        let announce_cap_preimage = build_announce_cap_attestation_preimage(&COV_ID, &TXID, 3, 1_000_000);
+        assert_eq!(&mint_preimage[..76], &announce_cap_preimage[..76]);
     }
 
     #[test]
-    fn raise_cap_preimage_is_field_sensitive() {
-        let base = build_raise_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_000);
+    fn announce_cap_preimage_is_field_sensitive() {
+        let base = build_announce_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_000);
 
-        let diff_cap = build_raise_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_001);
+        let diff_cap = build_announce_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_001);
         assert_ne!(base, diff_cap);
 
-        let diff_index = build_raise_cap_attestation_preimage(&COV_ID, &TXID, 1, 1_000_000);
+        let diff_index = build_announce_cap_attestation_preimage(&COV_ID, &TXID, 1, 1_000_000);
         assert_ne!(base, diff_index);
 
         let other_txid: [u8; 32] = [0x11; 32];
-        let diff_txid = build_raise_cap_attestation_preimage(&COV_ID, &other_txid, 0, 1_000_000);
+        let diff_txid = build_announce_cap_attestation_preimage(&COV_ID, &other_txid, 0, 1_000_000);
         assert_ne!(base, diff_txid);
     }
 
     #[test]
-    fn raise_cap_message_is_blake3_of_preimage() {
-        let preimage = build_raise_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_000);
-        let message = build_raise_cap_attestation_message(&COV_ID, &TXID, 0, 1_000_000);
+    fn announce_cap_message_is_blake3_of_preimage() {
+        let preimage = build_announce_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_000);
+        let message = build_announce_cap_attestation_message(&COV_ID, &TXID, 0, 1_000_000);
         assert_eq!(message, *blake3::hash(&preimage).as_bytes());
     }
 
@@ -447,13 +458,13 @@ mod tests {
     }
 
     #[test]
-    fn raise_cap_preimage_never_equals_a_mint_preimage() {
+    fn announce_cap_preimage_never_equals_a_mint_preimage() {
         // Even holding covenant_id/outpoint fields constant, the RAISE_CAP
         // preimage (84B) can never collide with a MINT preimage (124B) --
         // different lengths alone rule out cross-op replay, independent of
         // the fact the two ops are authorized by entirely different keys.
         let mint_preimage = build_mint_attestation_preimage(&COV_ID, &TXID, 0, 1000, 2000, &SPK);
-        let raise_cap_preimage = build_raise_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_000);
-        assert_ne!(mint_preimage.len(), raise_cap_preimage.len());
+        let announce_cap_preimage = build_announce_cap_attestation_preimage(&COV_ID, &TXID, 0, 1_000_000);
+        assert_ne!(mint_preimage.len(), announce_cap_preimage.len());
     }
 }

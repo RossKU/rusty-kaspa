@@ -1,9 +1,11 @@
 //! Mint-authority contract **sigscript** (unlocking script) builders
-//! (`STABLECOIN_ROBUST_DESIGN.md` §9 "Mint + Supply Cap").
+//! (`STABLECOIN_ROBUST_DESIGN.md` §9 "Mint + Supply Cap", extended
+//! 2026-07-20 for G4 RAISE_CAP ceiling+timelock / G5 MINT epoch budget).
 //!
-//! This is the spender side of [`super::body`]'s two-way `op_type` dispatch
-//! (`MINT`, `op_type = 0x00` / `RAISE_CAP`, `op_type = 0x01`). Mirrors the
-//! house style of `crate::contract::stablecoin::sigscript`: one
+//! This is the spender side of [`super::body`]'s three-way `op_type`
+//! dispatch (`MINT`, `op_type = 0x00` / `ANNOUNCE_CAP`, `op_type = 0x01`,
+//! renamed from `RAISE_CAP` / `ACTIVATE_CAP`, `op_type = 0x02`, new). Mirrors
+//! the house style of `crate::contract::stablecoin::sigscript`: one
 //! `build_mint_authority_*_sigscript` function per branch, each emitting
 //! exactly the push-only bytes that branch's bytecode pops/rolls off the
 //! stack, in the order it expects, with the redeem script pushed last (the
@@ -49,23 +51,25 @@
 //! This input's `sig_op_count` MUST be **1** (a single `OpCheckSigFromStack`
 //! for the MINT role).
 //!
-//! # RAISE_CAP (`op_type = 0x01`) push order
+//! # ANNOUNCE_CAP (`op_type = 0x01`, renamed from RAISE_CAP) push order
 //!
-//! Per [`super::body::build_raise_cap_branch`]'s module doc, the entry stack
-//! once the dispatch delivers control to the RAISE_CAP branch is
-//! (top-to-bottom): `current_cap(0), running_supply(1), new_cap(2),
-//! new_rs(3), old_rs(4), sig3(5), sig2(6), sig1(7)`. The sigscript this
-//! builder emits (first push == deepest) is:
+//! Per [`super::body::build_announce_cap_branch`]'s module doc, the entry
+//! stack once the dispatch delivers control to the ANNOUNCE_CAP branch is
+//! (top-to-bottom): `pending_cap(0), current_cap(1), epoch_start_daa(2),
+//! minted_this_epoch(3), running_supply(4), new_pending_cap(5), new_rs(6),
+//! old_rs(7), sig3(8), sig2(9), sig1(10)` — the first five are the state
+//! header's own live pushes (`state.rs`), not the sigscript. The sigscript
+//! this builder emits (first push == deepest) is:
 //!
 //! ```text
 //! push sig1(64B) -> push sig2(64B) -> push sig3(64B) -> push old_rs
-//!   -> push new_rs -> push new_cap(8B LE) -> push op_type_selector(1B, 0x01)
+//!   -> push new_rs -> push new_pending_cap(8B LE) -> push op_type_selector(1B, 0x01)
 //!   -> pushData(redeem_script)
 //! ```
 //!
 //! - **sig1**/**sig2**/**sig3** — FIXED POSITIONAL slots, the cold 2-of-3
 //!   `cap_authority` quorum's raw 64-byte Schnorr signatures over
-//!   [`super::attestation::build_raise_cap_attestation_message`]
+//!   [`super::attestation::build_announce_cap_attestation_message`]
 //!   (`OpCheckSigFromStack`, **no** SIGHASH type byte), checked against
 //!   `cap_authority_pubkeys[0]`/`[1]`/`[2]` respectively (mirroring
 //!   `stablecoin::sigscript::build_stablecoin_seize_sigscript`'s SEIZE-quorum
@@ -75,13 +79,34 @@
 //! - **old_rs** — this input's own current redeemScript, authenticated
 //!   on-chain via `dr_input_spk_check`.
 //! - **new_rs** — the candidate self-continuation successor redeem script.
-//! - **new_cap** — the new ceiling being raised to, folded into the
-//!   attestation pre-image and checked against the successor's actual
-//!   `current_cap` field.
+//! - **new_pending_cap** — the new ceiling being announced, folded into the
+//!   attestation pre-image, checked against the G4 ceiling
+//!   (`<= current_cap * K`), and checked against the successor's actual
+//!   `pending_cap` field (NOT `current_cap`, which must stay unchanged until
+//!   `ACTIVATE_CAP`'s CSV timelock clears).
 //!
 //! This input's `sig_op_count` MUST be **3** (three `OpCheckSigFromStack`
 //! calls for the 2-of-3 `cap_authority` quorum — no owner signature, no
 //! `mint_pubkey` involvement at all).
+//!
+//! # ACTIVATE_CAP (`op_type = 0x02`, new) push order
+//!
+//! Per [`super::body::build_activate_cap_branch`]'s module doc, the entry
+//! stack once the dispatch delivers control to the ACTIVATE_CAP branch is
+//! (top-to-bottom): `pending_cap(0), current_cap(1), epoch_start_daa(2),
+//! minted_this_epoch(3), running_supply(4), new_rs(5), old_rs(6)`. The
+//! sigscript this builder emits (first push == deepest) is:
+//!
+//! ```text
+//! push old_rs -> push new_rs -> push op_type_selector(1B, 0x02)
+//!   -> pushData(redeem_script)
+//! ```
+//!
+//! No signatures at all: this branch is PERMISSIONLESS (gated only by the
+//! CSV timelock, `input.sequence >= min_activation_delay_daa`, and the
+//! on-chain checks that the successor's `current_cap`/`pending_cap` both
+//! equal this coin's own already-announced `pending_cap`). This input's
+//! `sig_op_count` MUST be **0**.
 
 use crate::primitives::push_data;
 
@@ -136,36 +161,40 @@ pub fn build_mint_authority_mint_sigscript(
     ss
 }
 
-/// Build the mint-authority RAISE_CAP (`op_type = 0x01`) sigscript. See this
-/// module's top doc for the derivation of the push order from
-/// [`super::body::build_raise_cap_branch`]'s entry-stack layout.
+/// Build the mint-authority ANNOUNCE_CAP (`op_type = 0x01`, renamed from
+/// RAISE_CAP) sigscript. See this module's top doc for the derivation of the
+/// push order from [`super::body::build_announce_cap_branch`]'s entry-stack
+/// layout.
 ///
 /// `sig1`/`sig2`/`sig3` — FIXED POSITIONAL slots (checked against
 /// `cap_authority_pubkeys[0]`/`[1]`/`[2]` respectively), each a raw 64-byte
 /// Schnorr signature over
-/// [`super::attestation::build_raise_cap_attestation_message`] (no SIGHASH
-/// type byte; verified via `OpCheckSigFromStack`). A holder of only 2 of the
-/// 3 keys supplies a genuine signature in two slots and an arbitrary 64-byte
-/// placeholder in the third.
+/// [`super::attestation::build_announce_cap_attestation_message`] (no
+/// SIGHASH type byte; verified via `OpCheckSigFromStack`). A holder of only
+/// 2 of the 3 keys supplies a genuine signature in two slots and an
+/// arbitrary 64-byte placeholder in the third.
 /// `old_rs` — this input's own current redeemScript (authenticated via
 /// `dr_input_spk_check` on-chain).
 /// `new_rs` — the candidate self-continuation successor redeem script.
-/// `new_cap` — the new ceiling being raised to (encoded here as a fixed
-/// 8-byte LE sigscript push).
+/// `new_pending_cap` — the new ceiling being announced (encoded here as a
+/// fixed 8-byte LE sigscript push); checked against the G4 ceiling
+/// (`<= current_cap * K`) and against the successor's `pending_cap` field
+/// (NOT `current_cap`).
 /// `redeem_script` — the full mint-authority redeem script from
 /// [`super::body::build_mint_authority_redeem_script`].
 ///
 /// The returned bytes are push-only and pop in the order
-/// `build_raise_cap_branch` (`body.rs`) expects: `sig1` deepest, then `sig2`,
-/// then `sig3`, then `old_rs`, then `new_rs`, then `new_cap`, then the
-/// `op_type_selector` (`0x01 == RAISE_CAP`), then the redeem script last.
-pub fn build_mint_authority_raise_cap_sigscript(
+/// `build_announce_cap_branch` (`body.rs`) expects: `sig1` deepest, then
+/// `sig2`, then `sig3`, then `old_rs`, then `new_rs`, then
+/// `new_pending_cap`, then the `op_type_selector` (`0x01 == ANNOUNCE_CAP`),
+/// then the redeem script last.
+pub fn build_mint_authority_announce_cap_sigscript(
     sig1: &[u8; 64],
     sig2: &[u8; 64],
     sig3: &[u8; 64],
     old_rs: &[u8],
     new_rs: &[u8],
-    new_cap: u64,
+    new_pending_cap: u64,
     redeem_script: &[u8],
 ) -> Vec<u8> {
     let mut ss = Vec::with_capacity(3 * (2 + 64) + 3 + old_rs.len() + 3 + new_rs.len() + 2 + 8 + 2 + 3 + redeem_script.len());
@@ -179,10 +208,46 @@ pub fn build_mint_authority_raise_cap_sigscript(
     ss.extend_from_slice(&push_data(old_rs));
     // Then the candidate self-continuation successor redeem script.
     ss.extend_from_slice(&push_data(new_rs));
-    // Then the attested new_cap (8B LE u64).
-    ss.extend_from_slice(&push_data(&new_cap.to_le_bytes()));
-    // Then the op_type selector (0x01 == RAISE_CAP).
-    ss.extend_from_slice(&push_data(&[super::attestation::op_type::RAISE_CAP]));
+    // Then the attested new_pending_cap (8B LE u64).
+    ss.extend_from_slice(&push_data(&new_pending_cap.to_le_bytes()));
+    // Then the op_type selector (0x01 == ANNOUNCE_CAP).
+    ss.extend_from_slice(&push_data(&[super::attestation::op_type::ANNOUNCE_CAP]));
+    // Redeem script last: the P2SH wrapper pops it first, before the body runs.
+    ss.extend_from_slice(&push_data(redeem_script));
+    ss
+}
+
+/// Build the mint-authority ACTIVATE_CAP (`op_type = 0x02`, new) sigscript.
+/// See this module's top doc for the derivation of the push order from
+/// [`super::body::build_activate_cap_branch`]'s entry-stack layout.
+///
+/// PERMISSIONLESS: no signatures at all -- gated purely by the CSV timelock
+/// (`input.sequence >= min_activation_delay_daa`, enforced by the redeem
+/// script itself via `OpCheckSequenceVerify`) and the on-chain checks that
+/// the successor's `current_cap`/`pending_cap` both equal this coin's own
+/// already-announced `pending_cap`.
+///
+/// `old_rs` — this input's own current redeemScript (authenticated via
+/// `dr_input_spk_check` on-chain).
+/// `new_rs` — the candidate self-continuation successor redeem script.
+/// `redeem_script` — the full mint-authority redeem script from
+/// [`super::body::build_mint_authority_redeem_script`].
+///
+/// The returned bytes are push-only and pop in the order
+/// `build_activate_cap_branch` (`body.rs`) expects: `old_rs` deepest, then
+/// `new_rs`, then the `op_type_selector` (`0x02 == ACTIVATE_CAP`), then the
+/// redeem script last. Callers MUST also set this input's `sequence` field
+/// to a value `>= min_activation_delay_daa` (masked by
+/// `SEQUENCE_LOCK_TIME_MASK`) and `sig_op_count` to `0`.
+pub fn build_mint_authority_activate_cap_sigscript(old_rs: &[u8], new_rs: &[u8], redeem_script: &[u8]) -> Vec<u8> {
+    let mut ss = Vec::with_capacity(3 + old_rs.len() + 3 + new_rs.len() + 2 + 3 + redeem_script.len());
+    // Emitted first -> ends up deepest on the stack: this input's own
+    // current redeemScript (authenticated on-chain via dr_input_spk_check).
+    ss.extend_from_slice(&push_data(old_rs));
+    // Then the candidate self-continuation successor redeem script.
+    ss.extend_from_slice(&push_data(new_rs));
+    // Then the op_type selector (0x02 == ACTIVATE_CAP).
+    ss.extend_from_slice(&push_data(&[super::attestation::op_type::ACTIVATE_CAP]));
     // Redeem script last: the P2SH wrapper pops it first, before the body runs.
     ss.extend_from_slice(&push_data(redeem_script));
     ss
@@ -204,6 +269,7 @@ mod tests {
     const OPS_PK: [u8; 32] = [0xBB; 32];
     const FREEZE_PK: [u8; 32] = [0xDD; 32];
     const SEIZE_PKS: [[u8; 32]; 3] = [[0x91; 32], [0x92; 32], [0x93; 32]];
+    const RECOVERY_PKS: [[u8; 32]; 3] = [[0xB1; 32], [0xB2; 32], [0xB3; 32]];
     const ROOT: [u8; 32] = [0xCC; 32];
     const GENESIS: [u8; 32] = [0x77; 32];
     const RECIPIENT: [u8; 32] = [0xAA; 32];
@@ -211,15 +277,23 @@ mod tests {
     fn rs(running_supply: u64, current_cap: u64) -> Vec<u8> {
         build_mint_authority_redeem_script(
             running_supply,
+            0,   // minted_this_epoch
+            0,   // epoch_start_daa
             current_cap,
+            current_cap, // pending_cap (sentinel: no announcement pending)
             &MINT_PK,
             &CAP_AUTH,
             &OPS_PK,
             &FREEZE_PK,
             &SEIZE_PKS,
+            &RECOVERY_PKS,
             &ROOT,
             identifier_type::PUBKEY,
             &GENESIS,
+            2,           // cap_raise_multiplier_k
+            1_000,       // epoch_length_daa
+            u64::MAX / 2, // epoch_mint_budget (generous, not under test here)
+            100,         // min_activation_delay_daa
         )
     }
 
@@ -275,10 +349,10 @@ mod tests {
     }
 
     #[test]
-    fn raise_cap_emits_sig1_sig2_sig3_then_old_rs_then_new_rs_then_new_cap_then_optype_then_redeem_script() {
+    fn announce_cap_emits_sig1_sig2_sig3_then_old_rs_then_new_rs_then_new_pending_cap_then_optype_then_redeem_script() {
         let old_rs = rs(10_000, 1_000_000);
-        let new_rs = rs(10_000, 2_000_000);
-        let ss = build_mint_authority_raise_cap_sigscript(&SIG1, &SIG2, &SIG3, &old_rs, &new_rs, 2_000_000, &old_rs);
+        let new_rs = rs(10_000, 1_000_000);
+        let ss = build_mint_authority_announce_cap_sigscript(&SIG1, &SIG2, &SIG3, &old_rs, &new_rs, 2_000_000, &old_rs);
 
         // Field 1 (deepest): sig1 — OpData64 (0x40) + 64 raw bytes.
         assert_eq!(ss[0], 64);
@@ -291,24 +365,25 @@ mod tests {
         expected.extend_from_slice(&crate::primitives::push_data(&old_rs));
         expected.extend_from_slice(&crate::primitives::push_data(&new_rs));
         expected.extend_from_slice(&crate::primitives::push_data(&2_000_000u64.to_le_bytes()));
-        expected.extend_from_slice(&crate::primitives::push_data(&[crate::contract::stablecoin::mint_authority::attestation::op_type::RAISE_CAP]));
+        expected.extend_from_slice(&crate::primitives::push_data(&[crate::contract::stablecoin::mint_authority::attestation::op_type::ANNOUNCE_CAP]));
         expected.extend_from_slice(&crate::primitives::push_data(&old_rs));
 
         assert_eq!(ss, expected);
     }
 
     #[test]
-    fn raise_cap_accepts_2pow63_new_cap_without_panicking() {
+    fn announce_cap_accepts_2pow63_new_pending_cap_without_panicking() {
         // Mirrors mint_authority_contracts.rs's
-        // raise_cap_new_cap_at_or_above_2pow63_rejected regression: the
-        // builder itself performs no numeric-domain validation (that lives
-        // in MintAuthorityStateHeader::new_checked/check_numeric_domain) --
-        // it must faithfully push whatever raw u64 it is given, including
-        // the 2^63 boundary value a real attacker could craft directly on
-        // the wire.
+        // announce_cap_new_pending_cap_at_or_above_2pow63_rejected
+        // regression: the builder itself performs no numeric-domain
+        // validation (that lives in
+        // MintAuthorityStateHeader::new_checked/check_numeric_domain) -- it
+        // must faithfully push whatever raw u64 it is given, including the
+        // 2^63 boundary value a real attacker could craft directly on the
+        // wire.
         let old_rs = rs(10_000, 1_000_000);
-        let new_cap_raw: u64 = 1u64 << 63;
-        let ss = build_mint_authority_raise_cap_sigscript(&SIG1, &SIG2, &SIG3, &old_rs, &old_rs, new_cap_raw, &old_rs);
+        let new_pending_cap_raw: u64 = 1u64 << 63;
+        let ss = build_mint_authority_announce_cap_sigscript(&SIG1, &SIG2, &SIG3, &old_rs, &old_rs, new_pending_cap_raw, &old_rs);
 
         let mut expected = Vec::new();
         expected.extend_from_slice(&crate::primitives::push_data(&SIG1));
@@ -316,8 +391,23 @@ mod tests {
         expected.extend_from_slice(&crate::primitives::push_data(&SIG3));
         expected.extend_from_slice(&crate::primitives::push_data(&old_rs));
         expected.extend_from_slice(&crate::primitives::push_data(&old_rs));
-        expected.extend_from_slice(&crate::primitives::push_data(&new_cap_raw.to_le_bytes()));
-        expected.extend_from_slice(&crate::primitives::push_data(&[crate::contract::stablecoin::mint_authority::attestation::op_type::RAISE_CAP]));
+        expected.extend_from_slice(&crate::primitives::push_data(&new_pending_cap_raw.to_le_bytes()));
+        expected.extend_from_slice(&crate::primitives::push_data(&[crate::contract::stablecoin::mint_authority::attestation::op_type::ANNOUNCE_CAP]));
+        expected.extend_from_slice(&crate::primitives::push_data(&old_rs));
+
+        assert_eq!(ss, expected);
+    }
+
+    #[test]
+    fn activate_cap_emits_old_rs_then_new_rs_then_optype_then_redeem_script() {
+        let old_rs = rs(10_000, 1_000_000);
+        let new_rs = rs(10_000, 2_000_000);
+        let ss = build_mint_authority_activate_cap_sigscript(&old_rs, &new_rs, &old_rs);
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&crate::primitives::push_data(&old_rs));
+        expected.extend_from_slice(&crate::primitives::push_data(&new_rs));
+        expected.extend_from_slice(&crate::primitives::push_data(&[crate::contract::stablecoin::mint_authority::attestation::op_type::ACTIVATE_CAP]));
         expected.extend_from_slice(&crate::primitives::push_data(&old_rs));
 
         assert_eq!(ss, expected);

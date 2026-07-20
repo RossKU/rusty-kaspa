@@ -25,8 +25,10 @@
 //!      provably unspendable underneath -- see `BURN_SINK_SCRIPT`'s doc in
 //!      `core/src/contract/stablecoin/body.rs`).
 //!      With `MIGRATE_DEMO=1`, step 8 runs **MIGRATE** instead: `recovery`
-//!      (owner) + a cold 2-of-3 SEIZE quorum move the coin to a wholly
-//!      different template (here a plain wallet P2PK output -- the branch
+//!      (owner) + MIGRATE's own independent cold 2-of-3 `migrate_quorum`
+//!      (Decision 2026-07-20-G0 -- pairwise-distinct from the SEIZE quorum,
+//!      so a leaked SEIZE quorum cannot also authorize MIGRATE) move the
+//!      coin to a wholly different template (here a plain wallet P2PK output -- the branch
 //!      never inspects the destination), so the coin leaves covenant
 //!      governance by deliberate cold decision. The two are alternatives, not
 //!      successive steps, because this harness mints exactly one coin; both
@@ -102,12 +104,13 @@ use kob_cli::rpc::RpcUtxo;
 use kob_cli::signing;
 use kob_core::contract::stablecoin::attestation::op_type as coin_op_type;
 use kob_core::contract::stablecoin::mint_authority::attestation::{
-    build_mint_attestation_message, build_raise_cap_attestation_message, check_mint_amount_floor,
+    build_announce_cap_attestation_message, build_mint_attestation_message, check_mint_amount_floor,
 };
 use kob_core::contract::stablecoin::mint_authority::body::build_mint_authority_redeem_script;
 use kob_core::contract::stablecoin::mint_authority::sigscript::{
-    build_mint_authority_mint_sigscript, build_mint_authority_raise_cap_sigscript,
+    build_mint_authority_announce_cap_sigscript, build_mint_authority_mint_sigscript,
 };
+use kob_core::contract::stablecoin::mint_authority::state::MintAuthorityStateHeader;
 use kob_core::contract::stablecoin::state::{compute_role_registry_root, frozen_flag};
 use kob_core::contract::stablecoin::{
     build_attestation_message, build_freeze_attestation_message, build_migrate_attestation_message,
@@ -438,6 +441,12 @@ struct RoleKeys {
     ops: KeyPairHex,
     freeze: KeyPairHex,
     seize: [KeyPairHex; 3],
+    /// MIGRATE's own independent cold 2-of-3 quorum (Decision 2026-07-20-G0,
+    /// G0 CRITICAL fix): pairwise-distinct from `seize` -- a leaked SEIZE
+    /// quorum must not also authorize MIGRATE. NOT to be confused with the
+    /// `recovery` field above (a demo-only SEIZE-DESTINATION holder, an
+    /// unrelated concept that predates this fix and keeps its name).
+    migrate_quorum: [KeyPairHex; 3],
     mint: KeyPairHex,
     cap_authority: [KeyPairHex; 3],
     /// Opaque `role_registry_root` commitment (§2/§3) -- never individually
@@ -493,6 +502,12 @@ fn load_or_init_manifest(path: &Path) -> anyhow::Result<Manifest> {
 
     println!("No manifest at {} -- generating fresh role keypairs.", path.display());
     let seize = [gen_keypair()?, gen_keypair()?, gen_keypair()?];
+    // MIGRATE's own independent cold quorum (Decision 2026-07-20-G0) -- freshly
+    // generated, distinct from `seize` above (each `gen_keypair` call draws
+    // fresh randomness, so collision with the seize keys is not a real-world
+    // concern; `build_stablecoin_body`'s own pairwise-distinctness assertion
+    // would abort construction if it ever happened anyway).
+    let migrate_quorum = [gen_keypair()?, gen_keypair()?, gen_keypair()?];
     let cap_authority = [gen_keypair()?, gen_keypair()?, gen_keypair()?];
     let ops = gen_keypair()?;
     let freeze = gen_keypair()?;
@@ -519,6 +534,7 @@ fn load_or_init_manifest(path: &Path) -> anyhow::Result<Manifest> {
         ops,
         freeze,
         seize,
+        migrate_quorum,
         mint,
         cap_authority,
         role_registry_root: hex::encode(root),
@@ -552,6 +568,9 @@ struct RoleCtx {
     freeze_sk: [u8; 32],
     seize_pk: [[u8; 32]; 3],
     seize_sk: [[u8; 32]; 3],
+    /// MIGRATE's own independent cold 2-of-3 quorum (Decision 2026-07-20-G0).
+    migrate_quorum_pk: [[u8; 32]; 3],
+    migrate_quorum_sk: [[u8; 32]; 3],
     mint_pk: [u8; 32],
     mint_sk: [u8; 32],
     cap_authority_pk: [[u8; 32]; 3],
@@ -576,6 +595,16 @@ impl RoleCtx {
             freeze_sk: k.freeze.privkey_bytes()?,
             seize_pk: [k.seize[0].pubkey_bytes()?, k.seize[1].pubkey_bytes()?, k.seize[2].pubkey_bytes()?],
             seize_sk: [k.seize[0].privkey_bytes()?, k.seize[1].privkey_bytes()?, k.seize[2].privkey_bytes()?],
+            migrate_quorum_pk: [
+                k.migrate_quorum[0].pubkey_bytes()?,
+                k.migrate_quorum[1].pubkey_bytes()?,
+                k.migrate_quorum[2].pubkey_bytes()?,
+            ],
+            migrate_quorum_sk: [
+                k.migrate_quorum[0].privkey_bytes()?,
+                k.migrate_quorum[1].privkey_bytes()?,
+                k.migrate_quorum[2].privkey_bytes()?,
+            ],
             mint_pk: k.mint.pubkey_bytes()?,
             mint_sk: k.mint.privkey_bytes()?,
             cap_authority_pk: [
@@ -604,27 +633,71 @@ impl RoleCtx {
             &self.ops_pk,
             &self.freeze_pk,
             &self.seize_pk,
+            &self.migrate_quorum_pk,
             &self.mint_pk,
         )
     }
 
     /// Build the mint authority's redeem script at the given mutable-state
     /// values, with this run's baked role constants + genesis id.
-    fn authority_rs(&self, running_supply: u64, current_cap: u64, genesis_covenant_id: &[u8; 32]) -> Vec<u8> {
+    ///
+    /// `pending_cap` is the G4 ANNOUNCE_CAP/ACTIVATE_CAP ceiling-in-flight
+    /// field (2026-07-20 hardening); callers with no announcement in flight
+    /// (DEPLOY genesis, MINT, and every op in this harness's flow that runs
+    /// BEFORE `op_announce_cap`) pass `pending_cap == current_cap` (the "no
+    /// announcement pending" sentinel -- see `state.rs`).
+    /// `epoch_start_daa`/`minted_this_epoch` (G5 epoch budget) always start
+    /// at 0 for a fresh epoch window; this harness's MINT step recomputes
+    /// them honestly per spend (see `op_mint`).
+    #[allow(clippy::too_many_arguments)]
+    fn authority_rs(
+        &self,
+        running_supply: u64,
+        minted_this_epoch: u64,
+        epoch_start_daa: u64,
+        current_cap: u64,
+        pending_cap: u64,
+        genesis_covenant_id: &[u8; 32],
+    ) -> Vec<u8> {
         build_mint_authority_redeem_script(
             running_supply,
+            minted_this_epoch,
+            epoch_start_daa,
             current_cap,
+            pending_cap,
             &self.mint_pk,
             &self.cap_authority_pk,
             &self.ops_pk,
             &self.freeze_pk,
             &self.seize_pk,
+            &self.migrate_quorum_pk,
             &self.root,
             id_type::PUBKEY,
             genesis_covenant_id,
+            CAP_RAISE_MULTIPLIER_K,
+            EPOCH_LENGTH_DAA,
+            EPOCH_MINT_BUDGET,
+            MIN_ACTIVATION_DELAY_DAA,
         )
     }
 }
+
+/// G4 ANNOUNCE_CAP ceiling multiplier (constructor param, 2026-07-20
+/// hardening) -- must be `>= 2`. A per-deployment choice; this harness bakes
+/// a conservative default since it isn't under live-run test here.
+const CAP_RAISE_MULTIPLIER_K: u64 = 2;
+/// G5 MINT epoch window length in DAA blocks (constructor param). Baked
+/// generously here: this harness predicts `epoch_start_daa`/
+/// `minted_this_epoch` locally (never queries the authority UTXO's real,
+/// node-tracked `block_daa_score`), so the window must comfortably outlast
+/// any realistic elapsed DAA between this run's DEPLOY and MINT steps for
+/// that local prediction to keep matching the real on-chain computation.
+const EPOCH_LENGTH_DAA: u64 = 100_000_000;
+/// G5 MINT epoch sompi budget (constructor param) -- generous default so
+/// this harness's single-MINT-per-run flow never trips it.
+const EPOCH_MINT_BUDGET: u64 = u64::MAX / 4;
+/// G4 ACTIVATE_CAP CSV timelock floor in DAA blocks (constructor param).
+const MIN_ACTIVATION_DELAY_DAA: u64 = 100;
 
 // ---------------------------------------------------------------------
 // DEPLOY: TX1 (anchor) + TX2 (mint-authority genesis)
@@ -739,7 +812,9 @@ async fn deploy_tx2_authority(
     let privkey = *wallet.privkey_bytes();
     let wallet_spk = p2pk_script(&wallet.pubkey);
 
-    let authority_rs = roles.authority_rs(0, cap, genesis_covenant_id);
+    // Genesis: fresh epoch window (epoch_start_daa=0, minted_this_epoch=0),
+    // pending_cap == current_cap (no ANNOUNCE_CAP in flight).
+    let authority_rs = roles.authority_rs(0, 0, 0, cap, cap, genesis_covenant_id);
     let authority_p2sh = build_p2sh(&authority_rs);
     let authority_addr = kob_cli::cancel::p2sh_to_address(authority_p2sh.script(), "kaspatest");
     println!("Mint-authority P2SH address: {}", authority_addr);
@@ -850,7 +925,15 @@ async fn op_mint(
     println!("Predicted new coin covenant_id: {}", hex::encode(coin_cov_id));
 
     let new_running_supply = mint_amount; // old running_supply (0) + mint_amount
-    let new_authority_rs = roles.authority_rs(new_running_supply, cap, genesis_cov_id);
+    // G5 epoch budget: old epoch fields are both 0 (genesis) and
+    // EPOCH_LENGTH_DAA is baked generously (see its own doc), so this
+    // harness's single MINT-right-after-DEPLOY flow never crosses the epoch
+    // boundary -- new_minted_this_epoch = 0 + mint_amount, epoch_start_daa
+    // stays 0. current_cap/pending_cap both stay `cap` (MINT never touches
+    // either).
+    let new_minted_this_epoch = mint_amount;
+    let new_epoch_start_daa = 0u64;
+    let new_authority_rs = roles.authority_rs(new_running_supply, new_minted_this_epoch, new_epoch_start_daa, cap, cap, genesis_cov_id);
     let new_authority_p2sh = build_p2sh(&new_authority_rs);
     let authority_addr = kob_cli::cancel::p2sh_to_address(new_authority_p2sh.script(), "kaspatest");
     let coin_addr = kob_cli::cancel::p2sh_to_address(coin_p2sh.script(), "kaspatest");
@@ -1325,12 +1408,16 @@ struct MigrateResult {
 }
 
 /// MIGRATE: move the coin to a WHOLLY DIFFERENT covenant template, gated by
-/// the owner's SIGHASH_ALL signature PLUS a cold 2-of-3 SEIZE-quorum
-/// attestation (Decision 2026-07-20 -- see `build_migrate_branch`'s
-/// "Authorizer" doc). The initial Live shipped a single hot OPS key here,
-/// which made MIGRATE a governance exit: since the destination template is
-/// arbitrary, owner + a stolen OPS key could walk an unfrozen coin out of
-/// FREEZE/SEIZE/BURN reach entirely.
+/// the owner's SIGHASH_ALL signature PLUS MIGRATE's own independent cold
+/// 2-of-3 `migrate_quorum` attestation (Decision 2026-07-20-G0 -- see
+/// `build_migrate_branch`'s "Authorizer" doc). The initial Live shipped a
+/// single hot OPS key here, which made MIGRATE a governance exit: since the
+/// destination template is arbitrary, owner + a stolen OPS key could walk an
+/// unfrozen coin out of FREEZE/SEIZE/BURN reach entirely. A follow-up fix
+/// (Decision 2026-07-20, superseded by this one) then gated MIGRATE behind
+/// the SAME cold quorum SEIZE uses -- but that meant a leaked SEIZE quorum
+/// also destroyed the recovery path, so MIGRATE now uses its own independent
+/// `migrate_quorum` key set instead, pairwise-distinct from `seize`.
 ///
 /// # What the destination is, and what the covenant checks about it
 ///
@@ -1428,12 +1515,16 @@ async fn op_migrate(
         coin.value,
         &new_template_hash,
     );
-    // Fixed positional convention, shared with SEIZE: sig1<->seize_pk[0], etc.
-    // All three real keys are signed here (a valid superset of 2-of-3) rather
-    // than simulating a 2-key holder with a placeholder third signature.
-    let sig1 = signing::schnorr_sign(&roles.seize_sk[0], &migrate_msg)?;
-    let sig2 = signing::schnorr_sign(&roles.seize_sk[1], &migrate_msg)?;
-    let sig3 = signing::schnorr_sign(&roles.seize_sk[2], &migrate_msg)?;
+    // Fixed positional convention: sig1<->migrate_quorum_pk[0], etc. Only the
+    // bytecode SHAPE is shared with SEIZE (both call the same
+    // `emit_2of3_threshold` codegen); the KEY MATERIAL is independent
+    // (Decision 2026-07-20-G0, G0 CRITICAL fix) -- MIGRATE is authorized by
+    // its own cold `migrate_quorum` set, not `seize_pk`/`seize_sk`. All three
+    // real keys are signed here (a valid superset of 2-of-3) rather than
+    // simulating a 2-key holder with a placeholder third signature.
+    let sig1 = signing::schnorr_sign(&roles.migrate_quorum_sk[0], &migrate_msg)?;
+    let sig2 = signing::schnorr_sign(&roles.migrate_quorum_sk[1], &migrate_msg)?;
+    let sig3 = signing::schnorr_sign(&roles.migrate_quorum_sk[2], &migrate_msg)?;
 
     let sign_all = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
         let sh0 = compute_sighash(tx, 0)?;
@@ -1610,14 +1701,24 @@ struct RaiseCapResult {
     txid: String,
     authority_rs: Vec<u8>,
     authority_value: u64,
-    current_cap: u64,
+    /// The ceiling just ANNOUNCED into `pending_cap` (G4) -- NOT yet the
+    /// active `current_cap`; that promotion is a separate, permissionless,
+    /// CSV-timelocked ACTIVATE_CAP spend this harness does not submit live.
+    announced_pending_cap: u64,
 }
 
-/// RAISE_CAP: a cold 2-of-3 `cap_authority` quorum raises the mint
-/// authority's `current_cap` (STRICT increase); `running_supply` and native
-/// value are both preserved unchanged, and no coin is emitted. Independent
-/// of the coin lifecycle above -- this harness runs it against the mint
-/// authority's LATEST UTXO (post-MINT: `running_supply = mint_amount`).
+/// RAISE_CAP (2026-07-20 G4 hardening: this is now ANNOUNCE_CAP under the
+/// hood -- `op_type = 0x01` still, but it writes `pending_cap`, NOT
+/// `current_cap`; promoting `pending_cap` into `current_cap` is a SEPARATE,
+/// permissionless, CSV-timelocked `ACTIVATE_CAP` spend this harness does not
+/// (yet) submit live -- see `MIN_ACTIVATION_DELAY_DAA`'s doc): a cold 2-of-3
+/// `cap_authority` quorum announces a new ceiling (STRICT increase over
+/// `current_cap`, AND `<= current_cap * CAP_RAISE_MULTIPLIER_K`);
+/// `running_supply`/`minted_this_epoch`/`epoch_start_daa`/`current_cap` and
+/// native value are all preserved unchanged, and no coin is emitted.
+/// `authority_rs_old`'s own state header is decoded (rather than threading
+/// every field as a separate param) so this call always continues the
+/// REAL current on-chain state, not a locally-recomputed guess.
 ///
 /// # Fee input: threaded from BURN, NOT re-queried (the orphan bug)
 ///
@@ -1666,8 +1767,25 @@ async fn op_raise_cap(
     let privkey = *wallet.privkey_bytes();
     let wallet_spk = p2pk_script(&wallet.pubkey);
 
+    // Decode the REAL current state from authority_rs_old's own bytes
+    // (single source of truth) rather than trusting the caller's separate
+    // `running_supply` param to still agree with minted_this_epoch/
+    // epoch_start_daa/current_cap, none of which this fn otherwise receives.
+    let old_state = MintAuthorityStateHeader::decode(authority_rs_old)
+        .ok_or_else(|| anyhow::anyhow!("RAISE_CAP: authority_rs_old failed to decode a state header"))?;
+    debug_assert_eq!(old_state.running_supply, running_supply, "caller-supplied running_supply must match authority_rs_old's own encoded value");
+
     let old_authority_p2sh = build_p2sh(authority_rs_old);
-    let new_authority_rs = roles.authority_rs(running_supply, new_cap, genesis_cov_id);
+    // ANNOUNCE_CAP semantics (G4): current_cap/running_supply/epoch fields
+    // are all carried forward UNCHANGED; new_cap becomes pending_cap.
+    let new_authority_rs = roles.authority_rs(
+        old_state.running_supply,
+        old_state.minted_this_epoch,
+        old_state.epoch_start_daa,
+        old_state.current_cap,
+        new_cap,
+        genesis_cov_id,
+    );
     let new_authority_p2sh = build_p2sh(&new_authority_rs);
     let authority_addr = kob_cli::cancel::p2sh_to_address(new_authority_p2sh.script(), "kaspatest");
 
@@ -1711,11 +1829,11 @@ async fn op_raise_cap(
     tx.outputs.push(TxOutput::new(fee_value.saturating_sub(est_fee), 0, wallet_spk.clone(), None));
 
     let authority_txid_bytes = txid_bytes(authority_txid)?;
-    let raise_cap_msg = build_raise_cap_attestation_message(genesis_cov_id, &authority_txid_bytes, 0, new_cap);
+    let raise_cap_msg = build_announce_cap_attestation_message(genesis_cov_id, &authority_txid_bytes, 0, new_cap);
     let sig1 = signing::schnorr_sign(&roles.cap_authority_sk[0], &raise_cap_msg)?;
     let sig2 = signing::schnorr_sign(&roles.cap_authority_sk[1], &raise_cap_msg)?;
     let sig3 = signing::schnorr_sign(&roles.cap_authority_sk[2], &raise_cap_msg)?;
-    let sigscript0 = build_mint_authority_raise_cap_sigscript(&sig1, &sig2, &sig3, authority_rs_old, &new_authority_rs, new_cap, authority_rs_old);
+    let sigscript0 = build_mint_authority_announce_cap_sigscript(&sig1, &sig2, &sig3, authority_rs_old, &new_authority_rs, new_cap, authority_rs_old);
 
     let sign_fee = |tx: &Transaction| -> anyhow::Result<Vec<u8>> {
         let sh = compute_sighash(tx, 1)?;
@@ -1740,7 +1858,7 @@ async fn op_raise_cap(
     verify_utxo(rpc, "RAISE_CAP continuation", &authority_addr, &txid, 0, authority_value, Some(genesis_cov_id), 20, Duration::from_secs(3))
         .await?;
 
-    Ok(RaiseCapResult { txid, authority_rs: new_authority_rs, authority_value, current_cap: new_cap })
+    Ok(RaiseCapResult { txid, authority_rs: new_authority_rs, authority_value, announced_pending_cap: new_cap })
 }
 
 #[tokio::main]
@@ -1906,8 +2024,10 @@ async fn main() -> anyhow::Result<()> {
     save_manifest(&cfg.keys_manifest_path, &Manifest { keys: manifest.keys.clone(), state: state.clone() })?;
     println!();
     println!(
-        "RAISE_CAP complete. Authority live at {}:0, current_cap={}.",
-        raise_cap.txid, raise_cap.current_cap
+        "RAISE_CAP (ANNOUNCE_CAP) complete. Authority live at {}:0, pending_cap={} (NOT yet active -- \
+         requires a separate, permissionless ACTIVATE_CAP spend after the CSV timelock clears; not \
+         submitted by this harness).",
+        raise_cap.txid, raise_cap.announced_pending_cap
     );
     println!();
     println!(

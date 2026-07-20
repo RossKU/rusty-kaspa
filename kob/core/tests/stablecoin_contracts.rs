@@ -71,10 +71,16 @@ use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_core::contract::stablecoin::attestation::op_type;
 use kob_core::contract::stablecoin::state::frozen_flag;
+use kob_core::contract::stablecoin::state::{
+    EPOCH_OPCODE_OFFSET, FROZEN_FLAG_OPCODE_OFFSET, IDENTIFIER_TYPE_OPCODE_OFFSET, OWNER_PUBKEY_OPCODE_OFFSET,
+    ROLE_REGISTRY_ROOT_OPCODE_OFFSET,
+};
 use kob_core::contract::stablecoin::{
     build_attestation_message, build_freeze_attestation_message, build_migrate_attestation_message, build_seize_attestation_message,
     build_stablecoin_burn_sigscript, build_stablecoin_freeze_sigscript, build_stablecoin_migrate_sigscript,
-    build_stablecoin_redeem_script, build_stablecoin_seize_sigscript, build_stablecoin_transfer_sigscript, BURN_SINK_SCRIPT,
+    build_stablecoin_redeem_script, build_stablecoin_seize_sigscript, build_stablecoin_transfer_nm_delegator_sigscript,
+    build_stablecoin_transfer_nm_leader_sigscript, build_stablecoin_transfer_sigscript, build_transfer_nm_attestation_message,
+    fold_transfer_nm_inputs_digest, fold_transfer_nm_outputs_digest, BURN_SINK_SCRIPT, TRANSFER_NM_MAX_N,
 };
 use kob_core::contract::token::identifier_type as id_type;
 use kob_core::{build_p2sh, get_public_key, push_data, schnorr_sign};
@@ -104,8 +110,24 @@ const UNRELATED_SEIZE_SEEDS: [u8; 3] = [90, 91, 92];
 // mirroring `TRANSFER_SCENARIO_FREEZE_SEED`/`UNRELATED_SEIZE_SEEDS` above.
 const UNRELATED_MINT_SEED: u8 = 95;
 
+// Fixed RECOVERY-role pubkey seeds baked into every redeem script in this
+// file built by a scenario that does NOT itself exercise the MIGRATE branch
+// (TRANSFER's `Cfg::build`, FREEZE's `build_freeze_scenario`, SEIZE's
+// `build_seize`, BURN's `build_burn_scenario`) -- none of those batches test
+// the recovery key/branch, so a single shared constant (rather than new
+// fields on each `Cfg`) keeps those batches' existing field
+// lists/`..Cfg::honest()` call sites untouched, mirroring
+// `UNRELATED_SEIZE_SEEDS`/`UNRELATED_MINT_SEED` above. Decision
+// 2026-07-20-G0: `recovery_pubkeys` is now an INDEPENDENT cold set from
+// `seize_pubkeys`, gating MIGRATE alone.
+const UNRELATED_RECOVERY_SEEDS: [u8; 3] = [96, 97, 98];
+
 fn unrelated_seize_pubkeys() -> [[u8; 32]; 3] {
     [pubkey(UNRELATED_SEIZE_SEEDS[0]), pubkey(UNRELATED_SEIZE_SEEDS[1]), pubkey(UNRELATED_SEIZE_SEEDS[2])]
+}
+
+fn unrelated_recovery_pubkeys() -> [[u8; 32]; 3] {
+    [pubkey(UNRELATED_RECOVERY_SEEDS[0]), pubkey(UNRELATED_RECOVERY_SEEDS[1]), pubkey(UNRELATED_RECOVERY_SEEDS[2])]
 }
 
 fn unrelated_mint_pubkey() -> [u8; 32] {
@@ -176,6 +198,12 @@ struct Cfg {
     /// `frozen_flag` written into the SUCCESSOR. `None` == CLEAR (the honest
     /// case, and the only value TRANSFER may produce).
     successor_frozen_flag: Option<u8>,
+    /// Corrupt ONE byte of the successor `new_rs` at `(offset, value)`, applied
+    /// AFTER the honest script is built but BEFORE its P2SH/attestation are
+    /// derived from it -- so `dr_output_spk_check` and the OPS attestation stay
+    /// self-consistent with the corrupted script, exactly as the real §6.2
+    /// header-opcode attack would. `None` == honest.
+    successor_header_opcode_corrupt: Option<(usize, u8)>,
 
     // Overrides for what the OPS role actually SIGNS over (None/default ==
     // truthful, matching the real spend). A disagreeing value is the
@@ -203,6 +231,7 @@ impl Cfg {
             successor_epoch: None,
             successor_role_seeds: None,
             successor_frozen_flag: None,
+            successor_header_opcode_corrupt: None,
             attest_ops_seed: 2, // == ops_seed
             attest_op_type: op_type::TRANSFER,
             attest_outpoint_txid_seed: None,
@@ -230,6 +259,7 @@ fn build(cfg: &Cfg) -> Built {
         &ops_pub,
         &freeze_pub,
         &seize_pubs,
+        &unrelated_recovery_pubkeys(),
         &mint_pub,
     );
     let input_spk = build_p2sh(&rs);
@@ -248,7 +278,7 @@ fn build(cfg: &Cfg) -> Built {
             pubkey(m),
         ),
     };
-    let new_rs = build_stablecoin_redeem_script(
+    let mut new_rs = build_stablecoin_redeem_script(
         &recipient_pub,
         id_type::PUBKEY,
         &successor_root,
@@ -257,8 +287,12 @@ fn build(cfg: &Cfg) -> Built {
         &s_ops,
         &s_freeze,
         &s_seize,
+        &unrelated_recovery_pubkeys(),
         &s_mint,
     );
+    if let Some((off, val)) = cfg.successor_header_opcode_corrupt {
+        new_rs[off] = val;
+    }
     let out_spk = build_p2sh(&new_rs);
 
     let output = TransactionOutput::with_covenant(cfg.out_value, out_spk.clone(), Some(CovenantBinding::new(0, cfg.input_cov_id)));
@@ -523,6 +557,14 @@ struct FreezeCfg {
     successor_root: Option<[u8; 32]>,
     successor_epoch: Option<u32>,
     successor_frozen_flag: Option<u8>,
+    /// Role keys baked into the SUCCESSOR body (§6.3 role-swap guard). `None`
+    /// == this covenant's own role set (honest). `(ops, freeze, [seize x3],
+    /// mint)`. The §E template-authentication guard is wired into FREEZE too,
+    /// but until now only TRANSFER had a regression test exercising it.
+    successor_role_seeds: Option<(u8, u8, [u8; 3], u8)>,
+    /// Corrupt ONE byte of the successor `new_rs` before its P2SH/attestation
+    /// are derived (§6.2 header-opcode attack). `None` == honest.
+    successor_header_opcode_corrupt: Option<(usize, u8)>,
 
     // Key that actually produces issuer_sig (honest == freeze_seed). A
     // disagreeing value is the forgery being tested.
@@ -548,6 +590,8 @@ impl FreezeCfg {
             successor_root: None,
             successor_epoch: None,
             successor_frozen_flag: None,
+            successor_role_seeds: None,
+            successor_header_opcode_corrupt: None,
             attest_freeze_seed: 13, // == freeze_seed
         }
     }
@@ -578,6 +622,7 @@ fn build_freeze_scenario(cfg: &FreezeCfg, raw_issuer_sig: Option<&[u8]>) -> Buil
         &ops_pub,
         &freeze_pub,
         &seize_pubs,
+        &unrelated_recovery_pubkeys(),
         &mint_pub,
     );
     let input_spk = build_p2sh(&rs);
@@ -590,17 +635,25 @@ fn build_freeze_scenario(cfg: &FreezeCfg, raw_issuer_sig: Option<&[u8]>) -> Buil
     let successor_root = cfg.successor_root.unwrap_or(cfg.root);
     let successor_epoch = cfg.successor_epoch.unwrap_or(cfg.epoch);
     let successor_frozen_flag = cfg.successor_frozen_flag.unwrap_or(cfg.new_frozen_flag);
-    let new_rs = build_stablecoin_redeem_script(
+    let (s_ops, s_freeze, s_seize, s_mint) = match cfg.successor_role_seeds {
+        None => (ops_pub, freeze_pub, seize_pubs, mint_pub),
+        Some((o, f, sz, m)) => (pubkey(o), pubkey(f), [pubkey(sz[0]), pubkey(sz[1]), pubkey(sz[2])], pubkey(m)),
+    };
+    let mut new_rs = build_stablecoin_redeem_script(
         &successor_owner_pub,
         id_type::PUBKEY,
         &successor_root,
         successor_frozen_flag,
         successor_epoch,
-        &ops_pub,
-        &freeze_pub,
-        &seize_pubs,
-        &mint_pub,
+        &s_ops,
+        &s_freeze,
+        &s_seize,
+        &unrelated_recovery_pubkeys(),
+        &s_mint,
     );
+    if let Some((off, val)) = cfg.successor_header_opcode_corrupt {
+        new_rs[off] = val;
+    }
     let out_spk = build_p2sh(&new_rs);
 
     let output = TransactionOutput::with_covenant(cfg.out_value, out_spk.clone(), Some(CovenantBinding::new(0, cfg.input_cov_id)));
@@ -843,6 +896,14 @@ struct SeizeCfg {
     successor_root: Option<[u8; 32]>,
     successor_epoch: Option<u32>,
     successor_frozen_flag: Option<u8>,
+    /// Role keys baked into the SUCCESSOR body (§6.3 role-swap guard). `None`
+    /// == this covenant's own role set (honest). `(ops, freeze, [seize x3],
+    /// mint)`. The §E template-authentication guard is wired into SEIZE too,
+    /// but until now only TRANSFER had a regression test exercising it.
+    successor_role_seeds: Option<(u8, u8, [u8; 3], u8)>,
+    /// Corrupt ONE byte of the successor `new_rs` before its P2SH/attestation
+    /// are derived (§6.2 header-opcode attack). `None` == honest.
+    successor_header_opcode_corrupt: Option<(usize, u8)>,
 
     // Override for what is actually SIGNED (None == truthful, matching the
     // real spend). A disagreeing value is the replay being tested.
@@ -874,6 +935,8 @@ impl SeizeCfg {
             successor_root: None,
             successor_epoch: None,
             successor_frozen_flag: None,
+            successor_role_seeds: None,
+            successor_header_opcode_corrupt: None,
             attest_outpoint_txid_seed: None,
             signer_seeds: [Some(31), Some(32), Some(33)],
         }
@@ -896,6 +959,7 @@ fn build_seize(cfg: &SeizeCfg) -> Built {
         &ops_pub,
         &freeze_pub,
         &seize_pubs,
+        &unrelated_recovery_pubkeys(),
         &mint_pub,
     );
     let input_spk = build_p2sh(&rs);
@@ -909,17 +973,25 @@ fn build_seize(cfg: &SeizeCfg) -> Built {
     let successor_root = cfg.successor_root.unwrap_or(cfg.root);
     let successor_epoch = cfg.successor_epoch.unwrap_or(cfg.epoch);
     let successor_frozen_flag = cfg.successor_frozen_flag.unwrap_or(cfg.frozen_flag); // preserve (see body.rs doc)
-    let new_rs = build_stablecoin_redeem_script(
+    let (s_ops, s_freeze, s_seize, s_mint) = match cfg.successor_role_seeds {
+        None => (ops_pub, freeze_pub, seize_pubs, mint_pub),
+        Some((o, f, sz, m)) => (pubkey(o), pubkey(f), [pubkey(sz[0]), pubkey(sz[1]), pubkey(sz[2])], pubkey(m)),
+    };
+    let mut new_rs = build_stablecoin_redeem_script(
         &successor_owner_pub,
         id_type::PUBKEY,
         &successor_root,
         successor_frozen_flag,
         successor_epoch,
-        &ops_pub,
-        &freeze_pub,
-        &seize_pubs,
-        &mint_pub,
+        &s_ops,
+        &s_freeze,
+        &s_seize,
+        &unrelated_recovery_pubkeys(),
+        &s_mint,
     );
+    if let Some((off, val)) = cfg.successor_header_opcode_corrupt {
+        new_rs[off] = val;
+    }
     let out_spk = build_p2sh(&new_rs);
 
     let output = TransactionOutput::with_covenant(cfg.out_value, out_spk.clone(), Some(CovenantBinding::new(0, cfg.input_cov_id)));
@@ -1155,6 +1227,7 @@ fn build_burn_scenario(cfg: &BurnCfg, raw_owner_sig: Option<&[u8]>, raw_issuer_s
         &ops_pub,
         &freeze_pub,
         &seize_pubs,
+        &unrelated_recovery_pubkeys(),
         &mint_pub,
     );
     let input_spk = build_p2sh(&rs);
@@ -1364,16 +1437,21 @@ fn burn_of_unfrozen_coin_accepts() {
 // 6. MIGRATE (`op_type = 0x06`, Phase II final branch) -- happy path +
 //    adversarial batch. Two-of-two authorization, the SAME shape as
 //    TRANSFER/BURN (owner `OpCheckSigVerify`, SIGHASH_ALL, PLUS an
-//    `OpCheckSigFromStack` attestation) -- but the attesting role here is OPS
-//    (§4's MIGRATE authorization is "OWNER + (ROTATE or OPS)"; since ROTATE
-//    (`0x05`) is deferred to post-Live -- see `build_migrate_branch`'s doc,
-//    `core/src/contract/stablecoin/body.rs` -- OPS stands in as the
-//    authorizer for the initial Live; post-Live, once ROTATE/
-//    root-verification land, MIGRATE authorization may move to the ROTATE
-//    role instead). The successor is a WHOLLY DIFFERENT covenant template
+//    `OpCheckSigFromStack` attestation) -- but the attesting quorum here is
+//    MIGRATE's OWN independent cold 2-of-3 `recovery_pubkeys` (Decision
+//    2026-07-20-G0). §4's original branch table specified MIGRATE
+//    authorization as "OWNER + (ROTATE or OPS)"; ROTATE (`0x05`) is deferred
+//    to post-Live (see `build_migrate_branch`'s doc,
+//    `core/src/contract/stablecoin/body.rs`). Decision 2026-07-20 first
+//    replaced the initial-Live OPS stand-in with the SAME cold 2-of-3 quorum
+//    SEIZE uses (`seize_pubkeys`); Decision 2026-07-20-G0 (this fix) then
+//    found that sharing key material with SEIZE meant a SEIZE-key leak also
+//    destroyed the recovery path, so MIGRATE now uses its OWN independent
+//    `recovery_pubkeys` cold set instead, pairwise-distinct from
+//    `seize_pubkeys`. The successor is a WHOLLY DIFFERENT covenant template
 //    (not a same-template state mutation like TRANSFER/FREEZE/SEIZE/BURN):
 //    the body doesn't read/compare any fields inside it, it only checks that
-//    the successor output's SPK Blake3-hashes to the OPS-attested
+//    the successor output's SPK Blake3-hashes to the attested
 //    `new_template_hash` -- there is no `new_rs` sigscript field at all
 //    (unlike TRANSFER/FREEZE/SEIZE). Because the owner signs SIGHASH_ALL,
 //    value handling is owner-committed -- MIGRATE deliberately does NOT call
@@ -1381,10 +1459,10 @@ fn burn_of_unfrozen_coin_accepts() {
 //    `build_migrate_branch`'s doc (`body.rs`).
 // ============================================================================
 
-/// One MIGRATE scenario. `honest()` yields a fully valid owner+OPS migration
-/// to a distinct, non-stablecoin successor template (a plain OP_TRUE P2SH --
-/// proving MIGRATE doesn't validate the target's shape at all, per task
-/// spec); each adversarial test mutates exactly one lever.
+/// One MIGRATE scenario. `honest()` yields a fully valid owner+recovery-quorum
+/// migration to a distinct, non-stablecoin successor template (a plain
+/// OP_TRUE P2SH -- proving MIGRATE doesn't validate the target's shape at
+/// all, per task spec); each adversarial test mutates exactly one lever.
 #[derive(Clone)]
 struct MigrateCfg {
     input_cov_id: Hash,
@@ -1393,7 +1471,12 @@ struct MigrateCfg {
     owner_seed: u8,        // owner pubkey baked into the state header AND the key that signs owner_sig
     ops_seed: u8,          // OPS pubkey baked into the body (irrelevant to MIGRATE since Decision 2026-07-20)
     freeze_seed: u8,       // FREEZE pubkey baked into the body (irrelevant to MIGRATE itself)
-    seize_seeds: [u8; 3],  // the three baked SEIZE pubkey seeds -- MIGRATE's cold 2-of-3 quorum
+    seize_seeds: [u8; 3],  // the three baked SEIZE pubkey seeds -- SEIZE's own cold 2-of-3 quorum,
+                           // genuinely unrelated to MIGRATE since Decision 2026-07-20-G0 (see
+                           // `migrate_rejects_genuine_seize_quorum_signatures` below)
+    recovery_seeds: [u8; 3], // the three baked RECOVERY pubkey seeds -- MIGRATE's OWN independent
+                              // cold 2-of-3 quorum (Decision 2026-07-20-G0), pairwise-distinct from
+                              // `seize_seeds`
     mint_seed: u8,         // MINT pubkey baked into the body (irrelevant to MIGRATE itself)
     root: [u8; 32],        // this coin's role_registry_root (unread/uncompared by MIGRATE)
     epoch: u32,            // this coin's epoch (bound into the OPS attestation preimage)
@@ -1403,8 +1486,10 @@ struct MigrateCfg {
 
     // Which seed actually signs each of the 3 fixed quorum sigscript slots
     // (`Some(seed)`) vs. an arbitrary non-signature placeholder (`None`).
-    // Honest == all three slots signed by `seize_seeds` in order. Mirrors
-    // `SeizeCfg::signer_seeds` exactly (same shared quorum bytecode).
+    // Honest == all three slots signed by `recovery_seeds` in order (NOT
+    // `seize_seeds` -- Decision 2026-07-20-G0 made the two quorums
+    // independent; the shared bytecode SHAPE with `SeizeCfg::signer_seeds`
+    // remains, the key material does not).
     signer_seeds: [Option<u8>; 3],
     // Override for what the OPS attestation actually signs as the outpoint
     // txid (None == truthful, matching the real spend). A disagreeing value
@@ -1429,13 +1514,14 @@ impl MigrateCfg {
             ops_seed: 72,
             freeze_seed: 73,
             seize_seeds: [81, 82, 83],
+            recovery_seeds: [101, 102, 103],
             mint_seed: 84,
             root: ROOT,
             epoch: 8,
             frozen_flag: frozen_flag::CLEAR,
             in_amount: IN_AMOUNT,
             out_value: IN_AMOUNT,
-            signer_seeds: [Some(81), Some(82), Some(83)], // == seize_seeds
+            signer_seeds: [Some(101), Some(102), Some(103)], // == recovery_seeds, NOT seize_seeds
             attest_outpoint_txid_seed: None,
             successor_template_mismatch: false,
         }
@@ -1452,6 +1538,7 @@ fn build_migrate_scenario(cfg: &MigrateCfg, raw_owner_sig: Option<&[u8]>, raw_is
     let ops_pub = pubkey(cfg.ops_seed);
     let freeze_pub = pubkey(cfg.freeze_seed);
     let seize_pubs = [pubkey(cfg.seize_seeds[0]), pubkey(cfg.seize_seeds[1]), pubkey(cfg.seize_seeds[2])];
+    let recovery_pubs = [pubkey(cfg.recovery_seeds[0]), pubkey(cfg.recovery_seeds[1]), pubkey(cfg.recovery_seeds[2])];
     let mint_pub = pubkey(cfg.mint_seed);
     let rs = build_stablecoin_redeem_script(
         &owner_pub,
@@ -1462,6 +1549,7 @@ fn build_migrate_scenario(cfg: &MigrateCfg, raw_owner_sig: Option<&[u8]>, raw_is
         &ops_pub,
         &freeze_pub,
         &seize_pubs,
+        &recovery_pubs,
         &mint_pub,
     );
     let input_spk = build_p2sh(&rs);
@@ -1577,8 +1665,8 @@ fn build_migrate(cfg: &MigrateCfg) -> Built {
 fn migrate_owner_plus_2of3_quorum_accepts() {
     // A correctly owner-signed, correctly quorum-attested MIGRATE to a
     // distinct (non-stablecoin) successor template. That this passes on the
-    // real engine IS the conformance proof: the SEIZE-quorum members signed
-    // `build_migrate_attestation_message(...)` off-chain, and the body
+    // real engine IS the conformance proof: the independent recovery-quorum
+    // members signed `build_migrate_attestation_message(...)` off-chain, and the body
     // recomputed the identical 32-byte msg_hash from transaction
     // introspection -- if any field or width disagreed, `OpCheckSigFromStack`
     // would return false for every slot and the summed threshold would fall
@@ -1590,8 +1678,9 @@ fn migrate_owner_plus_2of3_quorum_accepts() {
 #[test]
 fn migrate_exactly_2of3_accepts() {
     // Decision 2026-07-20: the quorum is 2-of-3, not 3-of-3 -- one absent
-    // signer must not block a legitimate migration.
-    let cfg = MigrateCfg { signer_seeds: [Some(81), Some(82), None], ..MigrateCfg::honest() };
+    // signer must not block a legitimate migration. Signed with the
+    // independent recovery quorum (Decision 2026-07-20-G0), not seize_seeds.
+    let cfg = MigrateCfg { signer_seeds: [Some(101), Some(102), None], ..MigrateCfg::honest() };
     let res = run(&build_migrate(&cfg));
     assert!(res.is_ok(), "MIGRATE with exactly 2 of 3 quorum signatures must be accepted: {res:?}");
 }
@@ -1602,8 +1691,9 @@ fn migrate_1of3_insufficient_rejected() {
     // placeholders. The summed threshold (1) is below the required 2, so the
     // branch must reject even though the supplied signature is perfectly
     // valid. This is the governance-exit hole that Decision 2026-07-20
-    // closed: before it, a single hot OPS signature was enough.
-    let cfg = MigrateCfg { signer_seeds: [Some(81), None, None], ..MigrateCfg::honest() };
+    // closed: before it, a single hot OPS signature was enough. Signed with
+    // the independent recovery quorum (Decision 2026-07-20-G0).
+    let cfg = MigrateCfg { signer_seeds: [Some(101), None, None], ..MigrateCfg::honest() };
     let res = run(&build_migrate(&cfg));
     assert_rejected_with(&res, "VerifyError");
 }
@@ -1612,8 +1702,19 @@ fn migrate_1of3_insufficient_rejected() {
 fn migrate_ops_key_alone_cannot_authorize() {
     // The hot OPS key was MIGRATE's sole authorizer before Decision
     // 2026-07-20. Even signing all three quorum slots with it must now fail:
-    // it is not one of the three baked cold SEIZE keys.
+    // it is not one of the three baked cold recovery keys (Decision
+    // 2026-07-20-G0).
     let cfg = MigrateCfg { signer_seeds: [Some(72), Some(72), Some(72)], ..MigrateCfg::honest() };
+    let res = run(&build_migrate(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn migrate_rejects_genuine_seize_quorum_signatures() {
+    // G0 regression guard: the coin's REAL SEIZE-role signers (seize_seeds
+    // = [81,82,83], which genuinely authorize SEIZE on this coin) must NOT
+    // be able to authorize MIGRATE any more. Pre-fix this was accepted.
+    let cfg = MigrateCfg { signer_seeds: [Some(81), Some(82), Some(83)], ..MigrateCfg::honest() };
     let res = run(&build_migrate(&cfg));
     assert_rejected_with(&res, "VerifyError");
 }
@@ -1699,4 +1800,550 @@ fn migrate_of_unfrozen_coin_accepts() {
     let cfg = MigrateCfg { frozen_flag: frozen_flag::CLEAR, ..MigrateCfg::honest() };
     let res = run(&build_migrate(&cfg));
     assert!(res.is_ok(), "honest owner+quorum MIGRATE of an UNFROZEN coin must be accepted: {res:?}");
+}
+
+// ============================================================================
+// 6. Audit 2026-07-20 §6.2 -- successor header PUSH-OPCODE authentication
+//    (the "new HIGH"), and §6.3 -- FREEZE/SEIZE successor role-swap regression
+//    coverage the earlier audit round left to TRANSFER alone.
+//
+//    §6.2: `dr_suffix_check` pins the successor BODY ([STATE_HEADER_LEN..]) and
+//    each `dr_field_extract` pins a field's PAYLOAD, but the five header
+//    push-opcode bytes (offsets 0/33/35/68/70 == 0x20 0x01 0x20 0x01 0x04)
+//    were read by nothing. A spender who can satisfy a successor-producing
+//    branch -- in the worst case the single FREEZE key -- could corrupt one,
+//    passing every on-chain check yet committing the coin's P2SH to a header
+//    that re-parses at a different stack depth: permanently unspendable
+//    (griefing/destruction, effectively CRITICAL). `body.rs`'s shared
+//    `emit_header_opcode_authentication` now pins all five in every branch.
+// ============================================================================
+
+#[test]
+fn transfer_successor_header_opcode_corruption_rejected() {
+    // All five header opcode offsets, corrupted one at a time to 0xff (which
+    // differs from every canonical opcode 0x20/0x01/0x04). Each must reject --
+    // pre-fix, every one of these was ACCEPTED (see the pre-fix confirmation
+    // note in the audit; toggling the three `emit_header_opcode_authentication`
+    // calls off makes this test's cases pass acceptance again).
+    for off in [
+        OWNER_PUBKEY_OPCODE_OFFSET,
+        IDENTIFIER_TYPE_OPCODE_OFFSET,
+        ROLE_REGISTRY_ROOT_OPCODE_OFFSET,
+        FROZEN_FLAG_OPCODE_OFFSET,
+        EPOCH_OPCODE_OFFSET,
+    ] {
+        let cfg = Cfg { successor_header_opcode_corrupt: Some((off, 0xff)), ..Cfg::honest() };
+        let res = run(&build(&cfg));
+        assert_rejected_with(&res, "VerifyError");
+    }
+}
+
+#[test]
+fn freeze_successor_header_opcode_corruption_rejected() {
+    // The dangerous capability: a SINGLE FREEZE key. Corrupting the epoch
+    // push-opcode (offset 70) of the successor must now reject rather than
+    // brick the coin. Swept across all five offsets for parity with TRANSFER.
+    for off in [
+        OWNER_PUBKEY_OPCODE_OFFSET,
+        IDENTIFIER_TYPE_OPCODE_OFFSET,
+        ROLE_REGISTRY_ROOT_OPCODE_OFFSET,
+        FROZEN_FLAG_OPCODE_OFFSET,
+        EPOCH_OPCODE_OFFSET,
+    ] {
+        let cfg = FreezeCfg { successor_header_opcode_corrupt: Some((off, 0xff)), ..FreezeCfg::honest_freeze() };
+        let res = run(&build_freeze(&cfg));
+        assert_rejected_with(&res, "VerifyError");
+    }
+}
+
+#[test]
+fn seize_successor_header_opcode_corruption_rejected() {
+    // Same, on the SEIZE branch (cold 2-of-3 quorum path).
+    for off in [
+        OWNER_PUBKEY_OPCODE_OFFSET,
+        IDENTIFIER_TYPE_OPCODE_OFFSET,
+        ROLE_REGISTRY_ROOT_OPCODE_OFFSET,
+        FROZEN_FLAG_OPCODE_OFFSET,
+        EPOCH_OPCODE_OFFSET,
+    ] {
+        let cfg = SeizeCfg { successor_header_opcode_corrupt: Some((off, 0xff)), ..SeizeCfg::honest() };
+        let res = run(&build_seize(&cfg));
+        assert_rejected_with(&res, "VerifyError");
+    }
+}
+
+#[test]
+fn freeze_successor_swapping_the_role_set_rejected() {
+    // §6.3: the §E template-authentication guard IS wired into FREEZE
+    // (`body.rs`'s `dr_suffix_check`), but only TRANSFER had a regression test
+    // for it. A FREEZE that keeps every state field but bakes a different role
+    // set into the successor -- moving the coin into a covenant the real issuer
+    // holds no keys for -- must be rejected by the suffix compare.
+    let cfg = FreezeCfg { successor_role_seeds: Some((60, 61, [62, 63, 64], 65)), ..FreezeCfg::honest_freeze() };
+    let res = run(&build_freeze(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn seize_successor_swapping_the_role_set_rejected() {
+    // §6.3, SEIZE branch. Same property: an honest 2-of-3 quorum cannot hand
+    // the coin a successor with a swapped role set.
+    let cfg = SeizeCfg { successor_role_seeds: Some((60, 61, [62, 63, 64], 65)), ..SeizeCfg::honest() };
+    let res = run(&build_seize(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+// ============================================================================
+// TRANSFER_NM (op_type = 0x07 leader / 0x08 delegator) -- N:M transfer (G1,
+// split/merge), item 1 of this wave. Harness style follows
+// `kob/core/tests/kcc20_contracts.rs`'s `InSpec`/`OutSpec`/`build_transfer`/
+// `run` N-in/M-out pattern (the closest existing precedent for exactly this
+// leader/delegator group shape), adapted to this covenant's native-value
+// amount mapping and its own attestation preimage
+// (`build_transfer_nm_attestation_message`).
+//
+// Scope reminder (see `body.rs`'s `build_transfer_nm_branch` doc): N:M works
+// WITHIN one MINT lineage (one shared `covenant_id`) -- arbitrary-amount
+// payment + change + self-consolidation, not a merge across independent MINT
+// events.
+// ============================================================================
+
+const NM_ROOT: [u8; 32] = [0xFEu8; 32];
+const NM_EPOCH: u32 = 3;
+const NM_OPS_SEED: u8 = 150;
+const NM_FREEZE_SEED: u8 = 151;
+const NM_SEIZE_SEEDS: [u8; 3] = [152, 153, 154];
+const NM_RECOVERY_SEEDS: [u8; 3] = [155, 156, 157];
+const NM_MINT_SEED: u8 = 158;
+/// Base txid seed for NM scenario inputs (`outpoint(NM_TXID_BASE + idx, 0)`);
+/// kept in its own range so NM tests can never collide with an unrelated
+/// covenant_id input the way `kcc20_contracts.rs`'s
+/// `unrelated_covenant_id_input_is_not_absorbed_into_the_group` deliberately
+/// does (not exercised by this batch, but keeping the seed space disjoint
+/// avoids any accidental aliasing).
+const NM_TXID_BASE: u8 = 0x40;
+
+fn nm_role_pubkeys() -> ([u8; 32], [u8; 32], [[u8; 32]; 3], [[u8; 32]; 3], [u8; 32]) {
+    (
+        pubkey(NM_OPS_SEED),
+        pubkey(NM_FREEZE_SEED),
+        [pubkey(NM_SEIZE_SEEDS[0]), pubkey(NM_SEIZE_SEEDS[1]), pubkey(NM_SEIZE_SEEDS[2])],
+        [pubkey(NM_RECOVERY_SEEDS[0]), pubkey(NM_RECOVERY_SEEDS[1]), pubkey(NM_RECOVERY_SEEDS[2])],
+        pubkey(NM_MINT_SEED),
+    )
+}
+
+/// Build one coin's redeem script for the NM scenario. `role_override`
+/// (`Some((ops, freeze, seize_seeds, recovery_seeds, mint))`) is the
+/// audit-2026-07-20-section-E attack lever (§6.3, ported to TRANSFER_NM): a
+/// successor that keeps every state field this branch compares while baking
+/// a different role set out from under the issuer. `None` uses the group's
+/// shared honest roles.
+fn nm_redeem_script(owner_seed: u8, root: [u8; 32], frozen: u8, epoch: u32, role_override: Option<(u8, u8, [u8; 3], [u8; 3], u8)>) -> Vec<u8> {
+    let (ops, freeze, seize, recovery, mint) = match role_override {
+        None => nm_role_pubkeys(),
+        Some((o, f, sz, rc, m)) => {
+            (pubkey(o), pubkey(f), [pubkey(sz[0]), pubkey(sz[1]), pubkey(sz[2])], [pubkey(rc[0]), pubkey(rc[1]), pubkey(rc[2])], pubkey(m))
+        }
+    };
+    build_stablecoin_redeem_script(&pubkey(owner_seed), id_type::PUBKEY, &root, frozen, epoch, &ops, &freeze, &seize, &recovery, &mint)
+}
+
+/// One covenant input in an N:M scenario (leader == `ins[0]`, every other
+/// entry is a delegator/sibling). `owner_seed` derives BOTH the coin's
+/// `owner_pubkey` and (normally) the signing key; `sign_seed` lets a test
+/// sign with a DIFFERENT key. Every input in a group shares `NM_ROOT`/
+/// `NM_EPOCH` (the design's sibling pass does not itself check a sibling's
+/// root/epoch against the leader's -- see `build_transfer_nm_branch`'s
+/// per-step derivation; only `covenant_id` -- hash-derived at MINT genesis,
+/// carried structurally by every coin in one lineage -- ties the group
+/// together on-chain).
+#[derive(Clone)]
+struct NmInSpec {
+    owner_seed: u8,
+    sign_seed: u8,
+    amount: u64,
+    frozen_flag: u8,
+}
+
+impl NmInSpec {
+    fn honest(seed: u8, amount: u64) -> Self {
+        NmInSpec { owner_seed: seed, sign_seed: seed, amount, frozen_flag: frozen_flag::CLEAR }
+    }
+}
+
+/// One successor (covenant output) slot in an N:M scenario.
+#[derive(Clone)]
+struct NmOutSpec {
+    recipient_seed: u8,
+    amount: u64,
+    frozen_flag: u8,
+    root: [u8; 32],
+    epoch: u32,
+    role_override: Option<(u8, u8, [u8; 3], [u8; 3], u8)>,
+    /// Corrupt ONE byte of this successor's redeem script at `(offset,
+    /// value)`, applied AFTER the honest script is built but BEFORE its
+    /// P2SH/digest are derived from it -- ports the §6.2 header-opcode
+    /// corruption regression to a TRANSFER_NM successor slot.
+    header_opcode_corrupt: Option<(usize, u8)>,
+}
+
+impl NmOutSpec {
+    fn honest(seed: u8, amount: u64) -> Self {
+        NmOutSpec {
+            recipient_seed: seed,
+            amount,
+            frozen_flag: frozen_flag::CLEAR,
+            root: NM_ROOT,
+            epoch: NM_EPOCH,
+            role_override: None,
+            header_opcode_corrupt: None,
+        }
+    }
+}
+
+/// Pad/truncate `active` (in ascending successor-slot order) into the fixed
+/// `TRANSFER_NM_MAX_N`-length sigscript array (mirrors
+/// `kcc20_contracts.rs`'s `new_rs_slots`). Slots beyond `active.len()` are
+/// left empty (never read on-chain, guarded by `j <= OpCovOutputCount`);
+/// slots beyond `TRANSFER_NM_MAX_N` are silently dropped (used by the
+/// cardinality-overflow test, where the ACTUAL tx has more outputs than the
+/// leader can unroll -- rejection must come from the on-chain cardinality
+/// cap, not from this test helper).
+fn nm_new_rs_slots(active: &[Vec<u8>]) -> [Vec<u8>; TRANSFER_NM_MAX_N] {
+    let mut slots: [Vec<u8>; TRANSFER_NM_MAX_N] = Default::default();
+    for (i, rs) in active.iter().take(TRANSFER_NM_MAX_N).enumerate() {
+        slots[i] = rs.clone();
+    }
+    slots
+}
+
+struct NmBuilt {
+    tx: Transaction,
+    entries: Vec<UtxoEntry>,
+    n_inputs: usize,
+}
+
+/// Build a fully assembled, honestly-signed TRANSFER_NM transaction. The
+/// leader is `ins[0]`; `ins[1..]` are delegators, all sharing `cov_id`.
+/// Successor outputs are `outs`, each covenant-bound to the leader
+/// (`authorizing_input = 0`, matching `kcc20_contracts.rs`'s convention).
+///
+/// `attest_outs` is what the OPS attestation is computed FOR (its redeem
+/// scripts feed `outputs_digest`) -- separate from `outs` (what the tx
+/// ACTUALLY pays) so the attestation-replay test can honestly attest one
+/// output set and then swap in a different one. Every other test passes
+/// `attest_outs == outs`.
+fn build_transfer_nm(cov_id: Hash, ins: &[NmInSpec], outs: &[NmOutSpec], attest_outs: &[NmOutSpec]) -> NmBuilt {
+    let input_rs: Vec<Vec<u8>> = ins.iter().map(|i| nm_redeem_script(i.owner_seed, NM_ROOT, i.frozen_flag, NM_EPOCH, None)).collect();
+    let input_spks: Vec<ScriptPublicKey> = input_rs.iter().map(|rs| build_p2sh(rs)).collect();
+
+    let build_output_rs = |o: &NmOutSpec| -> Vec<u8> {
+        let mut rs = nm_redeem_script(o.recipient_seed, o.root, o.frozen_flag, o.epoch, o.role_override);
+        if let Some((off, val)) = o.header_opcode_corrupt {
+            rs[off] = val;
+        }
+        rs
+    };
+    let output_rs: Vec<Vec<u8>> = outs.iter().map(build_output_rs).collect();
+    let output_spks: Vec<ScriptPublicKey> = output_rs.iter().map(|rs| build_p2sh(rs)).collect();
+
+    let tx_outputs: Vec<TransactionOutput> = outs
+        .iter()
+        .zip(output_spks.iter())
+        .map(|(o, spk)| TransactionOutput::with_covenant(o.amount, spk.clone(), Some(CovenantBinding::new(0, cov_id))))
+        .collect();
+
+    let entries: Vec<UtxoEntry> = input_spks
+        .iter()
+        .zip(ins.iter())
+        .map(|(spk, i)| UtxoEntry { amount: i.amount, script_public_key: spk.clone(), block_daa_score: 0, is_coinbase: false, covenant_id: Some(cov_id) })
+        .collect();
+
+    // sig_op_count is committed into SIGHASH_ALL (`sig_op_counts_hash`,
+    // consensus/core/src/hashing/sighash.rs) -- the skeleton's placeholder
+    // inputs MUST carry the SAME sig_op_count as the real inputs below, or
+    // every owner signature computed here would sign a DIFFERENT hash than
+    // the one the engine reconstructs at verification time.
+    let placeholder_inputs: Vec<TransactionInput> = (0..ins.len())
+        .map(|idx| TransactionInput::new(outpoint(NM_TXID_BASE + idx as u8, 0), vec![], 0, if idx == 0 { 2 } else { 1 }))
+        .collect();
+    let skeleton_tx = Transaction::new(0, placeholder_inputs, tx_outputs.clone(), 0, Default::default(), 0, vec![]);
+    let populated_skeleton = PopulatedTransaction::new(&skeleton_tx, entries.clone());
+
+    // Owner signatures for EVERY input (leader + every delegator), SIGHASH_ALL.
+    let sigs: Vec<[u8; 64]> = (0..ins.len())
+        .map(|idx| {
+            let reused = SigHashReusedValuesUnsync::new();
+            let hash = calc_schnorr_signature_hash(&populated_skeleton, idx, SIG_HASH_ALL, &reused);
+            schnorr_sign(&hash.as_bytes(), &privkey(ins[idx].sign_seed)).unwrap()
+        })
+        .collect();
+
+    // --- Issuer (OPS) attestation over the WHOLE group, one signature ---
+    // (see `attestation.rs`'s `build_transfer_nm_attestation_preimage` doc:
+    // n_in/n_out are the ACTUAL OpCovInputCount/OpCovOutputCount values,
+    // i.e. n_in counts the leader too).
+    let cov_bytes: [u8; 32] = cov_id.as_bytes();
+    let n_in = ins.len() as u8;
+    let n_out = attest_outs.len() as u8;
+    // Siblings only (s = 1..), matching the on-chain leader's sibling pass --
+    // the leader's OWN outpoint/amount are deliberately excluded (see the
+    // attestation module doc).
+    let siblings: Vec<([u8; 32], u32, u64)> =
+        (1..ins.len()).map(|s| ([NM_TXID_BASE + s as u8; 32], 0u32, ins[s].amount)).collect();
+    let inputs_digest = fold_transfer_nm_inputs_digest(&siblings);
+    let attest_output_rs: Vec<Vec<u8>> = attest_outs.iter().map(build_output_rs).collect();
+    let attest_output_spk_bytes: Vec<Vec<u8>> = attest_output_rs.iter().map(|rs| spk_to_bytes(&build_p2sh(rs))).collect();
+    let outputs_digest = fold_transfer_nm_outputs_digest(&attest_output_spk_bytes);
+    let attest_msg = build_transfer_nm_attestation_message(&cov_bytes, NM_EPOCH, n_in, n_out, &inputs_digest, &outputs_digest);
+    let issuer_sig: [u8; 64] = schnorr_sign(&attest_msg, &privkey(NM_OPS_SEED)).unwrap();
+
+    let final_inputs: Vec<TransactionInput> = (0..ins.len())
+        .map(|idx| {
+            let ss = if idx == 0 {
+                let slots = nm_new_rs_slots(&output_rs);
+                build_stablecoin_transfer_nm_leader_sigscript(&input_rs[0], &issuer_sig, &slots, &sigs[0], &input_rs[0])
+            } else {
+                build_stablecoin_transfer_nm_delegator_sigscript(&sigs[idx], &input_rs[idx])
+            };
+            // sig_op_count: leader = 2 (owner CheckSigVerify + OPS
+            // CheckSigFromStack), delegator = 1 (owner CheckSigVerify only).
+            TransactionInput::new(outpoint(NM_TXID_BASE + idx as u8, 0), ss, 0, if idx == 0 { 2 } else { 1 })
+        })
+        .collect();
+
+    let tx = Transaction::new(0, final_inputs, tx_outputs, 0, Default::default(), 0, vec![]);
+    NmBuilt { tx, entries, n_inputs: ins.len() }
+}
+
+/// Re-sign delegator input `idx` (>=1) with the LEADER's sigscript shape
+/// instead of the delegator's -- proves a non-leader position invoking the
+/// leader entrypoint is rejected regardless of anything else in the body.
+fn nm_resign_as_leader(built: &mut NmBuilt, idx: usize, self_rs: &[u8], issuer_sig: &[u8; 64], new_rs: &[Vec<u8>], sign_seed: u8) {
+    let populated = PopulatedTransaction::new(&built.tx, built.entries.clone());
+    let reused = SigHashReusedValuesUnsync::new();
+    let hash = calc_schnorr_signature_hash(&populated, idx, SIG_HASH_ALL, &reused);
+    let sig = schnorr_sign(&hash.as_bytes(), &privkey(sign_seed)).unwrap();
+    let slots = nm_new_rs_slots(new_rs);
+    built.tx.inputs[idx].signature_script = build_stablecoin_transfer_nm_leader_sigscript(self_rs, issuer_sig, &slots, &sig, self_rs);
+}
+
+fn run_nm(built: &NmBuilt) -> Vec<Result<(), String>> {
+    let populated = PopulatedTransaction::new(&built.tx, built.entries.clone());
+    let cov_ctx = match CovenantsContext::from_tx(&populated) {
+        Ok(c) => c,
+        Err(e) => return vec![Err(format!("ctx: {e:?}")); built.n_inputs],
+    };
+    let cache = Cache::new(1000);
+    let flags = EngineFlags { covenants_enabled: true, sigop_script_units: Gram(1000).into() };
+    (0..built.n_inputs)
+        .map(|idx| {
+            let reused = SigHashReusedValuesUnsync::new();
+            let ctx = EngineCtx::new(&cache).with_covenants_ctx(&cov_ctx).with_reused(&reused);
+            let (input, entry) = populated.populated_input(idx);
+            let mut vm = TxScriptEngine::from_transaction_input(&populated, input, idx, entry, ctx, flags);
+            vm.execute().map_err(|e| format!("{e:?}"))
+        })
+        .collect()
+}
+
+// ---- 1. Happy paths -------------------------------------------------------
+
+#[test]
+fn transfer_nm_2in_1out_merge_accepts() {
+    let cov_id = hash32(0x60);
+    let ins = vec![NmInSpec::honest(1, 3_000_000), NmInSpec::honest(3, 2_000_000)];
+    let outs = vec![NmOutSpec::honest(2, 5_000_000)];
+    let built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+    let results = run_nm(&built);
+    assert_eq!(results.len(), 2);
+    assert!(results[0].is_ok(), "leader (merge) must pass: {:?}", results[0]);
+    assert!(results[1].is_ok(), "delegator (merge) must pass: {:?}", results[1]);
+}
+
+#[test]
+fn transfer_nm_1in_2out_split_with_change_accepts() {
+    // The core G1 case: pay X + keep change Y.
+    let cov_id = hash32(0x61);
+    let ins = vec![NmInSpec::honest(1, 7_000_000)];
+    let outs = vec![NmOutSpec::honest(2, 3_000_000), NmOutSpec::honest(4, 4_000_000)];
+    let built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+    let results = run_nm(&built);
+    assert!(results[0].is_ok(), "1-in/2-out split must pass: {:?}", results[0]);
+}
+
+#[test]
+fn transfer_nm_happy_all_slots_active_accepts() {
+    // Full unroll: N_in = MAX_N+1 (leader + every sibling slot), N_out =
+    // MAX_N (every successor slot) -- proves padding/guards work all the way
+    // to the last iteration, not just the first.
+    let cov_id = hash32(0x62);
+    let ins: Vec<NmInSpec> = (0..=TRANSFER_NM_MAX_N).map(|i| NmInSpec::honest(10 + i as u8, 1_000_000)).collect();
+    let total: u64 = ins.iter().map(|i| i.amount).sum();
+    let per_out = total / TRANSFER_NM_MAX_N as u64;
+    let mut outs: Vec<NmOutSpec> = (0..TRANSFER_NM_MAX_N).map(|j| NmOutSpec::honest(20 + j as u8, per_out)).collect();
+    // Fix up rounding so Σout == Σin exactly.
+    let out_sum: u64 = outs.iter().map(|o| o.amount).sum();
+    outs[0].amount += total - out_sum;
+
+    let built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+    let results = run_nm(&built);
+    assert_eq!(results.len(), TRANSFER_NM_MAX_N + 1);
+    for (i, r) in results.iter().enumerate() {
+        assert!(r.is_ok(), "input {i} (full unroll, N_in=MAX_N+1, N_out=MAX_N) must pass: {r:?}");
+    }
+}
+
+// ---- 2. Conservation / cardinality ----------------------------------------
+
+#[test]
+fn transfer_nm_conservation_violated_rejected() {
+    let cov_id = hash32(0x63);
+    let ins = vec![NmInSpec::honest(1, 3_000_000), NmInSpec::honest(3, 2_000_000)];
+    // Successor claims one sompi MORE than conserved.
+    let outs_over = vec![NmOutSpec::honest(2, 5_000_001)];
+    let built = build_transfer_nm(cov_id, &ins, &outs_over, &outs_over);
+    let results = run_nm(&built);
+    assert!(results[0].is_err(), "amount-inflating N:M transfer must be rejected by the leader");
+
+    // Under-delivery (burning value) must ALSO fail: exact conservation, not
+    // merely "no inflation".
+    let cov_id2 = hash32(0x64);
+    let outs_under = vec![NmOutSpec::honest(2, 4_999_999)];
+    let built2 = build_transfer_nm(cov_id2, &ins, &outs_under, &outs_under);
+    let results2 = run_nm(&built2);
+    assert!(results2[0].is_err(), "amount-deficit N:M transfer must be rejected by the leader");
+}
+
+#[test]
+fn transfer_nm_cardinality_over_max_n_rejected() {
+    // N_out = MAX_N+1: one more successor than the leader can unroll. Must
+    // be rejected at the cardinality-cap gate BEFORE any per-successor
+    // validation runs (the whole point of the cap: extra covenant members
+    // beyond MAX_N must not silently escape the conservation loop).
+    let cov_id = hash32(0x65);
+    let ins = vec![NmInSpec::honest(1, TRANSFER_NM_MAX_N as u64 + 1)];
+    let outs: Vec<NmOutSpec> = (0..=TRANSFER_NM_MAX_N).map(|j| NmOutSpec::honest(20 + j as u8, 1)).collect();
+    let built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+    let results = run_nm(&built);
+    assert!(results[0].is_err(), "N_out = MAX_N+1 must be rejected by the leader's cardinality cap");
+}
+
+// ---- 3. Per-successor-slot adversarial (not just slot 0) ------------------
+
+#[test]
+fn transfer_nm_successor_role_swap_rejected() {
+    // A 2-successor split where slot 2 (NOT slot 1) keeps every state field
+    // this branch compares while baking a DIFFERENT role set -- the
+    // audit-2026-07-20-section-E attack, ported to prove EVERY successor
+    // slot's loop iteration performs template authentication, not just the
+    // first.
+    let cov_id = hash32(0x66);
+    let ins = vec![NmInSpec::honest(1, 5_000_000)];
+    let mut outs = vec![NmOutSpec::honest(2, 2_000_000), NmOutSpec::honest(4, 3_000_000)];
+    outs[1].role_override = Some((60, 61, [62, 63, 64], NM_RECOVERY_SEEDS, 65));
+    let built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+    let results = run_nm(&built);
+    assert!(results[0].is_err(), "successor slot 2 with a swapped role set must be rejected");
+}
+
+#[test]
+fn transfer_nm_successor_frozen_flag_set_rejected() {
+    // Same slot-2 targeting, this time the successor's OWN frozen_flag byte
+    // (must always be CLEAR out of TRANSFER_NM, mirrors TRANSFER's invariant).
+    let cov_id = hash32(0x67);
+    let ins = vec![NmInSpec::honest(1, 5_000_000)];
+    let mut outs = vec![NmOutSpec::honest(2, 2_000_000), NmOutSpec::honest(4, 3_000_000)];
+    outs[1].frozen_flag = frozen_flag::SET;
+    let built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+    let results = run_nm(&built);
+    assert!(results[0].is_err(), "successor slot 2 carrying frozen_flag=SET must be rejected");
+}
+
+// ---- 4. Delegator adversarial ----------------------------------------------
+
+#[test]
+fn transfer_nm_delegator_frozen_input_rejected() {
+    // One delegator's OWN frozen_flag == SET (leader and the other delegator
+    // stay honest) -- the delegator's OWN script run must fail, proving
+    // per-coin freeze survives grouping (the leader's sibling pass never
+    // reads a sibling's frozen_flag at all -- only the sibling's OWN
+    // delegator branch enforces it). The tx as a whole is invalid because
+    // Kaspa requires EVERY input's script to succeed, even though the
+    // leader's OWN isolated run succeeds.
+    let cov_id = hash32(0x68);
+    let ins = vec![
+        NmInSpec::honest(1, 3_000_000),
+        NmInSpec { owner_seed: 3, sign_seed: 3, amount: 2_000_000, frozen_flag: frozen_flag::SET },
+    ];
+    let outs = vec![NmOutSpec::honest(2, 5_000_000)];
+    let built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+    let results = run_nm(&built);
+    assert!(results[0].is_ok(), "leader path is independent of a sibling's own freeze state: {:?}", results[0]);
+    assert!(results[1].is_err(), "the FROZEN delegator's own script run must be rejected");
+}
+
+#[test]
+fn transfer_nm_delegator_impersonating_leader_rejected() {
+    // A non-leader (higher-indexed) covenant input invokes the LEADER
+    // entrypoint (TRANSFER_NM) instead of TRANSFER_NM_DELEGATOR. Must be
+    // rejected: the leader-position check requires own_idx ==
+    // OpCovInputIdx(covenant_id, 0), which fails for input index 1.
+    let cov_id = hash32(0x69);
+    let ins = vec![NmInSpec::honest(1, 3_000_000), NmInSpec::honest(3, 2_000_000)];
+    let outs = vec![NmOutSpec::honest(2, 5_000_000)];
+    let mut built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+
+    let sibling_rs = nm_redeem_script(3, NM_ROOT, frozen_flag::CLEAR, NM_EPOCH, None);
+    // A structurally-valid (but never-honestly-attestable) issuer_sig --
+    // this must be rejected on the LEADER-POSITION check alone, before the
+    // attestation is even reconstructed, so any 64 bytes suffice.
+    let placeholder_issuer_sig = [0x11u8; 64];
+    nm_resign_as_leader(&mut built, 1, &sibling_rs, &placeholder_issuer_sig, &[], 3);
+
+    let results = run_nm(&built);
+    assert!(results[1].is_err(), "a non-leader input invoking the TRANSFER_NM leader entrypoint must be rejected");
+}
+
+// ---- 5. Header-opcode tamper (item-00 regression, ported to a successor) --
+
+#[test]
+fn transfer_nm_header_opcode_tamper_rejected() {
+    // Port the §6.2 corruption to a successor slot: regression-guards that
+    // item-00's emit_header_opcode_authentication is actually wired into
+    // TRANSFER_NM's per-successor loop, not skipped the way the
+    // pre-item-00 pattern skipped it.
+    let cov_id_base = 0x6Au8;
+    for (i, off) in
+        [OWNER_PUBKEY_OPCODE_OFFSET, IDENTIFIER_TYPE_OPCODE_OFFSET, ROLE_REGISTRY_ROOT_OPCODE_OFFSET, FROZEN_FLAG_OPCODE_OFFSET, EPOCH_OPCODE_OFFSET]
+            .into_iter()
+            .enumerate()
+    {
+        let cov_id = hash32(cov_id_base.wrapping_add(i as u8));
+        let ins = vec![NmInSpec::honest(1, 5_000_000)];
+        let mut outs = vec![NmOutSpec::honest(2, 5_000_000)];
+        outs[0].header_opcode_corrupt = Some((off, 0xff));
+        let built = build_transfer_nm(cov_id, &ins, &outs, &outs);
+        let results = run_nm(&built);
+        assert!(results[0].is_err(), "successor header-opcode corruption at offset {off} must be rejected");
+    }
+}
+
+// ---- 6. Attestation replay ------------------------------------------------
+
+#[test]
+fn transfer_nm_attestation_replay_different_output_set_rejected() {
+    // The OPS attestation is honestly computed for a 1-successor output set,
+    // then the transaction's ACTUAL output is swapped for a DIFFERENT
+    // (same-total-value, still individually honest) successor -- the
+    // captured attestation's outputs_digest no longer matches the real
+    // outputs_acc the leader folds on-chain, so this must be rejected.
+    let cov_id = hash32(0x6F);
+    let ins = vec![NmInSpec::honest(1, 5_000_000)];
+    let attested_outs = vec![NmOutSpec::honest(2, 5_000_000)];
+    let actual_outs = vec![NmOutSpec::honest(4, 5_000_000)]; // different recipient => different SPK => different outputs_digest
+    let built = build_transfer_nm(cov_id, &ins, &actual_outs, &attested_outs);
+    let results = run_nm(&built);
+    assert!(results[0].is_err(), "an attestation captured for a different output set must be rejected");
 }

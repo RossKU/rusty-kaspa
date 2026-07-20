@@ -177,7 +177,7 @@ KOB 自身が発行しうる資産に対して現実の検討事項になって�
 | 7 | **redemption(償還権)** | MUST | なし(本質的にオフチェーン + burn-to-redeem) | なし | オフチェーン + burn(B) |
 | 8 | **role-separation(ロール分離)** | MUST | なし(descriptor に authority フィールド無し) | **あり [2026-07-20]**: OPS / FREEZE / SEIZE×3 / MINT の distinct 鍵 + 別 `cap_authority`×3(mint-authority 側)、build 時 pairwise-distinctness assert(`build_stablecoin_body` `body.rs:1444-1466`、`build_mint_authority_body` `mint_authority/body.rs:921`)。spec の named extension としては未標準化 | 複数 issuer 鍵 / covenant-id に分離(D) |
 | 9 | **reserve-attestation(準備金照会)** | MUST | なし(本質的にオフチェーン監査) | なし | オフチェーン oracle / optional attestation cell |
-| 10 | **metadata(name/symbol)** | SHOULD(実務必須) | なし(descriptor は template 同定用、name/symbol 無し) | あり(`token.rs` の ad hoc `TokenDescriptor`) | オフチェーン descriptor |
+| 10 | **metadata(name/symbol)** | SHOULD(実務必須) | なし(descriptor は template 同定用、name/symbol 無し) | **stablecoin covenant には無し**(`StablecoinStateHeader` `state.rs:81-88` に name/symbol/decimals フィールド無し、`stablecoin/` に `TokenDescriptor` 参照 0 件)。case-A `token.rs` の ad hoc `TokenDescriptor` は**別 contract**で、本 covenant のメタデータではない | オフチェーン descriptor |
 | 11 | **decimals(小数桁)** | SHOULD(実務必須) | なし(`amount` は integer、decimals フィールド無し) | なし | descriptor / extended_state |
 | 12 | **KYC / travel-rule** | SHOULD(規制、主にランプ側) | なし | なし | オフチェーン(on/off ramp)、G |
 | 13 | **upgradeability(アップグレード)** | SHOULD | なし(template hash 不変が kcc-0001 §7 の設計、意図的に難しい) | **あり [2026-07-20]**: `build_migrate_branch`(`body.rs:1338`、`op_type::MIGRATE=0x06`)、owner + cold 2-of-3 quorum(SEIZE と同じ鍵・helper を共有)。testnet-10 で live 初実行済(txid `8cb054a6a07a66636421244d58413109543e0e77dc1a2f04ea5666119dca5260`、`STABLECOIN_E2E_LIVE.md` run 2 #8)。spec 側は依然 template hash 不変のまま — migration は spec 外の covenant 機能として実装された | 別 template への migration(kcc-0001 §8.5 different-template continuation) |
@@ -195,8 +195,9 @@ KOB 自身が発行しうる資産に対して現実の検討事項になって�
   CIP-113(Cardano、preview/testnet)も RCE(Nervos、RFC は明確だが mainnet 採用
   事例なし)も**本番未実証**である。したがって「D で書けるはず」は設計レベルの見
   通しであり、実運用実績の裏付けは現時点で存在しない。
-- **[2026-07-20]** KOB は #3 の緩和(cardinality 境界 reject)と #10 の ad hoc
-  metadata に加え、`contract/stablecoin/` の bespoke covenant として **#1
+- **[2026-07-20]** KOB は #3 の緩和(cardinality 境界 reject)と、case-A `token.rs`
+  側の #10 ad hoc metadata(**stablecoin covenant 自体は name/symbol/decimals を持たない**)
+  に加え、`contract/stablecoin/` の bespoke covenant として **#1
   mint / #2 burn / #4 freeze / #5 seize / #8 role-separation / #13
   upgradeability(migrate)を実装済み**で、testnet-10 で 2 回 live 実行してい
   る。いずれも KCC-0020 の named extension としてではなく spec 外の独立

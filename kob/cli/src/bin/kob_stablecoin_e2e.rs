@@ -94,7 +94,7 @@ use kob_cli::rpc::RpcUtxo;
 use kob_cli::signing;
 use kob_core::contract::stablecoin::attestation::op_type as coin_op_type;
 use kob_core::contract::stablecoin::mint_authority::attestation::{
-    build_mint_attestation_message, build_raise_cap_attestation_message,
+    build_mint_attestation_message, build_raise_cap_attestation_message, check_mint_amount_floor,
 };
 use kob_core::contract::stablecoin::mint_authority::body::build_mint_authority_redeem_script;
 use kob_core::contract::stablecoin::mint_authority::sigscript::{
@@ -107,7 +107,7 @@ use kob_core::contract::stablecoin::{
     build_stablecoin_seize_sigscript, build_stablecoin_transfer_sigscript,
 };
 use kob_core::contract::token::identifier_type as id_type;
-use kob_core::mass::{calc_mass_with_sigscripts, min_relay_fee};
+use kob_core::mass::{calc_mass_with_sigscripts, check_tx_storage_mass, min_relay_fee};
 use kob_core::p2sh::build_p2sh;
 use kob_core::sighash::{compute_covenant_id, compute_sighash};
 use kob_core::tx::{to_rpc_payload, AuthOutput, CovenantBinding, Transaction, TxInput, TxOutput};
@@ -130,6 +130,39 @@ fn verify_url(txid: &str) -> String {
 fn fee_with_floor(computed: u64) -> u64 {
     let floor = env::var("KOB_FEE_FLOOR").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     computed.max(floor)
+}
+
+/// Pre-submission checks every op runs on its fully-assembled transaction
+/// (audit 2026-07-20 §B3/§B5). Catches, locally, two classes of failure that
+/// otherwise only surface as an opaque node rejection:
+///
+/// 1. **KIP-9 storage mass** -- authoritative dust check. A covenant-bound
+///    output occupies two 100-byte storage units, so a small-value coin
+///    contributes `4e12 / value` to the transaction's harmonic term; past the
+///    network's storage limit the transaction cannot be mined at all. This is
+///    the whole-transaction check that `MIN_MINT_AMOUNT` explicitly is NOT a
+///    substitute for.
+/// 2. **Mandatory fee input** -- FREEZE/SEIZE/MINT/RAISE_CAP pin the covenant
+///    output's value to its input exactly (`dr_value_continuity_check` /
+///    `value_continuity_check_output0`), so none of the covenant coin's value
+///    can become a miner fee. A single-input build is therefore necessarily
+///    zero-fee and gets rejected as non-standard; a separate wallet-funded
+///    input is structurally required, not an optimization.
+fn preflight(tx: &Transaction, label: &str, requires_fee_input: bool) -> anyhow::Result<()> {
+    if requires_fee_input && tx.inputs.len() < 2 {
+        anyhow::bail!(
+            "{label}: exact value-continuity leaves no room for a fee from the covenant coin, \
+             so a separate wallet fee input is mandatory (got {} input(s))",
+            tx.inputs.len()
+        );
+    }
+    match check_tx_storage_mass(tx) {
+        Ok(mass) => {
+            println!("{label} storage mass: {} (limit {})", mass, kob_core::mass::MAX_TX_MASS);
+            Ok(())
+        }
+        Err(e) => anyhow::bail!("{label}: {e}"),
+    }
 }
 
 /// Per-input `sig_op_count` to declare for every input that spends a
@@ -648,6 +681,7 @@ async fn deploy_tx1_anchor(
     let sigs = sign_all(&tx)?;
     println!("TX1 exact fee: {} sompi", exact_fee);
 
+    preflight(&tx, "TX1", false)?;
     let payload = to_rpc_payload(&tx, &sigs);
     let txid = rpc.submit_transaction(payload).await?;
     println!("TX1 SUBMITTED. TXID: {}  verify: {}", txid, verify_url(&txid));
@@ -728,6 +762,7 @@ async fn deploy_tx2_authority(
     let sigs = sign_all(&tx, authority_value)?;
     println!("TX2 exact fee: {} sompi, authority operating value: {} sompi", exact_fee, authority_value);
 
+    preflight(&tx, "TX2", false)?;
     let payload = to_rpc_payload(&tx, &sigs);
     let txid = rpc.submit_transaction(payload).await?;
     println!("TX2 SUBMITTED. TXID: {}  verify: {}", txid, verify_url(&txid));
@@ -766,6 +801,11 @@ async fn op_mint(
     cap: u64,
     mint_amount: u64,
 ) -> anyhow::Result<MintResult> {
+    // Dust floor (audit 2026-07-20 §B3): a mint below MIN_MINT_AMOUNT drives
+    // the tx's KIP-9 storage mass past what the network will relay. Necessary
+    // condition only -- the whole-tx storage-mass check below is authoritative.
+    check_mint_amount_floor(mint_amount)?;
+
     let privkey = *wallet.privkey_bytes();
     let wallet_spk = p2pk_script(&wallet.pubkey);
 
@@ -884,6 +924,7 @@ async fn op_mint(
     let sig1 = sign_fee(&tx)?;
     println!("MINT exact fee: {} sompi", exact_fee);
 
+    preflight(&tx, "MINT", true)?;
     let payload = to_rpc_payload(&tx, &[sigscript0, sig1]);
     let txid = rpc.submit_transaction(payload).await?;
     println!("MINT SUBMITTED. TXID: {}  verify: {}", txid, verify_url(&txid));
@@ -1011,6 +1052,7 @@ async fn op_transfer(
     let sigs = sign_all(&tx)?;
     println!("TRANSFER exact fee: {} sompi", exact_fee);
 
+    preflight(&tx, "TRANSFER", false)?;
     let payload = to_rpc_payload(&tx, &sigs);
     let txid = rpc.submit_transaction(payload).await?;
     println!("TRANSFER SUBMITTED. TXID: {}  verify: {}", txid, verify_url(&txid));
@@ -1124,6 +1166,7 @@ async fn op_freeze(
     let sig1 = sign_fee(&tx)?;
     println!("FREEZE(new_flag={}) exact fee: {} sompi", new_frozen_flag, exact_fee);
 
+    preflight(&tx, "FREEZE", true)?;
     let payload = to_rpc_payload(&tx, &[sigscript0, sig1]);
     let txid = rpc.submit_transaction(payload).await?;
     println!("FREEZE(new_flag={}) SUBMITTED. TXID: {}  verify: {}", new_frozen_flag, txid, verify_url(&txid));
@@ -1236,6 +1279,7 @@ async fn op_seize(
     let sig_fee = sign_fee(&tx)?;
     println!("SEIZE exact fee: {} sompi", exact_fee);
 
+    preflight(&tx, "SEIZE", true)?;
     let payload = to_rpc_payload(&tx, &[sigscript0, sig_fee]);
     let txid = rpc.submit_transaction(payload).await?;
     println!("SEIZE SUBMITTED. TXID: {}  verify: {}", txid, verify_url(&txid));
@@ -1363,6 +1407,7 @@ async fn op_burn(rpc: &NodeClient, wallet: &WalletContext, roles: &RoleCtx, coin
     let sigs = sign_all(&tx)?;
     println!("BURN exact fee: {} sompi", exact_fee);
 
+    preflight(&tx, "BURN", false)?;
     let payload = to_rpc_payload(&tx, &sigs);
     let txid = rpc.submit_transaction(payload).await?;
     println!("BURN SUBMITTED. TXID: {}  verify: {}", txid, verify_url(&txid));
@@ -1512,6 +1557,7 @@ async fn op_raise_cap(
     let sig_fee = sign_fee(&tx)?;
     println!("RAISE_CAP exact fee: {} sompi", exact_fee);
 
+    preflight(&tx, "RAISE_CAP", true)?;
     let payload = to_rpc_payload(&tx, &[sigscript0, sig_fee]);
     let txid = rpc.submit_transaction(payload).await?;
     println!("RAISE_CAP SUBMITTED. TXID: {}  verify: {}", txid, verify_url(&txid));

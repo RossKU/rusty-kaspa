@@ -227,14 +227,12 @@ pub fn build_stablecoin_burn_sigscript(owner_sig: &[u8; 64], issuer_sig: &[u8; 6
 
 /// Build the robust stablecoin MIGRATE (`op_type = 0x06`) sigscript.
 ///
-/// Two-of-two authorization, the SAME SHAPE as TRANSFER's/BURN's owner
-/// `OpCheckSigVerify` + role `OpCheckSigFromStack` -- but the attesting role
-/// here is OPS (`STABLECOIN_ROBUST_DESIGN.md` §4's MIGRATE authorization is
-/// "OWNER + (ROTATE or OPS)"; since `ROTATE` (`0x05`) is deferred to
-/// post-Live -- see `super::body::build_migrate_branch`'s doc -- OPS stands
-/// in as the authorizer for the initial Live; post-Live, once ROTATE/
-/// root-verification land, MIGRATE authorization may move to the ROTATE
-/// role). There is NO `new_rs` field at all (unlike TRANSFER/FREEZE/SEIZE):
+/// Owner `OpCheckSigVerify` PLUS a cold 2-of-3 quorum over the three baked
+/// SEIZE keys (Decision 2026-07-20: MIGRATE moves the coin to an arbitrary
+/// template, so a hot-key authorizer made it a governance-exit hole -- see
+/// `super::body::build_migrate_branch`'s "Authorizer" doc section). The
+/// quorum uses the SAME fixed positional convention and the SAME bytecode
+/// segment as SEIZE. There is NO `new_rs` field at all (unlike TRANSFER/FREEZE/SEIZE):
 /// MIGRATE's successor is an ARBITRARY new covenant template whose fields
 /// this covenant never reads or carries forward (§4: "coin moves to new
 /// redeem-script template"), so the body only needs the successor's SPK
@@ -242,8 +240,11 @@ pub fn build_stablecoin_burn_sigscript(owner_sig: &[u8; 64], issuer_sig: &[u8; 6
 ///
 /// `owner_sig` -- the owner's raw 64-byte Schnorr signature over the
 /// transaction's SIGHASH_ALL sighash (the `0x01` type byte is appended here).
-/// `issuer_sig` -- the OPS role's raw 64-byte Schnorr signature over
-/// [`super::attestation::build_migrate_attestation_message`] (no type byte).
+/// `sig1`/`sig2`/`sig3` -- the SEIZE-quorum members' raw 64-byte Schnorr
+/// signatures over [`super::attestation::build_migrate_attestation_message`]
+/// (no type byte), in fixed positional correspondence with the baked
+/// `seize_pubkeys[0]`/`[1]`/`[2]`. Any TWO must be valid; the unused slot
+/// takes a 64-byte filler (e.g. all-zero), exactly as SEIZE does.
 /// `new_template_hash` -- the attested `Blake3` hash of the successor
 /// output's SPK (§5's op-specific preimage tail field); pushed as a 32-byte
 /// sigscript data item so the body can both fold it into the on-chain
@@ -253,12 +254,14 @@ pub fn build_stablecoin_burn_sigscript(owner_sig: &[u8; 64], issuer_sig: &[u8; 6
 /// [`super::body::build_stablecoin_redeem_script`].
 ///
 /// The returned bytes are push-only and pop in the order
-/// `build_migrate_branch` (`body.rs`) expects: `issuer_sig` deepest, then
-/// `new_template_hash`, then `owner_sig`, then the `op_type_selector`
+/// `build_migrate_branch` (`body.rs`) expects: `sig1` deepest, then `sig2`,
+/// `sig3`, `new_template_hash`, `owner_sig`, then the `op_type_selector`
 /// (`0x06 == MIGRATE`), then the redeem script last.
 pub fn build_stablecoin_migrate_sigscript(
     owner_sig: &[u8; 64],
-    issuer_sig: &[u8; 64],
+    sig1: &[u8; 64],
+    sig2: &[u8; 64],
+    sig3: &[u8; 64],
     new_template_hash: &[u8; 32],
     redeem_script: &[u8],
 ) -> Vec<u8> {
@@ -267,9 +270,13 @@ pub fn build_stablecoin_migrate_sigscript(
     owner_sig_with_type.extend_from_slice(owner_sig);
     owner_sig_with_type.push(SIGHASH_ALL);
 
-    let mut ss = Vec::with_capacity(2 + 64 + 2 + 32 + 2 + 65 + 2 + 3 + redeem_script.len());
-    // Emitted first -> ends up deepest on the stack: the OPS attestation sig.
-    ss.extend_from_slice(&push_data(issuer_sig));
+    let mut ss = Vec::with_capacity(3 * (2 + 64) + 2 + 32 + 2 + 65 + 2 + 3 + redeem_script.len());
+    // Emitted first -> ends up deepest on the stack: the three SEIZE-quorum
+    // attestation sigs, in the SAME fixed positional order SEIZE uses
+    // (sig1<->seize_pubkeys[0], sig2<->[1], sig3<->[2]).
+    ss.extend_from_slice(&push_data(sig1));
+    ss.extend_from_slice(&push_data(sig2));
+    ss.extend_from_slice(&push_data(sig3));
     // Then the attested new_template_hash (32B: Blake3 of the successor SPK).
     ss.extend_from_slice(&push_data(new_template_hash));
     // Then the owner authorization sig (65B: 64 Schnorr || 0x01 SIGHASH_ALL).
@@ -451,25 +458,31 @@ mod tests {
     }
 
     #[test]
-    fn migrate_emits_issuer_then_new_template_hash_then_owner_then_optype_then_redeem_script() {
+    fn migrate_emits_quorum_sigs_then_new_template_hash_then_owner_then_optype_then_redeem_script() {
         // MIGRATE has NO new_rs field (like BURN, unlike TRANSFER/FREEZE/
         // SEIZE): the successor is an arbitrary new template identified only
         // by its attested SPK hash, not a spender-supplied plaintext blob.
+        // Since Decision 2026-07-20 the authorizer is the cold 2-of-3 SEIZE
+        // quorum, so three sig slots are emitted (SEIZE's positional order).
         let rs = rs();
         const OWNER_SIG3: [u8; 64] = [0x51; 64];
-        const ISSUER_SIG3: [u8; 64] = [0x52; 64];
+        const MIG_SIG1: [u8; 64] = [0x52; 64];
+        const MIG_SIG2: [u8; 64] = [0x53; 64];
+        const MIG_SIG3: [u8; 64] = [0x54; 64];
         const NEW_TEMPLATE_HASH: [u8; 32] = [0x77; 32];
-        let ss = build_stablecoin_migrate_sigscript(&OWNER_SIG3, &ISSUER_SIG3, &NEW_TEMPLATE_HASH, &rs);
+        let ss = build_stablecoin_migrate_sigscript(&OWNER_SIG3, &MIG_SIG1, &MIG_SIG2, &MIG_SIG3, &NEW_TEMPLATE_HASH, &rs);
 
-        // Field 1 (deepest): issuer_sig — OpData64 (0x40) + 64 raw bytes.
+        // Field 1 (deepest): sig1 — OpData64 (0x40) + 64 raw bytes.
         assert_eq!(ss[0], 64);
-        assert_eq!(&ss[1..65], &ISSUER_SIG3);
+        assert_eq!(&ss[1..65], &MIG_SIG1);
 
         let mut owner_sig_with_type = OWNER_SIG3.to_vec();
         owner_sig_with_type.push(SIGHASH_ALL);
 
         let mut expected = Vec::new();
-        expected.extend_from_slice(&crate::primitives::push_data(&ISSUER_SIG3));
+        expected.extend_from_slice(&crate::primitives::push_data(&MIG_SIG1));
+        expected.extend_from_slice(&crate::primitives::push_data(&MIG_SIG2));
+        expected.extend_from_slice(&crate::primitives::push_data(&MIG_SIG3));
         expected.extend_from_slice(&crate::primitives::push_data(&NEW_TEMPLATE_HASH));
         expected.extend_from_slice(&crate::primitives::push_data(&owner_sig_with_type));
         expected.extend_from_slice(&crate::primitives::push_data(&[crate::contract::stablecoin::attestation::op_type::MIGRATE]));

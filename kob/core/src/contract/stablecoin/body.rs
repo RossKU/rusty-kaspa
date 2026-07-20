@@ -406,6 +406,21 @@ fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 /// frozen_flag, which is read but otherwise unused/unconstrained here --
 /// FREEZE must work from either starting state, 0->1 or 1->0).
 ///
+/// # `new_frozen_flag` domain gate (audit fix 2026-07-20)
+///
+/// FREEZE is the ONLY branch that writes `frozen_flag`, and it writes
+/// whatever byte the attestation carries. The post-Live audit
+/// (`STABLECOIN_AUDIT_2026-07-20.md` §B4) flagged that nothing constrained
+/// that byte to `{0x00, 0x01}`: every other branch tests the field with a
+/// BYTEWISE `OpEqual` against `[0x00]`, so writing e.g. `[0x02]` creates an
+/// undefined third state -- not "clear" to TRANSFER/BURN/MIGRATE (they all
+/// abort), yet not the `[0x01]` that tooling recognizes as frozen. Reachable
+/// by the FREEZE key alone, it would brick the coin's owner-side branches
+/// with no defined unfreeze semantics. This branch now gates the value to
+/// exactly the two canonical literals up front, bytewise (a numeric compare
+/// would also admit non-minimal encodings of 0/1, which the explicit-push
+/// convention forbids).
+///
 /// `freeze_pubkey` is baked into the branch bytecode as a literal constant,
 /// exactly as `build_transfer_branch` bakes in `ops_pubkey` -- role pubkeys
 /// are NOT (yet) individually revealed-and-verified against
@@ -438,6 +453,32 @@ fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 fn build_freeze_branch(freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     use op::*;
     let mut b = Vec::with_capacity(200);
+
+    // ---- Domain gate: new_frozen_flag MUST be exactly one of the two
+    // canonical 1-byte literals (`frozen_flag::CLEAR` / `frozen_flag::SET`).
+    // Without this the FREEZE key can write ANY byte into the successor's
+    // frozen_flag slot; every other branch tests that slot with a BYTEWISE
+    // `OpEqual` against `[0x00]`, so an out-of-domain value (e.g. `[0x02]`)
+    // reads as "not clear" to TRANSFER/BURN/MIGRATE while never matching the
+    // `[0x01]` any tooling looks for -- an undefined third state reachable by
+    // a single role key. Checked bytewise (NOT numerically): the field is a
+    // literal explicit push, so a numeric comparison would also accept
+    // non-minimal or alternately-encoded representations of 0/1. ----
+    // Stack: epoch(0), frozen_flag(1), root(2), identifier_type(3),
+    // owner_pubkey(4), new_frozen_flag(5), new_rs(6), issuer_sig(7).
+    e_pick(&mut b, 5); // copy of new_frozen_flag -> top
+    e_pick(&mut b, 0); // a second copy (the first is consumed by the CLEAR test)
+    b.push(DATA1);
+    b.push(frozen_flag::CLEAR);
+    b.push(EQUAL); // is_clear
+    // Stack: is_clear(0), new_frozen_flag_copy(1), epoch(2), ...
+    e_roll(&mut b, 1); // new_frozen_flag_copy -> top
+    b.push(DATA1);
+    b.push(frozen_flag::SET);
+    b.push(EQUAL); // is_set
+    // Stack: is_set(0), is_clear(1), epoch(2), ...
+    b.push(ADD); // exactly one can match, so the sum is 1 (valid) or 0 (invalid)
+    b.push(VERIFY); // fail-closed on any other byte
 
     // Stack: epoch(0), frozen_flag(1), root(2), identifier_type(3),
     // owner_pubkey(4), new_frozen_flag(5), new_rs(6), issuer_sig(7).
@@ -825,45 +866,65 @@ fn build_seize_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
     // sig1(3).
     b.push(BLAKE3);
 
-    // ---- 2-of-3 threshold over the three baked SEIZE pubkeys (see fn doc
-    // for why this is 3x OpCheckSigFromStack + a summed threshold rather
-    // than native OpCheckMultiSig). Fixed positional convention:
-    // sig3<->seize_pubkeys[2], sig2<->seize_pubkeys[1], sig1<->
-    // seize_pubkeys[0]. ----
+    emit_2of3_threshold(&mut b, seize_pubkeys);
 
-    // -- check sig3 vs seize_pubkeys[2] --
+    b.push(OP1);
+    b
+}
+
+/// Emit the 2-of-3 threshold check over three baked SEIZE-role pubkeys.
+///
+/// Entry stack is exactly `msg_hash(0), sig3(1), sig2(2), sig1(3)`; on success
+/// all four are consumed and nothing is left behind (fail-closed via the
+/// trailing `OpVerify`). Shared verbatim by [`build_seize_branch`] and
+/// [`build_migrate_branch`] so the two quorum gates cannot drift apart.
+///
+/// This is three `OpCheckSigFromStack` calls against fixed positional slots
+/// plus a summed threshold rather than a native `OpCheckMultiSig` (see
+/// [`build_seize_branch`]'s doc for why): `sig3<->pubkeys[2]`,
+/// `sig2<->pubkeys[1]`, `sig1<->pubkeys[0]`. Because every slot verifies the
+/// SAME `msg_hash`, a duplicated baked pubkey would let one signature satisfy
+/// two slots and collapse the threshold -- which is why
+/// [`build_stablecoin_body`] asserts the baked role keys are pairwise
+/// distinct, and [`build_stablecoin_redeem_script`] additionally asserts the
+/// owner key differs from all of them (MIGRATE consumes an owner signature
+/// AND this quorum).
+fn emit_2of3_threshold(b: &mut Vec<u8>, pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) {
+    use op::*;
+
+    // -- check sig3 vs pubkeys[2] --
     // Stack: msg_hash(0), sig3(1), sig2(2), sig1(3).
-    e_roll(&mut b, 1); // sig3 -> top
+    e_roll(b, 1); // sig3 -> top
     // Stack: sig3(0), msg_hash(1), sig2(2), sig1(3).
-    e_pick(&mut b, 1); // copy of msg_hash -> top
+    e_pick(b, 1); // copy of msg_hash -> top
     // Stack: msg_hash_copy(0), sig3(1), msg_hash(2), sig2(3), sig1(4).
     b.push(DATA32);
-    b.extend_from_slice(&seize_pubkeys[2]);
+    b.extend_from_slice(&pubkeys[2]);
     // Stack: pubkey3(0), msg_hash_copy(1), sig3(2), msg_hash(3), sig2(4),
     // sig1(5).
     b.push(CHECKSIGFROMSTACK);
     // Stack: bool3(0), msg_hash(1), sig2(2), sig1(3).
 
-    // -- check sig2 vs seize_pubkeys[1] --
-    e_roll(&mut b, 2); // sig2 -> top
+    // -- check sig2 vs pubkeys[1] --
+    e_roll(b, 2); // sig2 -> top
     // Stack: sig2(0), bool3(1), msg_hash(2), sig1(3).
-    e_pick(&mut b, 2); // copy of msg_hash -> top
+    e_pick(b, 2); // copy of msg_hash -> top
     // Stack: msg_hash_copy(0), sig2(1), bool3(2), msg_hash(3), sig1(4).
     b.push(DATA32);
-    b.extend_from_slice(&seize_pubkeys[1]);
+    b.extend_from_slice(&pubkeys[1]);
     // Stack: pubkey2(0), msg_hash_copy(1), sig2(2), bool3(3), msg_hash(4),
     // sig1(5).
     b.push(CHECKSIGFROMSTACK);
     // Stack: bool2(0), bool3(1), msg_hash(2), sig1(3).
 
-    // -- check sig1 vs seize_pubkeys[0] (consumes the ORIGINAL msg_hash; no
-    // copy needed since this is the last use) --
-    e_roll(&mut b, 3); // sig1 -> top
+    // -- check sig1 vs pubkeys[0] (consumes the ORIGINAL msg_hash; no copy
+    // needed since this is the last use) --
+    e_roll(b, 3); // sig1 -> top
     // Stack: sig1(0), bool2(1), bool3(2), msg_hash(3).
-    e_roll(&mut b, 3); // msg_hash -> top (directly above sig1)
+    e_roll(b, 3); // msg_hash -> top (directly above sig1)
     // Stack: msg_hash(0), sig1(1), bool2(2), bool3(3).
     b.push(DATA32);
-    b.extend_from_slice(&seize_pubkeys[0]);
+    b.extend_from_slice(&pubkeys[0]);
     // Stack: pubkey1(0), msg_hash(1), sig1(2), bool2(3), bool3(4).
     b.push(CHECKSIGFROMSTACK);
     // Stack: bool1(0), bool2(1), bool3(2).
@@ -874,9 +935,6 @@ fn build_seize_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
     b.push(OP2);
     b.push(GREATERTHANOREQUAL);
     b.push(VERIFY);
-
-    b.push(OP1);
-    b
 }
 
 /// Emit the BURN (`0x03`) branch bytecode (`STABLECOIN_ROBUST_DESIGN.md`
@@ -1084,21 +1142,35 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 /// TRANSFER's/BURN's (owner `OpCheckSigVerify`, SIGHASH_ALL, PLUS an
 /// `OpCheckSigFromStack` attestation) -- but see the authorizer note below.
 ///
-/// # Authorizer: OPS stands in for the (deferred) ROTATE role
+/// # Authorizer: cold 2-of-3 SEIZE quorum (Decision 2026-07-20)
 ///
 /// §4's branch table specifies MIGRATE authorization as "OWNER + (ROTATE or
 /// OPS)". Under Decision 2026-07-19 (option B, baked keys), `ROTATE` (`0x05`)
 /// is deferred to post-Live (it only becomes meaningful once role keys are
 /// verified against `role_registry_root` rather than baked -- see this
 /// module's top doc and `STABLECOIN_ROBUST_DESIGN.md`'s "Deferred to
-/// post-Live robustness upgrade" section). Since ROTATE doesn't exist yet in
-/// this dispatch, this branch uses the OPS role (the SAME baked pubkey
-/// TRANSFER already uses) as the authorizer -- the design doc explicitly
-/// allows this ("ROTATE or OPS"). **Post-Live**, once ROTATE/root-
-/// verification land, MIGRATE authorization MAY move to the ROTATE role
-/// instead (a stronger-quorum signer for what is, after all, a "redeploy the
-/// covenant" event) -- that would be a body-bytecode change at that time, not
-/// implied by anything here.
+/// post-Live robustness upgrade" section). The initial Live shipped OPS (the
+/// SAME hot key TRANSFER uses) as the stand-in authorizer.
+///
+/// The post-Live audit (`STABLECOIN_AUDIT_2026-07-20.md` §B2) rejected that
+/// as a **governance-exit hole**: MIGRATE moves the coin to an ARBITRARY new
+/// template (see the next section), so owner + a compromised HOT ops key
+/// could walk an unfrozen coin out of FREEZE/SEIZE/BURN reach entirely --
+/// contradicting §11's "a stolen OPS key cannot redirect funds". **Decision
+/// 2026-07-20: gate MIGRATE behind the same cold 2-of-3 quorum SEIZE uses**
+/// (the SAME three baked `seize_pubkeys` -- no new key material, and the
+/// quorum bytecode is literally the shared [`emit_2of3_threshold`] segment,
+/// so the two gates cannot drift). Escaping governance now costs the owner
+/// key AND two of the three cold keys -- i.e. exactly what it costs to seize
+/// the coin outright, which is the intended equivalence.
+///
+/// `frozen_flag == 0` is retained on top of the quorum: it is the cheap gate
+/// that stops a routine owner-initiated migration of a sanctioned coin
+/// without needing the cold keys to be involved at all.
+///
+/// **Post-Live**, once ROTATE/root-verification land, MIGRATE authorization
+/// MAY move to a dedicated ROTATE quorum -- that would be a body-bytecode
+/// change at that time, not implied by anything here.
 ///
 /// # No `new_rs` -- only the successor's SPK HASH is needed
 ///
@@ -1167,15 +1239,18 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 ///
 /// ```text
 /// epoch(0), frozen_flag(1), role_registry_root(2), identifier_type(3),
-/// owner_pubkey(4), owner_sig(5), new_template_hash(6), issuer_sig(7)
+/// owner_pubkey(4), owner_sig(5), new_template_hash(6), sig3(7), sig2(8),
+/// sig1(9)
 /// ```
 ///
-/// (sigscript push/emission order, first==deepest: `issuer_sig`,
+/// (sigscript push/emission order, first==deepest: `sig1`, `sig2`, `sig3`,
 /// `new_template_hash`, `owner_sig`, `op_type_selector`, `redeem_script` --
-/// see `super::sigscript::build_stablecoin_migrate_sigscript`.)
-fn build_migrate_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
+/// see `super::sigscript::build_stablecoin_migrate_sigscript`. The three
+/// quorum sigs sit BELOW every field this branch rolls, so all roll/pick
+/// depths are unchanged from the single-authorizer version.)
+fn build_migrate_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
     use op::*;
-    let mut b = Vec::with_capacity(200);
+    let mut b = Vec::with_capacity(300);
 
     // ---- Owner authorization (identical mechanics to TRANSFER's/BURN's
     // stage 1). ----
@@ -1258,14 +1333,13 @@ fn build_migrate_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     e_roll(&mut b, 1); // new_template_hash -> top
     b.push(CAT); // acc || new_template_hash == full 153B MIGRATE preimage
 
-    // msg_hash = Blake3(preimage). Stack: msg_hash(0), issuer_sig(1).
+    // msg_hash = Blake3(preimage). Stack: msg_hash(0), sig3(1), sig2(2),
+    // sig1(3) -- byte-identical to SEIZE's stack shape at this point, which
+    // is why the quorum segment below is shared verbatim.
     b.push(BLAKE3);
 
-    // Push OPS pubkey; verify the attestation.
-    b.push(DATA32);
-    b.extend_from_slice(ops_pubkey);
-    b.push(CHECKSIGFROMSTACK);
-    b.push(VERIFY);
+    // ---- Cold 2-of-3 SEIZE-quorum attestation (see fn doc "Authorizer"). ----
+    emit_2of3_threshold(&mut b, seize_pubkeys);
 
     b.push(OP1);
     b
@@ -1286,11 +1360,28 @@ pub fn build_stablecoin_body(
     seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
     mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
 ) -> Vec<u8> {
+    // Role keys MUST be pairwise distinct: a duplicated SEIZE key collapses the
+    // SEIZE (and MIGRATE) 2-of-3 threshold (one key satisfies two fixed
+    // positional slots, sum>=2), and a shared ops/freeze/mint key erodes role
+    // separation. The check lives HERE (not only in the
+    // `build_stablecoin_redeem_script` wrapper) because this is the function
+    // that actually emits the threshold bytecode and is itself `pub` -- a
+    // caller must not be able to route around the assertion by composing the
+    // state header manually.
+    {
+        let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 6] =
+            [ops_pubkey, freeze_pubkey, &seize_pubkeys[0], &seize_pubkeys[1], &seize_pubkeys[2], mint_pubkey];
+        for i in 0..role_keys.len() {
+            for j in (i + 1)..role_keys.len() {
+                assert!(role_keys[i] != role_keys[j], "stablecoin role pubkeys must be pairwise distinct (slot {i} == slot {j})");
+            }
+        }
+    }
     let transfer = build_transfer_branch(ops_pubkey);
     let freeze = build_freeze_branch(freeze_pubkey);
     let seize = build_seize_branch(seize_pubkeys);
     let burn = build_burn_branch(mint_pubkey);
-    let migrate = build_migrate_branch(ops_pubkey); // OPS stands in for the deferred ROTATE role, see build_migrate_branch's doc
+    let migrate = build_migrate_branch(seize_pubkeys); // cold 2-of-3 quorum, Decision 2026-07-20 -- see build_migrate_branch's doc
     build_op_type_dispatch(
         OP_TYPE_TAG_DEPTH,
         OpTypeBranches {
@@ -1334,16 +1425,20 @@ pub fn build_stablecoin_redeem_script(
     seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
     mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
 ) -> Vec<u8> {
-    // Role keys MUST be pairwise distinct: a duplicated SEIZE key collapses the
-    // 2-of-3 threshold (one key satisfies two fixed positional slots, sum>=2), and
-    // a shared ops/freeze/mint key erodes role separation. Reject at construction.
+    // The owner key must ALSO be distinct from every baked role key. Role-vs-role
+    // distinctness is asserted one layer down, in `build_stablecoin_body` (so no
+    // caller can route around it); the owner key never reaches that function, so
+    // it is checked here. This matters because MIGRATE requires an owner
+    // `OpCheckSigVerify` AND a 2-of-3 SEIZE quorum over the same message: if the
+    // owner key were also a SEIZE slot key, the owner's own keypair could cast
+    // one of the three quorum votes, degrading "owner + 2 independent cold
+    // signers" to "owner + 1". `owner == ops` would likewise let one party
+    // satisfy both the owner signature and the OPS attestation in TRANSFER.
     {
         let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 6] =
             [ops_pubkey, freeze_pubkey, &seize_pubkeys[0], &seize_pubkeys[1], &seize_pubkeys[2], mint_pubkey];
-        for i in 0..role_keys.len() {
-            for j in (i + 1)..role_keys.len() {
-                assert!(role_keys[i] != role_keys[j], "stablecoin role pubkeys must be pairwise distinct (slot {i} == slot {j})");
-            }
+        for (i, role_key) in role_keys.iter().enumerate() {
+            assert!(*role_key != owner_pubkey, "stablecoin owner pubkey must differ from every role pubkey (role slot {i})");
         }
     }
     let state = StablecoinStateHeader::new(*owner_pubkey, identifier_type, *role_registry_root, frozen_flag_value, epoch, 0);
@@ -1624,16 +1719,32 @@ mod tests {
     }
 
     #[test]
-    fn ops_pubkey_baked_via_checksigfromstack_in_migrate_branch() {
-        // MIGRATE's authorizer is OPS (standing in for the deferred ROTATE
-        // role, see `build_migrate_branch`'s doc) -- the SAME baked pubkey
-        // TRANSFER uses, reused here rather than a new dedicated key.
-        let migrate = build_migrate_branch(&OPS);
-        assert!(migrate.windows(32).any(|w| w == OPS));
-        // Exactly one OpCheckSigFromStack (0xd7) -- a single-signer OPS
-        // attestation, like TRANSFER's/BURN's, unlike SEIZE's 3x quorum.
+    fn seize_quorum_keys_baked_via_checksigfromstack_in_migrate_branch() {
+        // Decision 2026-07-20: MIGRATE's authorizer is the cold 2-of-3 SEIZE
+        // quorum, NOT the hot OPS key (governance-exit hole, see
+        // `build_migrate_branch`'s "Authorizer" doc section).
+        let migrate = build_migrate_branch(&SEIZE);
+        for (i, pk) in SEIZE.iter().enumerate() {
+            assert!(migrate.windows(32).any(|w| w == pk), "SEIZE quorum key {i} must be baked into the MIGRATE branch");
+        }
+        assert!(!migrate.windows(32).any(|w| w == OPS), "the hot OPS key must NOT authorize MIGRATE any more");
+        // Exactly three OpCheckSigFromStack (0xd7) calls -- the same 2-of-3
+        // quorum shape SEIZE uses (shared `emit_2of3_threshold` segment).
         let checksigfromstack_count = migrate.iter().filter(|&&byte| byte == 0xd7).count();
-        assert_eq!(checksigfromstack_count, 1, "expected exactly 1 OpCheckSigFromStack call in the MIGRATE branch");
+        assert_eq!(checksigfromstack_count, 3, "expected exactly 3 OpCheckSigFromStack calls in the MIGRATE branch");
+    }
+
+    #[test]
+    fn migrate_and_seize_share_the_same_quorum_segment() {
+        // The two quorum gates must not drift: both are emitted by
+        // `emit_2of3_threshold`, so MIGRATE's tail (from the first quorum
+        // opcode through the threshold VERIFY) must appear verbatim in SEIZE.
+        let mut expected = Vec::new();
+        emit_2of3_threshold(&mut expected, &SEIZE);
+        let migrate = build_migrate_branch(&SEIZE);
+        let seize = build_seize_branch(&SEIZE);
+        assert!(migrate.windows(expected.len()).any(|w| w == expected), "MIGRATE must use the shared 2-of-3 segment");
+        assert!(seize.windows(expected.len()).any(|w| w == expected), "SEIZE must use the shared 2-of-3 segment");
     }
 
     #[test]
@@ -1644,7 +1755,7 @@ mod tests {
         // (that helper is only needed by branches with no owner signature at
         // all, FREEZE/SEIZE). Regression guard on the deliberate omission
         // documented in `build_migrate_branch`'s doc.
-        let migrate = build_migrate_branch(&OPS);
+        let migrate = build_migrate_branch(&SEIZE);
         let needle: &[u8] = &[0xb9, 0xbe, 0xb9, 0xc2, 0x87, 0x69];
         assert!(
             !migrate.windows(needle.len()).any(|w| w == needle),
@@ -1660,7 +1771,7 @@ mod tests {
         // mechanism TRANSFER/FREEZE/SEIZE rely on -- it only ever needs the
         // successor SPK's hash (OpTxOutputSpk + OpBlake3), never OpSubstr
         // (0x7f, dr_field_extract's/dr_output_spk_check's slicing opcode).
-        let migrate = build_migrate_branch(&OPS);
+        let migrate = build_migrate_branch(&SEIZE);
         assert!(!migrate.contains(&0x7f), "MIGRATE branch must not contain OpSubstr (0x7f) -- no new_rs field/extraction expected");
     }
 }

@@ -375,7 +375,7 @@ fn transfer_successor_epoch_altered_rejected() {
 
 #[test]
 fn transfer_attestation_replay_other_outpoint_rejected() {
-    // The OPS role attested for outpoint txid seed 0x77, but the input
+    // The quorum attested for outpoint txid seed 0x77, but the input
     // actually spends the outpoint with txid seed 0x10 (Cfg::honest()'s
     // default). The on-chain OpOutpointTxId binds the REAL spend, so the
     // recomputed msg_hash differs from what was signed -- the 0x77 attestation
@@ -648,6 +648,31 @@ fn freeze_flag_mismatch_message_vs_successor_rejected() {
     // on-chain successor-frozen_flag-equality check must reject this
     // independently of the signature check succeeding.
     let cfg = FreezeCfg { successor_frozen_flag: Some(frozen_flag::CLEAR), ..FreezeCfg::honest_freeze() };
+    let res = run(&build_freeze(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn freeze_out_of_domain_flag_rejected() {
+    // Audit fix 2026-07-20 (§B4): the FREEZE key must not be able to write an
+    // arbitrary byte into the successor's frozen_flag slot. Everything here is
+    // otherwise honest -- the attestation genuinely signs new_frozen_flag =
+    // 0x02 and the successor genuinely carries 0x02, so both the signature
+    // check and the successor-equality check would pass -- yet the branch must
+    // still abort on the domain gate. Without it, 0x02 is an undefined third
+    // state: TRANSFER/BURN/MIGRATE all compare bytewise against [0x00] and
+    // abort, while no tooling recognizes it as frozen.
+    let cfg = FreezeCfg { new_frozen_flag: 0x02, ..FreezeCfg::honest_freeze() };
+    let res = run(&build_freeze(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn freeze_high_bit_flag_rejected() {
+    // Same gate, exercised with a byte whose numeric reading (0x80 == script
+    // number -0) differs from its bytewise one -- the gate is bytewise, so
+    // this must reject regardless of numeric interpretation.
+    let cfg = FreezeCfg { new_frozen_flag: 0x80, ..FreezeCfg::honest_freeze() };
     let res = run(&build_freeze(&cfg));
     assert_rejected_with(&res, "VerifyError");
 }
@@ -1281,9 +1306,9 @@ struct MigrateCfg {
     outpoint_txid_seed: u8,
     outpoint_index: u32,
     owner_seed: u8,        // owner pubkey baked into the state header AND the key that signs owner_sig
-    ops_seed: u8,          // OPS pubkey baked into the body (this branch's OpCheckSigFromStack key)
+    ops_seed: u8,          // OPS pubkey baked into the body (irrelevant to MIGRATE since Decision 2026-07-20)
     freeze_seed: u8,       // FREEZE pubkey baked into the body (irrelevant to MIGRATE itself)
-    seize_seeds: [u8; 3],  // SEIZE pubkeys baked into the body (irrelevant to MIGRATE itself)
+    seize_seeds: [u8; 3],  // the three baked SEIZE pubkey seeds -- MIGRATE's cold 2-of-3 quorum
     mint_seed: u8,         // MINT pubkey baked into the body (irrelevant to MIGRATE itself)
     root: [u8; 32],        // this coin's role_registry_root (unread/uncompared by MIGRATE)
     epoch: u32,            // this coin's epoch (bound into the OPS attestation preimage)
@@ -1291,9 +1316,11 @@ struct MigrateCfg {
     in_amount: u64,
     out_value: u64,        // successor (new-template) output native value -- owner-chosen, SIGHASH_ALL-committed
 
-    // Key that actually produces issuer_sig (honest == ops_seed). A
-    // disagreeing value is the wrong-OPS-key forgery being tested.
-    attest_ops_seed: u8,
+    // Which seed actually signs each of the 3 fixed quorum sigscript slots
+    // (`Some(seed)`) vs. an arbitrary non-signature placeholder (`None`).
+    // Honest == all three slots signed by `seize_seeds` in order. Mirrors
+    // `SeizeCfg::signer_seeds` exactly (same shared quorum bytecode).
+    signer_seeds: [Option<u8>; 3],
     // Override for what the OPS attestation actually signs as the outpoint
     // txid (None == truthful, matching the real spend). A disagreeing value
     // is the replay being tested.
@@ -1323,7 +1350,7 @@ impl MigrateCfg {
             frozen_flag: frozen_flag::CLEAR,
             in_amount: IN_AMOUNT,
             out_value: IN_AMOUNT,
-            attest_ops_seed: 72, // == ops_seed
+            signer_seeds: [Some(81), Some(82), Some(83)], // == seize_seeds
             attest_outpoint_txid_seed: None,
             successor_template_mismatch: false,
         }
@@ -1397,10 +1424,19 @@ fn build_migrate_scenario(cfg: &MigrateCfg, raw_owner_sig: Option<&[u8]>, raw_is
         cfg.in_amount,
         &new_template_hash,
     );
-    let issuer_sig: [u8; 64] = schnorr_sign(&attest_msg, &privkey(cfg.attest_ops_seed)).unwrap();
+    let sig_for = |slot: usize| -> [u8; 64] {
+        match cfg.signer_seeds[slot] {
+            Some(seed) => schnorr_sign(&attest_msg, &privkey(seed)).unwrap(),
+            None => SEIZE_GARBAGE_SIG,
+        }
+    };
+    let quorum_sigs = [sig_for(0), sig_for(1), sig_for(2)];
 
     // --- Owner authorization (SIGHASH_ALL over the tx) ---
-    let skeleton_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), vec![], 0, 2);
+    // `sig_op_count` is committed by Kaspa's sighash, so the skeleton must
+    // declare the SAME count as the final input (4 since Decision 2026-07-20:
+    // one OpCheckSigVerify + three quorum OpCheckSigFromStack).
+    let skeleton_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), vec![], 0, 4);
     let skeleton_tx = Transaction::new(0, vec![skeleton_input], vec![output.clone()], 0, Default::default(), 0, vec![]);
     let populated_skeleton = PopulatedTransaction::new(&skeleton_tx, entries.clone());
     let reused = SigHashReusedValuesUnsync::new();
@@ -1408,7 +1444,14 @@ fn build_migrate_scenario(cfg: &MigrateCfg, raw_owner_sig: Option<&[u8]>, raw_is
     let owner_sig: [u8; 64] = schnorr_sign(&sighash.as_bytes(), &privkey(cfg.owner_seed)).unwrap();
 
     let ss = match (raw_owner_sig, raw_issuer_sig) {
-        (None, None) => build_stablecoin_migrate_sigscript(&owner_sig, &issuer_sig, &new_template_hash, &rs),
+        (None, None) => build_stablecoin_migrate_sigscript(
+            &owner_sig,
+            &quorum_sigs[0],
+            &quorum_sigs[1],
+            &quorum_sigs[2],
+            &new_template_hash,
+            &rs,
+        ),
         (owner_override, issuer_override) => {
             let owner_sig_with_type: Vec<u8> = match owner_override {
                 Some(raw) => raw.to_vec(),
@@ -1418,10 +1461,15 @@ fn build_migrate_scenario(cfg: &MigrateCfg, raw_owner_sig: Option<&[u8]>, raw_is
                     v
                 }
             };
-            let issuer_bytes: Vec<u8> = issuer_override.map(<[u8]>::to_vec).unwrap_or_else(|| issuer_sig.to_vec());
+            // `issuer_override` replaces the FIRST quorum slot's bytes (the
+            // only slot a "missing/malformed attestation" test needs to
+            // perturb); the other two slots keep their honest signatures.
+            let sig1_bytes: Vec<u8> = issuer_override.map(<[u8]>::to_vec).unwrap_or_else(|| quorum_sigs[0].to_vec());
             let mut ss = Vec::new();
-            // Emitted first -> ends up deepest: the OPS attestation sig.
-            ss.extend_from_slice(&push_data(&issuer_bytes));
+            // Emitted first -> ends up deepest: the three quorum sigs.
+            ss.extend_from_slice(&push_data(&sig1_bytes));
+            ss.extend_from_slice(&push_data(&quorum_sigs[1]));
+            ss.extend_from_slice(&push_data(&quorum_sigs[2]));
             ss.extend_from_slice(&push_data(&new_template_hash));
             ss.extend_from_slice(&push_data(&owner_sig_with_type));
             ss.extend_from_slice(&push_data(&[op_type::MIGRATE]));
@@ -1429,8 +1477,9 @@ fn build_migrate_scenario(cfg: &MigrateCfg, raw_owner_sig: Option<&[u8]>, raw_is
             ss
         }
     };
-    // sig_op_count = 2: one OpCheckSigVerify (owner) + one OpCheckSigFromStack (OPS).
-    let final_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), ss, 0, 2);
+    // sig_op_count = 4: one OpCheckSigVerify (owner) + three OpCheckSigFromStack
+    // (the cold 2-of-3 quorum).
+    let final_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), ss, 0, 4);
     let tx = Transaction::new(0, vec![final_input], vec![output], 0, Default::default(), 0, vec![]);
     Built { tx, entries }
 }
@@ -1440,16 +1489,48 @@ fn build_migrate(cfg: &MigrateCfg) -> Built {
 }
 
 #[test]
-fn migrate_owner_plus_ops_accepts() {
-    // A correctly owner-signed, correctly OPS-attested MIGRATE to a distinct
-    // (non-stablecoin) successor template. That this passes on the real
-    // engine IS the conformance proof: the OPS role signed
+fn migrate_owner_plus_2of3_quorum_accepts() {
+    // A correctly owner-signed, correctly quorum-attested MIGRATE to a
+    // distinct (non-stablecoin) successor template. That this passes on the
+    // real engine IS the conformance proof: the SEIZE-quorum members signed
     // `build_migrate_attestation_message(...)` off-chain, and the body
     // recomputed the identical 32-byte msg_hash from transaction
     // introspection -- if any field or width disagreed, `OpCheckSigFromStack`
-    // would return false and `OpVerify` would abort.
+    // would return false for every slot and the summed threshold would fall
+    // below 2.
     let res = run(&build_migrate(&MigrateCfg::honest()));
-    assert!(res.is_ok(), "honest owner+OPS MIGRATE to a distinct template must be accepted: {res:?}");
+    assert!(res.is_ok(), "honest owner+2-of-3 MIGRATE to a distinct template must be accepted: {res:?}");
+}
+
+#[test]
+fn migrate_exactly_2of3_accepts() {
+    // Decision 2026-07-20: the quorum is 2-of-3, not 3-of-3 -- one absent
+    // signer must not block a legitimate migration.
+    let cfg = MigrateCfg { signer_seeds: [Some(81), Some(82), None], ..MigrateCfg::honest() };
+    let res = run(&build_migrate(&cfg));
+    assert!(res.is_ok(), "MIGRATE with exactly 2 of 3 quorum signatures must be accepted: {res:?}");
+}
+
+#[test]
+fn migrate_1of3_insufficient_rejected() {
+    // Only ONE quorum slot is genuinely signed; the other two are arbitrary
+    // placeholders. The summed threshold (1) is below the required 2, so the
+    // branch must reject even though the supplied signature is perfectly
+    // valid. This is the governance-exit hole that Decision 2026-07-20
+    // closed: before it, a single hot OPS signature was enough.
+    let cfg = MigrateCfg { signer_seeds: [Some(81), None, None], ..MigrateCfg::honest() };
+    let res = run(&build_migrate(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn migrate_ops_key_alone_cannot_authorize() {
+    // The hot OPS key was MIGRATE's sole authorizer before Decision
+    // 2026-07-20. Even signing all three quorum slots with it must now fail:
+    // it is not one of the three baked cold SEIZE keys.
+    let cfg = MigrateCfg { signer_seeds: [Some(72), Some(72), Some(72)], ..MigrateCfg::honest() };
+    let res = run(&build_migrate(&cfg));
+    assert_rejected_with(&res, "VerifyError");
 }
 
 #[test]
@@ -1465,10 +1546,10 @@ fn migrate_missing_owner_sig_rejected() {
 }
 
 #[test]
-fn migrate_missing_ops_attestation_rejected() {
-    // Empty issuer_sig (0 bytes): `OpCheckSigFromStack` tries to parse it as
-    // a 64-byte Schnorr signature and fails at parsing, before any key
-    // comparison is even attempted -- mirrors
+fn migrate_missing_quorum_attestation_rejected() {
+    // Empty sig in the first quorum slot (0 bytes): `OpCheckSigFromStack`
+    // tries to parse it as a 64-byte Schnorr signature and fails at parsing,
+    // before any key comparison is even attempted -- mirrors
     // `burn_missing_mint_attestation_rejected`'s failure shape.
     let cfg = MigrateCfg::honest();
     let res = run(&build_migrate_scenario(&cfg, None, Some(&[])));
@@ -1476,19 +1557,18 @@ fn migrate_missing_ops_attestation_rejected() {
 }
 
 #[test]
-fn migrate_wrong_issuer_key_rejected() {
-    // The attestation is a valid signature over the correct message, but from
-    // the WRONG key (not the OPS key baked into the body). Only the real OPS
-    // role (standing in for the deferred ROTATE role) can authorize a
-    // migration.
-    let cfg = MigrateCfg { attest_ops_seed: 99, ..MigrateCfg::honest() };
+fn migrate_wrong_quorum_keys_rejected() {
+    // Every attestation is a valid signature over the correct message, but
+    // from keys that are NOT the baked cold SEIZE keys. Only the real quorum
+    // members can authorize a migration.
+    let cfg = MigrateCfg { signer_seeds: [Some(97), Some(98), Some(99)], ..MigrateCfg::honest() };
     let res = run(&build_migrate(&cfg));
     assert_rejected_with(&res, "VerifyError");
 }
 
 #[test]
 fn migrate_successor_template_mismatch_rejected() {
-    // The OPS role genuinely attested a new_template_hash for one candidate
+    // The quorum genuinely attested a new_template_hash for one candidate
     // template, but the successor output ACTUALLY paid to hashes to a
     // DIFFERENT template -- the attestation itself is internally consistent
     // (OpCheckSigFromStack would pass), but the SEPARATE on-chain check
@@ -1502,7 +1582,7 @@ fn migrate_successor_template_mismatch_rejected() {
 
 #[test]
 fn migrate_replay_other_outpoint_rejected() {
-    // The OPS role attested for outpoint txid seed 0x77, but the input
+    // The quorum attested for outpoint txid seed 0x77, but the input
     // actually spends the outpoint with txid seed 0x50 (MigrateCfg::honest()'s
     // default). The on-chain OpOutpointTxId binds the REAL spend, so the
     // recomputed msg_hash differs from what was signed -- the 0x77
@@ -1516,8 +1596,8 @@ fn migrate_replay_other_outpoint_rejected() {
 fn migrate_of_frozen_coin_rejected() {
     // Audit fix (MEDIUM): "freeze == total owner immobility" -- a frozen
     // (sanctioned) coin must not be migratable to an arbitrary successor
-    // template by its owner, even with an otherwise fully honest owner + OPS
-    // co-signature -- that would let a frozen coin escape governance
+    // template by its owner, even with an otherwise fully honest owner +
+    // 2-of-3 quorum -- that would let a frozen coin escape governance
     // entirely. Only the issuer's SEIZE branch (no owner signature, no frozen
     // gate) may act on a frozen coin.
     let cfg = MigrateCfg { frozen_flag: frozen_flag::SET, ..MigrateCfg::honest() };
@@ -1528,10 +1608,10 @@ fn migrate_of_frozen_coin_rejected() {
 #[test]
 fn migrate_of_unfrozen_coin_accepts() {
     // Regression guard: the new frozen_flag gate must not disturb the
-    // existing happy path -- an unfrozen coin's owner + OPS co-signed MIGRATE
-    // still accepts (same scenario as `migrate_owner_plus_ops_accepts`, named
+    // existing happy path -- an unfrozen coin's owner + quorum co-signed
+    // MIGRATE still accepts (same scenario as the happy-path test, named
     // to pair explicitly with `migrate_of_frozen_coin_rejected` above).
     let cfg = MigrateCfg { frozen_flag: frozen_flag::CLEAR, ..MigrateCfg::honest() };
     let res = run(&build_migrate(&cfg));
-    assert!(res.is_ok(), "honest owner+OPS MIGRATE of an UNFROZEN coin must be accepted: {res:?}");
+    assert!(res.is_ok(), "honest owner+quorum MIGRATE of an UNFROZEN coin must be accepted: {res:?}");
 }

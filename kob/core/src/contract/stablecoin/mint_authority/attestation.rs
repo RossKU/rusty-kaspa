@@ -103,13 +103,47 @@ pub const MAX_OUTPOINT_INDEX_EXCLUSIVE: u64 = 1 << 31;
 /// different set of fields in this separate contract).
 pub const MAX_AMOUNT_EXCLUSIVE: u64 = 1 << 63;
 
-/// Minimum `mint_amount` for a newly-emitted coin. Because a coin's face amount
-/// IS its native sompi value (the KCC-0020 amount=sompi model), a coin below this
-/// floor carries a KIP-9 storage-mass term (`STORAGE_MASS_PARAMETER` 1e12 / amount)
-/// large enough that the mint tx exceeds a normal block-mass budget and will not
-/// relay. 0.1 KAS keeps that term negligible. Enforced off-chain at build time;
-/// on-chain enforcement is unnecessary because a dust mint simply fails to relay,
-/// harming only the would-be minter (no fund loss, no third-party exploit).
+/// Sanity floor on `mint_amount` for a newly-emitted coin: **necessary, not
+/// sufficient**.
+///
+/// Because a coin's face amount IS its native sompi value (the KCC-0020
+/// amount=sompi model), a small mint drives the KIP-9 storage mass of the mint
+/// transaction up. The emitted coin is a covenant-bound P2SH output, so its
+/// UTXO occupies TWO 100-byte storage units (`utxo_plurality` = 2:
+/// 63 const + 35 spk + 32 covenant_id = 130 bytes), and its contribution to
+/// the whole-transaction harmonic term is `C * p^2 / amount` = `4e12 / amount`
+/// -- four times the naive `C / amount` a plurality-1 output would cost.
+///
+/// The relay-gating limit is the mempool's storage-mass block-fit limit
+/// (`block_mass_limits.storage`, 500_000 on all networks;
+/// `mining/src/mempool/check_transaction_limits.rs`). The stricter
+/// pre-Toccata per-dimension standardness cap of 100_000 no longer applies:
+/// Toccata activated on testnet-10 (DAA 467_579_632, ~2026-05-18) and mainnet
+/// (474_165_565, ~2026-06-30).
+///
+/// Crucially, storage mass is a property of the WHOLE transaction (outputs'
+/// harmonic sum minus an input credit), not of `mint_amount` alone: with the
+/// reference MINT shape (authority in/out 1 KAS, one wallet fee input, three
+/// outputs) the true floor is ~8.1e6 sompi, but it rises above this constant
+/// -- to ~1.1e7 -- once the authority's own balance drops to 0.2 KAS, because
+/// output[0] then carries a larger harmonic term of its own. **No constant can
+/// guarantee relay.** This value is therefore a cheap, shape-independent
+/// rejection of obvious dust; the authoritative check is
+/// `kob_core::mass::check_tx_storage_mass` on the fully-built transaction,
+/// which every mint path must run before submission.
+///
+/// Enforced off-chain by [`check_mint_amount_floor`], which every
+/// transaction-building mint path calls before signing.
+/// It is deliberately NOT enforced on-chain: the floor's correct value depends
+/// on transaction shape, so a hardcoded bytecode threshold would either be too
+/// weak to guarantee anything or would permanently forbid legitimate mints in
+/// shapes it never anticipated. A sub-floor mint is also not a third-party
+/// attack -- it needs the MINT role's own key, and a mint that fails to relay
+/// costs only the minter. It is not entirely harmless either, which is why the
+/// off-chain check is a hard error rather than a warning: `running_supply` is
+/// strictly monotonic (no burn path decrements it -- BURN acts on the coin's
+/// own covenant, never on the authority UTXO), so a dust mint that DOES get
+/// mined permanently consumes that much of `current_cap`.
 pub const MIN_MINT_AMOUNT: u64 = 10_000_000;
 
 /// Errors from constructing mint-authority attestation/state material outside
@@ -124,6 +158,14 @@ pub enum MintAuthorityError {
     /// magnitude.
     #[error("value {0} must be < 2^63 to match the on-chain sign-magnitude script-number domain")]
     AmountTooLarge(u64),
+
+    /// `mint_amount` is below [`MIN_MINT_AMOUNT`] -- the emitted coin would
+    /// carry a KIP-9 storage-mass term large enough to push the mint
+    /// transaction past the network's storage-mass limit, so the mint could
+    /// not relay (and, if mined anyway, would permanently consume cap
+    /// headroom for a coin of negligible value).
+    #[error("mint_amount {0} is below the dust floor {1} (KIP-9 storage mass); see MIN_MINT_AMOUNT")]
+    MintAmountBelowFloor(u64, u64),
 }
 
 /// Check that `value` (a `running_supply`/`current_cap`/`mint_amount`/
@@ -136,6 +178,27 @@ pub enum MintAuthorityError {
 pub fn check_numeric_domain(value: u64) -> Result<(), MintAuthorityError> {
     if value >= MAX_AMOUNT_EXCLUSIVE {
         return Err(MintAuthorityError::AmountTooLarge(value));
+    }
+    Ok(())
+}
+
+/// Check that `mint_amount` clears the [`MIN_MINT_AMOUNT`] dust floor.
+///
+/// This is the lower-bound counterpart to [`check_numeric_domain`], and is the
+/// enforcement point [`MIN_MINT_AMOUNT`] refers to. Every transaction-building
+/// mint path MUST call it before signing; it is deliberately NOT wired into
+/// [`build_mint_attestation_message`], which is also the verifier-side and
+/// bytecode-conformance pre-image builder (those callers reconstruct messages
+/// for amounts chosen to exercise encoding, not to be relayed, and must stay
+/// infallible).
+///
+/// It is a NECESSARY condition only -- callers must ALSO run
+/// `kob_core::mass::check_tx_storage_mass` on the assembled transaction, since
+/// the real limit depends on the whole transaction's shape (see
+/// [`MIN_MINT_AMOUNT`]'s doc).
+pub fn check_mint_amount_floor(mint_amount: u64) -> Result<(), MintAuthorityError> {
+    if mint_amount < MIN_MINT_AMOUNT {
+        return Err(MintAuthorityError::MintAmountBelowFloor(mint_amount, MIN_MINT_AMOUNT));
     }
     Ok(())
 }
@@ -290,6 +353,45 @@ mod tests {
         let preimage = build_mint_attestation_preimage(&COV_ID, &TXID, 0, 1000, 2000, &SPK);
         let message = build_mint_attestation_message(&COV_ID, &TXID, 0, 1000, 2000, &SPK);
         assert_eq!(message, *blake3::hash(&preimage).as_bytes());
+    }
+
+    #[test]
+    fn mint_amount_floor_rejects_dust_and_accepts_the_boundary() {
+        // Audit 2026-07-20 §B3. The floor is a hard error, not a warning:
+        // running_supply is strictly monotonic, so a dust mint that does get
+        // mined permanently consumes cap headroom.
+        assert_eq!(check_mint_amount_floor(0), Err(MintAuthorityError::MintAmountBelowFloor(0, MIN_MINT_AMOUNT)));
+        assert_eq!(
+            check_mint_amount_floor(MIN_MINT_AMOUNT - 1),
+            Err(MintAuthorityError::MintAmountBelowFloor(MIN_MINT_AMOUNT - 1, MIN_MINT_AMOUNT))
+        );
+        assert!(check_mint_amount_floor(MIN_MINT_AMOUNT).is_ok());
+        assert!(check_mint_amount_floor(MIN_MINT_AMOUNT + 1).is_ok());
+    }
+
+    #[test]
+    fn mint_amount_floor_clears_storage_mass_in_the_reference_shape() {
+        // Ties the constant to the arithmetic its doc claims, using kaspad's
+        // own KIP-9 calculation rather than a restatement of the formula.
+        // Reference MINT shape: authority coin in/out at 1 KAS, one 1-KAS
+        // wallet fee input, outputs = [authority, minted coin, change].
+        // Covenant-bound P2SH outputs have plurality 2; the wallet ones 1.
+        let one_kas = 100_000_000u64;
+        let est_fee = 250_000u64;
+        let mass_for = |mint_amount: u64| -> u64 {
+            crate::mass::compute_storage_mass_ex(
+                &[(one_kas, 2), (one_kas, 1)],
+                &[(one_kas, 2), (mint_amount, 2), (one_kas - mint_amount - est_fee, 1)],
+            )
+        };
+        assert!(
+            mass_for(MIN_MINT_AMOUNT) <= crate::mass::MAX_TX_MASS,
+            "MIN_MINT_AMOUNT must clear the storage-mass limit in the reference shape (got {})",
+            mass_for(MIN_MINT_AMOUNT)
+        );
+        // ... and the floor is not vacuous: an order of magnitude below it
+        // genuinely blows the limit.
+        assert!(mass_for(MIN_MINT_AMOUNT / 10) > crate::mass::MAX_TX_MASS);
     }
 
     #[test]

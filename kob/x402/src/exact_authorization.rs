@@ -80,13 +80,22 @@ fn write_canonical(value: &serde_json::Value, out: &mut String) -> Result<(), Au
                 if !f.is_finite() {
                     return Err(AuthError::NotSerializable);
                 }
-                if f.fract() == 0.0 && f.abs() < 9_007_199_254_740_992.0 {
+                // The gate is the i64 range, NOT 2^53. `Number.isSafeInteger`'s
+                // threshold is the wrong criterion here: every finite f64 at or
+                // above 2^52 already has a ULP >= 1 and is therefore a whole
+                // number, and `f as i64` is exact for anything in range. Using
+                // 2^53 made 1.5e16 -- barely past the cutoff -- print as
+                // "1.5e+16" where JavaScript prints "15000000000000000".
+                if f.fract() == 0.0 && f >= -9_223_372_036_854_775_808.0 && f <= 9_223_372_036_854_775_295.0 {
                     out.push_str(&format!("{}", f as i64));
                 } else {
-                    // Both sides emit the shortest representation that
-                    // round-trips. They can still differ in exponent spelling
-                    // for extreme magnitudes; no documented x402 field is a
-                    // non-integral number, so that residue stays theoretical.
+                    // Beyond i64, JavaScript keeps printing plain digits up to
+                    // 1e21 while Rust switches to exponent form. No documented
+                    // x402 field is a number at all (amounts travel as decimal
+                    // strings), so this residue is unreachable in practice; it
+                    // is left rather than hand-rolled because a bespoke
+                    // big-decimal printer is more likely to introduce a
+                    // divergence than to remove one.
                     out.push_str(&n.to_string());
                 }
             }
@@ -386,6 +395,14 @@ mod tests {
         // the JS reference implementation.
         let v: serde_json::Value = serde_json::from_str(r#"{"a":1.0,"b":1e3,"c":-2.0}"#).unwrap();
         assert_eq!(canonical_json(&v).unwrap(), r#"{"a":1,"b":1000,"c":-2}"#);
+        // Past 2^53 the value is still a whole number and JavaScript still
+        // prints plain digits; an earlier cut at 2^53 wrongly switched these to
+        // exponent form.
+        let big: serde_json::Value = serde_json::from_str(r#"{"a":9007199254740992.0,"b":1.5e16}"#).unwrap();
+        assert_eq!(canonical_json(&big).unwrap(), r#"{"a":9007199254740992,"b":15000000000000000}"#);
+        // Negative zero prints as JavaScript does.
+        let nz: serde_json::Value = serde_json::from_str(r#"{"z":-0.0}"#).unwrap();
+        assert_eq!(canonical_json(&nz).unwrap(), r#"{"z":0}"#);
         // Genuine integers are untouched.
         let v2: serde_json::Value = serde_json::from_str(r#"{"a":1,"b":18446744073709551615}"#).unwrap();
         assert_eq!(canonical_json(&v2).unwrap(), r#"{"a":1,"b":18446744073709551615}"#);

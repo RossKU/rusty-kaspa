@@ -153,3 +153,32 @@ Both terminal branches are therefore live-proven against the hardened covenant:
 MIGRATE in run 2, BURN here. TRANSFER, FREEZE and SEIZE — the three branches
 that gained template authentication — have now each been accepted on-chain three
 times across the three runs.
+
+## Live run 4 — final, after the TRANSFER frozen_flag fix
+
+The final audit round found that TRANSFER never pinned the successor's
+`frozen_flag` (and dropped `identifier_type` unread). Fixing that changed the
+bytecode again, which invalidates runs 2 and 3 as proof of the SHIPPED covenant —
+a different body is a different redeem script is a different address. So the
+sequence was re-run against the current HEAD:
+
+| # | Op | TXID |
+|---|----|------|
+| 1 | DEPLOY TX1 | `3ced881d8d6380df4f53e8e49ae304b50b24f684e8be5cb2de20c38e05a76fd6` |
+| 2 | DEPLOY TX2 | `57a324937a24b6a2d0494adf379b107ca96802ae4a8bccaf38b1ac5f116be2ca` |
+| 3 | MINT | `ef0430027553befc4e221c27c5ffeabc6513e5d6533cf688a2be4c826e14c68e` |
+| 4 | TRANSFER | `00f8de1eeb227c9235e72f4f989ce46eb8a6dd38e26d43cfa80f67ded0d42f1d` |
+| 5 | FREEZE (flag=1) | `5ac99b0b9e577b215ce6e3b8cf144877b2fca3409c6b6a65ce47f903faf38889` |
+| 6 | SEIZE (2-of-3) | `0800af39f347c5fd65a007303c7a8819c0f4ab647c739be8924c96122ceea74a` |
+| 7 | UNFREEZE (flag=0) | `b86b7e2eaabf05de11b386a652fb857b0cf52a1e854d1db5d85591142e73fc06` |
+| 8 | MIGRATE | `684128bbb2a0956d7afb4e11c0741c32c10f6f94b604ff135c63131289cdc969` |
+| 9 | RAISE_CAP | `a3ebc66630c4ca01cdde0af6efde02b3d1ad4e2aab723f6ee876b4b835c935b2` |
+
+This run also exercises the two checks TRANSFER gained (successor `frozen_flag`
+pinned to CLEAR, successor `identifier_type` pinned to the coin's own) on a real
+node — the honest path still passes with both in place.
+
+**Reading the four runs:** only runs 3 and 4 were produced by bytecode that
+still exists. Run 3 is the BURN branch under the template-authentication fix;
+run 4 is everything else under the final bytecode. BURN itself is untouched by
+the TRANSFER change, so run 3 stands. Runs 1 and 2 are historical.

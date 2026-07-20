@@ -327,6 +327,18 @@ async fn verify_utxo(
 /// Pick a spendable wallet P2PK UTXO with at least `min_value` sompi,
 /// smallest-first (mirrors the `.min_by_key` selection idiom used
 /// throughout `kob_e2e_util.rs`/`cli/src/stablecoin.rs`).
+/// What a fee-only input must actually hold: the fee itself plus a change
+/// output that clears `MIN_UTXO_VALUE`.
+///
+/// `pick_wallet_utxo` picks the SMALLEST UTXO clearing `min_value`, so passing
+/// a number below the true requirement is not merely imprecise -- it actively
+/// selects a UTXO that is doomed to fail the change check later, while ignoring
+/// larger ones that would have worked. The 2026-07-20 BURN-path live run died
+/// exactly that way ("fee UTXO 3183989 too small after fee 1347300") on a
+/// `300_000` request. Observed covenant-op fees on testnet-10 run 1.1-1.6M
+/// sompi, so 2M of fee headroom on top of the change floor is comfortable.
+const FEE_INPUT_MIN: u64 = kob_core::MIN_UTXO_VALUE + 2_000_000;
+
 async fn pick_wallet_utxo(rpc: &NodeClient, wallet: &WalletContext, min_value: u64) -> anyhow::Result<RpcUtxo> {
     let utxos = rpc.get_spendable_utxos(&wallet.address).await?;
     utxos
@@ -843,7 +855,7 @@ async fn op_mint(
 
     let old_authority_p2sh = build_p2sh(authority_rs_old);
 
-    let fee_utxo = pick_wallet_utxo(rpc, wallet, mint_amount + 300_000).await?;
+    let fee_utxo = pick_wallet_utxo(rpc, wallet, mint_amount + FEE_INPUT_MIN).await?;
     println!(
         "MINT fee/funding UTXO: {}:{} ({} sompi)",
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
@@ -990,7 +1002,7 @@ async fn op_transfer(
     let successor_p2sh = build_p2sh(&successor_rs);
     let successor_addr = kob_cli::cancel::p2sh_to_address(successor_p2sh.script(), "kaspatest");
 
-    let fee_utxo = pick_wallet_utxo(rpc, wallet, 300_000).await?;
+    let fee_utxo = pick_wallet_utxo(rpc, wallet, FEE_INPUT_MIN).await?;
     println!(
         "TRANSFER fee UTXO: {}:{} ({} sompi)",
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
@@ -1107,7 +1119,7 @@ async fn op_freeze(
     // TRANSFER/BURN's `current_p2sh` rather than leaving the same latent trap.
     let current_p2sh = build_p2sh(&coin.rs);
 
-    let fee_utxo = pick_wallet_utxo(rpc, wallet, 300_000).await?;
+    let fee_utxo = pick_wallet_utxo(rpc, wallet, FEE_INPUT_MIN).await?;
     println!(
         "FREEZE(new_flag={}) fee UTXO: {}:{} ({} sompi)",
         new_frozen_flag, fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
@@ -1217,7 +1229,7 @@ async fn op_seize(
     // TRANSFER/BURN's `current_p2sh` rather than leaving the same latent trap.
     let current_p2sh = build_p2sh(&coin.rs);
 
-    let fee_utxo = pick_wallet_utxo(rpc, wallet, 300_000).await?;
+    let fee_utxo = pick_wallet_utxo(rpc, wallet, FEE_INPUT_MIN).await?;
     println!(
         "SEIZE fee UTXO: {}:{} ({} sompi)",
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
@@ -1364,7 +1376,7 @@ async fn op_migrate(
     // not the raw redeem script (see op_burn's `current_p2sh` doc).
     let current_p2sh = build_p2sh(&coin.rs);
 
-    let fee_utxo = pick_wallet_utxo(rpc, wallet, 300_000).await?;
+    let fee_utxo = pick_wallet_utxo(rpc, wallet, FEE_INPUT_MIN).await?;
     println!(
         "MIGRATE fee UTXO: {}:{} ({} sompi)",
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
@@ -1508,7 +1520,7 @@ async fn op_burn(rpc: &NodeClient, wallet: &WalletContext, roles: &RoleCtx, coin
 
     let sink_spk = build_p2sh(&kob_core::contract::stablecoin::BURN_SINK_SCRIPT);
 
-    let fee_utxo = pick_wallet_utxo(rpc, wallet, 300_000).await?;
+    let fee_utxo = pick_wallet_utxo(rpc, wallet, FEE_INPUT_MIN).await?;
     println!(
         "BURN fee UTXO: {}:{} ({} sompi)",
         fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount

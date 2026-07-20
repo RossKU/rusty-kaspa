@@ -123,17 +123,33 @@ covenant id and shape before the next op was built.
   the 500,000 limit and none was rejected by the node for mass — the local
   KIP-9 calculation agrees with what the network enforced.
 
-## BURN was not re-run: why that is acceptable
+## Live run 3 — the BURN path, same binary plus a fee-selection fix
 
-A second run without `MIGRATE_DEMO` reached DEPLOY → MINT → TRANSFER → FREEZE →
-SEIZE (double-confirming every branch this work touched) and then stopped at
-UNFREEZE with `fee UTXO 3183989 too small after fee 1347300` — the wallet's
-remaining UTXO could not leave a `MIN_UTXO_VALUE` (3,000,000 sompi) change
-output. That is the harness's own guard behaving correctly, not a covenant
-failure; the wallet simply needs refunding.
+Run 2's BURN-path attempt stopped at UNFREEZE with `fee UTXO 3183989 too small
+after fee 1347300`. The cause was not a shortage of funds but
+`pick_wallet_utxo`, which returns the SMALLEST UTXO clearing `min_value` — and
+the covenant ops asked for `300_000` when the real requirement is the fee
+(1.1–1.6M sompi on testnet-10) plus a change output clearing `MIN_UTXO_VALUE`
+(3,000,000). Asking for too little does not merely under-specify: it actively
+selects a UTXO that is doomed to fail the change check later, while passing over
+larger ones that would have worked. Fixed by introducing `FEE_INPUT_MIN`
+(`MIN_UTXO_VALUE + 2_000_000`) and using it at every fee-only call site.
 
-BURN's bytecode and sigscript are untouched by this round of work — it has no
-`new_rs` (its successor is the fixed unspendable sink), so no template
-authentication applies to it — and it is already proven live by run 1 above. Its
-re-verification is therefore a funding chore, not an open risk. **Pending: refund
-the wallet and run the BURN path once for completeness.**
+With that fix the full BURN sequence completed on the first attempt:
+
+| # | Op | TXID |
+|---|----|------|
+| 1 | DEPLOY TX1 | `ff9583bec021d186dd819faee13b2457560d12719139b46e26d6dd674bfcd07b` |
+| 2 | DEPLOY TX2 | `9b96a50587d9a7b0e00666a7599ba3d4ca7fc0d27ea47cdf1a7b08787b4cf7cc` |
+| 3 | MINT | `db575ea1ffb4ed89f34d45987bdc3c2d2a754edd2d33f94bb934787cf68055a1` |
+| 4 | TRANSFER | `eb8dd8b8b95ab6e3a563ef3d263b3cfd4e2f1456c48adf03ffc99d21fdf41665` |
+| 5 | FREEZE (flag=1) | `08c3dff10e9cc4eca99d577eea365f5c689a0e48918f70762d4c5721a1002cac` |
+| 6 | SEIZE (2-of-3) | `81faebca5ca6abdc354c9f4468317f7b8f00d5da782c7887cd0bb957c12b0d19` |
+| 7 | UNFREEZE (flag=0) | `d412abd69ab93890b201acb8395d2f87bdc88bcaec361ebf0e930cc81707437a` |
+| 8 | **BURN** | `583b511ac18a4aceb16cead3a8fa633e697ba63f2d10db5ffa9e518ef6aaca9d` |
+| 9 | RAISE_CAP | `bc878cc0abff607d08b65fa975591cd8bb7d9ece28f48c488a24c73581bbde50` |
+
+Both terminal branches are therefore live-proven against the hardened covenant:
+MIGRATE in run 2, BURN here. TRANSFER, FREEZE and SEIZE — the three branches
+that gained template authentication — have now each been accepted on-chain three
+times across the three runs.

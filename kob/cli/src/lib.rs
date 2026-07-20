@@ -1,9 +1,5 @@
 #![allow(clippy::too_many_arguments)]
 
-// TODO: replaced by new robust-stablecoin CLI migration (obsolete case-A
-// single-authority API; kob-core changed to the robust stablecoin covenant
-// and these modules no longer compile against it -- gated out, not deleted).
-// pub mod attest;
 pub mod auto_match;
 pub mod batch;
 pub mod bracket;
@@ -35,9 +31,6 @@ pub mod rest;
 pub mod rpc;
 pub mod scan;
 pub mod signing;
-// TODO: replaced by new robust-stablecoin CLI migration (obsolete case-A
-// single-authority API; see matching note above `attest` mod).
-// pub mod stablecoin;
 pub mod status;
 pub mod stop;
 pub mod tif;
@@ -510,28 +503,6 @@ pub enum Commands {
         #[command(subcommand)]
         action: token::TokenCommand,
     },
-
-    // TODO: replaced by new robust-stablecoin CLI migration. The `Attest`
-    // and `Stablecoin` subcommands called the obsolete case-A (single-
-    // authority) stablecoin API, which no longer matches kob-core's robust
-    // stablecoin covenant. Gated out (not deleted) until the new-API CLI
-    // migration lands.
-    //
-    // /// KCC-0020 stablecoin issuer-attestation tool (WU-D): sign the
-    // /// per-spend attestation a stablecoin transfer needs from the token
-    // /// issuer. Fully offline -- no node/wallet connection is made.
-    // Attest {
-    //     #[command(subcommand)]
-    //     action: attest::AttestCommand,
-    // },
-    //
-    // /// KCC-0020 stablecoin (Plan A, native-value) operations: deploy, mint,
-    // /// transfer (WU-E). Transfers are gated by a fresh issuer attestation
-    // /// from `kob-cli attest sign` (WU-D) -- see `stablecoin transfer --help`.
-    // Stablecoin {
-    //     #[command(subcommand)]
-    //     action: stablecoin::StablecoinCommand,
-    // },
 
     /// Automated continuous scanning and matching for a token pair.
     AutoMatch {

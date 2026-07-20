@@ -4857,6 +4857,7 @@ name = "kob-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
  "futures-util",
  "hex",
@@ -4949,14 +4950,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kob-lab"
-version = "0.1.0"
-dependencies = [
- "hex",
- "kob-core",
-]
-
-[[package]]
 name = "kob-settle"
 version = "0.1.0"
 dependencies = [
@@ -4995,6 +4988,7 @@ dependencies = [
  "anyhow",
  "axum 0.7.9",
  "base64",
+ "blake3",
  "hex",
  "kaspa-consensus-core",
  "kob-core",

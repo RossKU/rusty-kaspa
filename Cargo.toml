@@ -74,7 +74,6 @@ members = [
     "kob/domain",
     "kob/cli",
     "kob/engine",
-    "kob/lab",
     "kob/x402",
 ]
 

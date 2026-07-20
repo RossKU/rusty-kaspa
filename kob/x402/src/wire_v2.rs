@@ -37,6 +37,15 @@ pub const BINDING_EXACT: &str = "kaspa-exact-v2";
 pub const BINDING_NATIVE: &str = "kaspa-native-v1";
 /// KOB KCC20 token binding under the v2 envelope (not strict interop).
 pub const BINDING_KCC20: &str = "kaspa-kcc20-v1";
+/// KOB robust-stablecoin covenant binding under the v2 envelope (not strict
+/// interop; §7.4(B) of `STABLECOIN_FOUR_AXIS_AUDIT_2026-07-20.md`, G-x1).
+/// A payment under this binding is a single 1:1 TRANSFER of the KCC-0020
+/// "Plan A" robust stablecoin covenant (`kob-core`'s
+/// `contract::stablecoin`), NOT the generic `token_unit` covenant `kcc20`
+/// verifies -- the redeem-script template differs (role pubkeys,
+/// `role_registry_root`, `frozen_flag`, `epoch`) and every spend requires an
+/// issuer OPS attestation, so it needs its own scheme (`scheme_stablecoin`).
+pub const BINDING_STABLECOIN: &str = "kaspa-stablecoin-v1";
 
 /// alpha.8 exact profiles. `standard-native` is the default/baseline profile
 /// (plain native transfer — the "standard-transfer exact" baseline);

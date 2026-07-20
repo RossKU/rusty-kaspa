@@ -21,11 +21,12 @@ use crate::reservation::ReservationProvider;
 use crate::scheme_exact;
 use crate::scheme_kcc20;
 use crate::scheme_native;
+use crate::scheme_stablecoin;
 use crate::fingerprint;
 use crate::wire_v2::{
     errors, unix_secs_from_iso8601, AwaitRequest, FacilitatorRequest, KaspaSettleExt, Outpoint,
     PaymentRequired, PaymentRequirements, Resource, SettlementResponse, VerifyResponse, ASSET_KAS,
-    AUTHORIZATION_VERSION, BINDING_EXACT, BINDING_KCC20, BINDING_NATIVE, NETWORK_TESTNET10,
+    AUTHORIZATION_VERSION, BINDING_EXACT, BINDING_KCC20, BINDING_NATIVE, BINDING_STABLECOIN, NETWORK_TESTNET10,
     PROFILE_ADDITIVE, PROFILE_STANDARD_NATIVE, SCHEME_EXACT, TEMPLATE_KIP10_ADDITIVE,
     TX_ENCODING_SAFE_JSON, X402_VERSION,
 };
@@ -299,6 +300,18 @@ fn kcc20_reject_code(r: scheme_kcc20::Kcc20Reject) -> &'static str {
         FingerprintMissing | FingerprintMismatch { .. } => errors::INVALID_PAYLOAD,
         Malformed(_) | BadAsset(_) | BadRecipient(_) | BadPayer(_) | MissingCovenantBinding
         | NoInputs => errors::INVALID_PAYLOAD,
+    }
+}
+
+/// Map a stablecoin-scheme reject to a closed wire error code.
+fn stablecoin_reject_code(r: scheme_stablecoin::StablecoinReject) -> &'static str {
+    use scheme_stablecoin::StablecoinReject::*;
+    match r {
+        WrongRecipient | Underpayment { .. } => errors::INVALID_PAYMENT_REQUIREMENTS,
+        FingerprintMissing | FingerprintMismatch { .. } => errors::INVALID_PAYLOAD,
+        Malformed(_) | BadAsset(_) | BadRecipient(_) | BadPayer(_) | BadTemplate(_)
+        | MissingCovenantBinding | SuccessorTemplateMismatch | NoCovenantInput
+        | MultipleCovenantInputs | ForgedOpsAttestation | NoInputs => errors::INVALID_PAYLOAD,
     }
 }
 
@@ -701,7 +714,7 @@ impl<B: ChainBackend> Facilitator<B> {
             return Ok(validated);
         }
 
-        if binding != BINDING_NATIVE && binding != BINDING_KCC20 {
+        if binding != BINDING_NATIVE && binding != BINDING_KCC20 && binding != BINDING_STABLECOIN {
             return Err(errors::UNSUPPORTED_SCHEME);
         }
 
@@ -713,8 +726,9 @@ impl<B: ChainBackend> Facilitator<B> {
         let binding_fingerprint = requirements.fingerprint().map(|s| s.to_string()).ok_or(errors::INVALID_PAYLOAD)?;
 
         // `owner_addresses`: the address(es) whose unspent UTXO sets must cover
-        // every spent input. `require_covenant`: for KCC20, at least one spent
-        // input must be an on-chain UTXO carrying this token covenant id.
+        // every spent input. `require_covenant`: for KCC20/stablecoin, at
+        // least one spent input must be an on-chain UTXO carrying this token
+        // covenant id.
         let (validated, owner_addresses, require_covenant): (Validated, Vec<String>, Option<String>) =
             if is_native {
                 let v = scheme_native::verify_native_exact(&transaction, &from, requirements)
@@ -738,7 +752,7 @@ impl<B: ChainBackend> Facilitator<B> {
                     owners,
                     None,
                 )
-            } else {
+            } else if binding == BINDING_KCC20 {
                 let v = scheme_kcc20::verify_kcc20_exact(&transaction, &from, requirements)
                     .map_err(kcc20_reject_code)?;
                 // Inputs may include the token covenant UTXO (at the payer's
@@ -757,6 +771,37 @@ impl<B: ChainBackend> Facilitator<B> {
                         pay_to: requirements.pay_to.clone(),
                         // KCC20: the payment output lives at the recipient's
                         // token_unit P2SH address, not their P2PK identity.
+                        confirm_address,
+                        amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
+                        binding_fingerprint,
+                        reservation_id: None,
+                        settle_ext: KaspaSettleExt::default(),
+                    },
+                    owners,
+                    Some(asset),
+                )
+            } else {
+                // BINDING_STABLECOIN (§7.4(B) G-x1): robust KCC-0020 stablecoin
+                // covenant TRANSFER, verified by `scheme_stablecoin` (a single
+                // 1:1 spend of the payer's own stablecoin covenant UTXO --
+                // there is no separate KAS fee input in this binding's shape,
+                // unlike KCC20's generic token_unit).
+                let v = scheme_stablecoin::verify_stablecoin_transfer(&transaction, &from, requirements)
+                    .map_err(stablecoin_reject_code)?;
+                let owners = vec![v.payer_stablecoin_address.clone(), from.clone()];
+                let asset = v.asset.clone();
+                let confirm_address = v.recipient_stablecoin_address.clone();
+                (
+                    Validated {
+                        artifact_id: v.artifact_id,
+                        payer: v.payer,
+                        pay_output_index: v.pay_output_index,
+                        input_outpoints: v.input_outpoints,
+                        tx: v.tx,
+                        pay_to: requirements.pay_to.clone(),
+                        // Stablecoin: the payment output lives at the
+                        // recipient's stablecoin covenant P2SH address, not
+                        // their P2PK identity.
                         confirm_address,
                         amount: requirements.amount_sompi().map_err(|_| errors::INVALID_PAYMENT_REQUIREMENTS)?,
                         binding_fingerprint,
@@ -1921,6 +1966,167 @@ mod tests {
         let s = fac.settle(&req).await;
         assert!(!s.success);
         assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    // --- stablecoin binding (§7.4(B), audit finding G-x1) ---
+
+    fn stablecoin_test_template() -> scheme_stablecoin::StablecoinTemplate {
+        scheme_stablecoin::StablecoinTemplate {
+            identifier_type: kob_core::contract::token::identifier_type::PUBKEY,
+            role_registry_root: [0x77; 32],
+            frozen_flag: kob_core::contract::stablecoin::state::frozen_flag::CLEAR,
+            epoch: 3,
+            ops_pubkey: kob_settle::signing::get_public_key(&[99u8; 32]).unwrap(),
+            freeze_pubkey: [0xDD; 32],
+            seize_pubkeys: [[0x91; 32], [0x92; 32], [0x93; 32]],
+            recovery_pubkeys: [[0xA1; 32], [0xA2; 32], [0xA3; 32]],
+            mint_pubkey: [0xFA; 32],
+        }
+    }
+
+    fn stablecoin_addr_and_spk(pubkey: &[u8; 32], t: &scheme_stablecoin::StablecoinTemplate) -> (String, String) {
+        let rs = kob_core::contract::stablecoin::build_stablecoin_redeem_script(
+            pubkey, t.identifier_type, &t.role_registry_root, t.frozen_flag, t.epoch,
+            &t.ops_pubkey, &t.freeze_pubkey, &t.seize_pubkeys, &t.recovery_pubkeys, &t.mint_pubkey,
+        );
+        let spk = kob_settle::build_p2sh(&rs);
+        let spk_bytes = spk.script().to_vec();
+        let addr = kob_settle::bech32::spk_to_address(&spk_bytes, "kaspatest").unwrap();
+        (addr, hex::encode(&spk_bytes))
+    }
+
+    /// Build a genuinely OPS-attested stablecoin TRANSFER payment request
+    /// (via the real client builder + `TestOpsOracle`): spends the payer's
+    /// stablecoin covenant UTXO (`in_txid:0`) and creates a recipient
+    /// covenant output of `amount` bound to `asset`.
+    fn stablecoin_request(
+        payer_pk: &[u8; 32],
+        recipient_pk: &[u8; 32],
+        t: &scheme_stablecoin::StablecoinTemplate,
+        asset: &str,
+        amount: u64,
+        in_txid: &str,
+        req_amount: u64,
+    ) -> (FacilitatorRequest, String) {
+        let payer_addr = kob_settle::wallet::pubkey_to_address(payer_pk, kob_settle::types::Network::Testnet);
+        let recipient_addr = kob_settle::wallet::pubkey_to_address(recipient_pk, kob_settle::types::Network::Testnet);
+        let fp = test_fp();
+        let asset_bytes: [u8; 32] = hex::decode(asset).unwrap().try_into().unwrap();
+        let in_txid_bytes: [u8; 32] = hex::decode(in_txid).unwrap().try_into().unwrap();
+        let oracle = scheme_stablecoin::TestOpsOracle { ops_privkey: [99u8; 32] };
+        let art = scheme_stablecoin::build_stablecoin_transfer_artifact(
+            payer_pk, recipient_pk, t, &asset_bytes, &in_txid_bytes, 0, amount, &oracle, Some(&fp),
+        )
+        .unwrap();
+
+        let mut extra = t.to_extra_fields();
+        extra["binding"] = serde_json::json!(BINDING_STABLECOIN);
+        extra["assetId"] = serde_json::json!(asset);
+        extra["fingerprint"] = serde_json::json!(fp);
+        let requirements = PaymentRequirements {
+            scheme: SCHEME_EXACT.to_string(),
+            network: NETWORK_TESTNET10.to_string(),
+            amount: req_amount.to_string(),
+            asset: ASSET_KAS.to_string(),
+            pay_to: recipient_addr,
+            max_timeout_seconds: 60,
+            extra,
+            additional: Default::default(),
+        };
+        let req = FacilitatorRequest {
+            x402_version: X402_VERSION,
+            payment_payload: PaymentPayload {
+                x402_version: X402_VERSION,
+                accepted: requirements.clone(),
+                payload: serde_json::json!({
+                    "type": "kob-stablecoin-transfer",
+                    "payerAddress": payer_addr.clone(),
+                    "transaction": art["transaction"],
+                }),
+                extensions: None,
+            },
+            payment_requirements: requirements,
+            request_hash: None,
+            resource: None,
+        };
+        (req, payer_addr)
+    }
+
+    #[tokio::test]
+    async fn stablecoin_verify_and_settle_happy_path() {
+        let payer_pk = [1u8; 32];
+        let recipient_pk = [2u8; 32];
+        let t = stablecoin_test_template();
+        let asset = "ab".repeat(32);
+        let in_txid = "cc".repeat(32);
+        let (payer_addr, payer_spk) = stablecoin_addr_and_spk(&payer_pk, &t);
+
+        // The payer owns a stablecoin covenant UTXO for `asset` at their
+        // stablecoin P2SH address, holding 50 units.
+        let chain = MockChain::new(true).with_covenant_utxo(&payer_addr, &payer_spk, &in_txid, 0, 50_000_000, &asset);
+        let fac = Facilitator::new(chain, tmp_store("stablecoin_happy"), config());
+        let (req, _payer) = stablecoin_request(&payer_pk, &recipient_pk, &t, &asset, 50_000_000, &in_txid, 50_000_000);
+
+        let v = fac.verify(&req).await;
+        assert!(v.is_valid, "stablecoin verify: {:?}", v.invalid_reason);
+
+        let s = fac.settle(&req).await;
+        assert!(s.success, "stablecoin settle: {:?}", s.error_reason);
+        assert!(!s.transaction.is_empty());
+        assert_eq!(fac.backend.submit_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn stablecoin_rejects_when_covenant_input_absent_on_chain() {
+        let payer_pk = [1u8; 32];
+        let recipient_pk = [2u8; 32];
+        let t = stablecoin_test_template();
+        let asset = "ab".repeat(32);
+        let in_txid = "ce".repeat(32);
+        let (payer_addr, payer_spk) = stablecoin_addr_and_spk(&payer_pk, &t);
+
+        // The spent input exists on-chain but carries a DIFFERENT covenant id
+        // -- the facilitator's generic on-chain covenant check (shared with
+        // KCC20 via `check_inputs_on_chain`) must still catch this even
+        // though the artifact's own pure verification (asset id parsed from
+        // requirements) already passed.
+        let chain = MockChain::new(true).with_covenant_utxo(&payer_addr, &payer_spk, &in_txid, 0, 50_000_000, &"cd".repeat(32));
+        let fac = Facilitator::new(chain, tmp_store("stablecoin_nocov"), config());
+        let (req, _payer) = stablecoin_request(&payer_pk, &recipient_pk, &t, &asset, 50_000_000, &in_txid, 50_000_000);
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid, "must reject: covenant input does not match asset on-chain");
+        let s = fac.settle(&req).await;
+        assert!(!s.success);
+        assert_eq!(fac.backend.submit_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stablecoin_rejects_forged_ops_attestation_at_facilitator_level() {
+        let payer_pk = [1u8; 32];
+        let recipient_pk = [2u8; 32];
+        let t = stablecoin_test_template();
+        let asset = "ab".repeat(32);
+        let in_txid = "cf".repeat(32);
+        let (payer_addr, payer_spk) = stablecoin_addr_and_spk(&payer_pk, &t);
+        let chain = MockChain::new(true).with_covenant_utxo(&payer_addr, &payer_spk, &in_txid, 0, 50_000_000, &asset);
+        let fac = Facilitator::new(chain, tmp_store("stablecoin_forged"), config());
+        let (mut req, _payer) = stablecoin_request(&payer_pk, &recipient_pk, &t, &asset, 50_000_000, &in_txid, 50_000_000);
+
+        // Bit-flip a byte inside the issuer_sig field of the covenant
+        // input's sigscript (same technique as `scheme_stablecoin`'s own
+        // `rejects_forged_ops_attestation` test).
+        let tx = req.payment_payload.payload.get_mut("transaction").unwrap();
+        let ss_hex = tx["inputs"][0]["signatureScript"].as_str().unwrap().to_string();
+        let mut ss = hex::decode(&ss_hex).unwrap();
+        let (self_rs, n1) = kob_core::contract::kcc20::decode_push_explicit(&ss).unwrap();
+        let _ = self_rs;
+        ss[n1 + 1] ^= 0xff; // inside issuer_sig's 64-byte payload
+        tx["inputs"][0]["signatureScript"] = serde_json::json!(hex::encode(&ss));
+
+        let v = fac.verify(&req).await;
+        assert!(!v.is_valid, "must reject: forged OPS attestation");
+        assert_eq!(v.invalid_reason.as_deref(), Some(errors::INVALID_PAYLOAD));
     }
 
     #[tokio::test]

@@ -18,6 +18,10 @@
 //! - [`scheme_native`] — KOB-native binding "exact" verification (pure).
 //! - [`scheme_exact`] — strict-interop `kaspa-exact-v2` verification for both
 //!   alpha.8 profiles (pure).
+//! - [`scheme_stablecoin`] — robust KCC-0020 stablecoin covenant TRANSFER
+//!   binding (`kaspa-stablecoin-v1`) verification (pure), plus the client
+//!   tx builder and OPS-attestation co-sign seam (§7.4(B) of
+//!   `STABLECOIN_FOUR_AXIS_AUDIT_2026-07-20.md`, audit finding G-x1).
 //! - [`facilitator`] — verify/settle orchestration with replay protection and
 //!   idempotent settlement, over a mockable [`facilitator::ChainBackend`].
 //! - [`server`] — axum HTTP server.
@@ -31,6 +35,7 @@ pub mod reservation;
 pub mod scheme_exact;
 pub mod scheme_kcc20;
 pub mod scheme_native;
+pub mod scheme_stablecoin;
 pub mod server;
 pub mod transaction_id;
 pub mod wire_v2;
@@ -40,6 +45,6 @@ pub use reservation::{BorrowTerms, ReservationProvider};
 pub use wire_v2::{
     AwaitRequest, FacilitatorRequest, PaymentPayload, PaymentRequired, PaymentRequirements,
     SettlementResponse, SupportedResponse, VerifyResponse,
-    ASSET_KAS, BINDING_EXACT, BINDING_KCC20, BINDING_NATIVE, NETWORK_MAINNET, NETWORK_TESTNET10,
+    ASSET_KAS, BINDING_EXACT, BINDING_KCC20, BINDING_NATIVE, BINDING_STABLECOIN, NETWORK_MAINNET, NETWORK_TESTNET10,
     PROFILE_ADDITIVE, PROFILE_STANDARD_NATIVE, SCHEME_EXACT, X402_VERSION,
 };

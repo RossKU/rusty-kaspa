@@ -1,5 +1,31 @@
 # KCC-0020 / KCC-0001 ステーブルコイン機能ギャップ統合レポート
 
+> **[2026-07-20 追記 — 本レポートは古くなった箇所を含む]**
+> 本レポートは **2026-07-19 13:45 執筆**。その**5時間後**、同じ日のうちに
+> `kob/core/src/contract/stablecoin/`(+ `mint_authority/` サブモジュール)の
+> robust stablecoin covenant の実装が始まり、2026-07-20 にかけて hardening が
+> 入り、**testnet-10 で 3 回 live 実行済み**になった(1 回目: hardening 前の
+> DEPLOY→MINT→TRANSFER→FREEZE→SEIZE→UNFREEZE→BURN→RAISE_CAP、2 回目:
+> hardening 後の再走 + MIGRATE 初 live 実行、3 回目: hardening 後の BURN 分岐)。
+> 2/3 回目は CRITICAL 修正(successor template authentication)後のバイナリで
+> 走っており、covenant body が変わった＝ P2SH アドレスも変わったため、1 回目の
+> 出力とは別物である。詳細は `STABLECOIN_E2E_LIVE.md`。
+>
+> 結果、第 2 章のマスターテーブルを筆頭に、本レポートが「未実装」「なし」と
+> 記した機能のうち **mint / burn / freeze / seize / role-separation /
+> upgradeability(migrate)/ supply-cap の拡張分**は、**KOB が実装済み**という
+> 状態に変わっている。訂正の原則は一貫している(第 4 章の骨子と同じ):
+> **「KCC-0020 仕様にこれらが無い」という指摘そのものは今も真**(第 4 章で
+> 提案した named extension は依然どれも仕様側には未提出)。**変わったのは
+> 「KOB がそれを実装したか」であり、その実装は KCC-0020 準拠の named
+> extension としてではなく、独立した bespoke covenant として行われた**。
+> 該当箇所には `[2026-07-20]` 注記を付けて訂正してある。
+>
+> 設計の正本は `STABLECOIN_ROBUST_DESIGN.md`、コードは
+> `kob/core/src/contract/stablecoin/`、post-live 監査は
+> `STABLECOIN_AUDIT_2026-07-20.md`(template 認証の CRITICAL fix を含む)、
+> live 実行結果は `STABLECOIN_E2E_LIVE.md` を参照。
+
 規制準拠ステーブルコイン(USDT/USDC 型)の必須機能セットを、KCC-0020(Fungible
 Token Covenant Specification)/ KCC-0001(Covenant ABI)の現状と照合し、UTXO /
 BlockDAG モデル固有の実装上の緊張点まで含めて整理する。目的は「KCC に何が足り
@@ -108,13 +134,21 @@ KOB では未使用である。KOB の price attestation 配線(sigScript でデ
 covenant が読む、`spot/order.rs:95-113`)は近い配線経験だが別 opcode(生データ読み
 出し)であり、この区別は第 3.5 章で正確に扱う。
 
-**KOB への含意。** KOB が stablecoin covenant を発行するなら、既存の
-`transfer`/`transfer_delegator` に加えて issuer-authority extension(seize 分岐 +
-per-UTXO frozen フラグ)を実装する必要がある。さらに、KOB は covenant orderbook
-DEX であるため、**issuer-freeze/seize 付き資産を注文エスクローの担保に取ると、
-エスクロー中に発行体が没収した瞬間に settle 不能となり注文が沈黙死するリスク**
-(`KCC20_ISSUES.md §5.6`、ISSUE-15 と同型)がある。この座礁リスクは、凍結可能性を
-descriptor から機械判読可能にすることで事前回避すべきである。
+**KOB への含意。** **[2026-07-20 更新]** 本節執筆時点(2026-07-19)では、KOB が
+stablecoin covenant を発行するなら issuer-authority extension(seize 分岐 +
+frozen フラグ)を実装する必要がある、という未来形の記述だった。KOB は既に
+`kob/core/src/contract/stablecoin/` として issuer-authority 相当(freeze・
+seize・role-separation・upgradeability/migrate)と、別 covenant
+`mint_authority/`(mint・supply-cap)を実装し、testnet-10 で 2 回 live 実行済み
+である(KCC-0020 の named extension としてではなく bespoke covenant として、
+`STABLECOIN_ROBUST_DESIGN.md` / `STABLECOIN_E2E_LIVE.md`)。一方、次の DEX
+エスクロー座礁リスクの分析は今も未解決の open item のままである: KOB は
+covenant orderbook DEX であるため、**issuer-freeze/seize 付き資産を注文エスクロー
+の担保に取ると、エスクロー中に発行体が没収した瞬間に settle 不能となり注文が
+沈黙死するリスク**(`KCC20_ISSUES.md §5.6`、ISSUE-15 と同型)がある。この座礁
+リスクは、凍結可能性を descriptor から機械判読可能にすることで事前回避すべき
+であり、issuer-authority が実在の covenant になった今、この risk は仮説ではなく
+KOB 自身が発行しうる資産に対して現実の検討事項になっている。
 
 
 
@@ -134,19 +168,19 @@ descriptor から機械判読可能にすることで事前回避すべきであ
 
 | # | 機能 | 規制優先度 | KCC-0020 現状 | KOB 実装 | UTXO 実現パターン |
 |---|------|:---:|------|------|------|
-| 1 | **mint(発行)** | MUST | なし(`transfer` は amount 保存のみ、発行エントリポイント無し) | なし | B(reissuance token / group key)または D |
-| 2 | **burn(償却)** | MUST | なし(償却エントリポイント無し) | なし | B / ネイティブ(unspendable へ送る) |
-| 3 | **supply-cap / 供給整合性** | MUST | 部分: `transfer` は total 保存を意図するが cardinality 上限が仕様に無く、unroll 境界外の input が保存則を逃れて**インフレ可能**(ISSUE-19) | あり(緩和): `KCC20_TRANSFER_MAX_N=4` + `OpCovInputCount/OpCovOutputCount` の `OP_VERIFY` 2 本で境界超過を reject(`transfer.rs:130`, `:336-350`) | transfer covenant 内在。グローバル発行上限は D |
-| 4 | **freeze / blacklist** | MUST | なし(grep 0 件、`KCC20_ISSUES.md §5.1`) | なし(`kcc20_issuer_authority_v1` を §5.5 で提案済み、未実装) | **D**(registry cell + introspection)が唯一の UTXO ネイティブ解 |
-| 5 | **seize / 没収** | MUST | なし | なし(`issuer_seize` 分岐を提案) | **D**(owner 署名なしの強制第三者転送) |
+| 1 | **mint(発行)** | MUST | なし(`transfer` は amount 保存のみ、発行エントリポイント無し) | **あり [2026-07-20]**: `token.rs` の `token_mint`(旧、self-continuation + 発行体 `OpCheckSigVerify`)に加え、`contract/stablecoin/mint_authority/` に MINT + RAISE_CAP を持つ独立 mint-authority covenant を実装(dust floor `MIN_MINT_AMOUNT`、`mint_authority/attestation.rs:147`)。spec の named extension としては未標準化 | B(reissuance token / group key)または D |
+| 2 | **burn(償却)** | MUST | なし(償却エントリポイント無し) | **あり [2026-07-20]**: `token.rs` の `token_burn`(旧)に加え、stablecoin covenant の BURN 分岐(`op_type::BURN=0x03`、`body.rs`)。testnet-10 で live 実行済(`STABLECOIN_E2E_LIVE.md` run 1 #8)。spec の named extension としては未標準化 | B / ネイティブ(unspendable へ送る) |
+| 3 | **supply-cap / 供給整合性** | MUST | 部分: `transfer` は total 保存を意図するが cardinality 上限が仕様に無く、unroll 境界外の input が保存則を逃れて**インフレ可能**(ISSUE-19) | あり(緩和): `KCC20_TRANSFER_MAX_N=4` + `OpCovInputCount/OpCovOutputCount` の `OP_VERIFY` 2 本で境界超過を reject(`transfer.rs:130`, `:336-350`)。**[2026-07-20] さらに** `mint_authority` covenant が running-supply counter(`new_running_supply`)+ cold 2-of-3 `cap_authority` quorum で raise 可能な `current_cap` を実装(発行レベルの上限、spec 外) | transfer covenant 内在。グローバル発行上限は D |
+| 4 | **freeze / blacklist** | MUST | なし(grep 0 件、`KCC20_ISSUES.md §5.1`) | **あり [2026-07-20]**: `build_freeze_branch`(`contract/stablecoin/body.rs:484`、`op_type::FREEZE=0x01`)。FREEZE 役鍵の `OpCheckSigFromStack` attestation + `new_frozen_flag` のバイト単位 `{0x00,0x01}` domain gate(:488-512)。`kcc20_issuer_authority_v1` を §5.5 で提案した KCC-0020 named extension としては今も未標準化・未提出 | 設計上は **D** が唯一の permissionless 保持 UTXO ネイティブ解(3.2/3.6 参照)。ただし **KOB が実際に出荷したのは D ではなく 3.5(3) のオラクル attestation(パターン C 型、`OpCheckSigFromStack`)** — 本レポート自身が示した「第3の道」の実例化であり、「D が唯一の解」という本行の記述と実装は一致しない(3.5 参照) |
+| 5 | **seize / 没収** | MUST | なし | **あり [2026-07-20]**: `build_seize_branch`(`body.rs:778`、`op_type::SEIZE=0x02`)。owner 署名なしの cold 2-of-3 quorum(`emit_2of3_threshold`、SEIZE 鍵 3 本)。spec の named extension としては未標準化 | **D**(owner 署名なしの強制第三者転送) |
 | 6 | **pause(全体停止)** | SHOULD(USDC 実装 / USDT 無し=必須でない) | なし | なし | D(グローバル halt フラグ cell) |
 | 7 | **redemption(償還権)** | MUST | なし(本質的にオフチェーン + burn-to-redeem) | なし | オフチェーン + burn(B) |
-| 8 | **role-separation(ロール分離)** | MUST | なし(descriptor に authority フィールド無し) | なし | 複数 issuer 鍵 / covenant-id に分離(D) |
+| 8 | **role-separation(ロール分離)** | MUST | なし(descriptor に authority フィールド無し) | **あり [2026-07-20]**: OPS / FREEZE / SEIZE×3 / MINT の distinct 鍵 + 別 `cap_authority`×3(mint-authority 側)、build 時 pairwise-distinctness assert(`build_stablecoin_body` `body.rs:1444-1466`、`build_mint_authority_body` `mint_authority/body.rs:921`)。spec の named extension としては未標準化 | 複数 issuer 鍵 / covenant-id に分離(D) |
 | 9 | **reserve-attestation(準備金照会)** | MUST | なし(本質的にオフチェーン監査) | なし | オフチェーン oracle / optional attestation cell |
 | 10 | **metadata(name/symbol)** | SHOULD(実務必須) | なし(descriptor は template 同定用、name/symbol 無し) | あり(`token.rs` の ad hoc `TokenDescriptor`) | オフチェーン descriptor |
 | 11 | **decimals(小数桁)** | SHOULD(実務必須) | なし(`amount` は integer、decimals フィールド無し) | なし | descriptor / extended_state |
 | 12 | **KYC / travel-rule** | SHOULD(規制、主にランプ側) | なし | なし | オフチェーン(on/off ramp)、G |
-| 13 | **upgradeability(アップグレード)** | SHOULD | なし(template hash 不変が kcc-0001 §7 の設計、意図的に難しい) | なし | 別 template への migration(kcc-0001 §8.5 different-template continuation) |
+| 13 | **upgradeability(アップグレード)** | SHOULD | なし(template hash 不変が kcc-0001 §7 の設計、意図的に難しい) | **あり [2026-07-20]**: `build_migrate_branch`(`body.rs:1338`、`op_type::MIGRATE=0x06`)、owner + cold 2-of-3 quorum(SEIZE と同じ鍵・helper を共有)。testnet-10 で live 初実行済(txid `8cb054a6a07a66636421244d58413109543e0e77dc1a2f04ea5666119dca5260`、`STABLECOIN_E2E_LIVE.md` run 2 #8)。spec 側は依然 template hash 不変のまま — migration は spec 外の covenant 機能として実装された | 別 template への migration(kcc-0001 §8.5 different-template continuation) |
 | 14 | **rescue(誤送金回収)** | SHOULD(USDC は rescuer ロール) | なし | なし | seize の部分集合 → D |
 | 15 | **allowlist(許可制)** | OPTIONAL(汎用決済では条件付き禁止 = blacklist 型を採る) | なし | なし | C(co-signer)/ D(registry) |
 
@@ -161,8 +195,13 @@ descriptor から機械判読可能にすることで事前回避すべきであ
   CIP-113(Cardano、preview/testnet)も RCE(Nervos、RFC は明確だが mainnet 採用
   事例なし)も**本番未実証**である。したがって「D で書けるはず」は設計レベルの見
   通しであり、実運用実績の裏付けは現時点で存在しない。
-- KOB が既に持つのは #3 の緩和(cardinality 境界 reject)と #10 の ad hoc metadata
-  のみで、発行体コントロール(#4/#5/#6)は一切実装していない(提案段階)。
+- **[2026-07-20]** KOB は #3 の緩和(cardinality 境界 reject)と #10 の ad hoc
+  metadata に加え、`contract/stablecoin/` の bespoke covenant として **#1
+  mint / #2 burn / #4 freeze / #5 seize / #8 role-separation / #13
+  upgradeability(migrate)を実装済み**で、testnet-10 で 2 回 live 実行してい
+  る。いずれも KCC-0020 の named extension としてではなく spec 外の独立
+  covenant としての実装である点に注意(第 4 章の標準化提案は今も未提出)。
+  #6 pause と #14 rescue は引き続き未実装。
 - **base `State` / `transfer` を変更せずに済む**のが重要点。#1〜#9 はすべて
   descriptor の `kcc20_extensions` 経由の named extension、または extended_state /
   別エントリポイントで表現でき、Manyfest の minimal core を汚さない。
@@ -403,20 +442,38 @@ sighash とは独立にこの署名を検証する。blacklist の判定ロジ�
 ことはむしろ求められている機能であり、USDT/USDC のような「発行体が全権を持つ」思想
 とは整合的である(欠陥ではない)。
 
-> **KOB との関係(正確な区別)。** KOB は price attestation(`spot/order.rs` の
-> CANONICAL PRICE ATTESTATION、95-113 行付近)で「sigScript にデータを載せ covenant
-> が読む」配線を既に実装・engine テスト済みだが、これは `OpTxInputScriptSigSubstr`
-> (0xbc、`transfer.rs` 等ではなく `spot/order.rs` の `TXINPUTSIGSUBSTR` 定数)による
-> **生データの読み出し**であり、署名検証ではない。`OpCheckSigFromStack` 自体は KOB の
-> どのエントリポイントでも使われていない。それどころか、KOB は `transfer_delegator()`
-> の認可方式を検討した際にこの opcode を「leader が全 consumed state 分の署名を
-> `OpCheckSigFromStack` で検証する」案(a)として一度俎上に載せ、「kcc-0001 に一切
-> 登場せず、メッセージハッシュ規約も未定義」を理由に**明示的に不採用とし**、(b)
-> delegator 自己認可(標準の `OpCheckSigVerify` パターン)を採用した経緯がある
-> (`kcc20/transfer.rs:62-67`、`KCC20_ISSUES.md` ISSUE-12)。したがって本節の (3)
-> オラクル attestation は、KOB にとって「配線経験の延長」ではなく、**過去に別目的で
-> 検討・不採用にした opcode を、全く別の用途(発行体 freeze ゲート)で新規に採用する
-> 提案**である。誇張を避けるためこの区別を明記する。
+> **KOB との関係(正確な区別、[2026-07-20] 大幅更新)。** 本レポート執筆時点
+> (2026-07-19)では、KOB は price attestation(`spot/order.rs` の CANONICAL
+> PRICE ATTESTATION、95-113 行付近)で「sigScript にデータを載せ covenant が読む」
+> 配線を実装・engine テスト済みだったが、これは `OpTxInputScriptSigSubstr`
+> (0xbc、`spot/order.rs` の `TXINPUTSIGSUBSTR` 定数)による**生データの読み出し**
+> であり、署名検証ではなかった。当時 `OpCheckSigFromStack` は KOB のどのエント
+> リポイントでも使われておらず、KCC-0020 準拠 `kcc20/` の `transfer_delegator()`
+> 設計ではこの opcode を「leader が全 consumed state 分の署名を
+> `OpCheckSigFromStack` で検証する」案(a)として一度俎上に載せた上で、「kcc-0001
+> に一切登場せず、メッセージハッシュ規約も未定義」を理由に明示的に不採用とし、
+> (b) delegator 自己認可(標準の `OpCheckSigVerify` パターン)を採用していた
+> (`kcc20/transfer.rs:62-67`、`KCC20_ISSUES.md` ISSUE-12)。**この `kcc20/`
+> (KCC-0020 準拠の base token_unit)側の判断は今も変わっていない**ので、この
+> 段落自体は正しい記述として残す。
+>
+> **しかし [2026-07-20]、状況が一変した。** 本レポート執筆の 5 時間後に着手
+> された `contract/stablecoin/`(bespoke covenant、KCC-0020 の外)では、
+> `OpCheckSigFromStack`(定数名 `CHECKSIGFROMSTACK`、`body.rs:163`)が
+> TRANSFER の OPS 共署名・FREEZE/SEIZE の issuer attestation・mint-authority の
+> MINT/RAISE_CAP attestation・2-of-3 cold quorum(`emit_2of3_threshold`)など、
+> **この設計全体を支える load-bearing primitive として使われている**
+> (`kob/core/src/contract/stablecoin/` 配下で `grep -rn CHECKSIGFROMSTACK` が
+> コメント込み 69 件、実際のバイトコード発行 `b.push(CHECKSIGFROMSTACK)` だけ
+> でも 10 箇所 — TRANSFER の OPS 共署名・FREEZE・SEIZE/MIGRATE 共有の 2-of-3
+> quorum(3 箇所)・mint-authority の MINT/RAISE_CAP など)。したがって本節
+> (3) オラクル attestation は、もはや「KOB
+> 未採用の提案」ではなく、**実際に出荷され testnet-10 で 2 回 live 実行された
+> 設計**である。`kcc20/`(spec 準拠の base transfer)がこの opcode を使わない
+> 判断をした事実と、`stablecoin/`(spec 外の bespoke covenant)がこれを主要
+> primitive として全面採用した事実は矛盾しない — 前者は base transfer の認可
+> 方式の選択、後者は issuer-authority 拡張そのものの実装であり、別レイヤーの
+> 別判断である。誇張を避けるためこの区別を明記する。
 
 **3方式比較表。**
 
@@ -591,12 +648,20 @@ extension を標準化する際、Kaspa の BlockDAG 並列性を壊さないた
 
 - **mint / burn**: 発行体署名で新規 token UTXO を生成 / 消費する。**KOB は実装済み**
   (`token.rs` の `token_mint` = self-continuation + 発行体 `OpCheckSigVerify`、
-  `token_burn`)。
+  `token_burn`)。**[2026-07-20]** さらに `contract/stablecoin/mint_authority/`
+  に MINT + RAISE_CAP を持つ独立 mint-authority covenant を追加実装。
 - **seize(没収)**: 各コイン covenant に「issuer 署名 1 つで owner 同意なく強制
-  移転する経路」を最初から埋める(§4.2-A の `issuer_seize`、提案・未実装)。対象
-  コインを個別に処理するだけなのでグローバル state を要さず、並行性と無関係。
+  移転する経路」を最初から埋める(§4.2-A の `issuer_seize`、提案)。対象コインを
+  個別に処理するだけなのでグローバル state を要さず、並行性と無関係。**[2026-07-20]
+  実装済み**: `build_seize_branch`(`body.rs:778`、`op_type::SEIZE=0x02`)。ただし
+  提案の「issuer 署名 1 つ」より強い**cold 2-of-3 quorum**(単一鍵ではない)として
+  実装された。
 - **role-separation**: 経路ごとに検証鍵を別 pubkey にする / `OpCheckMultiSig`
-  (0xae、実在)で multisig 化する。
+  (0xae、実在)で multisig 化する。**[2026-07-20 実装との差分]** 実際の SEIZE/
+  MIGRATE の 2-of-3 は `OpCheckMultiSig` ではなく、`OpCheckSigFromStack` を 3 回
+  固定ポジションで呼ぶ自製の threshold(`emit_2of3_threshold`、`body.rs:979`)で
+  組まれている — 「別 pubkey に分離」の部分は的中したが、multisig の実現手段の
+  予測は外れた。
 
 層 I はいずれも「その tx が触るコインの中で完結」するため、Kaspa の BlockDAG
 並列性を一切損なわない。
@@ -604,9 +669,15 @@ extension を標準化する際、Kaspa の BlockDAG 並列性を壊さないた
 **層 II — グローバル状態が要る制御(オラクル attestation ゲート 1 本に集約)**
 
 freeze / pause / supply-cap / KYC は本来グローバル state を要するが、§3.5(3) の
-オラクル attestation(`OpCheckSigFromStack` 0xd7、提案・KOB 未使用)を採ると、
-これらを**発行体が attestation を出す off-chain ロジックに集約**し、covenant 側は
-「発行体署名が付いているか」の検証 1 本に統一できる。
+オラクル attestation(`OpCheckSigFromStack` 0xd7)を採ると、これらを**発行体が
+attestation を出す off-chain ロジックに集約**し、covenant 側は「発行体署名が
+付いているか」の検証 1 本に統一できる。**[2026-07-20]** この opcode は本節執筆
+時点では提案・KOB 未使用だったが、`contract/stablecoin/` で TRANSFER/FREEZE/
+SEIZE/MIGRATE/mint-authority 全体の load-bearing primitive として実装された
+(3.5 のコールアウト参照)。ただし freeze に限っては層 II の「attestation を
+出すのをやめれば全転送が止まる」という pause 型の設計ではなく、FREEZE 専用の
+`op_type` 分岐(発行体が明示的に `frozen_flag=1` へ遷移させる)として実装され
+ている点で、この節が描いた統合像とは実装形が異なる。
 
 - **pause は無料で付いてくる**: 発行体が attestation を出すのをやめれば全転送が
   止まる = pause。§3.5(3) の直接の帰結で、専用の halt フラグ cell(§2 表の
@@ -634,21 +705,34 @@ KOB は既に KCC-0020 準拠の surface(state / dispatch / p2sh / descriptor /
 identifier)と `transfer` / `transfer_delegator` body(`kcc20/transfer.rs`、engine
 テスト済み)、および covenant introspection opcode 群(`opcodes.rs`)を持つ。ステー
 ブルコインを出すには、この上に第 4 章の 3 extension のうち少なくとも次を実装する
-必要がある:
+必要がある(**[2026-07-20] 以下は本レポート執筆時点の要件分析であり、今もその
+分析として正確。ただし実際には、これらは `kcc20/` の extension としてではなく、
+`contract/stablecoin/` という別モジュールの独立 covenant として実装された** —
+各項目に実装後の対応 file:line を追記する):
 
 - **issuer-authority extension**(§4.2-A の実装): 新エントリポイント
   `issuer_seize`(発行体署名 1 つで強制第三者転送)+ `extended_state` の per-UTXO
   `frozen` フラグ。現状 `Kcc20State` は `owner_identifier` / `identifier_type` /
-  `amount` / `extended_state_digest` の 4 フィールド(`state.rs`、`ENCODED_LEN=77`)
-  で、`extended_state_digest` に凍結ビットを含む拡張 state をコミットする余地は
-  既にある(base transfer は digest を opaque 保存)。ただし現行の
-  `borrowed_receive.rs` が「stub、未実装」(module doc L2)である通り、新エントリ
-  ポイントの追加は `transfer.rs` の core ループの再設計を伴い、add-on では済まない
-  点に注意(同 module doc の time-box 判断)。
+  `amount` / `extended_state_digest` の 4 フィールド(`kcc20/state.rs`、
+  `ENCODED_LEN=77`)で、`extended_state_digest` に凍結ビットを含む拡張 state を
+  コミットする余地は既にある(base transfer は digest を opaque 保存)。ただし
+  現行の `borrowed_receive.rs` が「stub、未実装」(module doc L2)である通り、新
+  エントリポイントの追加は `transfer.rs` の core ループの再設計を伴い、add-on
+  では済まない点に注意(同 module doc の time-box 判断)。**[2026-07-20 実装との
+  差分]** 実装は `kcc20/state.rs` の `extended_state_digest` を拡張する経路を
+  採らず、代わりに `contract/stablecoin/state.rs` に**専用の state レイアウト**
+  (`owner_pubkey` / `identifier_type` / `role_registry_root` / `frozen_flag` /
+  `epoch`、`STATE_HEADER_LEN=75`)を新設した — この段落が予測した「add-on では
+  済まない」判断は的中し、実際に別 state header・別 covenant として実装された。
+  freeze は `build_freeze_branch`(`body.rs:484`、`op_type::FREEZE=0x01`)、seize
+  は `build_seize_branch`(`body.rs:778`、`op_type::SEIZE=0x02`、cold 2-of-3)。
 - **supply-control extension**(§4.2-B): 発行体 `mint` / `burn`。KOB は既に転送
   レベルのインフレ防止(`KCC20_TRANSFER_MAX_N=4` + `OpCov*Count` の `OP_VERIFY`、
   `transfer.rs:130`, `:336-350`)を持つので、発行レベルの mint 権限ゲートを足す
-  形になる。
+  形になる。**[2026-07-20 実装済み]** `contract/stablecoin/mint_authority/` が
+  MINT + RAISE_CAP を持つ独立 covenant として発行レベルのゲートを実装(running-
+  supply counter、cold 2-of-3 `cap_authority` で raise 可能な cap、dust floor
+  `MIN_MINT_AMOUNT`)。
 - **amount マッピングの再検討**: KOB の現行 `token_unit`(`token.rs`)は `amount` を
   UTXO の native sompi 値にマップし(`token.rs` L16-40 の設計判断: アドレス発見の
   安定性のため)、script バイトに埋めていない。一方 `kcc20/` の新実装は `amount` を
@@ -656,6 +740,10 @@ identifier)と `transfer` / `transfer_delegator` body(`kcc20/transfer.rs`、engi
   ステーブルコインの発行体 seize / supply 集計では、どちらの amount 表現を正本と
   するかを確定させる必要がある(covenant-id ベースの UTXO スキャンに寄せるなら
   in-script 方式、既存 DEX の address 発見を保つなら native-value 方式)。
+  **[2026-07-20]** `contract/stablecoin/` は **native-value 方式を継続選択**
+  した(`amount` は script に埋め込まず UTXO の sompi 値のまま、
+  `stablecoin/mod.rs` module doc「KCC-0020 `amount` mapping」)。したがってこの
+  問いはステーブルコインの実装によって native-value 側に決着した。
 
 ### 5.2 DEX(spot covenant)が issuer-freeze 付き資産を担保に取る場合の座礁リスク
 
@@ -721,8 +809,28 @@ descriptor 機械判読可能性」であり、これが本レポートの KCC �
 - **Kaspa txscript — `OpCheckSigFromStack`(オラクル attestation の材料、3.5)** —
   `crypto/txscript/src/opcodes/mod.rs:1634`(`OpCheckSigFromStack` 0xd7、スタック上の
   任意 32byte メッセージハッシュ+署名をトランザクション sighash と無関係に検証)、
-  `:1645`(ECDSA 版 `OpCheckSigFromStackECDSA` 0xd8)。KOB は現状この opcode を使用
-  していない(下記 KOB KCC-0020 実装の `transfer.rs` 該当箇所を参照)。
+  `:1645`(ECDSA 版 `OpCheckSigFromStackECDSA` 0xd8)。**[2026-07-20]** KOB の
+  KCC-0020 準拠 `kcc20/`(base token_unit)は今もこの opcode を使用していないが、
+  `contract/stablecoin/`(bespoke covenant、本レポート執筆後に実装)は
+  FREEZE/SEIZE/MIGRATE/mint-authority attestation の主要 primitive としてこれを
+  多用する(`body.rs:163` の定数 `CHECKSIGFROMSTACK`。下記「KOB stablecoin
+  covenant 実装」の項を参照)。
+- **KOB stablecoin covenant 実装([2026-07-20]、本レポート執筆後に追加、
+  KCC-0020 の named extension ではなく spec 外の bespoke covenant)** —
+  `kob/core/src/contract/stablecoin/body.rs`: `build_freeze_branch`(:484、
+  `op_type::FREEZE=0x01`)の `new_frozen_flag` バイト単位 `{0x00,0x01}` domain
+  gate(:488-512)、`build_seize_branch`(:778、`op_type::SEIZE=0x02`)の cold
+  2-of-3 quorum(`emit_2of3_threshold`、定義 :979、呼び出し :956)、
+  `build_migrate_branch`(:1338、`op_type::MIGRATE=0x06`)が同じ
+  `emit_2of3_threshold` を再利用(:1429)。role 鍵(OPS/FREEZE/SEIZE×3/MINT)の
+  pairwise-distinctness assert は `build_stablecoin_body`(:1444-1466)。
+  `kob/core/src/contract/stablecoin/mint_authority/`: running-supply counter・
+  cold `cap_authority`×3 2-of-3 raisable cap は `body.rs`(`build_raise_cap_branch`
+  :271、`build_mint_authority_body` :871、:921 の pairwise-distinctness assert)、
+  dust floor `MIN_MINT_AMOUNT`/`check_mint_amount_floor` は `attestation.rs:147,199`。
+  設計正本 `STABLECOIN_ROBUST_DESIGN.md`、post-live 監査
+  `STABLECOIN_AUDIT_2026-07-20.md`(template 認証の CRITICAL fix を含む)、
+  testnet-10 live 実行結果(2 回)`STABLECOIN_E2E_LIVE.md`。
 - **KOB covenant introspection 実装** — `kob/core/src/contract/opcodes.rs:99-111`
   (`OP_TXINPUTAMOUNT` 0xbe、`OP_TXINPUTSPK` 0xbf、`OP_TXOUTPUTAMOUNT` 0xc2、
   `OP_TXOUTPUTSPK` 0xc3、`OP_INPUTCOVENANTID` 0xcf、`OP_COVINPUTCOUNT` 0xd0、

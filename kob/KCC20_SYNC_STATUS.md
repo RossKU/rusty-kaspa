@@ -2,6 +2,15 @@
 
 Last updated: 2026-07-14
 
+> **Scope note [2026-07-20]:** this document only covers the `kob-phase0`
+> upstream merge and the base `token_unit`/KCC20 conformance sync described
+> below. It predates and is silent on a separate, later work stream: the
+> **robust stablecoin covenant** (`kob/core/src/contract/stablecoin/` +
+> `mint_authority/`), built starting 2026-07-19 and hardened through
+> 2026-07-20, now live-tested twice on testnet-10. That work is not a sync
+> issue and does not correct anything below — see `STABLECOIN_ROBUST_DESIGN.md`,
+> `STABLECOIN_AUDIT_2026-07-20.md` and `STABLECOIN_E2E_LIVE.md` for it.
+
 ## 1. Upstream merge
 
 - Branch: `kob-phase0` (RossKU/rusty-kaspa), merged `upstream/master`

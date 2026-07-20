@@ -1498,6 +1498,22 @@ transfer とも競合しうるケース(5.6 で述べる KOB 側の副作用と�
 への将来拡張の方向性として、pending/ready-to-spend に相当する2状態を
 `extended_state` 側に持たせる案を PR の場での検討候補として残す。
 
+**[2026-07-20 追記]** 本節の `kcc20_issuer_authority_v1` は、**KCC-0020 の
+named extension としては今も未実装のまま**である(本提案自体、kaspanet/kccs
+にまだ提出していない)。ただしこの提案の 5 時間後、KOB は同じ機能セット
+(freeze・seize・role-separation)を、この named extension としてではなく
+**`kob/core/src/contract/stablecoin/` という spec 外の bespoke covenant**
+として実装し、`kcc20_issuer_authority_v1` が描いたスコープの superset を
+出荷した(seize は「発行体署名1つ」ではなく cold 2-of-3 quorum、role
+separation は OPS/FREEZE/SEIZE×3/MINT の distinct 鍵、加えて本節が扱わない
+mint/supply-cap/upgradeability も別 covenant `mint_authority/` を含めて実装
+済み)。testnet-10 で 2 回 live 実行済み(`STABLECOIN_ROBUST_DESIGN.md`、
+`STABLECOIN_E2E_LIVE.md`、詳細な機能対応は `KCC20_STABLECOIN_GAP.md` 冒頭の
+[2026-07-20] 注記と第2章を参照)。この事実は本節の提案自体を無効にしない —
+descriptor 経由で宣言される KCC-0020 標準拡張として standardize すべきだ、
+という主張は今も未解決のまま残る。KOB のビスポーク実装は、その標準化提案の
+参考実装(reference implementation)として使える、という位置づけである。
+
 ### 5.6 KOB(DEX)側の副作用: ISSUE-15 との関連
 
 issuer-seize 権限を持つ資産が、KOB のような covenant orderbook DEX の

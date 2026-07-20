@@ -286,8 +286,23 @@ fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 
     // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
     // identifier_type(3), new_rs(4), issuer_sig(5).
+    // ---- successor.identifier_type == this coin's own (audit hygiene, final
+    // round). FREEZE and SEIZE both pin it; TRANSFER used to DROP it unread. It
+    // drives no on-chain branch, so an altered value has no consensus effect --
+    // but off-chain indexers and wallets classify a coin's owner-identifier from
+    // this byte, and nothing about a transfer should be able to relabel it.
+    // Compared against this coin's OWN value rather than a baked literal,
+    // because the deployer chooses `identifier_type` at construction. Net stack
+    // effect is identical to the DROP this replaces. ----
     e_roll(&mut b, 3); // identifier_type -> top
-    b.push(DROP); // unused, same as case-A
+    // Stack: identifier_type(0), epoch(1), frozen_flag(2), role_registry_root(3),
+    // new_rs(4), issuer_sig(5).
+    b.extend_from_slice(&dr_field_extract(4, IDENTIFIER_TYPE_PAYLOAD_OFFSET as u16, (IDENTIFIER_TYPE_PAYLOAD_OFFSET + 1) as u16));
+    // Stack: succ_idtype(0), identifier_type(1), epoch(2), frozen_flag(3),
+    // role_registry_root(4), new_rs(5), issuer_sig(6).
+    e_roll(&mut b, 1); // this coin's own identifier_type -> top
+    b.push(EQUAL);
+    b.push(VERIFY);
 
     // Stack: epoch(0), frozen_flag(1), role_registry_root(2), new_rs(3),
     // issuer_sig(4).
@@ -354,6 +369,30 @@ fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     e_roll(&mut b, 1); // epoch_copy -> top
     b.push(EQUAL);
     b.push(VERIFY); // successor.epoch == own (§4 invariant)
+
+    // ---- successor.frozen_flag == CLEAR (audit fix, final round 2026-07-20).
+    // TRANSFER gates on THIS coin's frozen_flag being 0x00 but used to leave the
+    // SUCCESSOR's byte entirely unconstrained, which made two claims elsewhere
+    // in this file false: that FREEZE is the only branch that writes
+    // `frozen_flag`, and that the domain gate confines it to {0x00, 0x01}.
+    // Owner + OPS -- the two keys TRANSFER already needs, neither of them the
+    // FREEZE role -- could hand the coin a successor carrying 0x01 (freezing it
+    // without the freeze key) or an out-of-domain byte like 0x02, which every
+    // owner branch's bytewise compare against [0x00] then rejects forever,
+    // leaving the coin immobile until the FREEZE key or the SEIZE quorum
+    // intervenes.
+    //
+    // Comparing against the literal, not against this coin's own byte, is
+    // deliberate: the gate above already established the current value IS
+    // 0x00, so the literal is the same constraint stated in one fewer stack
+    // operation, and it stays correct if the gate is ever tightened. ----
+    // Stack: epoch(0), new_rs(1), issuer_sig(2).
+    b.extend_from_slice(&dr_field_extract(1, FROZEN_FLAG_PAYLOAD_OFFSET as u16, (FROZEN_FLAG_PAYLOAD_OFFSET + 1) as u16));
+    // Stack: succ_frozen(0), epoch(1), new_rs(2), issuer_sig(3).
+    b.push(DATA1);
+    b.push(frozen_flag::CLEAR);
+    b.push(EQUAL);
+    b.push(VERIFY);
 
     // Stack: epoch(0), new_rs(1), issuer_sig(2). new_rs no longer needed.
     e_roll(&mut b, 1);
@@ -439,7 +478,8 @@ fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 ///
 /// # `new_frozen_flag` domain gate (audit fix 2026-07-20)
 ///
-/// FREEZE is the ONLY branch that writes `frozen_flag`, and it writes
+/// FREEZE is the only branch that CHANGES `frozen_flag` (TRANSFER/SEIZE pin
+/// the successor's byte to a value they already know), and it writes
 /// whatever byte the attestation carries. The post-Live audit
 /// (`STABLECOIN_AUDIT_2026-07-20.md` §B4) flagged that nothing constrained
 /// that byte to `{0x00, 0x01}`: every other branch tests the field with a

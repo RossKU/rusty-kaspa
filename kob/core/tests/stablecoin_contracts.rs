@@ -173,6 +173,9 @@ struct Cfg {
     /// a successor that keeps every state field this branch compares while
     /// swapping the role set out from under the issuer.
     successor_role_seeds: Option<(u8, u8, [u8; 3], u8)>,
+    /// `frozen_flag` written into the SUCCESSOR. `None` == CLEAR (the honest
+    /// case, and the only value TRANSFER may produce).
+    successor_frozen_flag: Option<u8>,
 
     // Overrides for what the OPS role actually SIGNS over (None/default ==
     // truthful, matching the real spend). A disagreeing value is the
@@ -199,6 +202,7 @@ impl Cfg {
             successor_root: None,
             successor_epoch: None,
             successor_role_seeds: None,
+            successor_frozen_flag: None,
             attest_ops_seed: 2, // == ops_seed
             attest_op_type: op_type::TRANSFER,
             attest_outpoint_txid_seed: None,
@@ -248,7 +252,7 @@ fn build(cfg: &Cfg) -> Built {
         &recipient_pub,
         id_type::PUBKEY,
         &successor_root,
-        frozen_flag::CLEAR,
+        cfg.successor_frozen_flag.unwrap_or(frozen_flag::CLEAR),
         successor_epoch,
         &s_ops,
         &s_freeze,
@@ -405,6 +409,27 @@ fn transfer_successor_with_identical_role_set_still_accepts() {
     };
     let res = run(&build(&cfg));
     assert!(res.is_ok(), "an unchanged role set must still transfer: {res:?}");
+}
+
+#[test]
+fn transfer_cannot_freeze_the_successor() {
+    // Final-round audit fix. TRANSFER gates on THIS coin's frozen_flag being 0
+    // but left the successor's byte unconstrained, so owner + OPS -- neither of
+    // them the FREEZE role -- could hand the coin forward already frozen.
+    let cfg = Cfg { successor_frozen_flag: Some(frozen_flag::SET), ..Cfg::honest() };
+    let res = run(&build(&cfg));
+    assert_rejected_with(&res, "VerifyError");
+}
+
+#[test]
+fn transfer_cannot_write_an_out_of_domain_successor_flag() {
+    // The worse half: an out-of-domain byte is neither "clear" to any owner
+    // branch's bytewise compare against [0x00] nor the 0x01 tooling reads as
+    // frozen, so the coin would be stuck until the FREEZE key or the SEIZE
+    // quorum intervened. FREEZE's own domain gate never applied here.
+    let cfg = Cfg { successor_frozen_flag: Some(0x02), ..Cfg::honest() };
+    let res = run(&build(&cfg));
+    assert_rejected_with(&res, "VerifyError");
 }
 
 #[test]

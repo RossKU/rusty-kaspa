@@ -926,6 +926,24 @@ pub fn build_mint_authority_redeem_script(
     identifier_type: u8,
     genesis_covenant_id: &[u8; 32],
 ) -> Vec<u8> {
+    // Role keys MUST be pairwise distinct: a duplicated cap_authority key collapses
+    // the RAISE_CAP 2-of-3 threshold, and mint_pubkey sharing a cap_authority slot
+    // lets the (hot) mint key cast one of the three cold cap-raise votes. Reject at
+    // construction. (seize/ops/freeze are also baked here for emitted-coin
+    // reconstruction and must match the covenant's own distinct set.)
+    {
+        let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 9] = [
+            mint_pubkey,
+            &cap_authority_pubkeys[0], &cap_authority_pubkeys[1], &cap_authority_pubkeys[2],
+            ops_pubkey, freeze_pubkey,
+            &seize_pubkeys[0], &seize_pubkeys[1], &seize_pubkeys[2],
+        ];
+        for i in 0..role_keys.len() {
+            for j in (i + 1)..role_keys.len() {
+                assert!(role_keys[i] != role_keys[j], "mint-authority role pubkeys must be pairwise distinct (slot {i} == slot {j})");
+            }
+        }
+    }
     let state = super::state::MintAuthorityStateHeader::new(running_supply, current_cap);
     let mut rs = state.encode_script();
     debug_assert_eq!(rs.len(), super::state::STATE_HEADER_LEN);

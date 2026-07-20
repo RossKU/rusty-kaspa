@@ -103,6 +103,15 @@ pub const MAX_OUTPOINT_INDEX_EXCLUSIVE: u64 = 1 << 31;
 /// different set of fields in this separate contract).
 pub const MAX_AMOUNT_EXCLUSIVE: u64 = 1 << 63;
 
+/// Minimum `mint_amount` for a newly-emitted coin. Because a coin's face amount
+/// IS its native sompi value (the KCC-0020 amount=sompi model), a coin below this
+/// floor carries a KIP-9 storage-mass term (`STORAGE_MASS_PARAMETER` 1e12 / amount)
+/// large enough that the mint tx exceeds a normal block-mass budget and will not
+/// relay. 0.1 KAS keeps that term negligible. Enforced off-chain at build time;
+/// on-chain enforcement is unnecessary because a dust mint simply fails to relay,
+/// harming only the would-be minter (no fund loss, no third-party exploit).
+pub const MIN_MINT_AMOUNT: u64 = 10_000_000;
+
 /// Errors from constructing mint-authority attestation/state material outside
 /// the numeric domain the on-chain bytecode's fixed-width, sign-magnitude
 /// script-number fields can represent as non-negative.

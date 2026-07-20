@@ -1334,6 +1334,18 @@ pub fn build_stablecoin_redeem_script(
     seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3],
     mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN],
 ) -> Vec<u8> {
+    // Role keys MUST be pairwise distinct: a duplicated SEIZE key collapses the
+    // 2-of-3 threshold (one key satisfies two fixed positional slots, sum>=2), and
+    // a shared ops/freeze/mint key erodes role separation. Reject at construction.
+    {
+        let role_keys: [&[u8; X_ONLY_PUBKEY_LEN]; 6] =
+            [ops_pubkey, freeze_pubkey, &seize_pubkeys[0], &seize_pubkeys[1], &seize_pubkeys[2], mint_pubkey];
+        for i in 0..role_keys.len() {
+            for j in (i + 1)..role_keys.len() {
+                assert!(role_keys[i] != role_keys[j], "stablecoin role pubkeys must be pairwise distinct (slot {i} == slot {j})");
+            }
+        }
+    }
     let state = StablecoinStateHeader::new(*owner_pubkey, identifier_type, *role_registry_root, frozen_flag_value, epoch, 0);
     let mut rs = state.encode_script();
     debug_assert_eq!(rs.len(), STATE_HEADER_LEN);
@@ -1376,6 +1388,21 @@ mod tests {
         // load-bearing on the dispatch/branch bytecode's fixed shape, so we
         // search rather than hardcode a brittle constant here).
         assert!(rs.windows(32).any(|w| w == OPS));
+    }
+
+    #[test]
+    #[should_panic(expected = "pairwise distinct")]
+    fn duplicated_seize_key_rejected() {
+        // seize[0] == seize[1] would let one key satisfy two 2-of-3 slots.
+        let dup_seize: [[u8; 32]; 3] = [[0x91; 32], [0x91; 32], [0x93; 32]];
+        let _ = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &dup_seize, &MINT);
+    }
+
+    #[test]
+    #[should_panic(expected = "pairwise distinct")]
+    fn shared_ops_mint_key_rejected() {
+        // mint == ops erodes role separation.
+        let _ = build_stablecoin_redeem_script(&OWNER, id_type::PUBKEY, &ROOT, frozen_flag::CLEAR, 0, &OPS, &FREEZE, &SEIZE, &OPS);
     }
 
     #[test]

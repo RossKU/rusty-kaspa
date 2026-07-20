@@ -65,3 +65,75 @@ Verify any TXID at `https://api-tn10.kaspa.org/transactions/<txid>`.
   and the wallet loader refuses to open it).
 - Invocation:
   `NODE=ws://65.108.107.30:18210 WALLET=/root/kob_wallet.json KEYS_MANIFEST=/root/kob_sc_keys.json CAP=100000000000 MINT_AMOUNT=50000000 MINT_AUTHORITY_VALUE=100000000 kob-stablecoin-e2e`
+
+---
+
+# Live run 2 — 2026-07-20, post-hardening (MIGRATE's first live execution)
+
+Run against testnet-10 with the binary built from `9a705335`, i.e. AFTER the
+covenant hardening and the CRITICAL template-authentication fix. Every branch
+whose bytecode changed is exercised here, so this run is the live proof of that
+work — the first run predates all of it and its P2SH addresses no longer exist,
+since changing the body changes the redeem script and therefore the address.
+
+Command (`MIGRATE_DEMO=1` swaps MIGRATE in for BURN; both consume the single
+minted coin, so they are alternatives):
+
+```
+NODE=ws://65.108.107.30:18210 WALLET=/root/kob_wallet.json \
+KEYS_MANIFEST=/root/kob_sc_keys_v2.json CAP=100000000000 \
+MINT_AMOUNT=50000000 MINT_AUTHORITY_VALUE=100000000 MIGRATE_DEMO=1 \
+kob-stablecoin-e2e
+```
+
+| # | Op | TXID | storage mass |
+|---|----|------|--------------|
+| 1 | DEPLOY TX1 (anchor) | `86fc330c12bc0d3f4d60ffd75a3a9ddc252b93515ebc0a2ac1bb145b70d39fbd` | — |
+| 2 | DEPLOY TX2 (mint authority) | `320bfbcfc7e66ae179c67860f5ba5f04777a80bd67644f80351571781c3b554c` | 30,066 |
+| 3 | MINT | `2a0728ac3725fdc05efd5113ae43336db979056c7094f3cf9265af0255fb6a3c` | 122,741 |
+| 4 | TRANSFER | `74984aa82c28cbe4f5ca9fbe9c4ef11defd5ce261dcb150c49d1f52d27c67e09` | 90,326 |
+| 5 | FREEZE (flag=1) | `5d501905f5d14d37ea1bbb948ad10a333f9ac1c85bfa49514f1c8a69947b117d` | 96,665 |
+| 6 | SEIZE (2-of-3) | `60fbba95ab8bd0e13f885c79ab54400898524e18d8328fd66dae33e53ac9a64f` | 104,905 |
+| 7 | UNFREEZE (flag=0) | `40d4bce01167a021d732c46a99c9aaaa33b8b86d948f6d3f0e7bc82e8095d9d7` | 115,544 |
+| 8 | **MIGRATE** (owner + cold 2-of-3) | `8cb054a6a07a66636421244d58413109543e0e77dc1a2f04ea5666119dca5260` | 13,196 |
+| 9 | RAISE_CAP (2-of-3) | `c5cb1d028d313dc50e48d54d2d4b40e7398ed2f76dd090ce17206f8070704524` | 141,197 |
+
+Genesis covenant id `60471fea…7611`; coin covenant id `30a2e430…1cd9`; final
+`current_cap` 200,000,000,000. Every output was verified on-chain for value,
+covenant id and shape before the next op was built.
+
+## What this run establishes
+
+- **Template authentication works on a real node.** TRANSFER, FREEZE and SEIZE
+  each now supply their own redeem script as an extra deepest sigscript item,
+  prove it against the input's own SPK, and suffix-compare the successor. All
+  three were accepted, so the added `dr_input_spk_check` + `dr_suffix_check`
+  bytecode executes correctly under the real engine, at the real script size,
+  with the real P2SH wrapper — not just in the test harness.
+- **MIGRATE ran live for the first time**, under its new authorization: owner
+  SIGHASH_ALL plus a cold 2-of-3 SEIZE quorum. The coin moved to a plain wallet
+  P2PK output (`covenant_id=None` on the destination, confirmed by the on-chain
+  check), which is the branch behaving as designed: it authenticates the target
+  only by the hash the quorum attested and never inspects it, so the coin does
+  genuinely leave covenant governance — by cold-quorum decision.
+- **The frozen_flag domain gate and the sig_op_count change are live-clean.**
+  Both FREEZE ops (set and clear) were accepted, and MIGRATE's 4 sig ops passed
+  the compute budget.
+- **Storage-mass preflight matched reality.** Every op printed a mass well under
+  the 500,000 limit and none was rejected by the node for mass — the local
+  KIP-9 calculation agrees with what the network enforced.
+
+## BURN was not re-run: why that is acceptable
+
+A second run without `MIGRATE_DEMO` reached DEPLOY → MINT → TRANSFER → FREEZE →
+SEIZE (double-confirming every branch this work touched) and then stopped at
+UNFREEZE with `fee UTXO 3183989 too small after fee 1347300` — the wallet's
+remaining UTXO could not leave a `MIN_UTXO_VALUE` (3,000,000 sompi) change
+output. That is the harness's own guard behaving correctly, not a covenant
+failure; the wallet simply needs refunding.
+
+BURN's bytecode and sigscript are untouched by this round of work — it has no
+`new_rs` (its successor is the fixed unspendable sink), so no template
+authentication applies to it — and it is already proven live by run 1 above. Its
+re-verification is therefore a funding chore, not an open risk. **Pending: refund
+the wallet and run the BURN path once for completeness.**

@@ -85,7 +85,8 @@
 //! INDEPENDENTLY computed `compute_covenant_id(mint_authority_outpoint.txid,
 //! mint_authority_outpoint.index, &[AuthOutput{index: 1, ...}])` -- i.e. the
 //! SAME genesis-outpoint convention every other single-output genesis in
-//! this codebase uses (`cli/src/stablecoin.rs`'s old case-A deploy,
+//! this codebase uses (the old case-A deploy in the since-deleted
+//! `cli/src/stablecoin.rs`,
 //! `cli/src/token.rs`, `cli/src/receipt.rs`), with the auth_outputs list
 //! containing ONLY that one new output. This is the harness's own
 //! prediction of what the (out-of-repo, vendored) consensus code assigns;
@@ -326,7 +327,8 @@ async fn verify_utxo(
 
 /// Pick a spendable wallet P2PK UTXO with at least `min_value` sompi,
 /// smallest-first (mirrors the `.min_by_key` selection idiom used
-/// throughout `kob_e2e_util.rs`/`cli/src/stablecoin.rs`).
+/// throughout `kob_e2e_util.rs`, and in the since-deleted
+/// `cli/src/stablecoin.rs`).
 /// What a fee-only input must actually hold: the fee itself plus a change
 /// output that clears `MIN_UTXO_VALUE`.
 ///

@@ -1392,7 +1392,7 @@ fn build_migrate_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8>
                   // different template with no promised field layout.
 
     // Stack: epoch(0), frozen_flag(1), role_registry_root(2),
-    // new_template_hash(3), issuer_sig(4).
+    // new_template_hash(3), sig3(4), sig2(5), sig1(6).
     e_roll(&mut b, 1); // frozen_flag -> top
     b.push(DATA1);
     b.push(frozen_flag::CLEAR); // literal explicit-push [0x00] (NOT OpN 0 / empty array)
@@ -1402,11 +1402,11 @@ fn build_migrate_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8>
                     // mirrors build_transfer_branch's gate exactly (same
                     // opcodes, same net stack effect as the DROP it replaces).
 
-    // Stack: epoch(0), role_registry_root(1), new_template_hash(2), issuer_sig(3).
+    // Stack: epoch(0), role_registry_root(1), new_template_hash(2), sig3(3), sig2(4), sig1(5).
     e_roll(&mut b, 1); // role_registry_root -> top
     b.push(DROP); // unused -- no shared successor state layout to carry it into
 
-    // Stack: epoch(0), new_template_hash(1), issuer_sig(2).
+    // Stack: epoch(0), new_template_hash(1), sig3(2), sig2(3), sig1(4).
 
     // ---- Successor-template authentication (fn doc): the successor
     // output's SPK must Blake3-hash to the attested new_template_hash --
@@ -1415,30 +1415,30 @@ fn build_migrate_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8>
     b.push(TXINPUTINDEX);
     b.push(TXOUTPUTSPK);
     b.push(BLAKE3); // real successor SPK hash
-    // Stack: real_hash(0), epoch(1), new_template_hash(2), issuer_sig(3).
+    // Stack: real_hash(0), epoch(1), new_template_hash(2), sig3(3), sig2(4), sig1(5).
     e_pick(&mut b, 2); // copy of new_template_hash -> top (needed again for the preimage tail below)
     // Stack: new_template_hash_copy(0), real_hash(1), epoch(2),
-    // new_template_hash(3), issuer_sig(4).
+    // new_template_hash(3), sig3(4), sig2(5), sig1(6).
     b.push(EQUAL);
     b.push(VERIFY); // real successor SPK hash == attested new_template_hash
 
-    // Stack: epoch(0), new_template_hash(1), issuer_sig(2).
+    // Stack: epoch(0), new_template_hash(1), sig3(2), sig2(3), sig1(4).
 
     // ---- Attestation pre-image (153B, §4/§5): 121B base + new_template_hash(32) tail. ----
     b.push(DATA8);
     b.extend_from_slice(&DOMAIN_TAG);
-    // Stack: domain_tag(0), epoch(1), new_template_hash(2), issuer_sig(3).
+    // Stack: domain_tag(0), epoch(1), new_template_hash(2), sig3(3), sig2(4), sig1(5).
     b.push(TXINPUTINDEX);
     b.push(INPUTCOVENANTID);
     b.push(CAT); // acc = domain_tag || covenant_id
-    // Stack: acc(0), epoch(1), new_template_hash(2), issuer_sig(3).
+    // Stack: acc(0), epoch(1), new_template_hash(2), sig3(3), sig2(4), sig1(5).
     b.push(DATA1);
     b.push(op_type::MIGRATE);
     b.push(CAT); // acc || op_type
-    // Stack: acc(0), epoch(1), new_template_hash(2), issuer_sig(3).
+    // Stack: acc(0), epoch(1), new_template_hash(2), sig3(3), sig2(4), sig1(5).
     e_roll(&mut b, 1); // epoch -> top
     b.push(CAT); // acc || epoch
-    // Stack: acc(0), new_template_hash(1), issuer_sig(2).
+    // Stack: acc(0), new_template_hash(1), sig3(2), sig2(3), sig1(4).
     b.push(TXINPUTINDEX);
     b.push(OUTPOINTTXID);
     b.push(CAT); // acc || outpoint_txid
@@ -1456,7 +1456,7 @@ fn build_migrate_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8>
     b.push(OP8);
     b.push(NUM2BIN);
     b.push(CAT); // acc || amount(8B LE) == full 121B base preimage
-    // Stack: acc(0), new_template_hash(1), issuer_sig(2).
+    // Stack: acc(0), new_template_hash(1), sig3(2), sig2(3), sig1(4).
     e_roll(&mut b, 1); // new_template_hash -> top
     b.push(CAT); // acc || new_template_hash == full 153B MIGRATE preimage
 

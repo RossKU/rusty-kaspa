@@ -6,7 +6,7 @@
 //! against the real TxScriptEngine in `planner_engine_repro.rs`.
 
 use kob_core::contract::spot::decay::{
-    build_decay_buy_redeem_script, build_decay_sell_redeem_script, decay_effective_pnum,
+    build_decay_buy_redeem_script, build_decay_sell_redeem_script,
 };
 use kob_core::contract::spot::order::{
     build_buy_redeem_script, build_buy_redeem_script_with_caps, build_sell_redeem_script,

@@ -1,6 +1,6 @@
 use super::*;
 use super::helpers::opn;
-use crate::primitives::{minimal_script_encode, push_data, u64_le};
+use crate::primitives::push_data;
 
 // Opcode constants used in tests
 const OP_0: u8 = 0x00;

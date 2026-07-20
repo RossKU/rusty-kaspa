@@ -1,5 +1,5 @@
 use super::*;
-use crate::primitives::{push_data, u64_le};
+use crate::primitives::u64_le;
 
 // Opcode constants used in tests
 const OP_0: u8 = 0x00;

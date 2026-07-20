@@ -166,3 +166,71 @@ Worth recording because two of that commit's three claims did not survive:
   network drops mid-stream (this session: 8 stalls). They resume with context
   intact via a follow-up message, so prefer small tasks and ask for findings to be
   emitted early rather than after further reads.
+
+## E. CRITICAL (found 2026-07-20, post-hardening audit): successor template is not authenticated
+
+**Status: OPEN. Do not run further live operations until fixed.**
+
+TRANSFER, FREEZE and SEIZE each let the spender supply the successor redeem
+script (`new_rs`) as plaintext and authenticate it ONLY against the output it
+pays to — `dr_output_spk_check` proves `Blake2b(new_rs) == P2SH(successor SPK)`.
+After that, the branches compare a handful of STATE HEADER fields between this
+coin and the successor (`body.rs`: TRANSFER pins `role_registry_root` + `epoch`;
+FREEZE pins `owner_pubkey`/`identifier_type`/`role_registry_root`/`epoch` plus
+the attested `frozen_flag`; SEIZE pins the same four plus the attested
+`new_owner_pubkey`).
+
+**Nothing compares the successor's BODY — the bytes after the state header, which
+is where every role pubkey is baked — against this covenant's own body.**
+`grep dr_suffix_check kob/core/src/contract/stablecoin/` returns nothing;
+`dr_prefix_check` likewise. The helper exists and is documented for exactly this
+("the `new_rs` tail from a boundary matches `old_rs`", `contract/dr.rs:9`), and
+the sibling KCC20 transfer covenant DOES use it, calling it "kcc-0001 §8.5's
+required template authentication" (`contract/kcc20/transfer.rs:36`, wired at
+L463). The stablecoin covenant simply never wired it in.
+
+### Impact
+
+A successor that keeps the four header fields but bakes DIFFERENT role pubkeys
+passes every check. Concretely:
+
+- **FREEZE is a single-key total takeover.** The FREEZE role alone (no owner
+  signature — that is the branch's design) can spend the coin into a successor
+  whose baked OPS/FREEZE/SEIZE/MINT keys are all attacker-chosen. The coin still
+  looks like a well-formed stablecoin coin, carries the same
+  `role_registry_root` (an opaque commitment nothing verifies the keys against)
+  and the same epoch, and the issuer's real FREEZE/SEIZE/BURN keys no longer
+  have any power over it.
+- **TRANSFER reopens exactly the governance exit the MIGRATE hardening closed**,
+  at a LOWER cost: owner + the HOT OPS key, rather than owner + a cold 2-of-3
+  quorum. §B2 gated MIGRATE behind cold keys precisely so a stolen OPS key could
+  not redirect funds out of governance; TRANSFER achieves the same outcome with
+  that stolen key, without ever touching MIGRATE.
+- **SEIZE lets the cold quorum re-key the covenant**, which is a privilege
+  escalation beyond "force-move ownership".
+
+This also subsumes the narrower owner-vs-role concern raised in the same audit
+(a SEIZE can set `new_owner_pubkey` to one of the baked role keys, since nothing
+on-chain constrains it): the build-time `owner != role` assert added in
+`fdabc98c` only ever runs for the initial construction, never for an owner value
+a branch writes at runtime.
+
+### Fix
+
+Authenticate the template, following the KCC20 transfer pattern: the sigscript
+supplies this coin's own redeem script as an explicit data item, the branch
+proves it genuine with `dr_input_spk_check` (against the input's own SPK), then
+`dr_suffix_check(old_rs, new_rs, STATE_HEADER_LEN)` pins everything from the end
+of the mutable state header onward. That single check makes the whole baked role
+set immutable across TRANSFER/FREEZE/SEIZE, and makes the runtime
+owner-vs-role question moot for every field the header does pin.
+
+MIGRATE is deliberately excluded: its successor is an arbitrary new template by
+design, which is why it is the branch that now requires the cold quorum.
+
+### Audit-trail note
+
+The five-dimension pre-Live audit, the post-Live audit in §B, and the live run
+itself all missed this, because every one of them reasoned about the fields the
+branches DO check rather than asking what the successor could change that is
+never checked at all.

@@ -35,6 +35,7 @@ path = "src/bin/kob_batch_lab.rs"
 
 [dependencies]
 kob-core = { path = "../core" }
+blake3 = { workspace = true }
 kob-domain = { path = "../domain" }
 kob-engine = { path = "../engine" }
 kaspa-consensus-core = { workspace = true }

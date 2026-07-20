@@ -150,10 +150,18 @@ Worth recording because two of that commit's three claims did not survive:
       was moved off its KOB-local blake2b digest onto the spec object as part of
       the same change, so client and facilitator compute the same digest.
 - [ ] Descriptor wire format (ISSUE-6) — upstream-blocked.
+- [x] **MIGRATE offline verification — DONE.** The real-engine suite
+      (`kob/core/tests/stablecoin_contracts.rs`, `TxScriptEngine` with covenants
+      enabled) covers the new authorization shape: honest owner + 2-of-3 accepts,
+      exactly-2-of-3 accepts, 1-of-3 rejects, and the old hot OPS key signing all
+      three slots rejects, alongside the pre-existing template-mismatch, replay
+      and frozen-gate cases.
+- [x] **MIGRATE is now runnable live.** `op_migrate` added to the e2e harness,
+      opt-in via `MIGRATE_DEMO=1`, running in place of BURN (both consume the one
+      coin the harness mints; both leave a wallet change output at index 1, so
+      RAISE_CAP chains off either). Not yet executed on testnet-10.
 - [ ] Phase 2: CLI migration (all ops as kob-cli subcommands = Liquid-equivalent
-      UTXO control), then re-verify offline → testnet-10. MIGRATE has still never
-      been run live, and its authorization shape changed here, so it needs an
-      offline engine pass before any live attempt.
+      UTXO control), then re-verify offline → testnet-10.
 - Env note: subagents keep hitting the 600s stream watchdog whenever the device's
   network drops mid-stream (this session: 8 stalls). They resume with context
   intact via a follow-up message, so prefer small tasks and ask for findings to be

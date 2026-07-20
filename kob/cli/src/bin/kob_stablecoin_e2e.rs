@@ -24,6 +24,13 @@
 //!      of a bare `OpReturn` redeem script (standard/relayable output form,
 //!      provably unspendable underneath -- see `BURN_SINK_SCRIPT`'s doc in
 //!      `core/src/contract/stablecoin/body.rs`).
+//!      With `MIGRATE_DEMO=1`, step 8 runs **MIGRATE** instead: `recovery`
+//!      (owner) + a cold 2-of-3 SEIZE quorum move the coin to a wholly
+//!      different template (here a plain wallet P2PK output -- the branch
+//!      never inspects the destination), so the coin leaves covenant
+//!      governance by deliberate cold decision. The two are alternatives, not
+//!      successive steps, because this harness mints exactly one coin; both
+//!      leave a wallet change output at index 1, which step 9 chains off.
 //!   9. RAISE_CAP   -- 2-of-3 `cap_authority` quorum raises the mint
 //!      authority's `current_cap` (independent of the coin lifecycle above;
 //!      run last only because the task's sequence lists it last).
@@ -102,9 +109,10 @@ use kob_core::contract::stablecoin::mint_authority::sigscript::{
 };
 use kob_core::contract::stablecoin::state::{compute_role_registry_root, frozen_flag};
 use kob_core::contract::stablecoin::{
-    build_attestation_message, build_freeze_attestation_message, build_seize_attestation_message,
-    build_stablecoin_burn_sigscript, build_stablecoin_freeze_sigscript, build_stablecoin_redeem_script,
-    build_stablecoin_seize_sigscript, build_stablecoin_transfer_sigscript,
+    build_attestation_message, build_freeze_attestation_message, build_migrate_attestation_message,
+    build_seize_attestation_message, build_stablecoin_burn_sigscript, build_stablecoin_freeze_sigscript,
+    build_stablecoin_migrate_sigscript, build_stablecoin_redeem_script, build_stablecoin_seize_sigscript,
+    build_stablecoin_transfer_sigscript,
 };
 use kob_core::contract::token::identifier_type as id_type;
 use kob_core::mass::{calc_mass_with_sigscripts, check_tx_storage_mass, min_relay_fee};
@@ -1290,6 +1298,159 @@ async fn op_seize(
 }
 
 // ---------------------------------------------------------------------
+// MIGRATE
+// ---------------------------------------------------------------------
+
+struct MigrateResult {
+    txid: String,
+    migrated_value: u64,
+    /// MIGRATE's own wallet-change output (output[1]) -- threaded forward as
+    /// RAISE_CAP's fee input for exactly the reason BURN's is (see
+    /// `BurnResult::change_value`).
+    change_value: u64,
+}
+
+/// MIGRATE: move the coin to a WHOLLY DIFFERENT covenant template, gated by
+/// the owner's SIGHASH_ALL signature PLUS a cold 2-of-3 SEIZE-quorum
+/// attestation (Decision 2026-07-20 -- see `build_migrate_branch`'s
+/// "Authorizer" doc). The initial Live shipped a single hot OPS key here,
+/// which made MIGRATE a governance exit: since the destination template is
+/// arbitrary, owner + a stolen OPS key could walk an unfrozen coin out of
+/// FREEZE/SEIZE/BURN reach entirely.
+///
+/// # What the destination is, and what the covenant checks about it
+///
+/// The branch verifies only that `Blake3(the successor output's SPK)` equals
+/// the `new_template_hash` the quorum attested. It never parses the
+/// destination -- it "does not even need to be another stablecoin covenant at
+/// all" -- so vetting the target is the quorum's off-chain responsibility.
+/// This harness migrates to a plain wallet P2PK output, which is the honest
+/// demonstration of that: the coin genuinely leaves covenant governance, by
+/// deliberate cold-quorum decision.
+///
+/// # Shape
+///
+/// Owner-signed, so value continuity comes free from SIGHASH_ALL and the
+/// branch deliberately omits `dr_value_continuity_check` -- which means
+/// MIGRATE, unlike FREEZE/SEIZE, *could* pay its fee from the coin itself.
+/// The harness still uses a separate fee input so the migrated value is
+/// exactly the coin's value (a clean, verifiable assertion afterward), and
+/// `preflight`'s fee-input requirement is therefore NOT asserted for this op.
+///
+/// The coin must be UNFROZEN: the branch keeps the `frozen_flag == 0` gate on
+/// top of the quorum, so a sanctioned coin cannot be migrated out even by the
+/// cold keys (only SEIZE acts on a frozen coin).
+async fn op_migrate(
+    rpc: &NodeClient,
+    wallet: &WalletContext,
+    roles: &RoleCtx,
+    coin_cov_id: &[u8; 32],
+    coin: &CoinResult,
+    owner_sk: &[u8; 32],
+) -> anyhow::Result<MigrateResult> {
+    if coin.frozen != frozen_flag::CLEAR {
+        anyhow::bail!("MIGRATE: refusing to attempt a frozen coin -- the branch's frozen_flag==0 gate would reject it");
+    }
+    let privkey = *wallet.privkey_bytes();
+    let wallet_spk = p2pk_script(&wallet.pubkey);
+
+    // The destination: a plain wallet P2PK output. Not a covenant -- see the
+    // fn doc. Its SPK is what the quorum attests, by hash.
+    let dest_spk = kaspa_consensus_core::tx::ScriptPublicKey::new(0, wallet_spk.clone().into());
+    let dest_addr = kob_core::wallet::pubkey_to_address(&wallet.pubkey, kob_core::types::Network::Testnet);
+
+    // The coin's OWN P2SH (the input's real prevout locking script) -- the
+    // owner's SIGHASH_ALL commits it, so it must be the P2SH-wrapped bytes,
+    // not the raw redeem script (see op_burn's `current_p2sh` doc).
+    let current_p2sh = build_p2sh(&coin.rs);
+
+    let fee_utxo = pick_wallet_utxo(rpc, wallet, 300_000).await?;
+    println!(
+        "MIGRATE fee UTXO: {}:{} ({} sompi)",
+        fee_utxo.outpoint.transaction_id, fee_utxo.outpoint.index, fee_utxo.utxo_entry.amount
+    );
+
+    let mut tx = Transaction::new(1);
+    tx.inputs.push(TxInput {
+        prev_tx_id: coin.txid.clone(),
+        prev_index: coin.index,
+        sequence: 0,
+        // Owner OpCheckSigVerify + three quorum OpCheckSigFromStack (real
+        // count: 4) -- bumped to COVENANT_COMPUTE_BUDGET_SIG_OPS for
+        // compute-budget headroom, see that constant's doc. Note this value is
+        // committed by the sighash, so it must be identical in every pass.
+        sig_op_count: COVENANT_COMPUTE_BUDGET_SIG_OPS,
+        script_version: current_p2sh.version(),
+        script_bytes: current_p2sh.script().to_vec(),
+        value: coin.value,
+    });
+    tx.inputs.push(TxInput {
+        prev_tx_id: fee_utxo.outpoint.transaction_id.clone(),
+        prev_index: fee_utxo.outpoint.index,
+        sequence: 0,
+        sig_op_count: 1,
+        script_version: fee_utxo.utxo_entry.script_public_key.version,
+        script_bytes: fee_utxo.script_bytes(),
+        value: fee_utxo.utxo_entry.amount,
+    });
+    // Output[0]: the migrated coin at its new template, value carried forward
+    // unchanged. No CovenantBinding -- this coin's covenant life under the
+    // stablecoin template ends here (same shape as BURN's plain successor).
+    tx.outputs.push(TxOutput::new(coin.value, dest_spk.version(), dest_spk.script().to_vec(), None));
+    // Output[1]: fee change.
+    let est_fee = 250_000u64;
+    tx.outputs.push(TxOutput::new(fee_utxo.utxo_entry.amount.saturating_sub(est_fee), 0, wallet_spk.clone(), None));
+
+    // The attested target: Blake3 of the successor output's SPK bytes, exactly
+    // what the branch recomputes on-chain from OpTxOutputSpk.
+    let new_template_hash: [u8; 32] = *blake3::hash(&spk_bytes_be(&dest_spk)).as_bytes();
+    let outpoint_txid = txid_bytes(&coin.txid)?;
+    let migrate_msg = build_migrate_attestation_message(
+        coin_cov_id,
+        coin.epoch,
+        &outpoint_txid,
+        coin.index,
+        &spk_bytes_be(&dest_spk),
+        coin.value,
+        &new_template_hash,
+    );
+    // Fixed positional convention, shared with SEIZE: sig1<->seize_pk[0], etc.
+    // All three real keys are signed here (a valid superset of 2-of-3) rather
+    // than simulating a 2-key holder with a placeholder third signature.
+    let sig1 = signing::schnorr_sign(&roles.seize_sk[0], &migrate_msg)?;
+    let sig2 = signing::schnorr_sign(&roles.seize_sk[1], &migrate_msg)?;
+    let sig3 = signing::schnorr_sign(&roles.seize_sk[2], &migrate_msg)?;
+
+    let sign_all = |tx: &Transaction| -> anyhow::Result<Vec<Vec<u8>>> {
+        let sh0 = compute_sighash(tx, 0)?;
+        let owner_sig = signing::schnorr_sign(owner_sk, &sh0)?;
+        let sigscript0 =
+            build_stablecoin_migrate_sigscript(&owner_sig, &sig1, &sig2, &sig3, &new_template_hash, &coin.rs);
+        let sh1 = compute_sighash(tx, 1)?;
+        let fee_sig = signing::schnorr_sign(&privkey, &sh1)?;
+        Ok(vec![sigscript0, signing::build_p2pk_sigscript(&fee_sig)])
+    };
+    let sigs = sign_all(&tx)?;
+    let exact_fee = fee_with_floor(min_relay_fee(calc_mass_with_sigscripts(&tx, &sigs)));
+    let new_change = fee_utxo.utxo_entry.amount.saturating_sub(exact_fee);
+    if new_change < kob_core::MIN_UTXO_VALUE {
+        anyhow::bail!("MIGRATE: fee UTXO {} too small after fee {}", fee_utxo.utxo_entry.amount, exact_fee);
+    }
+    tx.outputs[1].value = new_change;
+    let sigs = sign_all(&tx)?;
+    println!("MIGRATE exact fee: {} sompi", exact_fee);
+
+    preflight(&tx, "MIGRATE", false)?;
+    let payload = to_rpc_payload(&tx, &sigs);
+    let txid = rpc.submit_transaction(payload).await?;
+    println!("MIGRATE SUBMITTED. TXID: {}  verify: {}", txid, verify_url(&txid));
+
+    verify_utxo(rpc, "MIGRATE destination", &dest_addr, &txid, 0, coin.value, None, 20, Duration::from_secs(3)).await?;
+
+    Ok(MigrateResult { txid, migrated_value: coin.value, change_value: new_change })
+}
+
+// ---------------------------------------------------------------------
 // BURN
 // ---------------------------------------------------------------------
 
@@ -1677,13 +1838,33 @@ async fn main() -> anyhow::Result<()> {
     println!();
     println!("UNFREEZE complete. Coin live at {}:0, frozen={}.", coin.txid, coin.frozen);
 
-    // ---- Step 8: BURN ----
-    println!("--- BURN ---");
-    let burn = op_burn(&rpc, &wallet, &roles, &mint.coin_covenant_id, &coin).await?;
-    state.tx8_burn = Some(burn.txid.clone());
-    save_manifest(&cfg.keys_manifest_path, &Manifest { keys: manifest.keys.clone(), state: state.clone() })?;
-    println!();
-    println!("BURN complete. {} sompi destroyed in TX {}.", burn.burned_value, burn.txid);
+    // ---- Step 8: BURN, or MIGRATE when asked for ----
+    // Both consume the one coin this harness mints, so they are alternatives
+    // rather than successive steps. MIGRATE is opt-in (`MIGRATE_DEMO=1`)
+    // because BURN is what the original 7-op task sequence names; the two
+    // produce the same shape (a spent coin plus a wallet change output at
+    // index 1), so RAISE_CAP chains off whichever ran.
+    let migrate_demo = env::var("MIGRATE_DEMO").ok().as_deref() == Some("1");
+    let (spend_txid, spend_change) = if migrate_demo {
+        println!("--- MIGRATE (in place of BURN; MIGRATE_DEMO=1) ---");
+        let migrate = op_migrate(&rpc, &wallet, &roles, &mint.coin_covenant_id, &coin, &roles.recovery_sk).await?;
+        state.tx8_burn = Some(migrate.txid.clone());
+        save_manifest(&cfg.keys_manifest_path, &Manifest { keys: manifest.keys.clone(), state: state.clone() })?;
+        println!();
+        println!(
+            "MIGRATE complete. {} sompi left covenant governance in TX {} (owner + cold 2-of-3).",
+            migrate.migrated_value, migrate.txid
+        );
+        (migrate.txid, migrate.change_value)
+    } else {
+        println!("--- BURN ---");
+        let burn = op_burn(&rpc, &wallet, &roles, &mint.coin_covenant_id, &coin).await?;
+        state.tx8_burn = Some(burn.txid.clone());
+        save_manifest(&cfg.keys_manifest_path, &Manifest { keys: manifest.keys.clone(), state: state.clone() })?;
+        println!();
+        println!("BURN complete. {} sompi destroyed in TX {}.", burn.burned_value, burn.txid);
+        (burn.txid, burn.change_value)
+    };
 
     // ---- Step 9: RAISE_CAP (independent of the coin lifecycle above) ----
     println!("--- RAISE_CAP ---");
@@ -1702,9 +1883,9 @@ async fn main() -> anyhow::Result<()> {
         &mint.authority_rs,
         cfg.mint_amount, // running_supply after the one MINT this harness performed
         cfg.new_cap,
-        &burn.txid,
+        &spend_txid,
         1,
-        burn.change_value,
+        spend_change,
     )
     .await?;
     state.tx9_raise_cap = Some(raise_cap.txid.clone());

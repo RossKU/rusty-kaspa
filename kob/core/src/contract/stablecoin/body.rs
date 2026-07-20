@@ -300,6 +300,29 @@ fn e_own_covenant_id(b: &mut Vec<u8>) {
     b.push(op::INPUTCOVENANTID);
 }
 
+/// Single-coin-op guard (audit 2026-07-20 CRITICAL fix): assert exactly ONE
+/// input of THIS coin's own `covenant_id` lineage is consumed in the whole
+/// transaction. Every single-coin branch (TRANSFER/FREEZE/SEIZE/BURN/MIGRATE)
+/// accounts only for its own coin and does NOT constrain sibling covenant
+/// inputs. Without this guard, a `TRANSFER_NM_DELEGATOR` (`0x08`) -- which
+/// carries no OPS attestation and merely proves "I am not covenant-position 0"
+/// -- could ride alongside one of these single branches placed at position 0
+/// as a decoy, moving its coin's value out of the covenant with NO issuer
+/// (OPS) co-signature, defeating the mandatory per-transfer compliance gate.
+/// Pinning the count to 1 forces any multi-input same-lineage spend onto the
+/// `TRANSFER_NM` leader path instead: the leader (unavoidably at position 0,
+/// since single branches now reject when the count exceeds 1 and the delegator
+/// rejects at position 0) accounts for and OPS-attests every sibling. Net 0 on
+/// the data stack (mirrors the leader's own cardinality-cap idiom, `==` not
+/// `<=`).
+fn emit_single_input_covenant_guard(b: &mut Vec<u8>) {
+    use op::*;
+    e_own_covenant_id(b);
+    b.push(COVINPUTCOUNT);
+    e_num(b, 1);
+    b.push(NUMEQUALVERIFY);
+}
+
 fn e_pick(b: &mut Vec<u8>, depth: u16) {
     push_index(b, depth);
     b.push(op::PICK);
@@ -353,6 +376,9 @@ fn emit_header_opcode_authentication(b: &mut Vec<u8>, new_rs_depth: u16) {
 fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     use op::*;
     let mut b = Vec::with_capacity(160);
+
+    // Single-coin op: exactly one input of this lineage (CRITICAL fix). Net 0.
+    emit_single_input_covenant_guard(&mut b);
 
     // ---- Owner authorization (mirrors case-A's stage 1). ----
     e_roll(&mut b, 5); // owner_sig -> top
@@ -602,6 +628,9 @@ fn build_transfer_branch(ops_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 fn build_freeze_branch(freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     use op::*;
     let mut b = Vec::with_capacity(200);
+
+    // Single-coin op: exactly one input of this lineage (CRITICAL fix). Net 0.
+    emit_single_input_covenant_guard(&mut b);
 
     // ---- Domain gate: new_frozen_flag MUST be exactly one of the two
     // canonical 1-byte literals (`frozen_flag::CLEAR` / `frozen_flag::SET`).
@@ -900,6 +929,9 @@ fn build_freeze_branch(freeze_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 fn build_seize_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
     use op::*;
     let mut b = Vec::with_capacity(400);
+
+    // Single-coin op: exactly one input of this lineage (CRITICAL fix). Net 0.
+    emit_single_input_covenant_guard(&mut b);
 
     // Stack: epoch(0), frozen_flag(1), root(2), identifier_type(3),
     // owner_pubkey(4), new_owner_pubkey(5), new_rs(6), sig3(7), sig2(8),
@@ -1255,6 +1287,9 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
     use op::*;
     let mut b = Vec::with_capacity(160);
 
+    // Single-coin op: exactly one input of this lineage (CRITICAL fix). Net 0.
+    emit_single_input_covenant_guard(&mut b);
+
     // ---- Owner authorization (identical mechanics to TRANSFER's stage 1). ----
     e_roll(&mut b, 5); // owner_sig -> top
     e_roll(&mut b, 5); // owner_pubkey -> top (owner_sig now at depth 1)
@@ -1475,6 +1510,9 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 fn build_migrate_branch(recovery_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
     use op::*;
     let mut b = Vec::with_capacity(300);
+
+    // Single-coin op: exactly one input of this lineage (CRITICAL fix). Net 0.
+    emit_single_input_covenant_guard(&mut b);
 
     // ---- Owner authorization (identical mechanics to TRANSFER's/BURN's
     // stage 1). ----

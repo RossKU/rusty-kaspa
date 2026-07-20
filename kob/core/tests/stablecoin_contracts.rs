@@ -2347,3 +2347,66 @@ fn transfer_nm_attestation_replay_different_output_set_rejected() {
     let results = run_nm(&built);
     assert!(results[0].is_err(), "an attestation captured for a different output set must be rejected");
 }
+
+#[test]
+fn transfer_nm_delegator_decoy_attack_is_rejected() {
+    // CRITICAL regression (audit 2026-07-20): the delegator OPS-gate bypass.
+    // The attack: covenant-position 0 = an honest single TRANSFER (0x00) of
+    // coin B (carrying B's OWN narrow OPS attestation, for B's transfer only);
+    // position 1 = TRANSFER_NM_DELEGATOR (0x08) moving coin A's full value to
+    // a plain output with ONLY A's owner signature -- no group OPS attestation,
+    // and no verification that a real 0x07 leader ran. Pre-fix BOTH inputs'
+    // scripts returned Ok, so A left the covenant with zero issuer visibility.
+    // The single-input covenant guard now makes B's TRANSFER reject because a
+    // same-lineage sibling covenant input is present (OpCovInputCount == 2),
+    // killing the whole transaction and the bypass.
+    let cov_id = hash32(0x71);
+    let (b_seed, b_recip, a_seed) = (1u8, 2u8, 3u8);
+    let (b_amount, a_amount) = (1_000_000u64, 5_000_000u64);
+
+    let rs_b = nm_redeem_script(b_seed, NM_ROOT, frozen_flag::CLEAR, NM_EPOCH, None);
+    let rs_a = nm_redeem_script(a_seed, NM_ROOT, frozen_flag::CLEAR, NM_EPOCH, None);
+    let spk_b = build_p2sh(&rs_b);
+    let spk_a = build_p2sh(&rs_a);
+    let new_rs_b = nm_redeem_script(b_recip, NM_ROOT, frozen_flag::CLEAR, NM_EPOCH, None);
+    let out_spk_b = build_p2sh(&new_rs_b);
+    let attacker_spk = build_p2sh(&[0x51u8]); // arbitrary plain payout for A's value
+
+    let tx_outputs = vec![
+        TransactionOutput::with_covenant(b_amount, out_spk_b.clone(), Some(CovenantBinding::new(0, cov_id))),
+        TransactionOutput::new(a_amount, attacker_spk),
+    ];
+    let entries = vec![
+        UtxoEntry { amount: b_amount, script_public_key: spk_b, block_daa_score: 0, is_coinbase: false, covenant_id: Some(cov_id) },
+        UtxoEntry { amount: a_amount, script_public_key: spk_a, block_daa_score: 0, is_coinbase: false, covenant_id: Some(cov_id) },
+    ];
+
+    // SIGHASH_ALL skeleton (sig_op_count: TRANSFER=2, delegator=1).
+    let placeholder_inputs = vec![
+        TransactionInput::new(outpoint(0x71, 0), vec![], 0, 2),
+        TransactionInput::new(outpoint(0x72, 0), vec![], 0, 1),
+    ];
+    let skeleton = Transaction::new(0, placeholder_inputs, tx_outputs.clone(), 0, Default::default(), 0, vec![]);
+    let pop_skel = PopulatedTransaction::new(&skeleton, entries.clone());
+    let reused0 = SigHashReusedValuesUnsync::new();
+    let owner_b_sig = schnorr_sign(&calc_schnorr_signature_hash(&pop_skel, 0, SIG_HASH_ALL, &reused0).as_bytes(), &privkey(b_seed)).unwrap();
+    let reused1 = SigHashReusedValuesUnsync::new();
+    let owner_a_sig = schnorr_sign(&calc_schnorr_signature_hash(&pop_skel, 1, SIG_HASH_ALL, &reused1).as_bytes(), &privkey(a_seed)).unwrap();
+
+    // B's own single-transfer OPS attestation (op_type 0x00) -- covers only B.
+    let cov_bytes: [u8; 32] = cov_id.as_bytes();
+    let attest_b = build_attestation_message(&cov_bytes, op_type::TRANSFER, NM_EPOCH, &[0x71u8; 32], 0, &spk_to_bytes(&out_spk_b), b_amount);
+    let issuer_sig_b = schnorr_sign(&attest_b, &privkey(NM_OPS_SEED)).unwrap();
+
+    let ss_b = build_stablecoin_transfer_sigscript(&owner_b_sig, &issuer_sig_b, &new_rs_b, &rs_b);
+    let ss_a = build_stablecoin_transfer_nm_delegator_sigscript(&owner_a_sig, &rs_a);
+    let final_inputs = vec![
+        TransactionInput::new(outpoint(0x71, 0), ss_b, 0, 2),
+        TransactionInput::new(outpoint(0x72, 0), ss_a, 0, 1),
+    ];
+    let tx = Transaction::new(0, final_inputs, tx_outputs, 0, Default::default(), 0, vec![]);
+    let results = run_nm(&NmBuilt { tx, entries, n_inputs: 2 });
+
+    // Position-0 decoy TRANSFER is rejected by the single-input guard.
+    assert_rejected_with(&results[0], "VerifyError");
+}

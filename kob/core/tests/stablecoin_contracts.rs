@@ -112,10 +112,14 @@ fn unrelated_mint_pubkey() -> [u8; 32] {
     pubkey(UNRELATED_MINT_SEED)
 }
 
-/// The `ScriptPublicKey` for the canonical BURN sink (§8): SPK version 0 +
-/// [`BURN_SINK_SCRIPT`] (a bare `OpReturn`) -- the honest BURN successor.
+/// The `ScriptPublicKey` for the canonical BURN sink (§8): the P2SH wrapping
+/// of [`BURN_SINK_SCRIPT`] (a bare `OpReturn` REDEEM script) -- the honest
+/// BURN successor. A bare-`OpReturn` LOCKING script is non-standard on Kaspa
+/// (rejected by the mempool as "non-standard script form"); P2SH-wrapping it
+/// makes the output standard/relayable while keeping it exactly as
+/// unspendable (see `kob_core::contract::stablecoin::BURN_SINK_SCRIPT`'s doc).
 fn burn_sink_spk() -> ScriptPublicKey {
-    ScriptPublicKey::new(0, BURN_SINK_SCRIPT.to_vec().into())
+    build_p2sh(&BURN_SINK_SCRIPT)
 }
 
 fn privkey(seed: u8) -> [u8; 32] {
@@ -940,9 +944,10 @@ fn seize_replay_other_outpoint_rejected() {
 //    `OpCheckSigVerify`, SIGHASH_ALL, PLUS an `OpCheckSigFromStack`
 //    attestation), but the attesting role is MINT (the mint-authority's
 //    supply key, §2/§9/§4) rather than OPS, and there is NO `new_rs` field at
-//    all: the successor is a FIXED canonical unspendable sink
-//    (`BURN_SINK_SCRIPT`/`BURN_SINK_SPK_BYTES`, `core/src/contract/stablecoin/
-//    body.rs`), not a spender-supplied candidate covenant. Because the owner
+//    all: the successor is a FIXED canonical unspendable sink -- the P2SH
+//    wrapping of `BURN_SINK_SCRIPT` (`burn_sink_spk`/`burn_sink_spk_bytes`,
+//    `core/src/contract/stablecoin/body.rs`), not a spender-supplied
+//    candidate covenant. Because the owner
 //    signs SIGHASH_ALL, value handling is owner-committed -- BURN
 //    deliberately does NOT call `dr_value_continuity_check` (§4: "canonical-
 //    sink successor, not a value-carrying one"); see
@@ -1010,6 +1015,21 @@ impl BurnCfg {
 /// `&[u8; 64]` parameters can't express "absent" (mirrors FREEZE's
 /// `build_freeze_scenario` escape hatch, extended to BURN's two independent
 /// signature slots).
+///
+/// LIVE-FAITHFUL SHAPE (2026-07-20 bisection): this mirrors
+/// `cli/src/bin/kob_stablecoin_e2e.rs`'s `op_burn` EXACTLY -- 2 inputs (the
+/// covenant coin + a plain P2PK fee input), 2 outputs (the P2SH sink +
+/// P2PK change), transaction version 1, and the owner's SIGHASH_ALL
+/// signature computed over the FULL (both-input, both-output) transaction --
+/// NOT the single-input/single-output shape this scenario used before. A
+/// single-input/single-output/version-0 reproduction (the shape this
+/// function had until this bisection) still ACCEPTS the honest case, so it
+/// was not sufficient by itself to prove/disprove the live-only "verification
+/// failed" report; this shape closes every "test doesn't match the wire tx"
+/// gap named in the bisection task (output serialization, the MINT
+/// attestation's `successor_spk_hash`, the fee-input shape, and the output
+/// set the owner's SIGHASH_ALL commits to). It still ACCEPTS -- see the FINAL
+/// REPORT for what that does (and doesn't) establish.
 fn build_burn_scenario(cfg: &BurnCfg, raw_owner_sig: Option<&[u8]>, raw_issuer_sig: Option<&[u8]>) -> Built {
     let owner_pub = pubkey(cfg.owner_seed);
     let ops_pub = pubkey(cfg.ops_seed);
@@ -1037,15 +1057,33 @@ fn build_burn_scenario(cfg: &BurnCfg, raw_owner_sig: Option<&[u8]>, raw_issuer_s
     // covenant life ends here) -- no `CovenantBinding`, unlike
     // TRANSFER/FREEZE/SEIZE's same-covenant-id successors.
     let out_spk = if cfg.successor_not_sink { build_p2sh(&[0x51]) } else { burn_sink_spk() };
-    let output = TransactionOutput::new(cfg.in_amount, out_spk.clone());
+    let sink_output = TransactionOutput::new(cfg.in_amount, out_spk.clone());
 
-    let entries = vec![UtxoEntry {
-        amount: cfg.in_amount,
-        script_public_key: input_spk,
-        block_daa_score: 0,
-        is_coinbase: false,
-        covenant_id: Some(cfg.input_cov_id),
-    }];
+    // Plain P2PK fee input/change output -- the SAME shape `op_burn` pairs
+    // with every covenant spend (a separate wallet UTXO funds the fee/tx
+    // mass so the burn amount always destroys the coin's FULL native value).
+    const FEE_SEED: u8 = 111;
+    let fee_pub = pubkey(FEE_SEED);
+    let mut fee_script = Vec::with_capacity(34);
+    fee_script.push(0x20);
+    fee_script.extend_from_slice(&fee_pub);
+    fee_script.push(0xac);
+    let fee_spk = ScriptPublicKey::new(0, fee_script.into());
+    const FEE_IN_AMOUNT: u64 = 300_000;
+    const FEE_CHANGE: u64 = 250_000;
+    let fee_outpoint = outpoint(0x99, 0);
+    let change_output = TransactionOutput::new(FEE_CHANGE, fee_spk.clone());
+
+    let entries = vec![
+        UtxoEntry {
+            amount: cfg.in_amount,
+            script_public_key: input_spk,
+            block_daa_score: 0,
+            is_coinbase: false,
+            covenant_id: Some(cfg.input_cov_id),
+        },
+        UtxoEntry { amount: FEE_IN_AMOUNT, script_public_key: fee_spk, block_daa_score: 0, is_coinbase: false, covenant_id: None },
+    ];
 
     // --- MINT role attestation (off-chain "Writer" side) ---
     let cov_bytes: [u8; 32] = cfg.input_cov_id.as_bytes();
@@ -1063,15 +1101,29 @@ fn build_burn_scenario(cfg: &BurnCfg, raw_owner_sig: Option<&[u8]>, raw_issuer_s
     );
     let issuer_sig: [u8; 64] = schnorr_sign(&attest_msg, &privkey(cfg.attest_mint_seed)).unwrap();
 
-    // --- Owner authorization (SIGHASH_ALL over the tx) ---
-    let skeleton_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), vec![], 0, 2);
-    let skeleton_tx = Transaction::new(0, vec![skeleton_input], vec![output.clone()], 0, Default::default(), 0, vec![]);
+    // --- Owner authorization: SIGHASH_ALL over the FULL 2-input/2-output,
+    // version-1 tx (matches `op_burn`'s `Transaction::new(1)` + fee input --
+    // NOT just this coin's own input/output in isolation). ---
+    let covenant_outpoint = outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index);
+    let skeleton_inputs = vec![
+        TransactionInput::new(covenant_outpoint, vec![], 0, 2),
+        TransactionInput::new(fee_outpoint, vec![], 0, 1),
+    ];
+    let skeleton_tx = Transaction::new(
+        1,
+        skeleton_inputs,
+        vec![sink_output.clone(), change_output.clone()],
+        0,
+        Default::default(),
+        0,
+        vec![],
+    );
     let populated_skeleton = PopulatedTransaction::new(&skeleton_tx, entries.clone());
     let reused = SigHashReusedValuesUnsync::new();
     let sighash = calc_schnorr_signature_hash(&populated_skeleton, 0, SIG_HASH_ALL, &reused);
     let owner_sig: [u8; 64] = schnorr_sign(&sighash.as_bytes(), &privkey(cfg.owner_seed)).unwrap();
 
-    let ss = match (raw_owner_sig, raw_issuer_sig) {
+    let ss0 = match (raw_owner_sig, raw_issuer_sig) {
         (None, None) => build_stablecoin_burn_sigscript(&owner_sig, &issuer_sig, &rs),
         (owner_override, issuer_override) => {
             let owner_sig_with_type: Vec<u8> = match owner_override {
@@ -1093,8 +1145,10 @@ fn build_burn_scenario(cfg: &BurnCfg, raw_owner_sig: Option<&[u8]>, raw_issuer_s
         }
     };
     // sig_op_count = 2: one OpCheckSigVerify (owner) + one OpCheckSigFromStack (MINT).
-    let final_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), ss, 0, 2);
-    let tx = Transaction::new(0, vec![final_input], vec![output], 0, Default::default(), 0, vec![]);
+    // The fee input's own sigscript is irrelevant to `run()` (it only
+    // verifies input 0), so it's left empty here (never executed).
+    let final_inputs = vec![TransactionInput::new(covenant_outpoint, ss0, 0, 2), TransactionInput::new(fee_outpoint, vec![], 0, 1)];
+    let tx = Transaction::new(1, final_inputs, vec![sink_output, change_output], 0, Default::default(), 0, vec![]);
     Built { tx, entries }
 }
 
@@ -1154,7 +1208,7 @@ fn burn_successor_not_canonical_sink_rejected() {
     // canonical unspendable sink. The MINT role attested over the ACTUAL
     // (dishonest) successor SPK -- so the attestation itself is internally
     // consistent and would verify fine -- but the separate, structural
-    // sink-pin check (`OpTxOutputSpk == BURN_SINK_SPK_BYTES`) must still
+    // sink-pin check (`OpTxOutputSpk == burn_sink_spk_bytes()`) must still
     // reject it: attestation validity alone must never be enough to redirect
     // a burn to spendable value.
     let cfg = BurnCfg { successor_not_sink: true, ..BurnCfg::honest() };

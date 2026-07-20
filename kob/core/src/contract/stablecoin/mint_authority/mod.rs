@@ -28,10 +28,12 @@
 
 pub mod attestation;
 pub mod body;
+pub mod sigscript;
 pub mod state;
 
 pub use attestation::*;
 pub use body::*;
+pub use sigscript::*;
 pub use state::{MintAuthorityStateHeader, STATE_HEADER_LEN};
 
 /// 8-byte domain-separation tag for the mint-authority contract's MINT

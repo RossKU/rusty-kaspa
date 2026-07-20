@@ -19,6 +19,14 @@ path = "src/bin/kob_miner.rs"
 name = "kob-e2e-util"
 path = "src/bin/kob_e2e_util.rs"
 
+# testnet-10 live E2E harness for the robust KCC-0020 stablecoin
+# (STABLECOIN_ROBUST_DESIGN.md) -- builds/signs/submits the full DEPLOY(2-tx)
+# -> MINT -> TRANSFER -> FREEZE -> SEIZE -> UNFREEZE -> BURN -> RAISE_CAP
+# lifecycle against a live node. Not part of the product surface.
+[[bin]]
+name = "kob-stablecoin-e2e"
+path = "src/bin/kob_stablecoin_e2e.rs"
+
 # EXPERIMENTAL measurement bin (kob/BATCH_LIMITS.md) — deploys/settles
 # large-N lab covenants on testnet only; not part of the product surface.
 [[bin]]

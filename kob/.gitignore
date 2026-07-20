@@ -1,0 +1,5 @@
+# testnet wallet / run secrets -- never commit (plaintext keys)
+wallet.json
+*_wallet.json
+kob_sc_keys.json
+*.wallet.json

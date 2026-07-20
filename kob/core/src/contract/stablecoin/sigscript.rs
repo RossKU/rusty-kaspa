@@ -184,9 +184,15 @@ pub fn build_stablecoin_seize_sigscript(
 /// `OpCheckSigVerify` + role `OpCheckSigFromStack` -- but the attesting role
 /// here is MINT (the mint-authority's supply key, §2/§9), not OPS, and there
 /// is NO `new_rs` field at all: BURN's successor is a FIXED canonical
-/// unspendable sink (`super::body::BURN_SINK_SPK_BYTES`), not a
-/// spender-supplied candidate covenant the body authenticates via
-/// `dr_output_spk_check` -- see `build_burn_branch`'s doc (`body.rs`).
+/// unspendable sink (`super::body::burn_sink_spk_bytes`, the P2SH wrapping of
+/// `super::body::BURN_SINK_SCRIPT`), not a spender-supplied candidate
+/// covenant -- so there is nothing for the SPENDER to reveal via sigscript
+/// data. The body still authenticates the sink via `dr_output_spk_check`
+/// (the same live-proven mechanism TRANSFER/FREEZE/SEIZE use for their
+/// `new_rs`), just with the fixed `BURN_SINK_SCRIPT` constant pushed as a
+/// literal directly in the body bytecode instead of read from the sigscript
+/// -- see `build_burn_branch`'s doc (`body.rs`) for the full rationale
+/// (including the live-discovered bug this fixes).
 ///
 /// `owner_sig` -- the owner's raw 64-byte Schnorr signature over the
 /// transaction's SIGHASH_ALL sighash (the `0x01` type byte is appended here).

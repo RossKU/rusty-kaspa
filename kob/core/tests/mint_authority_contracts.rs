@@ -37,13 +37,14 @@ use kaspa_txscript::engine_context::EngineCtx;
 use kaspa_txscript::{EngineFlags, TxScriptEngine};
 
 use kob_core::contract::stablecoin::body::build_stablecoin_redeem_script;
-use kob_core::contract::stablecoin::mint_authority::attestation::{build_mint_attestation_message, build_raise_cap_attestation_message, op_type};
+use kob_core::contract::stablecoin::mint_authority::attestation::{build_mint_attestation_message, build_raise_cap_attestation_message};
 use kob_core::contract::stablecoin::mint_authority::body::{build_mint_authority_body, build_mint_authority_redeem_script};
+use kob_core::contract::stablecoin::mint_authority::sigscript::{build_mint_authority_mint_sigscript, build_mint_authority_raise_cap_sigscript};
 use kob_core::contract::stablecoin::mint_authority::state::MintAuthorityStateHeader;
 use kob_core::contract::stablecoin::mint_authority::DOMAIN_TAG_MINT;
 use kob_core::contract::stablecoin::state::frozen_flag;
 use kob_core::contract::token::identifier_type as id_type;
-use kob_core::{build_p2sh, get_public_key, push_data, schnorr_sign};
+use kob_core::{build_p2sh, get_public_key, schnorr_sign};
 
 const IN_AMOUNT: u64 = 10_000;
 
@@ -70,26 +71,6 @@ fn spk_to_bytes(spk: &ScriptPublicKey) -> Vec<u8> {
     let mut v = spk.version().to_be_bytes().to_vec();
     v.extend_from_slice(spk.script());
     v
-}
-
-/// Build the MINT (`op_type = 0x00`) sigscript: `mint_sig` deepest, then
-/// `old_rs`, then `new_rs`, then `mint_amount(8B LE)`, then `recipient_pubkey`,
-/// then the `op_type_selector` (`0x00`), then the redeem script last.
-///
-/// `recipient_pubkey` takes a raw `&[u8]` slice (not `&[u8; 32]`) so
-/// `mint_oversized_recipient_rejected` can push an oversized (33B) recipient
-/// in the same slot -- something a fixed-size-array parameter couldn't
-/// express.
-fn build_mint_sigscript(mint_sig: &[u8; 64], old_rs: &[u8], new_rs: &[u8], mint_amount: u64, recipient_pubkey: &[u8], redeem_script: &[u8]) -> Vec<u8> {
-    let mut ss = Vec::new();
-    ss.extend_from_slice(&push_data(mint_sig));
-    ss.extend_from_slice(&push_data(old_rs));
-    ss.extend_from_slice(&push_data(new_rs));
-    ss.extend_from_slice(&push_data(&mint_amount.to_le_bytes()));
-    ss.extend_from_slice(&push_data(recipient_pubkey));
-    ss.extend_from_slice(&push_data(&[op_type::MINT]));
-    ss.extend_from_slice(&push_data(redeem_script));
-    ss
 }
 
 /// One MINT scenario. `honest()` yields a fully valid mint (running_supply
@@ -309,7 +290,12 @@ fn build(cfg: &MintCfg) -> Built {
     let mint_sig: [u8; 64] = schnorr_sign(&msg, &privkey(cfg.attest_mint_seed)).unwrap();
 
     let sigscript_recipient: Vec<u8> = cfg.sigscript_recipient_bytes_override.clone().unwrap_or_else(|| recipient_pub.to_vec());
-    let ss = build_mint_sigscript(&mint_sig, &old_rs, &new_rs, cfg.mint_amount, &sigscript_recipient, &old_rs);
+    // Real-engine proof that the sigscript builder produces engine-accepted
+    // bytes: this is the same builder `kob_core::contract::stablecoin::mint_authority::sigscript`
+    // ships (mint_sig deepest, then old_rs, then new_rs, then
+    // mint_amount(8B LE), then recipient_pubkey, then the op_type_selector
+    // (0x00), then the redeem script last).
+    let ss = build_mint_authority_mint_sigscript(&mint_sig, &old_rs, &new_rs, cfg.mint_amount, &sigscript_recipient, &old_rs);
     // sig_op_count = 1: a single OpCheckSigFromStack (MINT role); no owner sig.
     let final_input = TransactionInput::new(mint_outpoint, ss, 0, 1);
     let tx = Transaction::new(0, vec![final_input], vec![self_output, coin_output], 0, Default::default(), 0, vec![]);
@@ -542,32 +528,6 @@ fn mint_authority_output_value_drained_rejected() {
 /// positional slot, mirroring `stablecoin_contracts.rs`'s `SEIZE_GARBAGE_SIG`.
 const RAISE_CAP_GARBAGE_SIG: [u8; 64] = [0u8; 64];
 
-/// Build the RAISE_CAP (`op_type = 0x01`) sigscript: `sig1` deepest, then
-/// `sig2`, then `sig3`, then `old_rs`, then `new_rs`, then `new_cap(8B LE)`,
-/// then the `op_type_selector` (`0x01`), then the redeem script last --
-/// mirrors `build_mint_sigscript`'s ordering convention with the SEIZE-style
-/// 3-signature prefix in place of a single `mint_sig`.
-fn build_raise_cap_sigscript(
-    sig1: &[u8; 64],
-    sig2: &[u8; 64],
-    sig3: &[u8; 64],
-    old_rs: &[u8],
-    new_rs: &[u8],
-    new_cap: u64,
-    redeem_script: &[u8],
-) -> Vec<u8> {
-    let mut ss = Vec::new();
-    ss.extend_from_slice(&push_data(sig1));
-    ss.extend_from_slice(&push_data(sig2));
-    ss.extend_from_slice(&push_data(sig3));
-    ss.extend_from_slice(&push_data(old_rs));
-    ss.extend_from_slice(&push_data(new_rs));
-    ss.extend_from_slice(&push_data(&new_cap.to_le_bytes()));
-    ss.extend_from_slice(&push_data(&[op_type::RAISE_CAP]));
-    ss.extend_from_slice(&push_data(redeem_script));
-    ss
-}
-
 /// One RAISE_CAP scenario. `honest()` yields a fully valid 3-of-3-signed cap
 /// raise (running_supply unchanged, current_cap strictly increased to
 /// exactly the attested new_cap); each adversarial test mutates exactly one
@@ -725,8 +685,13 @@ fn build_raise_cap(cfg: &RaiseCapCfg) -> Built {
     let sig3 = sig_for(2);
 
     // No mint_pubkey/owner authorization at all -- the cap_authority 2-of-3
-    // quorum gates alone (§9).
-    let ss = build_raise_cap_sigscript(&sig1, &sig2, &sig3, &old_rs, &new_rs, cfg.new_cap, &old_rs);
+    // quorum gates alone (§9). Real-engine proof that the sigscript builder
+    // produces engine-accepted bytes: this is the same builder
+    // `kob_core::contract::stablecoin::mint_authority::sigscript` ships
+    // (sig1 deepest, then sig2, then sig3, then old_rs, then new_rs, then
+    // new_cap(8B LE), then the op_type_selector (0x01), then the redeem
+    // script last).
+    let ss = build_mint_authority_raise_cap_sigscript(&sig1, &sig2, &sig3, &old_rs, &new_rs, cfg.new_cap, &old_rs);
     // sig_op_count = 3: three OpCheckSigFromStack calls (2-of-3 cap_authority
     // quorum).
     let final_input = TransactionInput::new(outpoint(cfg.outpoint_txid_seed, cfg.outpoint_index), ss, 0, 3);
@@ -965,7 +930,12 @@ fn raise_cap_new_cap_at_or_above_2pow63_rejected() {
     let sig2 = schnorr_sign(&attest_msg, &privkey(cap_authority_seeds[1])).unwrap();
     let sig3 = schnorr_sign(&attest_msg, &privkey(cap_authority_seeds[2])).unwrap();
 
-    let ss = build_raise_cap_sigscript(&sig1, &sig2, &sig3, &old_rs, &new_rs, new_cap_raw, &old_rs);
+    // build_mint_authority_raise_cap_sigscript performs no numeric-domain
+    // validation itself (that lives in MintAuthorityStateHeader::new_checked/
+    // check_numeric_domain) -- it faithfully pushes whatever raw u64 it is
+    // given, so routing through the real builder here still reproduces a
+    // real attacker crafting the raw 2^63 boundary value directly.
+    let ss = build_mint_authority_raise_cap_sigscript(&sig1, &sig2, &sig3, &old_rs, &new_rs, new_cap_raw, &old_rs);
     let final_input = TransactionInput::new(outpoint(outpoint_txid_seed, outpoint_index), ss, 0, 3);
     let tx = Transaction::new(0, vec![final_input], vec![self_output], 0, Default::default(), 0, vec![]);
     let built = Built { tx, entries };

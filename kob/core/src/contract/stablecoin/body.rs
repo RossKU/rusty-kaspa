@@ -165,7 +165,6 @@ mod op {
     pub const OP4: u8 = 0x54;
     pub const OP8: u8 = 0x58;
     pub const DATA1: u8 = 0x01;
-    pub const DATA3: u8 = 0x03;
     pub const DATA8: u8 = 0x08;
     pub const DATA32: u8 = 0x20;
     pub const ADD: u8 = 0x93;
@@ -178,26 +177,87 @@ const _: () = assert!(OUTPOINT_INDEX_LEN == 4);
 const _: () = assert!(AMOUNT_LEN == 8);
 const _: () = assert!(X_ONLY_PUBKEY_LEN == 32);
 
-/// Canonical "burn sink" locking-script bytes (`STABLECOIN_ROBUST_DESIGN.md`
-/// §4/§8, BURN `0x03`): a BARE `OpReturn` (`0x6a`), no push data. A script
-/// whose FIRST opcode is `OpReturn` is recognized by this codebase's own
-/// consensus-level `kaspa_txscript::is_unspendable` (`crypto/txscript/src/lib.rs`)
-/// as guaranteed to fail at execution -- nobody can ever construct a valid
-/// spending script for an output locked to it, so pinning BURN's successor
-/// SPK to it provably destroys the coin's native (sompi) value. This is the
-/// SAME "OP_RETURN-first" convention Bitcoin-family chains use for
-/// unspendable/data outputs; this crate has no prior "burn sink" constant, so
-/// this is a NEW definition (documented here as the single source of truth).
+/// Canonical "burn sink" REDEEM SCRIPT (`STABLECOIN_ROBUST_DESIGN.md` §4/§8,
+/// BURN `0x03`): a single `OpReturn` (`0x6a`) byte.
+///
+/// # Live-discovered bug this fixes: a BARE `OpReturn` OUTPUT is non-standard
+/// on Kaspa
+///
+/// This constant used to be used DIRECTLY as the sink's locking script
+/// (`ScriptPublicKey = version(0) || [0x6a]`). That output was rejected by
+/// every real node's mempool with `"transaction output #0: non-standard
+/// script form"` (live testnet-10 run; the other 6 covenant ops --
+/// deploy/mint/transfer/freeze/seize/unfreeze -- all relayed fine, because
+/// their outputs are P2PK/P2SH). The rejection is not a config quirk: Kaspa's
+/// mempool standardness gate
+/// (`mining/src/mempool/check_transaction_standard.rs`'s
+/// `check_transaction_standard_in_isolation`, which raises
+/// `NonStandardError::RejectOutputScriptClass` -> `"non-standard script
+/// form"`, `mining/errors/src/mempool.rs`) classifies every output via
+/// `kaspa_txscript::script_class::ScriptClass::from_script`, which recognizes
+/// **only three** shapes as standard: `PubKey` (`[OpData32][pk][OpCheckSig]`,
+/// P2PK Schnorr), `PubKeyECDSA` (P2PK ECDSA), and `ScriptHash` (P2SH,
+/// `[OpBlake2b][OpData32][hash(32B)][OpEqual]`, 35 bytes) -- all at SPK
+/// version `0` (`MAX_SCRIPT_PUBLIC_KEY_VERSION`). Anything else, including a
+/// bare `OpReturn`, falls through to `ScriptClass::NonStandard` and is
+/// rejected. **Kaspa has no OP_RETURN-output standardness class at all**
+/// (unlike Bitcoin's `nulldata`).
+///
+/// # The fix: P2SH-wrap this same unspendable byte
+///
+/// [`BURN_SINK_SCRIPT`] is now used as a P2SH REDEEM script (see
+/// [`burn_sink_spk`]) instead of a bare locking script, via [`crate::build_p2sh`]
+/// -- the identical Blake2b-based P2SH path every other covenant output in
+/// this codebase already uses. The resulting locking script --
+/// `[OpBlake2b][OpData32][Blake2b256([0x6a])][OpEqual]` -- IS one of the
+/// three standard forms (`ScriptClass::ScriptHash`), so the mempool relays
+/// it. It remains exactly as unspendable as before: `OpReturn` is a
+/// hardwired unconditional-abort opcode in this engine (vendored
+/// `crypto/txscript/src/opcodes/mod.rs`: `opcode OpReturn<0x6a, 1>(self, vm)
+/// Err(TxScriptError::EarlyReturn)`, unconditional regardless of any other
+/// stack contents or position). The instant anyone reveals `[0x6a]` as the
+/// redeem script to spend this P2SH output (the ONLY redeem script that
+/// hashes to the committed value, since Blake2b is preimage-resistant),
+/// script execution aborts with `EarlyReturn` before any other check can
+/// even run. There is no sigscript that can make this redeem script
+/// evaluate successfully, so the P2SH commitment to it is provably
+/// unspendable -- and, being a fresh single-byte redeem script with no
+/// signer/state, this address is unrelated to (and unreachable from) every
+/// other covenant's P2SH address in this codebase.
 pub const BURN_SINK_SCRIPT: [u8; 1] = [0x6a];
 
-/// The scriptPublicKey bytes (`version(2B BE) || script`) `OpTxOutputSpk`
-/// pushes for an output locked to [`BURN_SINK_SCRIPT`] at SPK version `0`
-/// (the same version every other SPK in this codebase uses -- see
-/// `crypto/txscript/src/lib.rs`'s `SpkEncoding::to_bytes`,
-/// `settle::crypto::p2sh::build_p2sh`). This is the literal
-/// [`build_burn_branch`] bakes in and compares the successor output's actual
-/// SPK against.
-pub const BURN_SINK_SPK_BYTES: [u8; 3] = [0x00, 0x00, BURN_SINK_SCRIPT[0]];
+/// The P2SH `ScriptPublicKey` locking [`BURN_SINK_SCRIPT`] -- computed via
+/// the same [`crate::build_p2sh`]/Blake2b path every other covenant output in
+/// this codebase uses: `[OpBlake2b][OpData32][Blake2b256(BURN_SINK_SCRIPT)][OpEqual]`,
+/// 35 bytes, at SPK version `0`. See [`BURN_SINK_SCRIPT`]'s doc for why this
+/// (rather than a bare `OpReturn` locking script) is the sink's standard
+/// AND provably-unspendable form.
+pub fn burn_sink_spk() -> kaspa_consensus_core::tx::ScriptPublicKey {
+    crate::build_p2sh(&BURN_SINK_SCRIPT)
+}
+
+/// The scriptPublicKey bytes (`version(2B BIG-ENDIAN) || script`) that
+/// `OpTxOutputSpk` pushes for [`burn_sink_spk`] (37 bytes: 2-byte version +
+/// 35-byte P2SH script) -- matches the vendored engine's
+/// `SpkEncoding::to_bytes` (`crypto/txscript/src/lib.rs`:
+/// `self.version.to_be_bytes().into_iter().chain(...)`) and the same
+/// big-endian convention every other off-chain SPK-bytes helper in this
+/// codebase uses (`spk_bytes_be`/`spk_to_bytes` in the CLI harness/tests,
+/// `dr_output_spk_check`'s in-script `[0x00, 0x00, 0xaa, 0x20]` reconstruction
+/// prefix). Version is always `0` (`MAX_SCRIPT_PUBLIC_KEY_VERSION`) for a
+/// P2SH SPK, so big- vs little-endian is a no-op in practice today, but this
+/// keeps the encoding correct-by-construction rather than correct-by-
+/// coincidence. This is no longer baked into or compared against by
+/// [`build_burn_branch`]'s on-chain sink-pin check (see that fn's doc) --
+/// it remains as the OFF-CHAIN utility for constructing the actual sink
+/// output (what the CLI harness's `build_p2sh(&BURN_SINK_SCRIPT)` computes).
+pub fn burn_sink_spk_bytes() -> Vec<u8> {
+    let spk = burn_sink_spk();
+    let mut out = Vec::with_capacity(2 + spk.script().len());
+    out.extend_from_slice(&spk.version().to_be_bytes());
+    out.extend_from_slice(spk.script());
+    out
+}
 
 fn e_roll(b: &mut Vec<u8>, depth: u16) {
     push_index(b, depth);
@@ -828,18 +888,44 @@ fn build_seize_branch(seize_pubkeys: &[[u8; X_ONLY_PUBKEY_LEN]; 3]) -> Vec<u8> {
 /// pre-image with NO op-specific tail (§5: "sink pinned structurally, not via
 /// preimage").
 ///
-/// # No `new_rs` -- the sink is a FIXED constant, not a candidate covenant
+/// # No `new_rs` sigscript field -- but the sink IS authenticated via
+/// `dr_output_spk_check`, like every other branch's successor
 ///
 /// Unlike TRANSFER/FREEZE/SEIZE, BURN's successor is NOT an arbitrary
-/// candidate redeem script the spender proposes and the body authenticates
-/// via `dr_output_spk_check` (the "P2SH-opacity problem" this module's doc
-/// explains) -- it is the FIXED canonical constant [`BURN_SINK_SPK_BYTES`],
-/// known at redeem-script-build time. So the body doesn't need the
-/// authenticate-then-slice dance at all: it just compares the successor
-/// output's raw SPK bytes (`OpTxOutputSpk`) directly against the baked
-/// literal (§4's pseudocode: `OpTxInputIndex OpTxOutputSpk <canonical sink
-/// SPK bytes> OpEqual OpVerify`). Consequently there is no `new_rs` sigscript
-/// field either -- see `super::sigscript::build_stablecoin_burn_sigscript`.
+/// candidate redeem script the SPENDER proposes via sigscript data -- it is
+/// the FIXED canonical constant [`BURN_SINK_SCRIPT`], known at
+/// redeem-script-build time. So there is no `new_rs` sigscript field (see
+/// `super::sigscript::build_stablecoin_burn_sigscript`).
+///
+/// **Live-discovered bug this fixes (2026-07-19/20 testnet-10 run):** BURN
+/// used to authenticate the sink by comparing the successor output's raw SPK
+/// bytes (`OpTxOutputSpk`) directly against a HOST-COMPUTED literal
+/// (`burn_sink_spk_bytes()`, baked in via a plain `OpEqual`) -- `OpTxInputIndex
+/// OpTxOutputSpk <canonical sink SPK bytes literal> OpEqual OpVerify`. That
+/// raw-literal compare had NEVER actually run on a real node before: the old
+/// bare-`OpReturn` sink was rejected by mempool standardness *before* script
+/// verification ever got a chance to exercise it (see [`BURN_SINK_SCRIPT`]'s
+/// doc), so once the P2SH-wrap standardness fix let the transaction reach
+/// script verification, this was the FIRST live exercise of the raw-literal
+/// mechanism -- and it failed ("script ran, but verification failed"),
+/// unlike TRANSFER/FREEZE/SEIZE's successor-authentication, which uses
+/// [`dr_output_spk_check`] (an ON-CHAIN `OpBlake2b` reconstruction of
+/// `P2SH(candidate)`, compared via `OpEqual` against the REAL successor's
+/// `OpTxOutputSpk` result) and HAS been live-proven on testnet-10.
+///
+/// The fix: BURN now authenticates its (fixed, non-spender-suppliable) sink
+/// through the exact same [`dr_output_spk_check`] mechanism, treating
+/// [`BURN_SINK_SCRIPT`] as the "candidate redeem script" -- except, since it
+/// is a compile-time constant rather than spender-supplied sigscript data,
+/// it is pushed as a literal directly in the BODY bytecode (not read from
+/// the sigscript) immediately before the check. This makes BURN inherit
+/// TRANSFER's live-correct on-chain SPK reconstruction/serialization
+/// handling instead of relying on a locally-computed absolute-byte literal
+/// that was never exercised against a real node. [`burn_sink_spk_bytes`]/
+/// [`burn_sink_spk`] remain as the OFF-CHAIN utility for constructing the
+/// actual sink output (the CLI harness still builds output\[0\] as
+/// `build_p2sh(&BURN_SINK_SCRIPT)`), but the ON-CHAIN check no longer bakes
+/// in or compares against their output directly.
 ///
 /// Because the destination is fixed and carries no coin state at all, neither
 /// `role_registry_root` nor `identifier_type` is read for any
@@ -967,13 +1053,27 @@ fn build_burn_branch(mint_pubkey: &[u8; X_ONLY_PUBKEY_LEN]) -> Vec<u8> {
 
     // ---- Sink pin (§4/§8): successor SPK must equal the canonical
     // unspendable burn sink, exactly (not attacker-suppliable). Stack is
-    // empty here (CHECKSIGFROMSTACK+VERIFY above consumed everything). ----
-    b.push(TXINPUTINDEX);
-    b.push(TXOUTPUTSPK);
-    b.push(DATA3);
-    b.extend_from_slice(&BURN_SINK_SPK_BYTES);
-    b.push(EQUAL);
-    b.push(VERIFY);
+    // empty here (CHECKSIGFROMSTACK+VERIFY above consumed everything).
+    //
+    // Live-discovered bug fix (see this fn's doc): this used to be a
+    // host-computed raw-literal `OpEqual` against `OpTxOutputSpk`'s output --
+    // never actually exercised on a real node before the P2SH-wrap
+    // standardness fix, and it failed the first time it was ("script ran,
+    // but verification failed"). Now it uses the SAME live-proven mechanism
+    // TRANSFER/FREEZE/SEIZE use for their `new_rs` ([`dr_output_spk_check`]:
+    // an ON-CHAIN `OpBlake2b` reconstruction of `P2SH(candidate)`, `OpEqual`
+    // against the REAL successor's `OpTxOutputSpk` result) -- BURN's
+    // "candidate" is the fixed constant `BURN_SINK_SCRIPT`, pushed as a
+    // literal directly here (not read from the sigscript, since it is not
+    // spender-suppliable). ----
+    b.push(DATA1);
+    b.push(BURN_SINK_SCRIPT[0]); // literal [0x6a] -- stand-in "candidate redeem script"
+    // Stack: sink_script(0).
+    b.push(TXINPUTINDEX); // fresh -- reused as the output index (1:1 successor-binding convention)
+    // Stack: input_idx(0), sink_script(1).
+    b.extend_from_slice(&dr_output_spk_check(1, 1)); // Blake2b(sink_script) == P2SH(real successor SPK)
+    b.push(DROP); // drop input_idx (dr_output_spk_check's own depth-adjustment discipline)
+    b.push(DROP); // drop sink_script -- no longer needed (no fields to extract from it)
 
     b.push(OP1);
     b
@@ -1360,7 +1460,8 @@ mod tests {
         // bytecode, so the floor drops from 2 to 1 (this is a MINIMUM bound,
         // not an exact count -- other branches incidentally embed their own
         // 0x00 bytes too, e.g. TRANSFER's `frozen_flag::CLEAR` literal and
-        // BURN's `BURN_SINK_SPK_BYTES`).
+        // BURN's `dr_output_spk_check` sink-pin reconstruction, whose
+        // `[0x00, 0x00, 0xaa, 0x20]` prefix literal also embeds two).
         let stub_count = body.iter().filter(|&&byte| byte == 0x00).count();
         assert!(stub_count >= 1, "expected at least 1 OP_0 stub byte (ROTATE), found {stub_count}");
     }
@@ -1403,20 +1504,38 @@ mod tests {
     }
 
     #[test]
-    fn burn_sink_spk_bytes_are_version_zero_plus_burn_sink_script() {
-        // Ties BURN_SINK_SPK_BYTES (what the branch bakes in and compares
-        // against) to BURN_SINK_SCRIPT (the locking-script bytes alone) --
-        // version 0 (2 BE bytes), matching every other SPK in this codebase.
-        assert_eq!(BURN_SINK_SPK_BYTES.len(), 3);
-        assert_eq!(&BURN_SINK_SPK_BYTES[..2], &[0x00, 0x00]);
-        assert_eq!(&BURN_SINK_SPK_BYTES[2..], &BURN_SINK_SCRIPT);
+    fn burn_sink_spk_bytes_are_version_zero_plus_p2sh_of_burn_sink_script() {
+        // Ties `burn_sink_spk_bytes()` (the off-chain utility for
+        // constructing the actual sink output -- no longer baked into the
+        // branch's on-chain check, see `build_burn_branch`'s doc) to
+        // `burn_sink_spk()`/`BURN_SINK_SCRIPT` -- version 0 (2 BIG-ENDIAN
+        // bytes, matching `OpTxOutputSpk`'s actual serialization) || the
+        // 35-byte P2SH script wrapping BURN_SINK_SCRIPT, matching every other
+        // SPK in this codebase (see `crate::build_p2sh`).
+        let bytes = burn_sink_spk_bytes();
+        let spk = burn_sink_spk();
+        assert_eq!(bytes.len(), 37, "37 = 2-byte version + 35-byte P2SH script");
+        assert_eq!(&bytes[..2], &[0x00, 0x00]);
+        assert_eq!(&bytes[2..], spk.script());
+        // And the P2SH script itself is the standard ScriptHash shape
+        // (OpBlake2b OpData32 <hash> OpEqual) wrapping BURN_SINK_SCRIPT, not
+        // BURN_SINK_SCRIPT used directly as a locking script.
+        assert_eq!(spk.script().len(), 35);
+        assert_eq!(spk.script()[0], 0xaa, "first byte must be OpBlake2b");
+        assert_eq!(spk.script()[1], 0x20, "second byte must be push32");
+        assert_eq!(spk.script()[34], 0x87, "last byte must be OpEqual");
+        assert_eq!(&spk.script()[2..34], &crate::blake2b_256(&BURN_SINK_SCRIPT));
     }
 
     #[test]
-    fn burn_sink_script_is_a_bare_op_return() {
-        // OpReturn (0x6a) as the FIRST (and only) opcode: this codebase's own
-        // consensus-level `is_unspendable` (`crypto/txscript/src/lib.rs`)
-        // recognizes exactly this shape as guaranteed to fail at execution.
+    fn burn_sink_script_is_a_bare_op_return_used_as_a_p2sh_redeem_script() {
+        // OpReturn (0x6a) as the FIRST (and only) opcode of the REDEEM
+        // script (not the locking script -- see `BURN_SINK_SCRIPT`'s doc for
+        // why a bare-OpReturn locking script is non-standard/non-relayable on
+        // Kaspa). This engine's `OpReturn` unconditionally errors
+        // (`TxScriptError::EarlyReturn`) the instant it executes, regardless
+        // of stack contents or position, so revealing this redeem script to
+        // spend the P2SH output can never succeed.
         assert_eq!(BURN_SINK_SCRIPT, [0x6a]);
     }
 
@@ -1431,13 +1550,32 @@ mod tests {
     }
 
     #[test]
-    fn burn_branch_pins_canonical_sink_bytes() {
-        // The exact literal the sink-pin check compares against must be
-        // present in the branch's bytecode (baked, not attacker-suppliable).
+    fn burn_branch_pins_canonical_sink_via_dr_output_spk_check() {
+        // Live-discovered-bug regression guard (see `build_burn_branch`'s
+        // doc): the sink-pin check must use the SAME live-proven on-chain
+        // reconstruction mechanism TRANSFER/FREEZE/SEIZE use for their
+        // `new_rs` (`dr_output_spk_check`: an ON-CHAIN `OpBlake2b`
+        // reconstruction of `P2SH(candidate)` compared via `OpEqual` against
+        // the REAL successor's `OpTxOutputSpk`), NOT a host-computed
+        // raw-literal `OpEqual` against `OpTxOutputSpk`'s serialized bytes
+        // (the mechanism that failed live the first time it was ever
+        // exercised on a real node).
         let burn = build_burn_branch(&MINT);
+        let needle = dr_output_spk_check(1, 1);
         assert!(
-            burn.windows(BURN_SINK_SPK_BYTES.len()).any(|w| w == BURN_SINK_SPK_BYTES),
-            "BURN branch missing the canonical sink SPK literal"
+            burn.windows(needle.len()).any(|w| w == needle),
+            "BURN branch missing dr_output_spk_check bytes for the sink-pin check"
+        );
+        // The BURN_SINK_SCRIPT literal (the "candidate redeem script" stand-in)
+        // must still be baked in -- not attacker-suppliable.
+        assert!(burn.contains(&BURN_SINK_SCRIPT[0]));
+        // And the OLD host-computed absolute SPK-byte literal must no longer
+        // appear anywhere in the branch bytecode -- the on-chain check no
+        // longer trusts a baked absolute-byte literal at all.
+        let sink_bytes = burn_sink_spk_bytes();
+        assert!(
+            !burn.windows(sink_bytes.len()).any(|w| w == sink_bytes),
+            "BURN branch must not bake the raw canonical-sink SPK literal anymore"
         );
     }
 
